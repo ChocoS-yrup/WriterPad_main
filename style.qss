@@ -1,0 +1,262 @@
+/* 기본 배경 및 텍스트 설정 */
+QWidget {
+    background-color: #1b1d24;
+    color: #e0e0e0;
+}
+
+QLabel, QPushButton, QComboBox, QCheckBox, QStatusBar, QMenu, QLineEdit, QTextBrowser, QListWidget, QDialog {
+    font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
+    font-weight: bold;
+    font-size: 14px;
+}
+
+/* 타이틀 라벨 스타일 */
+QLabel#TitleLabel {
+    color: #00e5ff;
+    font-size: 32px;
+    font-weight: bold;
+    padding: 10px;
+}
+
+/* 스마트 화수 콤보박스의 숫자 픽셀 라벨 */
+QLabel#DigitLabel {
+    background-color: #262933;
+    border: 1px solid #3a3f4c;
+    border-radius: 4px;
+    color: #00e5ff;
+    font-weight: bold;
+    font-size: 24px;
+}
+
+QLabel#DigitLabel:hover {
+    background-color: #323644;
+    border: 1px solid #00e5ff;
+}
+
+/* 콤보박스 (모델 선택기 등) */
+QComboBox {
+    background-color: #262933;
+    border: 1px solid #3a3f4c;
+    border-radius: 4px;
+    padding: 5px;
+    color: #e0e0e0;
+    min-width: 150px;
+}
+QComboBox:hover {
+    border: 1px solid #5a627a;
+}
+QComboBox::drop-down {
+    border: none;
+}
+
+/* 일반 텍스트 라벨 (배경 투명) */
+QLabel {
+    background-color: transparent;
+}
+
+/* 버튼 기본 스타일 (블루) */
+QPushButton {
+    background-color: #2a64f6;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #3b74ff;
+}
+QPushButton:pressed {
+    background-color: #1a54e6;
+}
+QPushButton:disabled {
+    background-color: #4a5060;
+    color: #888c99;
+}
+
+/* 화수 이동 꺾쇠 버튼 등 어두운 버튼용 */
+QPushButton#DarkButton {
+    background-color: #3a3f4c;
+    color: white;
+}
+QPushButton#DarkButton:hover {
+    background-color: #4a5060;
+}
+
+/* 종료/경고 류 빨간 버튼용 */
+QPushButton#RedButton {
+    background-color: #e53935;
+}
+QPushButton#RedButton:hover {
+    background-color: #f44336;
+}
+
+/* 텍스트 에디터 패널 */
+QTextEdit {
+    background-color: #ffffff;
+    border: 1px solid #3a3f4c;
+    border-radius: 6px;
+    padding: 15px;
+    color: #000000;
+    selection-background-color: #ffaa00;
+    selection-color: #000000;
+}
+QTextEdit:focus {
+    border: 1px solid #2a64f6;
+}
+
+/* =========================================================
+   Sidebar (QFrame & QPushButton) - 탭 구분 영역 표시
+   ========================================================= */
+QFrame#SidebarFrame {
+    background-color: #1e2129;
+    border: 1px solid #3a3f4c;
+    border-radius: 8px;
+    margin-right: 15px;
+}
+
+QPushButton#SidebarButton {
+    background-color: #1b1d24;
+    color: #888c99;
+    border: none;
+    border-radius: 6px;
+    padding: 20px 16px;
+    font-size: 24px;
+    font-weight: bold;
+    font-family: 'Segoe UI', 'Malgun Gothic', sans-serif;
+}
+
+QPushButton#SidebarButton:hover {
+    background-color: #262933;
+}
+
+QPushButton#SidebarButton:checked {
+    background-color: #2a64f6;
+    color: #ffffff;
+    font-weight: bold;
+}
+
+/* 상태 표시줄 */
+QStatusBar {
+    background-color: #15171c;
+    color: #888c99;
+    font-size: 13px;
+}
+
+/* 텍스트 에디터 모던 스크롤바 (깔끔한 그레이 톤) */
+QScrollBar:vertical {
+    border: none;
+    background: #ffffff;
+    width: 14px;
+    margin: 0px 0px 0px 0px;
+}
+QScrollBar::handle:vertical {
+    background: #d4d4d4;
+    min-height: 20px;
+    border-radius: 7px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #b5b5b5;
+}
+QScrollBar::handle:vertical:pressed {
+    background: #999999;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+    height: 0px;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+}
+
+/* =========================================================
+   AI 피드백 챗 모달 (AIChatDialog)
+   ========================================================= */
+QDialog#AIChatDialog {
+    background-color: #1a1b22;
+}
+
+QTextBrowser#ChatBrowser {
+    background-color: #1e2129;
+    border: 1px solid #3a3f4c;
+    border-radius: 8px;
+    padding: 10px;
+    color: #c7ccd6;
+}
+
+QLineEdit#ChatInput {
+    background-color: #2c313c;
+    border: 1px solid #3a3f4c;
+    border-radius: 8px;
+    padding: 12px;
+    color: #ffffff;
+    font-size: 14px;
+}
+QLineEdit#ChatInput:focus {
+    border: 1px solid #2a64f6;
+}
+
+QPushButton#SendButton {
+    background-color: #2a64f6;
+    color: white;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-weight: bold;
+    font-size: 14px;
+}
+QPushButton#SendButton:hover {
+    background-color: #3b71f7;
+}
+QPushButton#SendButton:disabled {
+    background-color: #4a5060;
+    color: #888c99;
+}
+
+QPushButton#ApplySelectedButton {
+    background-color: #2a64f6;
+    color: white;
+    border-radius: 6px;
+    padding: 10px 30px;
+    font-size: 16px;
+    font-weight: bold;
+}
+QPushButton#ApplySelectedButton:hover {
+    background-color: #3b71f7;
+}
+QPushButton#ApplySelectedButton:disabled {
+    background-color: #4a5060;
+    color: #888c99;
+}
+
+QPushButton#ApplyButton {
+    background-color: #00b894;
+    color: white;
+    border-radius: 6px;
+    padding: 10px 30px;
+    font-size: 16px;
+    font-weight: bold;
+}
+QPushButton#ApplyButton:hover {
+    background-color: #00d6ac;
+}
+QPushButton#ApplyButton:disabled {
+    background-color: #4a5060;
+    color: #888c99;
+}
+
+QPushButton#CancelButton {
+    background-color: #d63031;
+    color: white;
+    border-radius: 6px;
+    padding: 10px 30px;
+    font-size: 16px;
+    font-weight: bold;
+}
+QPushButton#CancelButton:hover {
+    background-color: #ff3e3f;
+}
+QPushButton#CancelButton:disabled {
+    background-color: #4a5060;
+    color: #888c99;
+}

@@ -1,0 +1,21 @@
+# Local credentials (keep the real values on this computer only)
+.env
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Local application state and manuscripts
+config.json
+fonts.json
+saves/
+작품목록/
+메인/
+백업/
+공유/
+
+# Generated packages and local working files
+build/
+dist/
+scratch/
+*.zip
