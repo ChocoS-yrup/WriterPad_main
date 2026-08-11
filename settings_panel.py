@@ -7,7 +7,9 @@ from PyQt6.QtWidgets import (
     QFontDialog, QTabWidget, QListWidgetItem, QGridLayout, QTabBar
 )
 from PyQt6.QtGui import QFont, QTextCursor, QGuiApplication, QTextDocument
-from PyQt6.QtCore import pyqtSignal, Qt, QSettings, QTimer, QThread
+from PyQt6.QtCore import (
+    pyqtSignal, Qt, QSettings, QTimer, QThread, QSignalBlocker,
+)
 
 from app_config import get_saved_font, save_font_to_json
 from cloud_config import classify_cloud_error
@@ -48,6 +50,13 @@ class SettingsPanel(QWidget):
     typewriterToggled = pyqtSignal(str, bool)
     extractRequested = pyqtSignal(bool, int, int, str)
     modelRefreshRequested = pyqtSignal()
+    _TYPEWRITER_CHECKBOX_ATTRS = {
+        "요약": "chk_tw_summary",
+        "초안": "chk_tw_draft",
+        "평가": "chk_tw_eval",
+        "완성본": "chk_tw_completed",
+        "집필모드": "chk_tw_writing",
+    }
 
     def __init__(self, pm):
         super().__init__()
@@ -696,6 +705,15 @@ class SettingsPanel(QWidget):
 
     def set_chk_tray(self, value):
         self.chk_tray.setChecked(value)
+
+    def set_typewriter_checked(self, step_name, enabled):
+        checkbox_name = self._TYPEWRITER_CHECKBOX_ATTRS.get(step_name)
+        checkbox = getattr(self, checkbox_name, None) if checkbox_name else None
+        if checkbox is None:
+            return
+        blocker = QSignalBlocker(checkbox)
+        checkbox.setChecked(bool(enabled))
+        del blocker
 
     def save_startup_mode(self, index):
         startup_mode = self.combo_startup_mode.itemData(index)

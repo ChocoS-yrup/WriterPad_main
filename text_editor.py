@@ -23,6 +23,12 @@ class SmartTextEdit(QTextEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.typewriter_enabled = False
+        self._typewriter_base_bottom_margin = (
+            self.document().rootFrame().frameFormat().bottomMargin()
+        )
+        self._typewriter_align_timer = QTimer(self)
+        self._typewriter_align_timer.setSingleShot(True)
+        self._typewriter_align_timer.timeout.connect(self.keep_cursor_centered)
         self._custom_placeholder = ""
         self._is_composing = False
         self._ime_preedit_text = ""
@@ -534,20 +540,45 @@ class SmartTextEdit(QTextEdit):
             scroll_bar = self.verticalScrollBar()
             scroll_bar.setValue(int(scroll_bar.value() + diff))
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # 타자기 모드에서 마지막 줄까지 부드럽게 스크롤 되도록 하단 여백 추가
+    def set_typewriter_mode(self, enabled, base_bottom_margin=None):
+        """Apply typewriter state and its document/view layout atomically."""
+        if base_bottom_margin is not None:
+            try:
+                self._typewriter_base_bottom_margin = max(
+                    0.0, float(base_bottom_margin)
+                )
+            except (TypeError, ValueError):
+                pass
+        self.typewriter_enabled = bool(enabled)
+        self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
+
+    def _refresh_typewriter_layout(self, align_cursor=False):
         doc = self.document()
         was_modified = doc.isModified()
         signals_were_blocked = self.blockSignals(True)
         try:
             root_frame = doc.rootFrame()
             fmt = root_frame.frameFormat()
-            fmt.setBottomMargin(self.viewport().height() / 2)
+            bottom_margin = (
+                self.viewport().height() / 2
+                if self.typewriter_enabled
+                else self._typewriter_base_bottom_margin
+            )
+            fmt.setBottomMargin(bottom_margin)
             root_frame.setFrameFormat(fmt)
             doc.setModified(was_modified)
         finally:
             self.blockSignals(signals_were_blocked)
+        self.viewport().update()
+        if align_cursor and not self.textCursor().hasSelection():
+            self.keep_cursor_centered()
+            self._typewriter_align_timer.start(0)
+        else:
+            self._typewriter_align_timer.stop()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
 
     @staticmethod
     def _is_direct_period_event(event):

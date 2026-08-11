@@ -1530,14 +1530,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 fmt.setLeftMargin(self.pad_h)
                 fmt.setRightMargin(self.pad_h)
                 fmt.setTopMargin(self.pad_v)
-                if editor.typewriter_enabled:
-                    fmt.setBottomMargin(editor.viewport().height() / 2)
-                else:
-                    fmt.setBottomMargin(self.pad_v)
                 root_frame.setFrameFormat(fmt)
                 doc.setModified(was_modified)
             finally:
                 editor.blockSignals(signals_were_blocked)
+            editor.set_typewriter_mode(
+                editor.typewriter_enabled,
+                base_bottom_margin=self.pad_v,
+            )
 
     def show_padding_dialog(self):
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QSpinBox, QDialogButtonBox
@@ -1575,9 +1575,15 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             self.set_active_editor(self.active_editor) # 즉시 적용
 
     def update_typewriter_setting(self):
-        tw_enabled = self.pm.global_config.get("tw_writing", False)
-        self.left_editor.typewriter_enabled = tw_enabled
-        self.right_editor.typewriter_enabled = tw_enabled
+        tw_enabled = bool(self.pm.global_config.get("tw_writing", False))
+        self.left_editor.set_typewriter_mode(
+            tw_enabled,
+            base_bottom_margin=self.pad_v,
+        )
+        self.right_editor.set_typewriter_mode(
+            tw_enabled,
+            base_bottom_margin=self.pad_v,
+        )
 
     @classmethod
     def _saved_split_mode(cls, project_manager):

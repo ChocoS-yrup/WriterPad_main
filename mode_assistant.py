@@ -21,6 +21,13 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
     switchModeRequested = pyqtSignal()
     sendToWritingModeRequested = pyqtSignal(str)
     typewriterModeToggled = pyqtSignal(str, bool)
+    _TYPEWRITER_CONFIG_KEYS = {
+        "요약": "tw_summary",
+        "초안": "tw_draft",
+        "평가": "tw_eval",
+        "완성본": "tw_completed",
+        "집필모드": "tw_writing",
+    }
     def __init__(self):
         super().__init__()
         self.pm = ProjectManager()
@@ -222,6 +229,7 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
             settings.modelRefreshRequested.connect(self.model_selector.refresh_account_models)
             self.model_selector.refreshStateChanged.connect(settings.set_model_refresh_status)
             
+        self._restore_typewriter_modes()
         QApplication.instance().focusChanged.connect(self.on_focus_changed)
         # --- 상태 표시줄 (Status Bar) ---
         self.status_bar = QStatusBar()
@@ -639,19 +647,44 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
             panel.text_edit.setFocus()
             
     def set_typewriter_mode(self, step_name, enabled):
-        for p in self.left_panels[:4] + self.right_panels[:4]:
+        self._apply_typewriter_mode(
+            step_name,
+            enabled,
+            persist=True,
+            notify=True,
+        )
+
+    def _restore_typewriter_modes(self):
+        for step_name in ("요약", "초안", "평가", "완성본"):
+            config_key = self._TYPEWRITER_CONFIG_KEYS[step_name]
+            self._apply_typewriter_mode(
+                step_name,
+                bool(self.pm.global_config.get(config_key, False)),
+                persist=False,
+                notify=False,
+            )
+
+    def _apply_typewriter_mode(
+        self, step_name, enabled, *, persist, notify
+    ):
+        config_key = self._TYPEWRITER_CONFIG_KEYS.get(step_name)
+        if config_key is None:
+            return
+        enabled = bool(enabled)
+        # The paired editors share a QTextDocument. Apply the hidden right view
+        # first so the initially visible left viewport owns the final margin.
+        for p in self.right_panels[:4] + self.left_panels[:4]:
             if p.step_name == step_name:
-                p.text_edit.typewriter_enabled = enabled
-                
-        # global_config에 저장
-        if step_name == "요약": self.pm.global_config["tw_summary"] = enabled
-        elif step_name == "초안": self.pm.global_config["tw_draft"] = enabled
-        elif step_name == "평가": self.pm.global_config["tw_eval"] = enabled
-        elif step_name == "완성본": self.pm.global_config["tw_completed"] = enabled
-        elif step_name == "집필모드": self.pm.global_config["tw_writing"] = enabled
-        self.pm.save_global_config()
-        
-        self.typewriterModeToggled.emit(step_name, enabled)
+                p.set_typewriter_mode(enabled)
+
+        for settings in (self.left_panels[4], self.right_panels[4]):
+            settings.set_typewriter_checked(step_name, enabled)
+
+        if persist:
+            self.pm.global_config[config_key] = enabled
+            self.pm.save_global_config()
+        if notify:
+            self.typewriterModeToggled.emit(step_name, enabled)
         
     def open_backup_folder(self, step_name):
         """해당 단계의 메인 폴더를 엽니다."""

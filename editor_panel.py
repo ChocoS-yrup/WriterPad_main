@@ -152,6 +152,9 @@ class EditorPanel(QWidget):
 
         self.setLayout(layout)
 
+    def set_typewriter_mode(self, enabled):
+        self.text_edit.set_typewriter_mode(enabled)
+
     def request_ai_generation(self):
         self.aiGenerationRequested.emit(self.step_name)
 
