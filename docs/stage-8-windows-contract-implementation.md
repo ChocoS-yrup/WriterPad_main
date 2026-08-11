@@ -7,7 +7,7 @@
 - Baseline freshness: confirmed by `git fetch origin main` on 2026-08-11
 - Branch: `codex/stage-8-windows-contract-implementation`
 - Contract 0.2 implementation commit: `f0de952d180babf56798ce27e00fa2e455cbbd15`
-- Review status: Draft PR #1; local implementation complete, staging client round trip not authorized
+- Review status: Draft PR #1, `CLEAN/MERGEABLE`; local implementation and Windows CI passed, staging client round trip not authorized
 - Production Supabase writes: none
 - Staging Supabase writes during Stage 8: none
 - Preserved user database writes: none
@@ -124,14 +124,22 @@ bytes: 78402492
 sha256: 4389a0f5a897c5d114352f7f5a6b417d3eb3d74f0b13dd23589bf574aa4921b1
 ```
 
-The CI workflow checks out contract content commit `7bcb5d25...`, runs the official verifier on Python 3.12, runs the complete Windows test suite on Python 3.11.9, builds the distributable executable, and prints its digest.
+Windows CI evidence for head `8577e494cf6d91cf19729c15c8f5f5b15b109c0b`:
+
+```yaml
+run: https://github.com/ChocoS-yrup/WriterPad_main/actions/runs/31473715140
+result: success
+ci_executable_bytes: 55359443
+ci_executable_sha256: 2b30f1bf815063712e39dc4254df3bffea892d0318d26816922fc5624e883ecf
+```
+
+The CI workflow checks out contract content commit `7bcb5d25...`, runs the official verifier on Python 3.12, runs the complete Windows test suite on Python 3.11.9, builds the distributable executable, and prints its digest. Local and CI executable digests differ because they are produced in different dependency environments; the pinned clean-runner CI digest is the release-candidate evidence.
 
 ## Remaining gates
 
-1. Push the updated Draft PR and require its Windows CI to pass at the exact head.
-2. Obtain separate approval before enabling the staging allowlist or connecting the real Windows client to staging.
-3. Under that approval, run actual document/empty-content/replay/rollback/cancellation/Unicode and atomic structure round trips only against WriterPad Staging, then restore the allowlist to `enabled=false`.
-4. Integrate or separately land the user-owned folder/root/order/barrier implementation, then run the complete folder identity, empty/non-empty rename, hierarchy, volume, manuscript-order, pull, crash, and reconnect regression matrix.
-5. Keep the PR in Draft and do not start Stage 9 until these Stage 8 gates pass and the Windows PR is reviewed and merged.
+1. Obtain separate approval before enabling the staging allowlist or connecting the real Windows client to staging.
+2. Under that approval, run actual document/empty-content/replay/rollback/cancellation/Unicode and atomic structure round trips only against WriterPad Staging, then restore the allowlist to `enabled=false`.
+3. Integrate or separately land the user-owned folder/root/order/barrier implementation, then run the complete folder identity, empty/non-empty rename, hierarchy, volume, manuscript-order, pull, crash, and reconnect regression matrix.
+4. Keep the PR in Draft and do not start Stage 9 until these Stage 8 gates pass and the Windows PR is reviewed and merged.
 
 No production project was accessed or changed, no staging row was changed during Stage 8, no legacy project was promoted, and no secret or manuscript body is present in this handoff.
