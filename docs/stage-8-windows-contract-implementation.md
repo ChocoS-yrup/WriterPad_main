@@ -3,49 +3,59 @@
 ## Status
 
 - Platform: Windows 10, Python 3.11.9, PyInstaller 6.21.0
-- Source baseline: `origin/main` at `539cbd39074475b59cbd729923fbc2bc5ee5a7f9`
+- Windows source baseline: `origin/main` at `539cbd39074475b59cbd729923fbc2bc5ee5a7f9`
+- Baseline freshness: confirmed by `git fetch origin main` on 2026-08-11
 - Branch: `codex/stage-8-windows-contract-implementation`
-- Implementation commit: `0bcc3f1f55621b58519cbc8f2356178fdb5c1c3d`
-- Review status: draft; staging evidence and the folder-identity integration gap below remain open
+- Contract 0.2 implementation commit: `f0de952d180babf56798ce27e00fa2e455cbbd15`
+- Review status: Draft PR #1; local implementation complete, staging client round trip not authorized
 - Production Supabase writes: none
+- Staging Supabase writes during Stage 8: none
 - Preserved user database writes: none
 
-## Contract and server pin
+## Contract and Stage 7 server pin
 
 ```yaml
-contract_version: 0.1.0
-contract_git_commit: 45d18cff62cc48e29d0e6efcfc634fec96150198
-contract_content_commit: 7f05f32dd385ce0e1922b88d688742fca2a503fa
-canonical_contract_bytes: 19473
-canonical_contract_sha256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
-server_source_commit: 3111faa589a302404aa57ae88b9eee347a961dc8
-server_migration_ids:
+stage_7_status: COMPLETE
+server_repository: https://github.com/ChocoS-yrup/Writerpad
+server_merge_sha: 20d60ea94da4cd2543db489ea240efa5db2f4091
+contract_version: 0.2.0
+contract_git_commit: fcd99b7098b9a04bd93c585d89b16588aa482530
+contract_content_commit: 7bcb5d25c5376b02469666df7318b90b456ffee6
+canonical_contract_bytes: 23256
+canonical_contract_sha256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
+staging_project_id: mhpnszcorfzrvhyondxr
+staging_endpoint: https://mhpnszcorfzrvhyondxr.supabase.co
+staging_migration_ids:
+  - 20260811000000
   - 20260811010000
   - 20260811020000
-staging_project_id: UNVERIFIED_NOT_PROVIDED
-staging_endpoint: UNVERIFIED_NOT_PROVIDED
+staging_allowlist_enabled: false
+production_changes: none
 ```
 
-The Windows client pins protocol 3 and the released digest for every contract batch. A contract-native write is rejected before dispatch when the protocol, digest, project mode, migration epoch, or required server capabilities do not match. An explicit server-proven activation call is required; opening or migrating SQLite never promotes a project automatically.
+Every protocol-3 batch pins the released version and canonical digest. Contract activation requires an explicit, server-proven project mode, epoch, protocol, digest, and capability set. Opening or migrating SQLite never promotes a project automatically.
 
 ## Implemented Windows client behavior
 
-- Additive SQLite migration to `PRAGMA user_version = 8001`.
-- Existing projects and operations import as `LEGACY`, epoch `0`, protocol `2`, and `LEGACY_EPOCH_0` without invented contract digest, batch ID, or attempt rows.
-- Operation intent fields are immutable after creation. SQLite triggers also reject operation deletion and update/delete of batches, events, attempts, and results.
-- State and cancellation are derived from append-only events. Dispatch outcomes are append-only attempts. Interrupted dispatch recovers as `transport_unknown` plus `retry_scheduled` using the same operation ID.
-- Rebase and dependent revision promotion create a new operation and preserve `supersedes_operation_id`; the original intent is never overwritten.
-- Atomic ordered structure requests use the Stage 7 `atomic_structure_commit(p_request)` boundary. Batch attempt transitions and response recording are local transactions.
-- Success is accepted only when every ordered result matches its sequence, operation ID, entity ID, and revision. Partial or mismatched responses roll back the local response transaction and leave all operations uncommitted.
-- Identical batch replay returns the stored result. Reusing a batch ID with different request or response bytes is rejected.
-- Unicode 15.0.0 `NFKC -> default casefold -> NFKC` storage-name validation is pinned through `unicodedata2==15.0.0`, including trailing ASCII space/dot removal and Windows reserved-name rejection.
+- Additive SQLite migration to `PRAGMA user_version = 8002`.
+- Existing projects and operations import as `LEGACY`, epoch `0`, protocol `2`, and `LEGACY_EPOCH_0` without invented contract digest, batch ID, attempt, or folder identity.
+- Operation intent fields are immutable after creation. SQLite triggers reject operation deletion and batch/event/attempt/result mutation.
+- State, cancellation, dispatch, retry, commit, replay, conflict, and supersession are derived from append-only events and attempts.
+- Interrupted dispatch recovers as `transport_unknown` plus `retry_scheduled` while preserving the operation and batch IDs.
+- Rebase and dependent revision promotion create a new intent with `supersedes_operation_id`; the original intent is never overwritten.
+- Protocol-3 document create/update/delete/restore and intentional empty content use the exact `document_commit(p_request)` wire format.
+- A document response is accepted only when batch digest, sequence, operation ID, document ID, revision, structure revision, parent ID, name, content digest, byte count, and deletion state all match the immutable request.
+- A partial or mismatched document response is rejected before local state changes. A response recorded before client termination is reused after restart without a second document apply.
+- Atomic ordered structure requests use `atomic_structure_commit(p_request)`. Partial structure results do not change any local operation state.
+- Identical committed/replayed responses are deterministic; changed payloads or incompatible results are rejected.
+- Server-proven folder snapshots preserve stable IDs. A nested document without a known folder ID or structure revision fails closed instead of falling back to a path-only protocol-3 write.
+- Unicode 15.0.0 `NFKC -> default casefold -> NFKC` normalization is pinned through `unicodedata2==15.0.0`. Invalid, reserved, and normalized sibling collisions are rejected before queueing.
 - Diagnostics retain only allowlisted IDs, digests, states, protocol metadata, and error codes. Document bodies, tokens, passwords, endpoints, and arbitrary URLs are discarded.
-- Legacy document sync remains on the protocol-2 `commit_document` adapter. Contract-mode document writes fail closed as `CONTRACT_DOCUMENT_RPC_UNAVAILABLE` because the Stage 7 server handoff does not provide a protocol-3 document commit RPC.
-- Name-based hidden tree-order writes are allowed only for `LEGACY/epoch 0`. A migrated project must supply stable IDs through the atomic structure API; otherwise it fails closed as `CONTRACT_STRUCTURE_IDS_REQUIRED`.
+- Legacy projects remain on the protocol-2 adapter unless explicitly transitioned. Migration alone does not change project mode or epoch.
 
 ## Preserved database: directly observed facts
 
-The original was inspected using SQLite URI `mode=ro&immutable=1`. Migration was run only against a separate temporary copy.
+The original was identified and hashed before any copy was opened. Migration was run only against a disposable copy.
 
 ```yaml
 original_path: D:\안티그래비티\scratch\작가님 힘내세요\evidence\windows-99516096-20260810-055633\sync_v2.sqlite3
@@ -53,78 +63,75 @@ original_bytes: 9273344
 original_sha256_before: 512e131e038f51dc3c4b0ae281cfef8b2ccd82a57ffa4f4bec2390bdbde5ba77
 original_sha256_after: 512e131e038f51dc3c4b0ae281cfef8b2ccd82a57ffa4f4bec2390bdbde5ba77
 original_user_version: 0
-original_integrity_check: ok
+original_wal_present: false
+original_shm_present: false
 projects: 9
-documents: 574
 operations: 218
-operation_statuses:
-  completed: 209
-  pending: 9
+folder_snapshots: 40
 ```
 
-The preserved database also contains `sync_folders`, `sync_tree_barriers`, `sync_folder_rename_intents`, and `sync_project_imports`. These tables are preserved by the additive migration.
-
-On the disposable copy, the migration was run twice:
+Disposable-copy migration and second-run result:
 
 ```yaml
-migrated_user_version: 8001
+migrated_user_version: 8002
 migrated_integrity_check: ok
 legacy_epoch_zero_projects: 9
 legacy_epoch_zero_operations: 218
-operation_events: 427
-invented_attempt_rows: 0
+contract_batch_count: 0
+folder_snapshot_count: 40
+second_migration_run: passed
 ```
 
-The 427 imported events are the 218 enqueue snapshots plus 209 completion snapshots. Historical mutable `attempts` counts remain in `legacy_attempt_count`; they are not rewritten into fabricated append-only attempt records.
+All nine projects remained `LEGACY/epoch 0`; all 218 historical operations became `LEGACY_EPOCH_0`. No contract batch or invented protocol-3 provenance was created. The preserved source file hash was unchanged after validation.
 
-## Source-code inferences, kept separate from database facts
+## Source-code inferences, separate from database facts
 
-- The exact clean `origin/main` baseline does not contain the folder-identity and commit-barrier implementation represented by the extra preserved tables.
-- The original dirty Windows workspace contains uncommitted folder identity, root-folder, order, empty-folder rename, pull-batch, and barrier work. Those user-owned edits were inspected read-only and were not copied, reset, cleaned, or committed into this branch.
-- Consequently, this branch preserves legacy path/document behavior and provides the contract-native atomic structure boundary, but it does not yet translate the current UI's rename/move/order actions into stable-ID batches. Migrated projects fail closed instead of falling back to name-based writes.
-- Folder identity, root folder, volume/manuscript order, empty folder, remote rename, pull, delete/restore, and trash behavior covered by the clean baseline tests still pass. This is not equivalent to a staging round trip of the uncommitted folder-ID implementation.
+- The clean Windows `origin/main` still lacks some folder-identity, root-folder, order, empty-folder rename, pull-barrier, and commit-barrier work present as uncommitted user-owned changes in the original dirty workspace.
+- Those user files were inspected read-only and were not reset, cleaned, copied wholesale, or committed into this branch.
+- This branch provides the contract-native document and atomic structure boundaries plus stable folder snapshot storage. The clean baseline UI does not yet translate every rename/move/order action into a protocol-3 atomic batch.
+- Consequently, local contract conformance is complete for the implemented boundary, while the full real Windows UI ↔ staging server scenario remains a separate authorized test and integration gate.
 
 ## Verification evidence
 
-Official released-contract verifier, Python 3.12.13 / Unicode 15.0.0:
+Official contract verifier, Python 3.12.13 / Unicode 15.0.0:
 
 ```text
-Validated 6 JSON schemas.
-Validated released protocol contract 0.1.0.
+Validated 7 JSON schemas.
+Validated released protocol contract 0.2.0.
 Validated 12 transition vectors with cross-file semantics.
 Validated 15 storage-name conformance vectors (Unicode 15.0.0).
 Validated 4 atomic wire conformance cases.
-Canonical protocol bytes: 19473
-Canonical SHA-256: fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46
+Validated 7 document wire conformance cases.
+Canonical protocol bytes: 23256
+Canonical SHA-256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
 ```
 
 Windows test suite:
 
 ```text
 python -m unittest discover -s tests -v
-Ran 119 tests
+Ran 126 tests
 OK
 ```
 
-This includes 19 Stage 8 tests for exact pinning, all released vectors, fail-closed compatibility, legacy/new database migration, immutable intent, event-derived restart, idempotent cancellation, structure rebase, exact Supabase `p_request`, complete commit/replay, partial-response refusal, and secret-free diagnostics.
+The Stage 8 tests cover exact pins, all released vectors, protocol/capability/digest rejection, new and preserved DB migration, immutable intent, append-only recovery/cancellation, document create and intentional-empty commit, exact RPC payload, replay after response loss, partial-response refusal, normalized collision, server-proven folder identity, structure batch rollback, and secret-free diagnostics.
 
-Windows executable:
+Windows executable generated from the local implementation:
 
 ```yaml
 path: dist/Antigravity_AI_Writer.exe
-bytes: 78393726
-sha256: 52af8e2fa002b2b6d1acec6be36c22c7c14bcb0a62668f115c6f8f1f5717e454
-smoke_test: process remained running for 5 seconds in a disposable directory, then was stopped
+bytes: 78402492
+sha256: 4389a0f5a897c5d114352f7f5a6b417d3eb3d74f0b13dd23589bf574aa4921b1
 ```
 
-CI definition `.github/workflows/windows-contract.yml` verifies the exact PR head, checks out contract content commit `7f05f32d...`, runs the official verifier on the latest available Python 3.12 patch release, runs Windows tests on Python 3.11.9, builds the executable, and prints its digest. The local pinned verifier evidence above used Python 3.12.13 exactly.
+The CI workflow checks out contract content commit `7bcb5d25...`, runs the official verifier on Python 3.12, runs the complete Windows test suite on Python 3.11.9, builds the distributable executable, and prints its digest.
 
-## Not verified / required follow-up
+## Remaining gates
 
-1. Provide the Stage 7 staging endpoint and staging project ID, and confirm the two migration IDs are present in the staging migration ledger.
-2. With explicit staging write authorization, exercise atomic commit, response-loss replay, rollback, concurrent rename/move/order, cancellation races, server restart, mixed legacy/new clients, and normalization collisions against the deployed RPC.
-3. Reconcile or separately publish the user-owned folder-identity/barrier work, then wire Windows rename/move/order actions to `queue_atomic_structure_batch` with stable folder/document IDs.
-4. Add or expose a Stage 7 protocol-3 document commit RPC before promoting projects that need content writes. Until then, those writes intentionally remain blocked.
-5. Keep the PR in draft until the staging evidence and folder-ID integration are complete. Do not manually promote a legacy project merely because SQLite or server migrations exist.
+1. Push the updated Draft PR and require its Windows CI to pass at the exact head.
+2. Obtain separate approval before enabling the staging allowlist or connecting the real Windows client to staging.
+3. Under that approval, run actual document/empty-content/replay/rollback/cancellation/Unicode and atomic structure round trips only against WriterPad Staging, then restore the allowlist to `enabled=false`.
+4. Integrate or separately land the user-owned folder/root/order/barrier implementation, then run the complete folder identity, empty/non-empty rename, hierarchy, volume, manuscript-order, pull, crash, and reconnect regression matrix.
+5. Keep the PR in Draft and do not start Stage 9 until these Stage 8 gates pass and the Windows PR is reviewed and merged.
 
-No production project was promoted, no staging or production row was changed, and no secret value or manuscript body is present in this handoff.
+No production project was accessed or changed, no staging row was changed during Stage 8, no legacy project was promoted, and no secret or manuscript body is present in this handoff.
