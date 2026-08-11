@@ -5,12 +5,11 @@
 - Repository: `ChocoS-yrup/WriterPad_main`
 - Contract stacked base: `codex/stage-8-windows-contract-implementation`
 - Original reconstruction base: `5b8f0b2b2867fe5340e98d0d4c5b460e1c442219`
-- Published corrective PR #1 head previously merged into this branch: `2a560c724d7f75bd455328e72c3a9c3cc39b7211`
-- Local PR #1 mode/epoch correction: `b81051c` (publication pending)
+- Published PR #1 mode/epoch correction: `b81051c85d8bf736a1830c1c320f05847ec20376`
 - Local stacked-base merge commit: `d70aa3a054bb6a8edc451f37e748ecfe2904de9f`
 - Exact source snapshot commit: `ec0d0181526f0aaede6c65459fc1cd61595ca8fd`
-- Local integration branch: `codex/stage-8-windows-ui-structure-fixes`
-- Published Draft PR branch remains: `codex/stage-8-windows-ui-structure-integration`
+- Local corrective worktree branch: `codex/stage-8-windows-ui-structure-fixes`
+- Published Draft PR branch: `codex/stage-8-windows-ui-structure-integration`
 - Contract version: `0.2.0`
 - Canonical contract SHA-256: `416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670`
 - Local 50-commit history reused: `false`
@@ -156,9 +155,16 @@ top-level status record while it remains mounted:
 - Exact-source local EXE size: `78,591,142` bytes; `build/` and `dist/` remained
   ignored and are not PR content.
 - `git diff --check`: passed.
-- New PR #1/PR #2 heads and hosted CI: pending publication because the local
-  GitHub CLI credential is currently invalid; no older CI result is represented
-  as validation of `b81051c` or `ec0d018`.
+- PR #1 exact head `b81051c` passed workflow-dispatch CI run `31525762343`:
+  129 tests, contract digest verification and executable packaging passed;
+  CI EXE was `55,358,115` bytes with SHA-256
+  `e9f9f0ab90fd69140915a0c4a4b58e6c7ca1d7506e3423af485bc8a5f3c2e4b4`.
+- PR #2 evidence head `05e808a` passed pull-request CI run `31526070833`:
+  380 tests, contract digest verification and executable packaging passed;
+  CI EXE was `55,551,763` bytes with SHA-256
+  `a7e0891bfbd864473ae1f2c422c1a2b2e507fcdc0b83a39036ab9fe8060fdb0c`.
+- The final metadata-only handoff commit's exact-head CI URL is recorded in the
+  Draft PR body after completion, avoiding a self-referential evidence commit.
 - Staging/production access or writes: `none`.
 - Contract allowlist changes: `none`.
 - Existing project promotion: `none`.
@@ -166,8 +172,8 @@ top-level status record while it remains mounted:
 ## Remaining gates
 
 - The stacked pull request must remain Draft.
-- Publish PR #1 correction first, wait for its CI, then publish the ordinary
-  stacked merge plus `ec0d018` and this evidence update to PR #2.
+- Both Draft PR branches are published and CI-validated; neither is authorized
+  for Ready conversion or merge by this handoff update.
 - PR #1 must not be rebased, updated, readied or merged by this work.
 - Staging client connection and allowlist activation require separate approval.
 - Stage 9 must not begin until Stage 8 review, merge and approved staging validation complete.
