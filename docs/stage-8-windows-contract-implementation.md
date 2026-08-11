@@ -6,7 +6,8 @@
 - Windows source baseline: `origin/main` at `539cbd39074475b59cbd729923fbc2bc5ee5a7f9`
 - Baseline freshness: confirmed by `git fetch origin main` on 2026-08-11
 - Branch: `codex/stage-8-windows-contract-implementation`
-- Contract 0.2 implementation commit: `f0de952d180babf56798ce27e00fa2e455cbbd15`
+- Contract 0.2 initial implementation commit: `f0de952d180babf56798ce27e00fa2e455cbbd15`
+- Mode/epoch corrective head: the commit containing this handoff
 - Review status: Draft PR #1, `CLEAN/MERGEABLE`; local implementation and Windows CI passed, staging client round trip not authorized
 - Production Supabase writes: none
 - Staging Supabase writes during Stage 8: none
@@ -37,7 +38,7 @@ Every protocol-3 batch pins the released version and canonical digest. Contract 
 
 ## Implemented Windows client behavior
 
-- Additive SQLite migration to `PRAGMA user_version = 8002`.
+- Additive SQLite migration to `PRAGMA user_version = 8004`.
 - Existing projects and operations import as `LEGACY`, epoch `0`, protocol `2`, and `LEGACY_EPOCH_0` without invented contract digest, batch ID, attempt, or folder identity.
 - Operation intent fields are immutable after creation. SQLite triggers reject operation deletion and batch/event/attempt/result mutation.
 - State, cancellation, dispatch, retry, commit, replay, conflict, and supersession are derived from append-only events and attempts.
@@ -51,7 +52,12 @@ Every protocol-3 batch pins the released version and canonical digest. Contract 
 - Server-proven folder snapshots preserve stable IDs. A nested document without a known folder ID or structure revision fails closed instead of falling back to a path-only protocol-3 write.
 - Unicode 15.0.0 `NFKC -> default casefold -> NFKC` normalization is pinned through `unicodedata2==15.0.0`. Invalid, reserved, and normalized sibling collisions are rejected before queueing.
 - Diagnostics retain only allowlisted IDs, digests, states, protocol metadata, and error codes. Document bodies, tokens, passwords, endpoints, and arbitrary URLs are discarded.
-- Legacy projects remain on the protocol-2 adapter unless explicitly transitioned. Migration alone does not change project mode or epoch.
+- SQLite pair and `OLD -> NEW` transition triggers enforce only same-state
+  updates, `LEGACY/0 -> MIGRATING/1`, and `MIGRATING/n -> ID_BASED/n`.
+  Direct SQL epoch jumps, reverse transitions and demotions fail closed.
+- A server-verified Contract `0.2.0` project may use protocol 3 while remaining
+  `LEGACY/0`; protocol use never promotes mode or epoch. Unverified compatibility
+  retains the protocol-2 adapter or fails closed.
 
 ## Preserved database: directly observed facts
 
@@ -82,6 +88,11 @@ folder_snapshot_count: 40
 second_migration_run: passed
 ```
 
+The disposable preserved-DB evidence above records the earlier `8002`
+validation and was not reopened during this source-only correction. Current
+new-DB and in-memory migration tests validate schema version `8004`; the final
+preserved-copy rerun remains part of the combined Stage 8 gate.
+
 All nine projects remained `LEGACY/epoch 0`; all 218 historical operations became `LEGACY_EPOCH_0`. No contract batch or invented protocol-3 provenance was created. The preserved source file hash was unchanged after validation.
 
 ## Source-code inferences, separate from database facts
@@ -109,12 +120,12 @@ Canonical SHA-256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7
 Windows test suite:
 
 ```text
-python -m unittest discover -s tests -v
-Ran 126 tests
+python -m unittest
+Ran 136 tests
 OK
 ```
 
-The Stage 8 tests cover exact pins, all released vectors, protocol/capability/digest rejection, new and preserved DB migration, immutable intent, append-only recovery/cancellation, document create and intentional-empty commit, exact RPC payload, replay after response loss, partial-response refusal, normalized collision, server-proven folder identity, structure batch rollback, and secret-free diagnostics.
+The Stage 8 tests cover exact pins, all released vectors, protocol/capability/digest rejection, new and preserved DB migration, immutable intent, append-only recovery/cancellation, document create and intentional-empty commit, exact RPC payload, replay after response loss, partial-response refusal, normalized collision, server-proven folder identity, structure batch rollback, direct-SQL mode/epoch transition rejection and secret-free diagnostics.
 
 Windows executable generated from the local implementation:
 
