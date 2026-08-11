@@ -8,6 +8,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, QMutex, QMutexLocker
 from datetime import datetime
 
 from runtime_profile import is_forced_offline
+from sync_contract import SyncContractError
 from sync_v2_store import SyncV2Store
 from three_way_merge import three_way_merge
 
@@ -275,12 +276,38 @@ class V2QueueWorker(QThread):
             result = self.sync_manager._process_v2_operation(self.operation_id)
             kind = result.get("kind")
             self.resultReady.emit(
-                kind in {"committed", "auto_merged", "conflict"},
+                kind in {"committed", "auto_merged", "conflict", "blocked"},
                 result.get("error", ""),
                 result,
             )
         except Exception as e:
             self.resultReady.emit(False, str(e), {"kind": "retry", "error": str(e)})
+
+
+class V2StructureBatchWorker(QThread):
+    resultReady = pyqtSignal(bool, str, object)
+
+    def __init__(self, sync_manager, batch_id):
+        super().__init__()
+        self.sync_manager = sync_manager
+        self.batch_id = batch_id
+
+    def run(self):
+        try:
+            result = self.sync_manager._process_contract_structure_batch(self.batch_id)
+            self.resultReady.emit(
+                result.get("kind") in {
+                    "atomic_structure_commit_success",
+                    "atomic_structure_commit_failure",
+                },
+                result.get("error_message", ""),
+                result,
+            )
+        except Exception as error:
+            self.resultReady.emit(
+                False, str(error),
+                {"kind": "retry", "error_message": str(error)},
+            )
 
 
 class V2PullWorker(QThread):
@@ -330,6 +357,7 @@ class SyncManager(QObject):
         self._v2_wpm = None
         self._v2_device_id = None
         self._v2_worker = None
+        self._v2_structure_worker = None
         self._v2_callbacks = {}
         self._v2_conflict_callbacks = {}
         self._v2_leases = {}
@@ -351,6 +379,7 @@ class SyncManager(QObject):
         self._v2_context = self._v2_store.configure_project(
             wpm.writing_root_path, project_name, forced_project_id() or None
         )
+        self._v2_context["writer_device_id"] = self._v2_device_id
         deterministic_ids = bool(forced_project_id())
         root = getattr(wpm, "writing_root_path", None)
         if root and os.path.isdir(root):
@@ -534,6 +563,11 @@ class SyncManager(QObject):
         """Persist project binder order as one hidden revisioned v2 document."""
         if not self.is_v2_enabled:
             return None
+        if self._v2_context.get("project_sync_mode", "LEGACY") != "LEGACY":
+            raise SyncContractError(
+                "CONTRACT_STRUCTURE_IDS_REQUIRED",
+                "ID-based projects require an atomic ID structure batch",
+            )
         content = self._tree_order_content(tree_order)
         document_id = str(uuid.uuid5(
             uuid.UUID(self._v2_context["project_id"]), TREE_ORDER_DOCUMENT_PATH
@@ -563,6 +597,45 @@ class SyncManager(QObject):
         if retry:
             self.retry_pending_syncs()
         return operation
+
+    def activate_contract_project(
+        self,
+        *,
+        project_sync_mode,
+        migration_epoch,
+        server_protocol_version,
+        server_contract_sha256,
+        server_capabilities,
+    ):
+        """Apply an explicitly verified server project state; never auto-promote."""
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        project = self._v2_store.activate_contract_project(
+            self._v2_context["local_key"],
+            project_sync_mode=project_sync_mode,
+            migration_epoch=migration_epoch,
+            server_protocol_version=server_protocol_version,
+            server_contract_sha256=server_contract_sha256,
+            server_capabilities=server_capabilities,
+        )
+        self._v2_context.update({
+            "project_sync_mode": project["project_sync_mode"],
+            "migration_epoch": int(project["migration_epoch"] or 0),
+        })
+        return project
+
+    def queue_atomic_structure_batch(self, ordered_intents, retry=True):
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        request = self._v2_store.create_structure_batch(
+            self._v2_context,
+            self._v2_device_id,
+            ordered_intents,
+        )
+        self._publish_sync_state()
+        if retry:
+            self.retry_pending_syncs()
+        return request
 
     @property
     def is_v2_enabled(self):
@@ -651,8 +724,20 @@ class SyncManager(QObject):
     def retry_pending_syncs(self):
         """다른 서버 요청이 성공한 뒤 대기 중인 항목을 한 건씩 다시 전송한다."""
         if self.is_v2_enabled:
-            if self._v2_worker is not None or self._active_server_syncs > 0:
+            if (
+                self._v2_worker is not None
+                or self._v2_structure_worker is not None
+                or self._active_server_syncs > 0
+            ):
                 return False
+            structure_request = self._v2_store.next_ready_structure_batch(
+                self._v2_context["local_key"]
+            )
+            if structure_request:
+                self._launch_contract_structure_batch(
+                    structure_request["batch"]["batch_id"]
+                )
+                return True
             operation = self._v2_store.next_ready_operation(self._v2_context["local_key"])
             if operation:
                 self._launch_v2_operation(operation)
@@ -709,6 +794,8 @@ class SyncManager(QObject):
             # this module's directory, so both paths load the same public
             # Supabase URL/publishable-key configuration.
             env_path = os.path.join(supabase_config_dir(), ".env")
+            if not os.path.exists(env_path):
+                env_path = os.path.join(supabase_config_dir(), ".env.example")
             if os.path.exists(env_path):
                 with open(env_path, "r", encoding="utf-8") as f:
                     for line in f:
@@ -849,6 +936,9 @@ class SyncManager(QObject):
             "DOCUMENT_NOT_FOUND", "DOCUMENT_ALREADY_EXISTS",
             "REVISION_CONFLICT", "OPERATION_ID_REUSED", "LEASE_REQUIRED",
             "LEASE_CONFLICT", "LEASE_EXPIRED", "PATH_CONFLICT",
+            "CONTRACT_NOT_ALLOWED", "CONTRACT_DIGEST_MISMATCH",
+            "PROTOCOL_TOO_OLD", "CAPABILITY_MISMATCH",
+            "CONTRACT_DOCUMENT_RPC_UNAVAILABLE", "PARTIAL_BATCH_RESPONSE",
         ):
             if code in message:
                 return code
@@ -1374,18 +1464,77 @@ class SyncManager(QObject):
         self._start_worker(worker)
         return True
 
+    def _process_contract_structure_batch(self, batch_id):
+        if is_forced_offline():
+            raise RuntimeError("테스트 오프라인 모드")
+        if not self.supabase:
+            raise RuntimeError("서버 연결 없음")
+        request = self._v2_store.structure_batch_request(batch_id)
+        if (
+            not request
+            or request.get("batch", {}).get("batch_id") != batch_id
+            or request.get("project_id") != self._v2_context["project_id"]
+        ):
+            raise RuntimeError("BATCH_NOT_READY")
+        response = self.supabase.rpc(
+            "atomic_structure_commit", {"p_request": request}
+        ).execute()
+        result = self._response_data(response)
+        return self._v2_store.record_structure_batch_response(batch_id, result)
+
+    def _launch_contract_structure_batch(self, batch_id):
+        operation_ids = self._v2_store.mark_structure_batch_attempt(batch_id)
+        worker = V2StructureBatchWorker(self, batch_id)
+        self._v2_structure_worker = worker
+        self._active_server_syncs += 1
+        self._publish_sync_state()
+
+        def handle_result(success, error_message, payload):
+            self._active_server_syncs = max(0, self._active_server_syncs - 1)
+            self._v2_structure_worker = None
+            if not success:
+                self._v2_store.mark_structure_batch_retry(batch_id, error_message)
+                self._v2_store.record_diagnostic(
+                    self._v2_context["local_key"],
+                    "structure_batch_retry",
+                    batch_id=batch_id,
+                    error_code=self._stable_error_code(error_message) or "CLIENT_ERROR",
+                )
+                self._last_sync_error = error_message
+                self._last_failure_offline = self._is_connectivity_error(error_message)
+            else:
+                self._last_sync_error = ""
+                self._last_failure_offline = False
+                self._v2_store.record_diagnostic(
+                    self._v2_context["local_key"],
+                    "structure_batch_result",
+                    batch_id=batch_id,
+                    state="completed" if payload.get("applied") else "blocked",
+                )
+            self._publish_sync_state()
+            if success and payload.get("applied"):
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, self.retry_pending_syncs)
+
+        worker.resultReady.connect(handle_result)
+        worker.finished.connect(worker.deleteLater)
+        self._start_worker(worker)
+        return {"worker": worker, "operation_ids": operation_ids}
+
     def _process_v2_operation(self, operation_id):
         operation = self._v2_store.operation(operation_id)
         if not operation:
             return {"kind": "retry", "error": "대기 작업을 찾을 수 없습니다."}
+        if operation.get("provenance_kind") == "CONTRACT_BATCH":
+            error = "CONTRACT_DOCUMENT_RPC_UNAVAILABLE"
+            self._v2_store.mark_blocked(operation_id, error)
+            return {"kind": "blocked", "error": error, "operation": operation}
         if is_forced_offline():
             error = "테스트 오프라인 모드"
-            self._v2_store.mark_retry(operation_id, error)
             return {"kind": "retry", "error": error, "operation": operation}
         client = self.supabase
         if not client:
             error = "서버 연결 없음"
-            self._v2_store.mark_retry(operation_id, error)
             return {"kind": "retry", "error": error, "operation": operation}
 
         try:
@@ -1415,7 +1564,6 @@ class SyncManager(QObject):
                 remote = self._fetch_remote_document(operation["document_id"], client)
                 if not remote:
                     message = "REVISION_CONFLICT: 서버 문서를 읽을 수 없습니다."
-                    self._v2_store.mark_retry(operation_id, message)
                     return {"kind": "retry", "error": message, "operation": operation}
                 if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
                     # Binder order is one project preference snapshot. A later local
@@ -1538,7 +1686,6 @@ class SyncManager(QObject):
                 }
 
             message = code or str(error)
-            self._v2_store.mark_retry(operation_id, message)
             return {"kind": "retry", "error": message, "operation": operation}
 
     def _launch_v2_operation(self, operation):
@@ -1580,6 +1727,11 @@ class SyncManager(QObject):
                     conflict_callback(payload)
                 if callback:
                     callback(False, "REVISION_CONFLICT", original["local_path"], None)
+            elif kind == "blocked":
+                self._last_sync_error = payload.get("error", "CONTRACT_NOT_ALLOWED")
+                self._last_failure_offline = False
+                if callback:
+                    callback(False, self._last_sync_error, original["local_path"], None)
             else:
                 self._last_sync_error = error_message or payload.get("error", "")
                 self._last_failure_offline = self._is_connectivity_error(self._last_sync_error)

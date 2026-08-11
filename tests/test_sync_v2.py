@@ -84,7 +84,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(queued["operation_id"], operation["operation_id"])
         self.assertEqual(queued["content"], "영구 보관할 내용")
 
-    def test_force_kill_resets_inflight_operation_to_pending_with_same_id(self):
+    def test_force_kill_appends_retry_recovery_with_same_operation_id(self):
         operation = self.store.enqueue(
             self.context, "메인/원고/강제종료.txt", "종료 직전 내용"
         )
@@ -95,7 +95,11 @@ class SyncV2StoreTestCase(unittest.TestCase):
         recovered = reopened.next_ready_operation(self.context["local_key"])
 
         self.assertEqual(recovered["operation_id"], operation["operation_id"])
-        self.assertEqual(recovered["status"], "pending")
+        self.assertEqual(recovered["status"], "retry_wait")
+        self.assertEqual(
+            reopened.operation_attempts(operation["operation_id"])[0]["outcome"],
+            "transport_unknown",
+        )
 
     def test_two_offline_profiles_keep_independent_durable_queues(self):
         first_path = str(Path(self.temp.name, "first.sqlite3"))
@@ -124,7 +128,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(SyncV2Store(first_path).counts(context_a["local_key"])["pending"], 1)
         self.assertEqual(SyncV2Store(other_path).counts(context_b["local_key"])["pending"], 1)
 
-    def test_success_promotes_next_operation_to_returned_revision(self):
+    def test_success_supersedes_dependent_with_immutable_promoted_operation(self):
         first = self.store.enqueue(self.context, "메인/원고/001화.txt", "첫 저장")
         second = self.store.enqueue(self.context, "메인/원고/001화.txt", "둘째 저장")
         self.assertIsNone(second["base_revision"])
@@ -133,8 +137,12 @@ class SyncV2StoreTestCase(unittest.TestCase):
             "revision": 1,
             "content_hash": "a" * 64,
         })
-        promoted = self.store.operation(second["operation_id"])
+        original_dependent = self.store.operation(second["operation_id"])
+        promoted = self.store.next_ready_operation(self.context["local_key"])
 
+        self.assertEqual(original_dependent["status"], "cancelled")
+        self.assertNotEqual(promoted["operation_id"], second["operation_id"])
+        self.assertEqual(promoted["supersedes_operation_id"], second["operation_id"])
         self.assertEqual(promoted["base_revision"], 1)
         self.assertEqual(promoted["base_content"], "첫 저장")
 
@@ -201,12 +209,18 @@ class SyncV2StoreTestCase(unittest.TestCase):
         first = self.store.enqueue(self.context, "메인/원고/001화.txt", "로컬 1")
         stale_dependent = self.store.enqueue(self.context, "메인/원고/001화.txt", "로컬 최신")
 
-        self.store.rebase_clean_merge(first["operation_id"], 2, "서버 변경", "자동 병합본")
+        successor = self.store.rebase_clean_merge(
+            first["operation_id"], 2, "서버 변경", "자동 병합본"
+        )
 
-        rebased = self.store.operation(first["operation_id"])
+        original_intent = self.store.operation(first["operation_id"])
         cancelled = self.store.operation(stale_dependent["operation_id"])
-        self.assertEqual(rebased["base_revision"], 2)
-        self.assertEqual(rebased["content"], "자동 병합본")
+        self.assertEqual(original_intent["base_revision"], 1)
+        self.assertEqual(original_intent["content"], "로컬 1")
+        self.assertEqual(original_intent["status"], "cancelled")
+        self.assertEqual(successor["base_revision"], 2)
+        self.assertEqual(successor["content"], "자동 병합본")
+        self.assertEqual(successor["supersedes_operation_id"], first["operation_id"])
         self.assertEqual(cancelled["status"], "cancelled")
 
     def test_remote_rename_rebase_keeps_uuid_and_changes_only_server_path(self):
@@ -222,7 +236,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.store.move_local_path(
             self.context["local_key"], "메인/원고/옛이름.txt", "메인/원고/새이름.txt"
         )
-        self.store.rebase_clean_merge(
+        successor = self.store.rebase_clean_merge(
             edited["operation_id"], 2, "서버 수정", "자동 병합본",
             remote_path="메인/원고/새이름.txt",
         )
@@ -230,10 +244,12 @@ class SyncV2StoreTestCase(unittest.TestCase):
         document = self.store.get_document(
             self.context["local_key"], "메인/원고/새이름.txt"
         )
-        operation = self.store.operation(edited["operation_id"])
+        original_operation = self.store.operation(edited["operation_id"])
         self.assertEqual(document["document_id"], original["document_id"])
         self.assertEqual(document["server_path"], "메인/원고/새이름.txt")
-        self.assertEqual(operation["relative_path"], "메인/원고/새이름.txt")
+        self.assertEqual(original_operation["relative_path"], "메인/원고/옛이름.txt")
+        self.assertEqual(successor["relative_path"], "메인/원고/새이름.txt")
+        self.assertEqual(successor["supersedes_operation_id"], edited["operation_id"])
 
     def test_simultaneous_overlapping_save_is_kept_as_conflict(self):
         created = self.store.enqueue(self.context, "메인/원고/동시저장.txt", "공통 문장\n")

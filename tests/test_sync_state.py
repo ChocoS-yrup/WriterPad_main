@@ -176,7 +176,10 @@ class SyncManagerStateTestCase(unittest.TestCase):
     def test_windows_build_includes_public_supabase_configuration(self):
         spec = Path("Antigravity_AI_Writer.spec").read_text(encoding="utf-8")
 
-        self.assertIn("('.env', '.')", spec)
+        self.assertIn("config_source = '.env' if os.path.exists('.env') else '.env.example'", spec)
+        self.assertIn("(config_source, '.')", spec)
+        source = Path("sync_manager.py").read_text(encoding="utf-8")
+        self.assertIn('os.path.join(supabase_config_dir(), ".env.example")', source)
 
 
 class _FakeLabel:

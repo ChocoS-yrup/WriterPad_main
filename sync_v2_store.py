@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -6,8 +7,28 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from sync_contract import (
+    CANONICAL_CONTRACT_SHA256,
+    CLIENT_BUILD_ID,
+    CONTRACT_VERSION,
+    EVENT_STATE,
+    SYNC_PROTOCOL_VERSION,
+    TERMINAL_STATES,
+    SyncContractError,
+    build_atomic_structure_request,
+    canonical_json,
+    json_sha256,
+    require_server_compatibility,
+    safe_trace,
+    validate_atomic_structure_response,
+)
+
 
 ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
+CONTRACT_ACTIVE_STATES = (
+    "pending", "inflight", "retry_wait", "blocked", "conflict"
+)
+STAGE8_USER_VERSION = 8001
 
 
 def _utc_now():
@@ -121,9 +142,524 @@ class SyncV2Store:
                     ON sync_operations(document_id, queue_id);
                 """
             )
-            connection.execute(
-                "UPDATE sync_operations SET status = 'pending' WHERE status = 'inflight'"
+            self._migrate_contract_schema(connection)
+
+    @staticmethod
+    def _table_columns(connection, table):
+        return {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+
+    @classmethod
+    def _add_column(cls, connection, table, definition):
+        name = definition.split()[0]
+        if name not in cls._table_columns(connection, table):
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    @staticmethod
+    def _legacy_event_id(operation_id, event_type):
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"writerpad:stage8:legacy:{operation_id}:{event_type}",
+        ))
+
+    def _migrate_contract_schema(self, connection):
+        current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if current_version > STAGE8_USER_VERSION:
+            raise RuntimeError(
+                f"Unsupported sync database user_version {current_version}"
             )
+
+        for definition in (
+            "project_sync_mode TEXT NOT NULL DEFAULT 'LEGACY'",
+            "migration_epoch INTEGER NOT NULL DEFAULT 0",
+            "server_protocol_version INTEGER",
+            "active_contract_sha256 TEXT",
+            "server_capabilities_json TEXT",
+            "contract_validated_at TEXT",
+        ):
+            self._add_column(connection, "sync_projects", definition)
+
+        for definition in (
+            "entity_kind TEXT",
+            "intent_kind TEXT",
+            "provenance_kind TEXT",
+            "batch_id TEXT",
+            "batch_sequence INTEGER",
+            "payload_sha256 TEXT",
+            "supersedes_operation_id TEXT",
+            "sync_protocol_version INTEGER",
+            "contract_version TEXT",
+            "canonical_contract_sha256 TEXT",
+            "client_build_id TEXT",
+            "client_capabilities_json TEXT",
+            "legacy_imported_at TEXT",
+            "legacy_attempt_count INTEGER NOT NULL DEFAULT 0",
+        ):
+            self._add_column(connection, "sync_operations", definition)
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sync_contract_batches (
+                batch_id TEXT PRIMARY KEY,
+                local_key TEXT NOT NULL REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                project_id TEXT NOT NULL,
+                writer_device_id TEXT NOT NULL,
+                client_build_id TEXT NOT NULL,
+                sync_protocol_version INTEGER NOT NULL,
+                contract_version TEXT NOT NULL,
+                canonical_contract_sha256 TEXT NOT NULL,
+                client_capabilities_json TEXT NOT NULL,
+                batch_payload_sha256 TEXT NOT NULL,
+                project_sync_mode TEXT NOT NULL,
+                migration_epoch INTEGER NOT NULL,
+                request_json TEXT NOT NULL,
+                request_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_structure_operations (
+                queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id TEXT NOT NULL UNIQUE,
+                local_key TEXT NOT NULL REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                project_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                intent_kind TEXT NOT NULL,
+                provenance_kind TEXT NOT NULL CHECK (provenance_kind = 'CONTRACT_BATCH'),
+                batch_id TEXT NOT NULL REFERENCES sync_contract_batches(batch_id),
+                batch_sequence INTEGER NOT NULL,
+                base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+                payload_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                supersedes_operation_id TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(batch_id, batch_sequence)
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_operation_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                rpc_name TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                request_sha256 TEXT,
+                response_sha256 TEXT,
+                http_status INTEGER,
+                error_code TEXT,
+                error_detail_json TEXT NOT NULL DEFAULT '{}',
+                result_revision INTEGER,
+                UNIQUE(operation_id, attempt_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_operation_events (
+                event_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                event_sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                error_code TEXT,
+                related_operation_id TEXT,
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(operation_id, event_sequence)
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_contract_batch_results (
+                batch_id TEXT PRIMARY KEY REFERENCES sync_contract_batches(batch_id),
+                response_json TEXT NOT NULL,
+                response_sha256 TEXT NOT NULL,
+                applied INTEGER NOT NULL CHECK (applied IN (0, 1)),
+                recorded_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_contract_diagnostics (
+                trace_id TEXT PRIMARY KEY,
+                local_key TEXT,
+                event TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS sync_contract_batches_ready_idx
+                ON sync_contract_batches(local_key, created_at);
+            CREATE INDEX IF NOT EXISTS sync_structure_operations_batch_idx
+                ON sync_structure_operations(batch_id, batch_sequence);
+            CREATE INDEX IF NOT EXISTS sync_operation_events_operation_idx
+                ON sync_operation_events(operation_id, event_sequence);
+            CREATE INDEX IF NOT EXISTS sync_operation_attempts_operation_idx
+                ON sync_operation_attempts(operation_id, attempt_number);
+            """
+        )
+
+        now = _utc_now()
+        legacy_rows = connection.execute(
+            """
+            SELECT * FROM sync_operations
+            WHERE provenance_kind IS NULL
+            ORDER BY queue_id
+            """
+        ).fetchall()
+        for row in legacy_rows:
+            payload = {
+                "base_content": row["base_content"],
+                "content": row["content"],
+                "is_deleted": bool(row["is_deleted"]),
+                "local_path": row["local_path"],
+                "relative_path": row["relative_path"],
+            }
+            intent_kind = (
+                "delete" if row["is_deleted"]
+                else "create" if int(row["base_revision"] or 0) == 0
+                else "update"
+            )
+            connection.execute(
+                """
+                UPDATE sync_operations
+                SET entity_kind = 'document', intent_kind = ?,
+                    provenance_kind = 'LEGACY_EPOCH_0', payload_sha256 = ?,
+                    sync_protocol_version = 2, legacy_imported_at = ?,
+                    legacy_attempt_count = attempts
+                WHERE operation_id = ?
+                """,
+                (intent_kind, json_sha256(payload), now, row["operation_id"]),
+            )
+            events = ["enqueued"]
+            status = str(row["status"] or "pending")
+            if status == "completed":
+                events.append("committed")
+            elif status == "cancelled":
+                events.append("cancel_requested")
+            elif status == "conflict":
+                events.append("conflict_detected")
+            elif status == "inflight":
+                events.extend(("dispatch_started", "retry_scheduled"))
+            for sequence, event_type in enumerate(events, 1):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO sync_operation_events (
+                        event_id, operation_id, event_sequence, event_type,
+                        recorded_at, error_code, detail_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._legacy_event_id(row["operation_id"], event_type),
+                        row["operation_id"], sequence, event_type, now,
+                        "LEGACY_SNAPSHOT" if event_type in {
+                            "conflict_detected", "retry_scheduled"
+                        } else None,
+                        canonical_json({
+                            "legacy_status": status,
+                            "source": "legacy_snapshot",
+                        }),
+                    ),
+                )
+
+        connection.execute(
+            """
+            UPDATE sync_projects
+            SET project_sync_mode = 'LEGACY', migration_epoch = 0,
+                server_protocol_version = NULL, active_contract_sha256 = NULL,
+                server_capabilities_json = NULL, contract_validated_at = NULL
+            WHERE project_sync_mode IS NULL OR project_sync_mode = ''
+            """
+        )
+
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS sync_operations_intent_immutable
+            BEFORE UPDATE OF operation_id, local_key, project_id, document_id,
+                local_path, relative_path, base_revision, base_content, content,
+                is_deleted, entity_kind, intent_kind, provenance_kind, batch_id,
+                batch_sequence, payload_sha256, supersedes_operation_id,
+                sync_protocol_version, contract_version,
+                canonical_contract_sha256, client_build_id,
+                client_capabilities_json, created_at
+            ON sync_operations
+            BEGIN
+                SELECT RAISE(ABORT, 'IMMUTABLE_OPERATION_INTENT');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS sync_operations_no_delete
+            BEFORE DELETE ON sync_operations
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_OPERATION');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS sync_structure_operations_no_update
+            BEFORE UPDATE ON sync_structure_operations
+            BEGIN
+                SELECT RAISE(ABORT, 'IMMUTABLE_OPERATION_INTENT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_structure_operations_no_delete
+            BEFORE DELETE ON sync_structure_operations
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_OPERATION');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_operation_events_no_update
+            BEFORE UPDATE ON sync_operation_events
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_operation_events_no_delete
+            BEFORE DELETE ON sync_operation_events
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_operation_attempts_no_update
+            BEFORE UPDATE ON sync_operation_attempts
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_ATTEMPT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_operation_attempts_no_delete
+            BEFORE DELETE ON sync_operation_attempts
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_ATTEMPT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_batches_no_update
+            BEFORE UPDATE ON sync_contract_batches
+            BEGIN
+                SELECT RAISE(ABORT, 'IMMUTABLE_BATCH_METADATA');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_batches_no_delete
+            BEFORE DELETE ON sync_contract_batches
+            BEGIN
+                SELECT RAISE(ABORT, 'IMMUTABLE_BATCH_METADATA');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_batch_results_no_update
+            BEFORE UPDATE ON sync_contract_batch_results
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_BATCH_RESULT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_batch_results_no_delete
+            BEFORE DELETE ON sync_contract_batch_results
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_BATCH_RESULT');
+            END;
+            """
+        )
+        connection.execute(f"PRAGMA user_version = {STAGE8_USER_VERSION}")
+        self._recover_interrupted_dispatches(connection)
+
+    @staticmethod
+    def _event_state(event_type):
+        try:
+            return EVENT_STATE[event_type]
+        except KeyError as exc:
+            raise RuntimeError(f"unknown operation event: {event_type}") from exc
+
+    def _events_for(self, connection, operation_id):
+        return connection.execute(
+            """
+            SELECT * FROM sync_operation_events
+            WHERE operation_id = ? ORDER BY event_sequence
+            """,
+            (operation_id,),
+        ).fetchall()
+
+    def _derived_state(self, connection, operation_id):
+        events = self._events_for(connection, operation_id)
+        if not events:
+            raise RuntimeError("operation has no append-only event history")
+        for expected, event in enumerate(events, 1):
+            if event["event_sequence"] != expected:
+                raise RuntimeError("operation event sequence is not contiguous")
+        return self._event_state(events[-1]["event_type"])
+
+    def _operation_row(self, connection, operation_id):
+        row = connection.execute(
+            "SELECT *, 'document' AS queue_kind FROM sync_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row:
+            return row
+        return connection.execute(
+            """
+            SELECT *, 'structure' AS queue_kind
+            FROM sync_structure_operations WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+
+    def _operation_dict(self, connection, row):
+        if row is None:
+            return None
+        result = dict(row)
+        operation_id = result["operation_id"]
+        events = self._events_for(connection, operation_id)
+        result["status"] = self._derived_state(connection, operation_id)
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM sync_operation_attempts WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()[0]
+        result["attempts"] = int(result.get("legacy_attempt_count") or 0) + attempt_count
+        latest_error = next(
+            (event["error_code"] for event in reversed(events) if event["error_code"]),
+            "",
+        )
+        result["last_error"] = latest_error or ""
+        if result.get("queue_kind") == "structure":
+            result["payload"] = json.loads(result.pop("payload_json"))
+            result["sequence"] = result.get("batch_sequence")
+        return result
+
+    def _append_event(
+        self,
+        connection,
+        operation_id,
+        event_type,
+        *,
+        event_id=None,
+        error_code=None,
+        related_operation_id=None,
+        detail=None,
+    ):
+        row = self._operation_row(connection, operation_id)
+        if row is None:
+            raise KeyError(operation_id)
+        event_id = str(uuid.UUID(str(event_id or uuid.uuid4())))
+        detail_json = canonical_json(detail or {})
+        existing = connection.execute(
+            "SELECT * FROM sync_operation_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if existing:
+            same = (
+                existing["operation_id"] == operation_id
+                and existing["event_type"] == event_type
+                and existing["error_code"] == error_code
+                and existing["related_operation_id"] == related_operation_id
+                and existing["detail_json"] == detail_json
+            )
+            if not same:
+                raise SyncContractError("EVENT_ID_REUSED")
+            return dict(existing)
+
+        events = self._events_for(connection, operation_id)
+        if events:
+            current_state = self._event_state(events[-1]["event_type"])
+            if current_state in TERMINAL_STATES:
+                raise SyncContractError("OPERATION_TERMINAL")
+            sequence = events[-1]["event_sequence"] + 1
+        else:
+            sequence = 1
+        if event_type not in EVENT_STATE:
+            raise SyncContractError("INVALID_ARGUMENT")
+        connection.execute(
+            """
+            INSERT INTO sync_operation_events (
+                event_id, operation_id, event_sequence, event_type, recorded_at,
+                error_code, related_operation_id, detail_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id, operation_id, sequence, event_type, _utc_now(),
+                error_code, related_operation_id, detail_json,
+            ),
+        )
+        return dict(connection.execute(
+            "SELECT * FROM sync_operation_events WHERE event_id = ?", (event_id,)
+        ).fetchone())
+
+    def _dispatch_info(self, connection, operation_id):
+        event = connection.execute(
+            """
+            SELECT * FROM sync_operation_events
+            WHERE operation_id = ? AND event_type = 'dispatch_started'
+            ORDER BY event_sequence DESC LIMIT 1
+            """,
+            (operation_id,),
+        ).fetchone()
+        if not event:
+            return None
+        detail = json.loads(event["detail_json"] or "{}")
+        return {
+            "attempt_number": int(detail.get("attempt_number") or 1),
+            "started_at": event["recorded_at"],
+            "request_sha256": detail.get("request_sha256"),
+            "rpc_name": detail.get("rpc_name") or "commit_document",
+        }
+
+    def _finish_attempt(
+        self,
+        connection,
+        operation_id,
+        outcome,
+        *,
+        response_sha256=None,
+        http_status=None,
+        error_code=None,
+        error_detail=None,
+        result_revision=None,
+    ):
+        dispatch = self._dispatch_info(connection, operation_id)
+        if dispatch is None:
+            return None
+        existing = connection.execute(
+            """
+            SELECT * FROM sync_operation_attempts
+            WHERE operation_id = ? AND attempt_number = ?
+            """,
+            (operation_id, dispatch["attempt_number"]),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        attempt_id = str(uuid.uuid4())
+        connection.execute(
+            """
+            INSERT INTO sync_operation_attempts (
+                attempt_id, operation_id, attempt_number, started_at, finished_at,
+                rpc_name, outcome, request_sha256, response_sha256, http_status,
+                error_code, error_detail_json, result_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_id, operation_id, dispatch["attempt_number"],
+                dispatch["started_at"], _utc_now(), dispatch["rpc_name"], outcome,
+                dispatch["request_sha256"], response_sha256, http_status,
+                error_code, canonical_json(error_detail or {}), result_revision,
+            ),
+        )
+        return dict(connection.execute(
+            "SELECT * FROM sync_operation_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone())
+
+    def _recover_interrupted_dispatches(self, connection):
+        rows = connection.execute(
+            """
+            SELECT operation_id FROM sync_operations
+            UNION ALL
+            SELECT operation_id FROM sync_structure_operations
+            """
+        ).fetchall()
+        for row in rows:
+            operation_id = row["operation_id"]
+            if self._derived_state(connection, operation_id) != "inflight":
+                continue
+            self._finish_attempt(
+                connection, operation_id, "transport_unknown",
+                error_code="CLIENT_RESTART_RECOVERY",
+            )
+            self._append_event(
+                connection, operation_id, "retry_scheduled",
+                error_code="CLIENT_RESTART_RECOVERY",
+                detail={"source": "client_restart"},
+            )
+
+    def operation_events(self, operation_id):
+        with self._reader() as connection:
+            return [dict(row) for row in self._events_for(connection, operation_id)]
+
+    def operation_attempts(self, operation_id):
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_operation_attempts
+                WHERE operation_id = ? ORDER BY attempt_number
+                """,
+                (operation_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     @staticmethod
     def local_key_for(writing_root_path):
@@ -160,6 +696,8 @@ class SyncV2Store:
             "local_key": local_key,
             "project_id": project_id,
             "project_name": project_name,
+            "project_sync_mode": row["project_sync_mode"] if row else "LEGACY",
+            "migration_epoch": int(row["migration_epoch"] or 0) if row else 0,
         }
 
     def get_project(self, local_key):
@@ -168,6 +706,66 @@ class SyncV2Store:
                 "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
             ).fetchone()
             return dict(row) if row else None
+
+    def activate_contract_project(
+        self,
+        local_key,
+        *,
+        project_sync_mode,
+        migration_epoch,
+        server_protocol_version,
+        server_contract_sha256,
+        server_capabilities,
+    ):
+        """Persist a server-proven project transition; never auto-promote."""
+        require_server_compatibility(
+            project_sync_mode=project_sync_mode,
+            migration_epoch=migration_epoch,
+            server_protocol_version=server_protocol_version,
+            server_contract_sha256=server_contract_sha256,
+            server_capabilities=server_capabilities,
+        )
+        now = _utc_now()
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(local_key)
+            old_mode = current["project_sync_mode"] or "LEGACY"
+            old_epoch = int(current["migration_epoch"] or 0)
+            allowed = {
+                ("LEGACY", "LEGACY"),
+                ("LEGACY", "MIGRATING"),
+                ("MIGRATING", "MIGRATING"),
+                ("MIGRATING", "ID_BASED"),
+                ("ID_BASED", "ID_BASED"),
+            }
+            if (old_mode, project_sync_mode) not in allowed:
+                raise SyncContractError("INVALID_PROJECT_MODE_TRANSITION")
+            if int(migration_epoch) < old_epoch:
+                raise SyncContractError("STALE_MIGRATION_EPOCH")
+            if project_sync_mode == "LEGACY" and int(migration_epoch) != 0:
+                raise SyncContractError("STALE_MIGRATION_EPOCH")
+            connection.execute(
+                """
+                UPDATE sync_projects
+                SET project_sync_mode = ?, migration_epoch = ?,
+                    server_protocol_version = ?, active_contract_sha256 = ?,
+                    server_capabilities_json = ?, contract_validated_at = ?,
+                    updated_at = ?
+                WHERE local_key = ?
+                """,
+                (
+                    project_sync_mode, int(migration_epoch),
+                    int(server_protocol_version), server_contract_sha256,
+                    canonical_json(sorted(set(server_capabilities))), now, now,
+                    local_key,
+                ),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
+            ).fetchone())
 
     def ensure_document(self, local_key, local_path, content="", document_id=None):
         local_path = _normalize_path(local_path)
@@ -220,42 +818,48 @@ class SyncV2Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def _has_active_connection(self, connection, document_id):
+        rows = connection.execute(
+            "SELECT operation_id FROM sync_operations WHERE document_id = ?",
+            (document_id,),
+        ).fetchall()
+        return any(
+            self._derived_state(connection, row["operation_id"]) in CONTRACT_ACTIVE_STATES
+            for row in rows
+        )
+
     def has_active_operations(self, document_id):
         with self._reader() as connection:
-            row = connection.execute(
-                """
-                SELECT 1 FROM sync_operations
-                WHERE document_id = ? AND status IN ('pending', 'inflight', 'conflict')
-                LIMIT 1
-                """,
-                (document_id,),
-            ).fetchone()
-            return row is not None
+            return self._has_active_connection(connection, document_id)
 
     def has_tombstone_for_server_path(self, local_key, server_path):
         """Return whether a path is deleted or has a queued deletion."""
         server_path = _normalize_path(server_path)
         with self._reader() as connection:
-            row = connection.execute(
+            documents = connection.execute(
                 """
-                SELECT 1
-                FROM sync_documents AS document
-                WHERE document.local_key = ?
-                  AND document.server_path = ?
-                  AND (
-                    document.is_deleted = 1
-                    OR EXISTS (
-                        SELECT 1 FROM sync_operations AS operation
-                        WHERE operation.document_id = document.document_id
-                          AND operation.is_deleted = 1
-                          AND operation.status IN ('pending', 'inflight', 'conflict')
-                    )
-                  )
-                LIMIT 1
+                SELECT * FROM sync_documents
+                WHERE local_key = ? AND server_path = ?
                 """,
                 (local_key, server_path),
-            ).fetchone()
-            return row is not None
+            ).fetchall()
+            for document in documents:
+                if document["is_deleted"]:
+                    return True
+                operations = connection.execute(
+                    """
+                    SELECT * FROM sync_operations
+                    WHERE document_id = ? AND is_deleted = 1
+                    """,
+                    (document["document_id"],),
+                ).fetchall()
+                if any(
+                    self._derived_state(connection, operation["operation_id"])
+                    in CONTRACT_ACTIVE_STATES
+                    for operation in operations
+                ):
+                    return True
+            return False
 
     def apply_remote_snapshot(
         self,
@@ -280,15 +884,7 @@ class SyncV2Store:
             existing = connection.execute(
                 "SELECT * FROM sync_documents WHERE document_id = ?", (document_id,)
             ).fetchone()
-            active = connection.execute(
-                """
-                SELECT 1 FROM sync_operations
-                WHERE document_id = ? AND status IN ('pending', 'inflight', 'conflict')
-                LIMIT 1
-                """,
-                (document_id,),
-            ).fetchone()
-            if active:
+            if self._has_active_connection(connection, document_id):
                 return {"applied": False, "reason": "active_operations"}
             if existing and revision <= existing["revision"]:
                 return {"applied": False, "reason": "not_newer", "document": dict(existing)}
@@ -372,15 +968,7 @@ class SyncV2Store:
             ).fetchone()
             if document is None or not document["is_deleted"]:
                 return {"applied": False, "reason": "not_deleted"}
-            active = connection.execute(
-                """
-                SELECT 1 FROM sync_operations
-                WHERE document_id = ? AND status IN ('pending', 'inflight', 'conflict')
-                LIMIT 1
-                """,
-                (document_id,),
-            ).fetchone()
-            if active:
+            if self._has_active_connection(connection, document_id):
                 return {"applied": False, "reason": "active_operations"}
             collision = connection.execute(
                 """
@@ -407,6 +995,146 @@ class SyncV2Store:
                 "document": dict(repaired),
             }
 
+    @staticmethod
+    def _payload_for_document(local_path, relative_path, base_content, content, is_deleted):
+        return {
+            "base_content": base_content,
+            "content": content,
+            "is_deleted": bool(is_deleted),
+            "local_path": local_path,
+            "relative_path": relative_path,
+        }
+
+    @staticmethod
+    def _stable_local_error(error_message):
+        text = str(error_message or "")
+        for token in text.replace(":", " ").split():
+            if token and token.replace("_", "").isalnum() and token.upper() == token:
+                return token[:80]
+        lowered = text.lower()
+        if any(marker in lowered for marker in (
+            "network", "connection", "offline", "timeout", "서버 연결", "오프라인"
+        )):
+            return "NETWORK_ERROR"
+        return "CLIENT_ERROR"
+
+    def _insert_document_operation(
+        self,
+        connection,
+        *,
+        context,
+        document,
+        local_path,
+        relative_path,
+        base_revision,
+        base_content,
+        content,
+        is_deleted,
+        supersedes_operation_id=None,
+    ):
+        project = connection.execute(
+            "SELECT * FROM sync_projects WHERE local_key = ?", (context["local_key"],)
+        ).fetchone()
+        if project is None:
+            raise KeyError(context["local_key"])
+        mode = project["project_sync_mode"] or "LEGACY"
+        payload = self._payload_for_document(
+            local_path, relative_path, base_content, content, is_deleted
+        )
+        operation_id = str(uuid.uuid4())
+        batch_id = None
+        provenance = "LEGACY_EPOCH_0"
+        protocol_version = 2
+        contract_version = None
+        contract_sha256 = None
+        capabilities_json = canonical_json(["folders_authoritative", "tombstones"])
+        if mode != "LEGACY":
+            provenance = "CONTRACT_BATCH"
+            protocol_version = SYNC_PROTOCOL_VERSION
+            contract_version = CONTRACT_VERSION
+            contract_sha256 = CANONICAL_CONTRACT_SHA256
+            capabilities_json = canonical_json([
+                "folders_authoritative", "tree_order_ids", "tombstones",
+                "immutable_batch_contract_metadata", "operation_attempt_history",
+                "operation_state_events", "storage_name_v1",
+            ])
+            request = build_atomic_structure_request(
+                project_id=context["project_id"],
+                project_sync_mode=mode,
+                migration_epoch=int(project["migration_epoch"] or 0),
+                writer_device_id=context.get("writer_device_id") or uuid.uuid4(),
+                ordered_intents=[{
+                    "operation_id": operation_id,
+                    "entity_kind": "document",
+                    "entity_id": document["document_id"],
+                    "intent_kind": (
+                        "delete" if is_deleted else
+                        "create" if int(base_revision or 0) == 0 else "update"
+                    ),
+                    "base_revision": int(base_revision or 0),
+                    "payload": payload,
+                    "supersedes_operation_id": supersedes_operation_id,
+                }],
+                client_build_id=CLIENT_BUILD_ID,
+            )
+            batch = request["batch"]
+            batch_id = batch["batch_id"]
+            connection.execute(
+                """
+                INSERT INTO sync_contract_batches (
+                    batch_id, local_key, project_id, writer_device_id,
+                    client_build_id, sync_protocol_version, contract_version,
+                    canonical_contract_sha256, client_capabilities_json,
+                    batch_payload_sha256, project_sync_mode, migration_epoch,
+                    request_json, request_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id, context["local_key"], context["project_id"],
+                    batch["writer_device_id"], batch["client_build_id"],
+                    batch["sync_protocol_version"], batch["contract_version"],
+                    batch["canonical_contract_sha256"],
+                    canonical_json(batch["client_capabilities"]),
+                    batch["batch_payload_sha256"], mode,
+                    int(project["migration_epoch"] or 0), canonical_json(request),
+                    json_sha256(request), _utc_now(),
+                ),
+            )
+
+        now = _utc_now()
+        intent_kind = (
+            "delete" if is_deleted else
+            "create" if int(base_revision or 0) == 0 else "update"
+        )
+        connection.execute(
+            """
+            INSERT INTO sync_operations (
+                operation_id, local_key, project_id, document_id, local_path,
+                relative_path, base_revision, base_content, content, is_deleted,
+                status, attempts, last_error, created_at, updated_at,
+                entity_kind, intent_kind, provenance_kind, batch_id,
+                batch_sequence, payload_sha256, supersedes_operation_id,
+                sync_protocol_version, contract_version,
+                canonical_contract_sha256, client_build_id,
+                client_capabilities_json, legacy_attempt_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', ?, ?,
+                'document', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                operation_id, context["local_key"], context["project_id"],
+                document["document_id"], local_path, relative_path,
+                None if base_revision is None else int(base_revision), base_content, content,
+                int(bool(is_deleted)), now, now, intent_kind, provenance,
+                batch_id, 1 if batch_id else None, json_sha256(payload),
+                supersedes_operation_id, protocol_version, contract_version,
+                contract_sha256, CLIENT_BUILD_ID, capabilities_json,
+            ),
+        )
+        self._append_event(connection, operation_id, "enqueued")
+        return self._operation_dict(
+            connection, self._operation_row(connection, operation_id)
+        )
+
     def enqueue(
         self,
         context,
@@ -421,23 +1149,31 @@ class SyncV2Store:
         now = _utc_now()
 
         with self._transaction() as connection:
-            # A new explicit save is the user's resolution of a previously surfaced conflict.
-            connection.execute(
-                """
-                UPDATE sync_operations
-                SET status = 'cancelled', updated_at = ?
-                WHERE document_id = ? AND status = 'conflict'
-                """,
-                (now, document["document_id"]),
-            )
-            latest = connection.execute(
+            candidates = connection.execute(
                 """
                 SELECT * FROM sync_operations
-                WHERE document_id = ? AND status IN ('pending', 'inflight')
-                ORDER BY queue_id DESC LIMIT 1
+                WHERE document_id = ? ORDER BY queue_id DESC
                 """,
                 (document["document_id"],),
-            ).fetchone()
+            ).fetchall()
+            active = [
+                row for row in candidates
+                if self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+            ]
+            for row in active:
+                if self._derived_state(connection, row["operation_id"]) in {
+                    "conflict", "blocked"
+                }:
+                    self._append_event(
+                        connection, row["operation_id"], "cancel_requested",
+                        detail={"source": "explicit_save"},
+                    )
+            latest = next((
+                row for row in active
+                if self._derived_state(connection, row["operation_id"])
+                in {"pending", "inflight", "retry_wait"}
+            ), None)
 
             if (
                 latest
@@ -445,42 +1181,28 @@ class SyncV2Store:
                 and latest["relative_path"] == relative_path
                 and bool(latest["is_deleted"]) == bool(is_deleted)
             ):
-                return dict(latest)
+                return self._operation_dict(connection, latest)
 
+            current = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (document["document_id"],),
+            ).fetchone()
             if latest:
                 base_revision = None
                 base_content = latest["content"]
             else:
-                current = connection.execute(
-                    "SELECT * FROM sync_documents WHERE document_id = ?",
-                    (document["document_id"],),
-                ).fetchone()
                 base_revision = current["revision"]
                 base_content = current["base_content"]
-
-            operation_id = str(uuid.uuid4())
-            cursor = connection.execute(
-                """
-                INSERT INTO sync_operations (
-                    operation_id, local_key, project_id, document_id, local_path,
-                    relative_path, base_revision, base_content, content, is_deleted,
-                    status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-                """,
-                (
-                    operation_id,
-                    context["local_key"],
-                    context["project_id"],
-                    document["document_id"],
-                    local_path,
-                    relative_path,
-                    base_revision,
-                    base_content,
-                    content,
-                    int(bool(is_deleted)),
-                    now,
-                    now,
-                ),
+            operation = self._insert_document_operation(
+                connection,
+                context=context,
+                document=current,
+                local_path=local_path,
+                relative_path=relative_path,
+                base_revision=base_revision,
+                base_content=base_content,
+                content=content,
+                is_deleted=is_deleted,
             )
             connection.execute(
                 """
@@ -493,103 +1215,135 @@ class SyncV2Store:
                 """,
                 (now, document["document_id"]),
             )
-            row = connection.execute(
-                "SELECT * FROM sync_operations WHERE queue_id = ?", (cursor.lastrowid,)
-            ).fetchone()
-            return dict(row)
+            return operation
 
     def next_ready_operation(self, local_key=None):
         params = []
-        where = "status = 'pending' AND base_revision IS NOT NULL"
+        where = "base_revision IS NOT NULL"
         if local_key:
             where += " AND local_key = ?"
             params.append(local_key)
         with self._reader() as connection:
-            row = connection.execute(
-                f"SELECT * FROM sync_operations WHERE {where} ORDER BY queue_id LIMIT 1",
+            rows = connection.execute(
+                f"SELECT * FROM sync_operations WHERE {where} ORDER BY queue_id",
                 params,
-            ).fetchone()
-            return dict(row) if row else None
+            ).fetchall()
+            for row in rows:
+                if self._derived_state(connection, row["operation_id"]) in {
+                    "pending", "retry_wait"
+                }:
+                    return self._operation_dict(connection, row)
+            return None
 
     def mark_attempt(self, operation_id):
-        now = _utc_now()
         with self._transaction() as connection:
-            connection.execute(
-                """
-                UPDATE sync_operations
-                SET status = 'inflight', attempts = attempts + 1, updated_at = ?
-                WHERE operation_id = ? AND status = 'pending'
-                """,
-                (now, operation_id),
+            operation = self._operation_dict(
+                connection, self._operation_row(connection, operation_id)
+            )
+            if operation is None:
+                return None
+            if operation["status"] not in {"pending", "retry_wait"}:
+                if operation["status"] in TERMINAL_STATES:
+                    raise SyncContractError("OPERATION_TERMINAL")
+                raise SyncContractError("OPERATION_NOT_READY")
+            attempt_number = operation["attempts"] + 1
+            request_sha256 = operation.get("payload_sha256")
+            rpc_name = (
+                "atomic_structure_commit"
+                if operation.get("queue_kind") == "structure"
+                else "commit_document"
+            )
+            return self._append_event(
+                connection, operation_id, "dispatch_started",
+                detail={
+                    "attempt_number": attempt_number,
+                    "request_sha256": request_sha256,
+                    "rpc_name": rpc_name,
+                },
             )
 
     def mark_retry(self, operation_id, error_message):
         now = _utc_now()
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT document_id FROM sync_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
+            row = self._operation_row(connection, operation_id)
             if not row:
                 return
-            connection.execute(
-                """
-                UPDATE sync_operations
-                SET status = 'pending', last_error = ?, updated_at = ?
-                WHERE operation_id = ?
-                """,
-                (error_message, now, operation_id),
+            state = self._derived_state(connection, operation_id)
+            if state == "retry_wait":
+                return self._operation_dict(connection, row)
+            if state in TERMINAL_STATES:
+                return self._operation_dict(connection, row)
+            error_code = self._stable_local_error(error_message)
+            self._finish_attempt(
+                connection, operation_id, "retryable_error",
+                error_code=error_code,
             )
+            self._append_event(
+                connection, operation_id, "retry_scheduled",
+                error_code=error_code,
+            )
+            if row["queue_kind"] == "structure":
+                return self._operation_dict(connection, row)
             connection.execute(
                 """
                 UPDATE sync_documents
                 SET sync_state = 'pending', last_error = ?, updated_at = ?
                 WHERE document_id = ?
                 """,
-                (error_message, now, row["document_id"]),
+                (error_code, now, row["document_id"]),
             )
+            return self._operation_dict(connection, row)
+
+    def mark_blocked(self, operation_id, error_code):
+        with self._transaction() as connection:
+            row = self._operation_row(connection, operation_id)
+            if row is None:
+                return None
+            state = self._derived_state(connection, operation_id)
+            if state == "blocked":
+                return self._operation_dict(connection, row)
+            if state in TERMINAL_STATES:
+                raise SyncContractError("OPERATION_TERMINAL")
+            self._finish_attempt(
+                connection, operation_id, "blocked", error_code=error_code
+            )
+            self._append_event(
+                connection, operation_id, "blocked", error_code=error_code
+            )
+            return self._operation_dict(connection, row)
 
     def mark_success(self, operation_id, result):
         now = _utc_now()
         with self._transaction() as connection:
-            operation = connection.execute(
-                "SELECT * FROM sync_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
+            operation = self._operation_row(connection, operation_id)
             if not operation:
                 return None
-            connection.execute(
-                """
-                UPDATE sync_operations
-                SET status = 'completed', last_error = '', updated_at = ?
-                WHERE operation_id = ?
-                """,
-                (now, operation_id),
+            state = self._derived_state(connection, operation_id)
+            if state == "completed":
+                return self._operation_dict(connection, operation)
+            response_sha256 = json_sha256({
+                key: value for key, value in result.items()
+                if key in {"revision", "content_hash", "status"}
+                and isinstance(value, (str, int, bool, type(None)))
+            })
+            outcome = "replayed" if result.get("status") == "replayed" else "committed"
+            self._finish_attempt(
+                connection, operation_id, outcome,
+                response_sha256=response_sha256,
+                result_revision=int(result["revision"]),
             )
-            next_operation = connection.execute(
-                """
-                SELECT * FROM sync_operations
-                WHERE document_id = ? AND status = 'pending'
-                ORDER BY queue_id LIMIT 1
-                """,
-                (operation["document_id"],),
-            ).fetchone()
-            if next_operation and next_operation["base_revision"] is None:
-                connection.execute(
+            self._append_event(connection, operation_id, outcome)
+            still_pending = any(
+                self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+                for row in connection.execute(
                     """
-                    UPDATE sync_operations
-                    SET base_revision = ?, base_content = ?, updated_at = ?
-                    WHERE queue_id = ?
+                    SELECT operation_id FROM sync_operations
+                    WHERE document_id = ? AND operation_id <> ?
                     """,
-                    (result["revision"], operation["content"], now, next_operation["queue_id"]),
-                )
-            still_pending = connection.execute(
-                """
-                SELECT 1 FROM sync_operations
-                WHERE document_id = ? AND status IN ('pending', 'inflight') LIMIT 1
-                """,
-                (operation["document_id"],),
-            ).fetchone()
+                    (operation["document_id"], operation_id),
+                ).fetchall()
+            )
             connection.execute(
                 """
                 UPDATE sync_documents
@@ -608,7 +1362,42 @@ class SyncV2Store:
                     operation["document_id"],
                 ),
             )
-            return dict(operation)
+            dependent = connection.execute(
+                """
+                SELECT * FROM sync_operations
+                WHERE document_id = ? AND base_revision IS NULL
+                ORDER BY queue_id LIMIT 1
+                """,
+                (operation["document_id"],),
+            ).fetchone()
+            if dependent and self._derived_state(
+                connection, dependent["operation_id"]
+            ) in {"pending", "retry_wait"}:
+                context = {
+                    "local_key": dependent["local_key"],
+                    "project_id": dependent["project_id"],
+                }
+                successor = self._insert_document_operation(
+                    connection,
+                    context=context,
+                    document=connection.execute(
+                        "SELECT * FROM sync_documents WHERE document_id = ?",
+                        (dependent["document_id"],),
+                    ).fetchone(),
+                    local_path=dependent["local_path"],
+                    relative_path=dependent["relative_path"],
+                    base_revision=int(result["revision"]),
+                    base_content=operation["content"],
+                    content=dependent["content"],
+                    is_deleted=bool(dependent["is_deleted"]),
+                    supersedes_operation_id=dependent["operation_id"],
+                )
+                self._append_event(
+                    connection, dependent["operation_id"], "superseded",
+                    related_operation_id=successor["operation_id"],
+                    detail={"successor_operation_id": successor["operation_id"]},
+                )
+            return self._operation_dict(connection, operation)
 
     def rebase_clean_merge(
         self, operation_id, remote_revision, remote_content, merged_content,
@@ -616,30 +1405,47 @@ class SyncV2Store:
     ):
         now = _utc_now()
         with self._transaction() as connection:
-            operation = connection.execute(
-                "SELECT * FROM sync_operations WHERE operation_id = ?", (operation_id,)
-            ).fetchone()
+            operation = self._operation_row(connection, operation_id)
             if not operation:
                 return
-            connection.execute(
+            self._finish_attempt(
+                connection, operation_id, "conflict", error_code="REVISION_CONFLICT"
+            )
+            context = {
+                "local_key": operation["local_key"],
+                "project_id": operation["project_id"],
+            }
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (operation["document_id"],),
+            ).fetchone()
+            successor = self._insert_document_operation(
+                connection,
+                context=context,
+                document=document,
+                local_path=operation["local_path"],
+                relative_path=remote_path or operation["relative_path"],
+                base_revision=int(remote_revision),
+                base_content=remote_content,
+                content=merged_content,
+                is_deleted=bool(operation["is_deleted"]),
+                supersedes_operation_id=operation_id,
+            )
+            active_rows = connection.execute(
                 """
-                UPDATE sync_operations
-                SET status = 'cancelled', updated_at = ?
+                SELECT operation_id FROM sync_operations
                 WHERE document_id = ? AND operation_id <> ?
-                  AND status IN ('pending', 'inflight', 'conflict')
                 """,
-                (now, operation["document_id"], operation_id),
-            )
-            connection.execute(
-                """
-                UPDATE sync_operations
-                SET base_revision = ?, base_content = ?, content = ?,
-                    relative_path = COALESCE(?, relative_path),
-                    status = 'pending', last_error = '', updated_at = ?
-                WHERE operation_id = ?
-                """,
-                (remote_revision, remote_content, merged_content, remote_path, now, operation_id),
-            )
+                (operation["document_id"], successor["operation_id"]),
+            ).fetchall()
+            for active in active_rows:
+                active_id = active["operation_id"]
+                if self._derived_state(connection, active_id) in CONTRACT_ACTIVE_STATES:
+                    self._append_event(
+                        connection, active_id, "superseded",
+                        related_operation_id=successor["operation_id"],
+                        detail={"successor_operation_id": successor["operation_id"]},
+                    )
             connection.execute(
                 """
                 UPDATE sync_documents
@@ -657,6 +1463,7 @@ class SyncV2Store:
                     operation["document_id"],
                 ),
             )
+            return successor
 
     def mark_conflict(
         self,
@@ -670,20 +1477,32 @@ class SyncV2Store:
     ):
         now = _utc_now()
         with self._transaction() as connection:
-            operation = connection.execute(
-                "SELECT * FROM sync_operations WHERE operation_id = ?", (operation_id,)
-            ).fetchone()
+            operation = self._operation_row(connection, operation_id)
             if not operation:
                 return None
-            connection.execute(
-                """
-                UPDATE sync_operations
-                SET status = CASE WHEN operation_id = ? THEN 'conflict' ELSE 'cancelled' END,
-                    last_error = ?, updated_at = ?
-                WHERE document_id = ? AND status IN ('pending', 'inflight', 'conflict')
-                """,
-                (operation_id, error_message, now, operation["document_id"]),
+            self._finish_attempt(
+                connection, operation_id, "conflict", error_code="REVISION_CONFLICT"
             )
+            self._append_event(
+                connection, operation_id, "conflict_detected",
+                error_code="REVISION_CONFLICT",
+            )
+            for dependent in connection.execute(
+                """
+                SELECT operation_id FROM sync_operations
+                WHERE document_id = ? AND operation_id <> ?
+                """,
+                (operation["document_id"], operation_id),
+            ).fetchall():
+                dependent_id = dependent["operation_id"]
+                if self._derived_state(connection, dependent_id) in {
+                    "pending", "retry_wait", "inflight"
+                }:
+                    self._append_event(
+                        connection, dependent_id, "blocked",
+                        error_code="BLOCKED_BY_CONFLICT",
+                        related_operation_id=operation_id,
+                    )
             connection.execute(
                 """
                 UPDATE sync_documents
@@ -707,7 +1526,7 @@ class SyncV2Store:
                     operation["document_id"],
                 ),
             )
-            return dict(operation)
+            return self._operation_dict(connection, operation)
 
     def move_local_path(self, local_key, old_path, new_path):
         old_path = _normalize_path(old_path)
@@ -728,13 +1547,6 @@ class SyncV2Store:
                 updated_path = new_path + suffix
                 connection.execute(
                     "UPDATE sync_documents SET local_path = ?, updated_at = ? WHERE document_id = ?",
-                    (updated_path, now, row["document_id"]),
-                )
-                connection.execute(
-                    """
-                    UPDATE sync_operations SET local_path = ?, updated_at = ?
-                    WHERE document_id = ? AND status IN ('pending', 'inflight', 'conflict')
-                    """,
                     (updated_path, now, row["document_id"]),
                 )
                 moved.append({**dict(row), "old_local_path": row["local_path"], "local_path": updated_path})
@@ -772,37 +1584,374 @@ class SyncV2Store:
             return conflicts
 
     def counts(self, local_key=None):
-        params = []
-        where = "status IN ('pending', 'inflight', 'conflict')"
-        if local_key:
-            where += " AND local_key = ?"
-            params.append(local_key)
         with self._reader() as connection:
+            params = []
+            where = ""
+            if local_key:
+                where = " WHERE local_key = ?"
+                params.append(local_key)
             rows = connection.execute(
-                f"SELECT status, COUNT(*) AS count FROM sync_operations WHERE {where} GROUP BY status",
-                params,
+                f"SELECT operation_id FROM sync_operations{where}", params
             ).fetchall()
-        result = {"pending": 0, "inflight": 0, "conflict": 0}
-        result.update({row["status"]: row["count"] for row in rows})
+            structure_rows = connection.execute(
+                f"SELECT operation_id FROM sync_structure_operations{where}", params
+            ).fetchall()
+            result = {
+                "pending": 0, "inflight": 0, "retry_wait": 0,
+                "blocked": 0, "conflict": 0,
+            }
+            for row in [*rows, *structure_rows]:
+                state = self._derived_state(connection, row["operation_id"])
+                if state in result:
+                    result[state] += 1
         result["total"] = sum(result.values())
         return result
 
     def latest_error(self, local_key=None):
-        params = []
-        where = "status IN ('pending', 'conflict') AND last_error <> ''"
-        if local_key:
-            where += " AND local_key = ?"
-            params.append(local_key)
         with self._reader() as connection:
+            params = []
+            scope = ""
+            if local_key:
+                scope = " AND operation_id IN (SELECT operation_id FROM sync_operations WHERE local_key = ? UNION SELECT operation_id FROM sync_structure_operations WHERE local_key = ?)"
+                params.extend((local_key, local_key))
             row = connection.execute(
-                f"SELECT last_error FROM sync_operations WHERE {where} ORDER BY updated_at DESC LIMIT 1",
+                """
+                SELECT error_code FROM sync_operation_events
+                WHERE error_code IS NOT NULL
+                """ + scope + " ORDER BY recorded_at DESC, event_sequence DESC LIMIT 1",
                 params,
             ).fetchone()
-            return row["last_error"] if row else ""
+            return row["error_code"] if row else ""
 
     def operation(self, operation_id):
         with self._reader() as connection:
-            row = connection.execute(
-                "SELECT * FROM sync_operations WHERE operation_id = ?", (operation_id,)
+            return self._operation_dict(
+                connection, self._operation_row(connection, operation_id)
+            )
+
+    def cancel_operation(self, operation_id, cancel_event_id):
+        cancel_event_id = str(uuid.UUID(str(cancel_event_id)))
+        with self._transaction() as connection:
+            row = self._operation_row(connection, operation_id)
+            if row is None:
+                raise KeyError(operation_id)
+            existing = connection.execute(
+                "SELECT * FROM sync_operation_events WHERE event_id = ?",
+                (cancel_event_id,),
             ).fetchone()
-            return dict(row) if row else None
+            if existing:
+                if (
+                    existing["operation_id"] != operation_id
+                    or existing["event_type"] != "cancel_requested"
+                ):
+                    raise SyncContractError("EVENT_ID_REUSED")
+                return {"status": "already_cancelled", "event_id": cancel_event_id}
+            state = self._derived_state(connection, operation_id)
+            if state == "completed":
+                raise SyncContractError("OPERATION_TERMINAL")
+            if state == "cancelled":
+                return {"status": "already_cancelled", "event_id": None}
+            self._append_event(
+                connection, operation_id, "cancel_requested",
+                event_id=cancel_event_id,
+            )
+            return {"status": "cancelled", "event_id": cancel_event_id}
+
+    def create_structure_batch(
+        self,
+        context,
+        writer_device_id,
+        ordered_intents,
+        *,
+        batch_id=None,
+    ):
+        with self._transaction() as connection:
+            project = connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?",
+                (context["local_key"],),
+            ).fetchone()
+            if project is None:
+                raise KeyError(context["local_key"])
+            capabilities = json.loads(project["server_capabilities_json"] or "[]")
+            require_server_compatibility(
+                project_sync_mode=project["project_sync_mode"],
+                migration_epoch=int(project["migration_epoch"] or 0),
+                server_protocol_version=int(project["server_protocol_version"] or 0),
+                server_contract_sha256=project["active_contract_sha256"] or "",
+                server_capabilities=capabilities,
+            )
+            request = build_atomic_structure_request(
+                project_id=context["project_id"],
+                project_sync_mode=project["project_sync_mode"],
+                migration_epoch=int(project["migration_epoch"] or 0),
+                writer_device_id=writer_device_id,
+                ordered_intents=ordered_intents,
+                batch_id=batch_id,
+                client_build_id=CLIENT_BUILD_ID,
+            )
+            batch = request["batch"]
+            existing = connection.execute(
+                "SELECT * FROM sync_contract_batches WHERE batch_id = ?",
+                (batch["batch_id"],),
+            ).fetchone()
+            if existing:
+                if existing["request_sha256"] != json_sha256(request):
+                    raise SyncContractError("BATCH_ID_REUSED")
+                return json.loads(existing["request_json"])
+            now = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO sync_contract_batches (
+                    batch_id, local_key, project_id, writer_device_id,
+                    client_build_id, sync_protocol_version, contract_version,
+                    canonical_contract_sha256, client_capabilities_json,
+                    batch_payload_sha256, project_sync_mode, migration_epoch,
+                    request_json, request_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch["batch_id"], context["local_key"], context["project_id"],
+                    batch["writer_device_id"], batch["client_build_id"],
+                    batch["sync_protocol_version"], batch["contract_version"],
+                    batch["canonical_contract_sha256"],
+                    canonical_json(batch["client_capabilities"]),
+                    batch["batch_payload_sha256"], request["project_sync_mode"],
+                    request["migration_epoch"], canonical_json(request),
+                    json_sha256(request), now,
+                ),
+            )
+            for intent in request["ordered_intents"]:
+                connection.execute(
+                    """
+                    INSERT INTO sync_structure_operations (
+                        operation_id, local_key, project_id, entity_kind,
+                        entity_id, intent_kind, provenance_kind, batch_id,
+                        batch_sequence, base_revision, payload_json,
+                        payload_sha256, supersedes_operation_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'CONTRACT_BATCH', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent["operation_id"], context["local_key"],
+                        context["project_id"], intent["entity_kind"],
+                        intent["entity_id"], intent["intent_kind"],
+                        intent["batch_id"], intent["sequence"],
+                        intent["base_revision"], canonical_json(intent["payload"]),
+                        intent["payload_sha256"],
+                        intent.get("supersedes_operation_id"), now,
+                    ),
+                )
+                self._append_event(connection, intent["operation_id"], "enqueued")
+            for intent in request["ordered_intents"]:
+                original_id = intent.get("supersedes_operation_id")
+                if original_id:
+                    self._append_event(
+                        connection, original_id, "superseded",
+                        related_operation_id=intent["operation_id"],
+                        detail={"successor_operation_id": intent["operation_id"]},
+                    )
+            return request
+
+    def next_ready_structure_batch(self, local_key=None):
+        with self._reader() as connection:
+            params = []
+            scope = ""
+            if local_key:
+                scope = "WHERE batch.local_key = ?"
+                params.append(local_key)
+            rows = connection.execute(
+                f"""
+                SELECT batch.* FROM sync_contract_batches AS batch
+                LEFT JOIN sync_contract_batch_results AS result
+                    ON result.batch_id = batch.batch_id
+                {scope}
+                AND result.batch_id IS NULL
+                ORDER BY batch.created_at
+                """ if scope else """
+                SELECT batch.* FROM sync_contract_batches AS batch
+                LEFT JOIN sync_contract_batch_results AS result
+                    ON result.batch_id = batch.batch_id
+                WHERE result.batch_id IS NULL
+                ORDER BY batch.created_at
+                """,
+                params,
+            ).fetchall()
+            for batch in rows:
+                operations = connection.execute(
+                    """
+                    SELECT operation_id FROM sync_structure_operations
+                    WHERE batch_id = ? ORDER BY batch_sequence
+                    """,
+                    (batch["batch_id"],),
+                ).fetchall()
+                states = [
+                    self._derived_state(connection, row["operation_id"])
+                    for row in operations
+                ]
+                if states and all(state in {"pending", "retry_wait"} for state in states):
+                    return json.loads(batch["request_json"])
+            return None
+
+    def structure_batch_request(self, batch_id):
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT request_json FROM sync_contract_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            return json.loads(row["request_json"]) if row else None
+
+    def mark_structure_batch_attempt(self, batch_id):
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_structure_operations
+                WHERE batch_id = ? ORDER BY batch_sequence
+                """,
+                (batch_id,),
+            ).fetchall()
+            if not rows:
+                raise KeyError(batch_id)
+            for row in rows:
+                state = self._derived_state(connection, row["operation_id"])
+                if state not in {"pending", "retry_wait"}:
+                    if state in TERMINAL_STATES:
+                        raise SyncContractError("OPERATION_TERMINAL")
+                    raise SyncContractError("OPERATION_NOT_READY")
+            operation_ids = []
+            for row in rows:
+                operation_id = row["operation_id"]
+                attempts = connection.execute(
+                    "SELECT COUNT(*) FROM sync_operation_attempts WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()[0]
+                self._append_event(
+                    connection,
+                    operation_id,
+                    "dispatch_started",
+                    detail={
+                        "attempt_number": int(attempts) + 1,
+                        "request_sha256": row["payload_sha256"],
+                        "rpc_name": "atomic_structure_commit",
+                    },
+                )
+                operation_ids.append(operation_id)
+            return operation_ids
+
+    def mark_structure_batch_retry(self, batch_id, error_message):
+        with self._transaction() as connection:
+            operation_ids = [
+                row["operation_id"] for row in connection.execute(
+                    """
+                    SELECT operation_id FROM sync_structure_operations
+                    WHERE batch_id = ? ORDER BY batch_sequence
+                    """,
+                    (batch_id,),
+                ).fetchall()
+            ]
+            if not operation_ids:
+                raise KeyError(batch_id)
+            error_code = self._stable_local_error(error_message)
+            for operation_id in operation_ids:
+                state = self._derived_state(connection, operation_id)
+                if state == "retry_wait" or state in TERMINAL_STATES:
+                    continue
+                self._finish_attempt(
+                    connection,
+                    operation_id,
+                    "retryable_error",
+                    error_code=error_code,
+                )
+                self._append_event(
+                    connection,
+                    operation_id,
+                    "retry_scheduled",
+                    error_code=error_code,
+                )
+            return operation_ids
+
+    def record_structure_batch_response(self, batch_id, response):
+        with self._transaction() as connection:
+            batch = connection.execute(
+                "SELECT * FROM sync_contract_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise KeyError(batch_id)
+            request = json.loads(batch["request_json"])
+            validated = validate_atomic_structure_response(request, response)
+            response_sha256 = json_sha256(validated)
+            existing = connection.execute(
+                "SELECT * FROM sync_contract_batch_results WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if existing:
+                if existing["response_sha256"] != response_sha256:
+                    raise SyncContractError("BATCH_ID_REUSED")
+                return json.loads(existing["response_json"])
+
+            intents = request["ordered_intents"]
+            if validated["kind"] == "atomic_structure_commit_success":
+                result_by_operation = {
+                    item["operation_id"]: item for item in validated["results"]
+                }
+                event_type = (
+                    "replayed" if validated["status"] == "replayed" else "committed"
+                )
+                for intent in intents:
+                    result = result_by_operation[intent["operation_id"]]
+                    self._finish_attempt(
+                        connection, intent["operation_id"], event_type,
+                        response_sha256=response_sha256,
+                        result_revision=result["result_revision"],
+                    )
+                    self._append_event(
+                        connection, intent["operation_id"], event_type
+                    )
+                applied = 1
+            else:
+                error = validated["error"]
+                for intent in intents:
+                    is_failure = intent["sequence"] == error["failed_sequence"]
+                    conflict = is_failure and error["code"] == "REVISION_CONFLICT"
+                    outcome = "conflict" if conflict else "blocked"
+                    event_type = "conflict_detected" if conflict else "blocked"
+                    self._finish_attempt(
+                        connection, intent["operation_id"], outcome,
+                        response_sha256=response_sha256,
+                        error_code=error["code"],
+                        error_detail={"failed_sequence": error["failed_sequence"]},
+                    )
+                    self._append_event(
+                        connection, intent["operation_id"], event_type,
+                        error_code=error["code"],
+                        detail={"failed_sequence": error["failed_sequence"]},
+                    )
+                applied = 0
+            connection.execute(
+                """
+                INSERT INTO sync_contract_batch_results (
+                    batch_id, response_json, response_sha256, applied, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id, canonical_json(validated), response_sha256,
+                    applied, _utc_now(),
+                ),
+            )
+            return validated
+
+    def record_diagnostic(self, local_key, event, **metadata):
+        trace = safe_trace(event, **metadata)
+        with self._transaction() as connection:
+            trace_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO sync_contract_diagnostics (
+                    trace_id, local_key, event, metadata_json, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    trace_id, local_key, trace["event"], canonical_json(trace),
+                    _utc_now(),
+                ),
+            )
+            return {"trace_id": trace_id, **trace}
