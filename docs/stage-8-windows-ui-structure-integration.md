@@ -35,7 +35,7 @@ rebased.
 
 - Source manifest: `docs/stage-8-source-reconstruction-manifest.json`
 - Source entries: `36`
-- Source manifest SHA-256: `09904026c6a065fbf04618e2daee3d872c48b19ce4382288a4d6b239987a7ce8`
+- Source manifest SHA-256: `8d9a38fb06b3a2e91a017a4825cd151ff85b8c5dd79529c33ba85b373a9158ab`
 - All included files passed UTF-8 text, forbidden-path, binary, 1 MiB and secret-rule gates.
 - Excluded: local 50-commit history, `.env`, historic secret material,
   `saves/project_data.json`, real work content, DB/WAL/SHM, EXE/DLL,

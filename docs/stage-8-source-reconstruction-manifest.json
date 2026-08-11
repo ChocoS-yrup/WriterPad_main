@@ -2,8 +2,8 @@
   "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
   "stacked_pr_base_branch": "codex/stage-8-windows-contract-implementation",
   "local_history_reused": false,
-  "source_manifest_sha256": "09904026c6a065fbf04618e2daee3d872c48b19ce4382288a4d6b239987a7ce8",
-  "source_entry_count": 36,
+  "source_manifest_sha256": "8d9a38fb06b3a2e91a017a4825cd151ff85b8c5dd79529c33ba85b373a9158ab",
+  "source_entry_count": 37,
   "safety_gate": {
     "utf8_text_only": true,
     "forbidden_path_findings": 0,
@@ -52,6 +52,12 @@
     }
   ],
   "entries": [
+    {
+      "path": ".github/workflows/windows-contract.yml",
+      "provenance": "reviewed UTF-8 CI configuration",
+      "bytes": 3214,
+      "output_sha256": "1ce0ea0f875ada3c51e01b2b325c7040bc9ecfbf0fa8025a306c4bf6393d81bb"
+    },
     {
       "path": "binder_order.py",
       "provenance": "read-only untracked text source",
