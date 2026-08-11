@@ -1,11 +1,12 @@
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
-from PyQt6.QtCore import QMutex
+from PyQt6.QtCore import QMutex, Qt
 
 from mode_writing import WritingModeWidget
 from project_manager import ProjectManager
@@ -36,6 +37,53 @@ class WritingDataTestCase(unittest.TestCase):
     def path(self, relative_path):
         return Path(self.wpm.writing_root_path, relative_path)
 
+    def test_fixed_binder_uses_story_plot_label_without_changing_storage_path(self):
+        roots = dict(WritingTreeMixin.FIXED_ROOT_NODES)
+
+        self.assertEqual(roots["🗺️ 스토리 플롯"], "메인/플롯")
+        self.assertNotIn("🗺️ 메인 스토리 틀", roots)
+        self.assertEqual(
+            WritingTreeMixin._normalize_fixed_root_order([
+                "📚 원고", "🗺️ 메인 스토리 틀", "🗑️ 휴지통"
+            ]),
+            ["원고", "플롯", "휴지통"],
+        )
+
+    def test_split_mode_defaults_on_and_reads_global_state(self):
+        self.assertTrue(WritingModeWidget._saved_split_mode(
+            SimpleNamespace(global_config={})
+        ))
+        self.assertFalse(WritingModeWidget._saved_split_mode(
+            SimpleNamespace(global_config={
+                WritingModeWidget._SPLIT_MODE_STATE_KEY: False
+            })
+        ))
+
+    def test_split_mode_toggle_persists_program_wide_state(self):
+        left_editor = object()
+        right_editor = object()
+        pm = SimpleNamespace(
+            global_config={}, save_global_config=MagicMock()
+        )
+        panel = SimpleNamespace(
+            pm=pm,
+            right_editor_container=MagicMock(),
+            active_editor=right_editor,
+            right_editor=right_editor,
+            left_editor=left_editor,
+            set_active_editor=MagicMock(),
+            _SPLIT_MODE_STATE_KEY=WritingModeWidget._SPLIT_MODE_STATE_KEY,
+        )
+
+        WritingModeWidget.toggle_split_mode(panel, False)
+
+        panel.right_editor_container.setVisible.assert_called_once_with(False)
+        panel.set_active_editor.assert_called_once_with(left_editor)
+        self.assertFalse(pm.global_config[
+            WritingModeWidget._SPLIT_MODE_STATE_KEY
+        ])
+        pm.save_global_config.assert_called_once_with()
+
     def test_atomic_file_save_and_rename_and_move_preserve_content(self):
         original = "메인/메모/초안.txt"
         renamed = "메인/메모/수정 초안.txt"
@@ -53,6 +101,159 @@ class WritingDataTestCase(unittest.TestCase):
         moved = self.wpm.move_item(renamed, destination)
         self.assertEqual(moved, "메인/복선/수정 초안.txt")
         self.assertEqual(self.wpm.read_text_file(moved), content)
+
+    @staticmethod
+    def _rename_item_mock(old_path, entered_name, is_folder=False):
+        item = MagicMock()
+
+        def item_data(_column, role):
+            if role == Qt.ItemDataRole.UserRole:
+                return old_path
+            if role == Qt.ItemDataRole.UserRole + 1:
+                return is_folder
+            if role == Qt.ItemDataRole.UserRole + 4:
+                return False
+            return None
+
+        item.data.side_effect = item_data
+        item.text.return_value = entered_name
+        item.childCount.return_value = 0
+        return item
+
+    def _rename_panel(self):
+        panel = WritingTreeMixin()
+        panel.binder_tree = MagicMock()
+        panel.wpm = SimpleNamespace(
+            writing_root_path=self.wpm.writing_root_path,
+            rename_item=MagicMock(return_value=True),
+        )
+        panel.sync_manager = MagicMock()
+        panel.loaded_versions = {}
+        panel.current_loaded_file_left = None
+        panel.current_loaded_file_right = None
+        panel.lbl_current_doc = MagicMock()
+        panel.lbl_r_doc = MagicMock()
+        panel.save_tree_order = MagicMock()
+        panel.save_tree_order_for_rename = MagicMock()
+        return panel
+
+    def test_rename_trims_trailing_blanks_before_disk_and_sync_path_change(self):
+        panel = self._rename_panel()
+        item = self._rename_item_mock(
+            "메인/메모장/이전 이름.txt", "가 나 다   ", is_folder=False
+        )
+
+        with patch("writing_tree.QTimer.singleShot"):
+            panel.on_tree_item_changed(item, 0)
+
+        expected_path = "메인/메모장/가 나 다.txt"
+        item.setText.assert_called_with(0, "가 나 다")
+        panel.wpm.rename_item.assert_called_once_with(
+            "메인/메모장/이전 이름.txt", expected_path
+        )
+        panel.sync_manager.record_path_change.assert_called_once_with(
+            "메인/메모장/이전 이름.txt", expected_path, retry=False
+        )
+        item.setData.assert_called_with(
+            0, Qt.ItemDataRole.UserRole, expected_path
+        )
+
+    def test_folder_rename_uses_the_same_trailing_blank_cleanup(self):
+        panel = self._rename_panel()
+        item = self._rename_item_mock(
+            "메인/메모장/이전 폴더", "가 나 다  ", is_folder=True
+        )
+
+        with patch("writing_tree.QTimer.singleShot"):
+            panel.on_tree_item_changed(item, 0)
+
+        expected_path = "메인/메모장/가 나 다"
+        panel.wpm.rename_item.assert_called_once_with(
+            "메인/메모장/이전 폴더", expected_path
+        )
+        panel.sync_manager.record_path_change.assert_called_once_with(
+            "메인/메모장/이전 폴더", expected_path, retry=False
+        )
+        panel.sync_manager.local_structure_mutation.assert_called_once_with()
+        panel.save_tree_order_for_rename.assert_called_once_with(
+            "메인/메모장/이전 폴더",
+            expected_path,
+            retry=False,
+            operations=panel.sync_manager.record_path_change.return_value,
+        )
+        panel.sync_manager.retry_pending_syncs.assert_called_once_with()
+
+    def test_folder_rename_preserves_unloaded_saved_descendants(self):
+        old_path = "메인/메모장/새 폴더F"
+        new_path = "메인/메모장/새 폴더H"
+        saved = {
+            "<root>": ["메모장"],
+            "메인/메모장": ["앞 폴더", "새 폴더F", "뒤 폴더"],
+            old_path: [],
+            "메인/접힌 폴더": ["화면에 없는 하위 폴더"],
+        }
+
+        renamed = WritingTreeMixin._rename_saved_tree_order(
+            saved, old_path, new_path
+        )
+
+        self.assertEqual(
+            renamed["메인/메모장"],
+            ["앞 폴더", "새 폴더H", "뒤 폴더"],
+        )
+        self.assertNotIn(old_path, renamed)
+        self.assertEqual(renamed[new_path], [])
+        self.assertEqual(
+            renamed["메인/접힌 폴더"],
+            ["화면에 없는 하위 폴더"],
+        )
+        self.assertEqual(saved["메인/메모장"][1], "새 폴더F")
+
+    def test_root_folder_rename_updates_logical_root_order(self):
+        old_path = "메인/새 폴더1"
+        new_path = "메인/새 폴더2"
+        saved = {
+            "<root>": ["원고", "새 폴더1", "휴지통"],
+            old_path: [],
+        }
+
+        renamed = WritingTreeMixin._rename_saved_tree_order(
+            saved, old_path, new_path
+        )
+
+        self.assertEqual(
+            renamed["<root>"], ["원고", "새 폴더2", "휴지통"]
+        )
+        self.assertNotIn(old_path, renamed)
+        self.assertEqual(renamed[new_path], [])
+
+    def test_unsupported_rename_restores_old_name_and_shows_temporary_message(self):
+        panel = self._rename_panel()
+        panel._show_temporary_invalid_name_message = MagicMock()
+        item = self._rename_item_mock(
+            "메인/메모장/이전 이름.txt", "금지:이름", is_folder=False
+        )
+
+        panel.on_tree_item_changed(item, 0)
+
+        item.setText.assert_called_with(0, "이전 이름")
+        panel.wpm.rename_item.assert_not_called()
+        panel.sync_manager.record_path_change.assert_not_called()
+        panel._show_temporary_invalid_name_message.assert_called_once_with()
+
+    def test_invalid_name_message_is_scheduled_to_close_after_two_seconds(self):
+        panel = SimpleNamespace()
+        message_box = MagicMock()
+        with patch("writing_tree.QMessageBox", return_value=message_box), patch(
+            "writing_tree.QTimer.singleShot"
+        ) as single_shot:
+            WritingTreeMixin._show_temporary_invalid_name_message(panel)
+
+        message_box.setText.assert_called_once_with(
+            "지원하지 않는 파일명 입니다."
+        )
+        message_box.show.assert_called_once_with()
+        self.assertEqual(single_shot.call_args.args[0], 2000)
 
     def test_creating_same_name_adds_a_suffix_without_overwriting(self):
         parent = "메인/메모"
@@ -223,6 +424,98 @@ class WritingDataTestCase(unittest.TestCase):
         self.assertEqual(first_chapters[-1], "025화.txt")
         self.assertEqual(second_chapters[0], "026화.txt")
         self.assertEqual(second_chapters[-1], "050화.txt")
+
+    def test_contract_volume_queues_folder_before_documents_and_defers_order(self):
+        manager = MagicMock()
+        manager.local_structure_mutation.return_value = nullcontext()
+        folder_intent = {
+            "contract_structure_intents": [{
+                "entity_kind": "folder",
+                "entity_id": "folder-id",
+                "intent_kind": "create",
+            }]
+        }
+        manager.record_path_change.return_value = [folder_intent]
+        manager.record_created_document.side_effect = [
+            {"operation_id": f"operation-{index}"}
+            for index in range(1, 26)
+        ]
+        panel = SimpleNamespace(
+            wpm=self.wpm,
+            sync_manager=manager,
+            load_tree_data=MagicMock(),
+            defer_tree_order_until_operations=MagicMock(),
+            binder_tree=MagicMock(),
+            _open_new_volume_chapters=MagicMock(),
+        )
+
+        with patch.object(
+            WritingTreeMixin,
+            "_current_tree_order_snapshot",
+            return_value={"메인/원고": []},
+        ), patch("writing_tree.QMessageBox.information"), patch(
+            "PyQt6.QtCore.QTimer.singleShot"
+        ):
+            WritingTreeMixin.add_volume(panel)
+
+        volume_path = "메인/원고/1권"
+        manager.record_path_change.assert_called_once_with(
+            volume_path, volume_path, retry=False
+        )
+        manager.queue_contract_structure_intents.assert_called_once_with(
+            folder_intent["contract_structure_intents"], retry=False
+        )
+        self.assertEqual(manager.record_created_document.call_count, 25)
+        first_document_call = manager.record_created_document.call_args_list[0]
+        last_document_call = manager.record_created_document.call_args_list[-1]
+        self.assertEqual(first_document_call, call(
+            "메인/원고/1권/001화.txt", retry=False
+        ))
+        self.assertEqual(last_document_call, call(
+            "메인/원고/1권/025화.txt", retry=False
+        ))
+        queued_operations, queued_order = (
+            panel.defer_tree_order_until_operations.call_args.args
+        )
+        self.assertEqual(len(queued_operations), 25)
+        self.assertEqual(
+            queued_order["메인/원고/1권"],
+            [f"{index:03d}화.txt" for index in range(1, 26)],
+        )
+        folder_call_index = manager.mock_calls.index(call.record_path_change(
+            volume_path, volume_path, retry=False
+        ))
+        first_document_index = manager.mock_calls.index(call.record_created_document(
+            "메인/원고/1권/001화.txt", retry=False
+        ))
+        self.assertLess(folder_call_index, first_document_index)
+        manager.retry_pending_syncs.assert_called_once_with()
+
+    def test_new_volume_opens_first_two_chapters_and_leaves_left_active_in_split_view(self):
+        left_editor = object()
+        right_editor = object()
+        panel = SimpleNamespace(
+            left_editor=left_editor,
+            right_editor=right_editor,
+            btn_toggle_split=SimpleNamespace(isChecked=lambda: True),
+            right_editor_container=SimpleNamespace(isVisible=lambda: True),
+            set_active_editor=MagicMock(),
+            _open_file_by_path=MagicMock(),
+        )
+
+        WritingTreeMixin._open_new_volume_chapters(panel, "2권")
+
+        self.assertEqual(
+            panel._open_file_by_path.call_args_list,
+            [
+                call("메인/원고/2권/026화.txt"),
+                call("메인/원고/2권/027화.txt"),
+            ],
+        )
+        self.assertEqual(
+            panel.set_active_editor.call_args_list,
+            [call(left_editor), call(right_editor), call(left_editor)],
+        )
 
     def test_autosave_writes_only_a_timestamped_backup_copy(self):
         relative_path = "메인/원고/1권/001화.txt"

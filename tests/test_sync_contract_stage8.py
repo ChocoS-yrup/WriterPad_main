@@ -7,6 +7,7 @@ import unittest
 import uuid
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 from sync_contract import (
     CANONICAL_CONTRACT_BYTES,
@@ -257,6 +258,31 @@ class ContractStoreTests(unittest.TestCase):
             server_capabilities=SERVER_CAPABILITIES,
         )
 
+    def _contract_manager(self):
+        project = self._activate_id_based()
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = {**self.context, **project}
+        manager._v2_device_id = DEVICE_ID
+        manager._v2_wpm = SimpleNamespace(
+            writing_root_path=str(Path(self.temp.name) / "writing"),
+            read_text_file=lambda _path: None,
+            project_settings={"tree_order": {}},
+            save_settings=lambda: True,
+        )
+        Path(manager._v2_wpm.writing_root_path).mkdir(parents=True, exist_ok=True)
+        return manager
+
+    def _folder_snapshot(self, path, *, parent_id=None, revision=1):
+        return {
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": parent_id,
+            "local_path": path,
+            "name": path.rsplit("/", 1)[-1],
+            "revision": revision,
+            "is_deleted": False,
+        }
+
     def _vector_intents(self):
         request = load_json(
             contract_root() / "conformance_vectors" / "atomic-structure-commit.json"
@@ -311,6 +337,212 @@ class ContractStoreTests(unittest.TestCase):
         reopened = SyncV2Store(self.db_path)
         project = reopened.get_project(self.context["local_key"])
         self.assertEqual((project["project_sync_mode"], project["migration_epoch"]), ("LEGACY", 0))
+
+    def test_contract_ui_tree_order_queues_atomic_batch_not_hidden_document(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        child = self._folder_snapshot(
+            "메인/메모장/장면", parent_id=parent["folder_id"]
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, child]
+        )
+
+        request = manager.record_tree_order(
+            {"메인/메모장": ["장면"]}, retry=False
+        )
+
+        self.assertEqual(request["kind"], "atomic_structure_commit_request")
+        self.assertEqual(
+            [item["entity_kind"] for item in request["ordered_intents"]],
+            ["tree_order"],
+        )
+        self.assertEqual(
+            request["ordered_intents"][0]["payload"],
+            {
+                "parent_folder_id": parent["folder_id"],
+                "children": [child["folder_id"]],
+            },
+        )
+        self.assertIsNone(
+            self.store.get_document(
+                self.context["local_key"], "__antigravity__/tree-order.json"
+            )
+        )
+
+    def test_contract_folder_rename_and_order_share_one_atomic_batch(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        child = self._folder_snapshot(
+            "메인/메모장/옛 이름", parent_id=parent["folder_id"], revision=4
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, child]
+        )
+        old_path = Path(manager._v2_wpm.writing_root_path, child["local_path"])
+        new_path = old_path.with_name("새 이름")
+        old_path.mkdir(parents=True)
+        old_path.rename(new_path)
+
+        operations = manager.record_path_change(
+            child["local_path"], "메인/메모장/새 이름", retry=False
+        )
+        request = manager.queue_contract_path_change_with_order(
+            operations, {"메인/메모장": ["새 이름"]}, retry=False
+        )
+
+        self.assertEqual(
+            [item["entity_kind"] for item in request["ordered_intents"]],
+            ["folder", "tree_order"],
+        )
+        rename, order = request["ordered_intents"]
+        self.assertEqual((rename["intent_kind"], rename["base_revision"]), ("rename", 4))
+        self.assertEqual(rename["entity_id"], child["folder_id"])
+        self.assertEqual(order["payload"]["children"], [child["folder_id"]])
+        self.assertEqual(
+            self.store.get_folder_by_id(child["folder_id"])["local_path"],
+            "메인/메모장/새 이름",
+        )
+
+    def test_contract_document_move_and_order_share_one_atomic_batch(self):
+        manager = self._contract_manager()
+        source = self._folder_snapshot("메인/메모장/원본")
+        target = self._folder_snapshot("메인/메모장/대상")
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [source, target]
+        )
+        document_id = str(uuid.uuid4())
+        old_path = "메인/메모장/원본/초고.txt"
+        new_path = "메인/메모장/대상/완성.txt"
+        self.store.apply_remote_snapshot(
+            self.context,
+            document_id,
+            old_path,
+            "body",
+            revision=3,
+            parent_folder_id=source["folder_id"],
+            name="초고.txt",
+            structure_revision=7,
+        )
+        physical_old = Path(manager._v2_wpm.writing_root_path, old_path)
+        physical_new = Path(manager._v2_wpm.writing_root_path, new_path)
+        physical_old.parent.mkdir(parents=True)
+        physical_old.write_text("body", encoding="utf-8")
+        physical_new.parent.mkdir(parents=True)
+        physical_old.rename(physical_new)
+
+        operations = manager.record_path_change(old_path, new_path, retry=False)
+        request = manager.queue_contract_path_change_with_order(
+            operations,
+            {"메인/메모장/대상": ["완성.txt"]},
+            retry=False,
+        )
+
+        self.assertEqual(
+            [(item["entity_kind"], item["intent_kind"]) for item in request["ordered_intents"]],
+            [("document", "rename"), ("document", "move"), ("tree_order", "reorder")],
+        )
+        rename, move, order = request["ordered_intents"]
+        self.assertEqual((rename["base_revision"], move["base_revision"]), (7, 8))
+        self.assertEqual({rename["entity_id"], move["entity_id"]}, {document_id})
+        self.assertEqual(move["payload"]["parent_folder_id"], target["folder_id"])
+        self.assertEqual(order["payload"]["children"], [document_id])
+
+    def test_repeated_offline_tree_order_supersedes_without_mutating_original(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        first = self._folder_snapshot(
+            "메인/메모장/첫째", parent_id=parent["folder_id"]
+        )
+        second = self._folder_snapshot(
+            "메인/메모장/둘째", parent_id=parent["folder_id"]
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, first, second]
+        )
+        first_request = manager.record_tree_order(
+            {"메인/메모장": ["첫째", "둘째"]}, retry=False
+        )
+        first_intent = copy.deepcopy(first_request["ordered_intents"][0])
+
+        second_request = manager.record_tree_order(
+            {"메인/메모장": ["둘째", "첫째"]}, retry=False
+        )
+        second_intent = second_request["ordered_intents"][0]
+
+        self.assertNotEqual(
+            first_request["batch"]["batch_id"], second_request["batch"]["batch_id"]
+        )
+        self.assertNotEqual(first_intent["operation_id"], second_intent["operation_id"])
+        self.assertEqual(
+            second_intent["supersedes_operation_id"], first_intent["operation_id"]
+        )
+        self.assertEqual(
+            self.store.structure_batch_request(first_request["batch"]["batch_id"])["ordered_intents"][0],
+            first_intent,
+        )
+        self.assertEqual(
+            self.store.operation(first_intent["operation_id"])["status"], "cancelled"
+        )
+
+    def test_contract_tree_order_pull_resolves_ids_and_preserves_local_trash(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        folder = self._folder_snapshot(
+            "메인/메모장/장면", parent_id=parent["folder_id"]
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, folder]
+        )
+        document_id = str(uuid.uuid4())
+        self.store.apply_remote_snapshot(
+            self.context,
+            document_id,
+            "메인/메모장/초고.txt",
+            "body",
+            revision=2,
+            parent_folder_id=parent["folder_id"],
+            name="초고.txt",
+            structure_revision=3,
+        )
+        manager._v2_wpm.project_settings["tree_order"] = {
+            "메인/휴지통": ["로컬 보관본.txt"]
+        }
+        snapshots = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [folder["folder_id"], document_id],
+            "revision": 5,
+        }]
+
+        change = manager._apply_contract_tree_order_snapshots(snapshots)
+
+        self.assertEqual(change["kind"], "tree_order")
+        self.assertEqual(change["revision"], 5)
+        self.assertEqual(
+            manager._v2_wpm.project_settings["tree_order"],
+            {
+                "메인/메모장": ["장면", "초고.txt"],
+                "메인/휴지통": ["로컬 보관본.txt"],
+            },
+        )
+
+    def test_pending_contract_tree_order_is_detected_before_remote_projection(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        child = self._folder_snapshot(
+            "메인/메모장/장면", parent_id=parent["folder_id"]
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, child]
+        )
+        manager.record_tree_order({"메인/메모장": ["장면"]}, retry=False)
+
+        self.assertTrue(
+            self.store.has_active_structure_kind(
+                self.context["local_key"], "tree_order"
+            )
+        )
 
     def test_restart_recovery_is_append_only_and_reuses_operation_id(self):
         operation = self.store.enqueue(self.context, "메인/원고/001화.txt", "offline")

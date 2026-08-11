@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -32,7 +33,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8002
+STAGE8_USER_VERSION = 8003
 
 
 def _utc_now():
@@ -40,7 +41,9 @@ def _utc_now():
 
 
 def _normalize_path(path):
-    return (path or "").replace("\\", "/").strip("/")
+    return unicodedata.normalize(
+        "NFC", (path or "").replace("\\", "/").strip("/")
+    )
 
 
 class SyncV2Store:
@@ -94,6 +97,22 @@ class SyncV2Store:
                     local_key TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL UNIQUE,
                     project_name TEXT NOT NULL,
+                    server_name TEXT NOT NULL DEFAULT '',
+                    server_state TEXT NOT NULL DEFAULT 'active',
+                    server_state_updated_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sync_project_imports (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES sync_projects(project_id) ON DELETE CASCADE,
+                    local_key TEXT NOT NULL UNIQUE
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    project_name TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('preparing', 'pulling', 'failed', 'complete')),
+                    last_error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -129,7 +148,7 @@ class SyncV2Store:
                     local_path TEXT NOT NULL,
                     name TEXT NOT NULL,
                     storage_name_key TEXT,
-                    revision INTEGER NOT NULL CHECK (revision >= 1),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
                     is_deleted INTEGER NOT NULL DEFAULT 0
                         CHECK (is_deleted IN (0, 1)),
                     created_at TEXT NOT NULL,
@@ -139,6 +158,19 @@ class SyncV2Store:
 
                 CREATE INDEX IF NOT EXISTS sync_folders_project_idx
                     ON sync_folders(local_key, folder_id);
+
+                CREATE TABLE IF NOT EXISTS sync_tree_orders (
+                    tree_order_id TEXT PRIMARY KEY,
+                    local_key TEXT NOT NULL
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    parent_folder_id TEXT,
+                    parent_path TEXT NOT NULL,
+                    children_json TEXT NOT NULL DEFAULT '[]',
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(local_key, parent_path)
+                );
 
                 CREATE TABLE IF NOT EXISTS sync_operations (
                     queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +195,34 @@ class SyncV2Store:
                     ON sync_operations(status, base_revision, queue_id);
                 CREATE INDEX IF NOT EXISTS sync_operations_document_idx
                     ON sync_operations(document_id, queue_id);
+
+                CREATE TABLE IF NOT EXISTS sync_tree_barriers (
+                    barrier_id TEXT PRIMARY KEY,
+                    local_key TEXT NOT NULL UNIQUE
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    project_id TEXT NOT NULL,
+                    tree_order_content TEXT NOT NULL,
+                    required_operation_ids TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sync_folder_rename_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    local_key TEXT NOT NULL
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    old_path TEXT NOT NULL,
+                    new_path TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'completed')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS sync_folder_rename_intents_pending_idx
+                    ON sync_folder_rename_intents(
+                        local_key, status, old_path, new_path
+                    );
                 """
             )
             self._migrate_contract_schema(connection)
@@ -691,6 +751,34 @@ class SyncV2Store:
                 error_code="CLIENT_RESTART_RECOVERY",
                 detail={"source": "client_restart"},
             )
+            project_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(sync_projects)"
+                ).fetchall()
+            }
+            if "server_name" not in project_columns:
+                connection.execute(
+                    "ALTER TABLE sync_projects "
+                    "ADD COLUMN server_name TEXT NOT NULL DEFAULT ''"
+                )
+            if "server_state" not in project_columns:
+                connection.execute(
+                    "ALTER TABLE sync_projects "
+                    "ADD COLUMN server_state TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "server_state_updated_at" not in project_columns:
+                connection.execute(
+                    "ALTER TABLE sync_projects "
+                    "ADD COLUMN server_state_updated_at TEXT NOT NULL DEFAULT ''"
+                )
+            connection.execute(
+                """
+                UPDATE sync_projects
+                SET server_name = project_name
+                WHERE server_name = ''
+                """
+            )
 
     def operation_events(self, operation_id):
         with self._reader() as connection:
@@ -725,10 +813,16 @@ class SyncV2Store:
                 connection.execute(
                     """
                     INSERT INTO sync_projects
-                        (local_key, project_id, project_name, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (
+                            local_key, project_id, project_name, server_name,
+                            created_at, updated_at
+                        )
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (local_key, project_id, project_name, now, now),
+                    (
+                        local_key, project_id, project_name, project_name,
+                        now, now,
+                    ),
                 )
             else:
                 if project_id and project_id != row["project_id"]:
@@ -738,12 +832,15 @@ class SyncV2Store:
                     "UPDATE sync_projects SET project_name = ?, updated_at = ? WHERE local_key = ?",
                     (project_name, now, local_key),
                 )
+        project = self.get_project(local_key)
         return {
             "local_key": local_key,
             "project_id": project_id,
             "project_name": project_name,
             "project_sync_mode": row["project_sync_mode"] if row else "LEGACY",
             "migration_epoch": int(row["migration_epoch"] or 0) if row else 0,
+            "server_name": project.get("server_name") or project_name,
+            "server_state": project.get("server_state") or "active",
         }
 
     def get_project(self, local_key):
@@ -812,6 +909,190 @@ class SyncV2Store:
             return dict(connection.execute(
                 "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
             ).fetchone())
+    def get_project_by_id(self, project_id):
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_projects(self):
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_projects ORDER BY project_name, project_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def remove_project_binding(self, project_id):
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            )
+            return cursor.rowcount > 0
+
+    def set_project_server_state(self, project_id, state):
+        if state not in {"active", "trashed", "purged"}:
+            raise ValueError("유효하지 않은 서버 작품 상태입니다.")
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        now = _utc_now()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sync_projects
+                SET server_state = ?, server_state_updated_at = ?,
+                    updated_at = ?
+                WHERE project_id = ?
+                """,
+                (state, now, now, project_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return dict(row)
+
+    def begin_project_import(
+        self,
+        writing_root_path,
+        project_name,
+        project_id,
+        server_name=None,
+        reset_complete=False,
+    ):
+        local_key = self.local_key_for(writing_root_path)
+        project_id = str(uuid.UUID(str(project_id)))
+        server_name = str(server_name or project_name)
+        now = _utc_now()
+        with self._transaction() as connection:
+            by_id = connection.execute(
+                "SELECT * FROM sync_projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            by_path = connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
+            ).fetchone()
+            if by_id is not None and by_id["local_key"] != local_key:
+                raise ValueError(
+                    "이 Supabase project_id는 이미 다른 로컬 프로젝트에 연결되어 있습니다."
+                )
+            if by_path is not None and by_path["project_id"] != project_id:
+                raise ValueError(
+                    "이 로컬 프로젝트는 이미 다른 Supabase project_id에 연결되어 있습니다."
+                )
+            if by_id is None:
+                connection.execute(
+                    """
+                    INSERT INTO sync_projects
+                        (
+                            local_key, project_id, project_name, server_name,
+                            created_at, updated_at
+                        )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_key, project_id, project_name, server_name,
+                        now, now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE sync_projects
+                    SET project_name = ?, updated_at = ?
+                    WHERE project_id = ?
+                    """,
+                    (project_name, now, project_id),
+                )
+
+            journal = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            previous_state = journal["state"] if journal else None
+            if journal is None:
+                connection.execute(
+                    """
+                    INSERT INTO sync_project_imports (
+                        project_id, local_key, project_name, state,
+                        last_error, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'preparing', '', ?, ?)
+                    """,
+                    (project_id, local_key, project_name, now, now),
+                )
+            elif journal["local_key"] != local_key:
+                raise ValueError(
+                    "이 Supabase project_id의 가져오기 위치가 기존 기록과 다릅니다."
+                )
+            elif journal["state"] != "complete" or reset_complete:
+                connection.execute(
+                    """
+                    UPDATE sync_project_imports
+                    SET project_name = ?, state = 'preparing',
+                        last_error = '', updated_at = ?
+                    WHERE project_id = ?
+                    """,
+                    (project_name, now, project_id),
+                )
+
+            current = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return {
+            "local_key": local_key,
+            "project_id": project_id,
+            "project_name": project_name,
+            "server_name": server_name,
+            "previous_state": previous_state,
+            "import_state": current["state"],
+        }
+
+    def get_project_import(self, project_id):
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_project_import_state(self, project_id, state, error_message=""):
+        if state not in {"preparing", "pulling", "failed", "complete"}:
+            raise ValueError("유효하지 않은 가져오기 상태입니다.")
+        project_id = str(uuid.UUID(str(project_id)))
+        now = _utc_now()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sync_project_imports
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (state, str(error_message or ""), now, project_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("가져오기 기록을 찾을 수 없습니다.")
+            row = connection.execute(
+                "SELECT * FROM sync_project_imports WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return dict(row)
 
     def ensure_document(self, local_key, local_path, content="", document_id=None):
         local_path = _normalize_path(local_path)
@@ -874,6 +1155,145 @@ class SyncV2Store:
                 "SELECT * FROM sync_folders WHERE folder_id = ?", (folder_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def get_folder_by_path(self, local_key, local_path):
+        local_path = _normalize_path(local_path)
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_folders "
+                "WHERE local_key = ? AND local_path = ? AND is_deleted = 0",
+                (local_key, local_path),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def ensure_local_folder(
+        self, local_key, local_path, *, folder_id=None, parent_folder_id=None
+    ):
+        """Create only local revision-zero identity for an unsent folder create."""
+        local_path = _normalize_path(local_path)
+        if not local_path:
+            raise SyncContractError("INVALID_FOLDER_SNAPSHOT")
+        name = local_path.rsplit("/", 1)[-1]
+        storage_name_key = normalize_storage_name(name).normalized
+        folder_id = str(uuid.UUID(str(folder_id or uuid.uuid4())))
+        if parent_folder_id is not None:
+            parent_folder_id = str(uuid.UUID(str(parent_folder_id)))
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM sync_folders WHERE local_key = ? AND local_path = ?",
+                (local_key, local_path),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            connection.execute(
+                """
+                INSERT INTO sync_folders (
+                    folder_id, local_key, parent_folder_id, local_path,
+                    name, storage_name_key, revision, is_deleted,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                """,
+                (
+                    folder_id, local_key, parent_folder_id, local_path,
+                    name, storage_name_key, now, now,
+                ),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM sync_folders WHERE folder_id = ?", (folder_id,)
+            ).fetchone())
+
+    def move_folder_paths(self, local_key, old_path, new_path):
+        old_path = _normalize_path(old_path)
+        new_path = _normalize_path(new_path)
+        now = _utc_now()
+        moved = []
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_folders
+                WHERE local_key = ? AND (local_path = ? OR local_path LIKE ?)
+                ORDER BY length(local_path)
+                """,
+                (local_key, old_path, old_path + "/%"),
+            ).fetchall()
+            for row in rows:
+                suffix = row["local_path"][len(old_path):]
+                updated_path = new_path + suffix
+                updated_name = updated_path.rsplit("/", 1)[-1]
+                connection.execute(
+                    """
+                    UPDATE sync_folders
+                    SET local_path = ?, name = ?, storage_name_key = ?, updated_at = ?
+                    WHERE folder_id = ?
+                    """,
+                    (
+                        updated_path, updated_name,
+                        normalize_storage_name(updated_name).normalized,
+                        now, row["folder_id"],
+                    ),
+                )
+                moved.append({
+                    **dict(row), "old_local_path": row["local_path"],
+                    "local_path": updated_path, "name": updated_name,
+                })
+        return moved
+
+    def get_tree_order(self, local_key, parent_path):
+        parent_path = _normalize_path(parent_path) or "<root>"
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_tree_orders "
+                "WHERE local_key = ? AND parent_path = ?",
+                (local_key, parent_path),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["children"] = json.loads(result.pop("children_json") or "[]")
+            return result
+
+    def replace_tree_order_snapshots(self, local_key, snapshots):
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM sync_tree_orders WHERE local_key = ?", (local_key,)
+            )
+            for snapshot in snapshots or []:
+                tree_order_id = str(uuid.UUID(str(snapshot["tree_order_id"])))
+                parent_folder_id = snapshot.get("parent_folder_id")
+                parent_folder_id = (
+                    str(uuid.UUID(str(parent_folder_id)))
+                    if parent_folder_id else None
+                )
+                parent_path = "<root>"
+                if parent_folder_id:
+                    parent = connection.execute(
+                        "SELECT local_path FROM sync_folders WHERE folder_id = ?",
+                        (parent_folder_id,),
+                    ).fetchone()
+                    if parent is None:
+                        raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+                    parent_path = parent["local_path"]
+                children = [
+                    str(uuid.UUID(str(value)))
+                    for value in (snapshot.get("children") or [])
+                ]
+                revision = int(snapshot.get("revision") or 0)
+                if revision < 1:
+                    raise SyncContractError("REVISION_CONFLICT")
+                connection.execute(
+                    """
+                    INSERT INTO sync_tree_orders (
+                        tree_order_id, local_key, parent_folder_id, parent_path,
+                        children_json, revision, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tree_order_id, local_key, parent_folder_id, parent_path,
+                        canonical_json(children), revision, now, now,
+                    ),
+                )
 
     def list_folders(self, local_key):
         with self._reader() as connection:
@@ -978,6 +1398,26 @@ class SyncV2Store:
     def has_active_operations(self, document_id):
         with self._reader() as connection:
             return self._has_active_connection(connection, document_id)
+
+    def has_nonempty_active_content(self, document_id):
+        """Return whether the newest queued live snapshot contains text."""
+        with self._reader() as connection:
+            row = connection.execute(
+                """
+                SELECT content, is_deleted
+                FROM sync_operations
+                WHERE document_id = ?
+                  AND status IN ('pending', 'inflight')
+                ORDER BY queue_id DESC
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+            return bool(
+                row
+                and not row["is_deleted"]
+                and row["content"]
+            )
 
     def has_tombstone_for_server_path(self, local_key, server_path):
         """Return whether a path is deleted or has a queued deletion."""
@@ -1127,6 +1567,62 @@ class SyncV2Store:
                 "reason": "applied",
                 "previous_path": previous_path,
                 "document": dict(document),
+            }
+
+    def repair_clean_document_path(
+        self, document_id, local_path, server_path=None
+    ):
+        """Canonicalize a clean document path without changing its revision."""
+        document_id = str(uuid.UUID(str(document_id)))
+        local_path = _normalize_path(local_path)
+        server_path = _normalize_path(server_path or local_path)
+        now = _utc_now()
+        with self._transaction() as connection:
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            if document is None:
+                return {"applied": False, "reason": "missing_document"}
+            active = connection.execute(
+                """
+                SELECT 1 FROM sync_operations
+                WHERE document_id = ?
+                  AND status IN ('pending', 'inflight', 'conflict')
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+            if active:
+                return {"applied": False, "reason": "active_operations"}
+            collision = connection.execute(
+                """
+                SELECT document_id FROM sync_documents
+                WHERE local_key = ? AND local_path = ? AND document_id <> ?
+                LIMIT 1
+                """,
+                (document["local_key"], local_path, document_id),
+            ).fetchone()
+            if collision:
+                return {"applied": False, "reason": "path_conflict"}
+            previous_path = document["local_path"]
+            connection.execute(
+                """
+                UPDATE sync_documents
+                SET local_path = ?, server_path = ?, updated_at = ?
+                WHERE document_id = ?
+                """,
+                (local_path, server_path, now, document_id),
+            )
+            repaired = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            return {
+                "applied": True,
+                "reason": "canonical_path_repaired",
+                "previous_path": previous_path,
+                "document": dict(repaired),
             }
 
     def relocate_deleted_document(self, document_id, local_path):
@@ -1877,6 +2373,11 @@ class SyncV2Store:
             structure_rows = connection.execute(
                 f"SELECT operation_id FROM sync_structure_operations{where}", params
             ).fetchall()
+            documents = connection.execute(
+                f"SELECT COUNT(DISTINCT document_id) AS count "
+                f"FROM sync_operations{where}",
+                params,
+            ).fetchone()
             result = {
                 "pending": 0, "inflight": 0, "retry_wait": 0,
                 "blocked": 0, "conflict": 0,
@@ -1886,6 +2387,7 @@ class SyncV2Store:
                 if state in result:
                     result[state] += 1
         result["total"] = sum(result.values())
+        result["documents"] = int(documents["count"] or 0)
         return result
 
     def latest_error(self, local_key=None):
@@ -1909,6 +2411,21 @@ class SyncV2Store:
             return self._operation_dict(
                 connection, self._operation_row(connection, operation_id)
             )
+
+    def latest_active_structure_operation(self, entity_id):
+        entity_id = str(uuid.UUID(str(entity_id)))
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_structure_operations "
+                "WHERE entity_id = ? ORDER BY created_at DESC, operation_id DESC",
+                (entity_id,),
+            ).fetchall()
+            for row in rows:
+                if self._derived_state(connection, row["operation_id"]) in {
+                    "pending", "inflight", "retry_wait", "blocked", "conflict"
+                }:
+                    return dict(row)
+            return None
 
     def cancel_operation(self, operation_id, cancel_event_id):
         cancel_event_id = str(uuid.UUID(str(cancel_event_id)))
@@ -2238,6 +2755,60 @@ class SyncV2Store:
                     self._append_event(
                         connection, intent["operation_id"], event_type
                     )
+                    result_revision = int(result["result_revision"])
+                    if intent["entity_kind"] == "folder":
+                        connection.execute(
+                            "UPDATE sync_folders SET revision = ?, updated_at = ? "
+                            "WHERE folder_id = ? AND local_key = ?",
+                            (
+                                result_revision, _utc_now(), intent["entity_id"],
+                                batch["local_key"],
+                            ),
+                        )
+                    elif intent["entity_kind"] == "document":
+                        connection.execute(
+                            "UPDATE sync_documents SET structure_revision = ?, "
+                            "updated_at = ? WHERE document_id = ? AND local_key = ?",
+                            (
+                                result_revision, _utc_now(), intent["entity_id"],
+                                batch["local_key"],
+                            ),
+                        )
+                    elif intent["entity_kind"] == "tree_order":
+                        payload = intent["payload"]
+                        parent_folder_id = payload.get("parent_folder_id")
+                        parent_path = "<root>"
+                        if parent_folder_id:
+                            parent = connection.execute(
+                                "SELECT local_path FROM sync_folders "
+                                "WHERE folder_id = ? AND local_key = ?",
+                                (parent_folder_id, batch["local_key"]),
+                            ).fetchone()
+                            if parent is None:
+                                raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+                            parent_path = parent["local_path"]
+                        now = _utc_now()
+                        connection.execute(
+                            """
+                            INSERT INTO sync_tree_orders (
+                                tree_order_id, local_key, parent_folder_id,
+                                parent_path, children_json, revision,
+                                created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(tree_order_id) DO UPDATE SET
+                                parent_folder_id = excluded.parent_folder_id,
+                                parent_path = excluded.parent_path,
+                                children_json = excluded.children_json,
+                                revision = excluded.revision,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                intent["entity_id"], batch["local_key"],
+                                parent_folder_id, parent_path,
+                                canonical_json(payload["children"]),
+                                result_revision, now, now,
+                            ),
+                        )
                 applied = 1
             else:
                 error = validated["error"]
@@ -2287,3 +2858,265 @@ class SyncV2Store:
                 ),
             )
             return {"trace_id": trace_id, **trace}
+
+    def defer_tree_order(self, context, tree_order_content, operation_ids):
+        operation_ids = [str(uuid.UUID(str(value))) for value in operation_ids]
+        if not operation_ids:
+            raise ValueError("tree-order barrier requires document operations")
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM sync_tree_barriers WHERE local_key = ?",
+                (context["local_key"],),
+            ).fetchone()
+            required = set(operation_ids)
+            barrier_id = str(uuid.uuid4())
+            created_at = now
+            if existing:
+                barrier_id = existing["barrier_id"]
+                created_at = existing["created_at"]
+                try:
+                    required.update(json.loads(existing["required_operation_ids"]))
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            for operation_id in required:
+                operation = connection.execute(
+                    "SELECT local_key, project_id, relative_path FROM sync_operations "
+                    "WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if (
+                    operation is None
+                    or operation["local_key"] != context["local_key"]
+                    or operation["project_id"] != context["project_id"]
+                    or operation["relative_path"] == "__antigravity__/tree-order.json"
+                ):
+                    raise ValueError("invalid tree-order barrier operation")
+            payload = json.dumps(sorted(required), separators=(",", ":"))
+            connection.execute(
+                """
+                INSERT INTO sync_tree_barriers (
+                    barrier_id, local_key, project_id, tree_order_content,
+                    required_operation_ids, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(local_key) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    tree_order_content = excluded.tree_order_content,
+                    required_operation_ids = excluded.required_operation_ids,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    barrier_id, context["local_key"], context["project_id"],
+                    tree_order_content, payload, created_at, now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM sync_tree_barriers WHERE local_key = ?",
+                (context["local_key"],),
+            ).fetchone()
+            return dict(row)
+
+    def ready_tree_order_barrier(self, local_key):
+        with self._reader() as connection:
+            barrier = connection.execute(
+                "SELECT * FROM sync_tree_barriers WHERE local_key = ?",
+                (local_key,),
+            ).fetchone()
+            if barrier is None:
+                return None
+            try:
+                operation_ids = json.loads(barrier["required_operation_ids"])
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not operation_ids:
+                return None
+            placeholders = ",".join("?" for _ in operation_ids)
+            rows = connection.execute(
+                f"SELECT operation_id FROM sync_operations "
+                f"WHERE operation_id IN ({placeholders})",
+                operation_ids,
+            ).fetchall()
+            statuses = {
+                row["operation_id"]: self._derived_state(
+                    connection, row["operation_id"]
+                )
+                for row in rows
+            }
+            if any(
+                statuses.get(operation_id) != "completed"
+                for operation_id in operation_ids
+            ):
+                return None
+            result = dict(barrier)
+            result["required_operation_ids"] = operation_ids
+            return result
+
+    def has_active_structure_kind(self, local_key, entity_kind):
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT operation_id FROM sync_structure_operations "
+                "WHERE local_key = ? AND entity_kind = ?",
+                (local_key, entity_kind),
+            ).fetchall()
+            return any(
+                self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+                for row in rows
+            )
+
+    def complete_tree_order_barrier(self, barrier_id):
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM sync_tree_barriers WHERE barrier_id = ?",
+                (barrier_id,),
+            )
+
+    def record_folder_rename_intent(self, local_key, old_path, new_path):
+        """Durably record an explicit local folder rename, coalescing chains."""
+        old_path = _normalize_path(old_path)
+        new_path = _normalize_path(new_path)
+        if not old_path or not new_path or old_path == new_path:
+            raise ValueError("invalid folder rename intent")
+        now = _utc_now()
+        with self._transaction() as connection:
+            previous = connection.execute(
+                """
+                SELECT * FROM sync_folder_rename_intents
+                WHERE local_key = ? AND status = 'pending' AND new_path = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (local_key, old_path),
+            ).fetchone()
+            if previous:
+                connection.execute(
+                    """
+                    UPDATE sync_folder_rename_intents
+                    SET new_path = ?, updated_at = ? WHERE intent_id = ?
+                    """,
+                    (new_path, now, previous["intent_id"]),
+                )
+                intent_id = previous["intent_id"]
+            else:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM sync_folder_rename_intents
+                    WHERE local_key = ? AND status = 'pending'
+                      AND old_path = ? AND new_path = ?
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (local_key, old_path, new_path),
+                ).fetchone()
+                if existing:
+                    intent_id = existing["intent_id"]
+                    connection.execute(
+                        """
+                        UPDATE sync_folder_rename_intents SET updated_at = ?
+                        WHERE intent_id = ?
+                        """,
+                        (now, intent_id),
+                    )
+                else:
+                    intent_id = str(uuid.uuid4())
+                    connection.execute(
+                        """
+                        INSERT INTO sync_folder_rename_intents (
+                            intent_id, local_key, old_path, new_path, status,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                        """,
+                        (intent_id, local_key, old_path, new_path, now, now),
+                    )
+            row = connection.execute(
+                "SELECT * FROM sync_folder_rename_intents WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            return dict(row)
+
+    def pending_folder_rename_intent(self, local_key, old_path, new_path):
+        old_path = _normalize_path(old_path)
+        new_path = _normalize_path(new_path)
+        with self._reader() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM sync_folder_rename_intents
+                WHERE local_key = ? AND old_path = ? AND new_path = ?
+                  AND status = 'pending'
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (local_key, old_path, new_path),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def pending_folder_rename_intents(self, local_key):
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_folder_rename_intents
+                WHERE local_key = ? AND status = 'pending'
+                ORDER BY created_at, intent_id
+                """,
+                (local_key,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def complete_folder_rename_intent(self, intent_id):
+        now = _utc_now()
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE sync_folder_rename_intents
+                SET status = 'completed', updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (now, str(intent_id)),
+            )
+
+    def tree_order_barrier(self, local_key):
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_tree_barriers WHERE local_key = ?",
+                (local_key,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def adopt_pristine_document_identity(
+        self, local_key, local_path, remote_document_id
+    ):
+        """Replace an unused local UUID only when it has no sync history/state."""
+        remote_document_id = str(uuid.UUID(str(remote_document_id)))
+        now = _utc_now()
+        with self._transaction() as connection:
+            local = connection.execute(
+                "SELECT * FROM sync_documents WHERE local_key = ? AND local_path = ?",
+                (local_key, local_path),
+            ).fetchone()
+            if local is None:
+                return False
+            if local["document_id"] == remote_document_id:
+                return True
+            remote_existing = connection.execute(
+                "SELECT 1 FROM sync_documents WHERE document_id = ?",
+                (remote_document_id,),
+            ).fetchone()
+            history = connection.execute(
+                "SELECT status FROM sync_operations WHERE document_id = ? LIMIT 1",
+                (local["document_id"],),
+            ).fetchone()
+            if (
+                remote_existing is not None
+                or int(local["revision"] or 0) != 0
+                or local["sync_state"] not in {"local", "synced"}
+                or local["last_error"]
+                or any(local[name] is not None for name in (
+                    "conflict_base", "conflict_local", "conflict_remote",
+                    "conflict_merged",
+                ))
+                or history is not None
+            ):
+                return False
+            connection.execute(
+                "UPDATE sync_documents SET document_id = ?, updated_at = ? "
+                "WHERE document_id = ?",
+                (remote_document_id, now, local["document_id"]),
+            )
+            return True

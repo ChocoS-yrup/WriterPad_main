@@ -40,6 +40,23 @@ class WritingProjectManager:
         
         self._initialized = True
 
+    @classmethod
+    def create_detached(cls, workspace_dir, project_name, writing_root_path):
+        """Create a path-scoped manager without changing the app-wide singleton."""
+        instance = object.__new__(cls)
+        instance._initialized = True
+        instance.root_dir = os.path.dirname(os.path.abspath(workspace_dir))
+        instance.workspace_dir = os.path.abspath(workspace_dir)
+        instance.current_project = project_name
+        instance.writing_root_path = os.path.abspath(writing_root_path)
+        instance.settings_path = os.path.join(
+            instance.writing_root_path, "설정.json"
+        )
+        instance.project_settings = {}
+        instance._create_folder_structure()
+        instance._load_settings()
+        return instance
+
     def initialize_project(self, project_name):
         """
         프로젝트 진입 시, 해당 프로젝트의 '집필모드' 전용 샌드박스 영역을 초기화합니다.
@@ -97,13 +114,25 @@ class WritingProjectManager:
     def save_settings(self):
         """현재 설정을 설정.json에 저장합니다."""
         if not self.settings_path:
-            return
-            
+            return False
+
+        temp_path = self.settings_path + ".tmp"
         try:
-            with open(self.settings_path, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
+            with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(self.project_settings, f, ensure_ascii=False, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.settings_path)
+            return True
         except Exception as e:
             print(f"집필 모드 설정 저장 실패: {e}")
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            return False
 
     def read_text_file(self, relative_path):
         """

@@ -4,30 +4,122 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QCheckBox, QDialog, QListWidget, QLineEdit, QRadioButton, QSpinBox, QButtonGroup,
     QFontDialog, QTabWidget, QListWidgetItem, QGridLayout, QTabBar
 )
-from PyQt6.QtGui import QFont, QTextCursor, QGuiApplication, QTextDocument
-from PyQt6.QtCore import pyqtSignal, Qt, QSettings, QTimer, QThread
+from PyQt6.QtGui import (
+    QFont, QTextCursor, QGuiApplication, QTextDocument, QTextCharFormat,
+    QTextFormat, QPen,
+)
+from PyQt6.QtCore import (
+    pyqtSignal, Qt, QSettings, QTimer, QThread, QEventLoop,
+)
 
 
 class SmartTextEdit(QTextEdit):
     """따옴표 자동완성을 지원하는 텍스트 에디터"""
+    compositionChanged = pyqtSignal()
     _last_windows_ime_open = None
     _force_korean_on_first_activation = True
+    _ELLIPSIS_FORMAT_PROPERTY = int(QTextFormat.Property.UserProperty) + 1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.typewriter_enabled = False
         self._custom_placeholder = ""
         self._is_composing = False
+        self._ime_preedit_text = ""
         self._input_activation_serial = 0
         self._startup_ime_guard_active = False
         self._startup_ime_key_buffer = []
         self._startup_ime_replay_scheduled = False
+        self._ellipsis_start = None
+        self._ellipsis_count = 0
         self.cursorPositionChanged.connect(self.keep_cursor_centered)
         self.textChanged.connect(self.on_text_changed)
 
     def focusOutEvent(self, event):
+        self._finish_pending_ellipsis_edit()
         self._remember_windows_ime_state()
         super().focusOutEvent(event)
+
+    def commit_pending_input_method(self):
+        """Commit the focused editor's visible IME preedit before persistence."""
+        if (
+            self.isReadOnly()
+            or not self.hasFocus()
+            or not self._is_composing
+            or not self._ime_preedit_text
+        ):
+            return False
+
+        # Let the native IME own the commit. Inserting the cached preedit here
+        # can race with the real Windows commit event and duplicate the final
+        # character. A zero-net cursor nudge mirrors the user's Right/Left
+        # action, which closes the boxed composition without adding text.
+        input_method = QGuiApplication.inputMethod()
+        if input_method is None:
+            return False
+        input_method.commit()
+        self._nudge_cursor_for_input_commit()
+
+        # Windows may post the commit event after QInputMethod.commit()
+        # returns. Give that native event a short event-loop turn before the
+        # caller reads toPlainText().
+        if self._is_composing:
+            loop = QEventLoop()
+
+            def finish_when_committed():
+                if not self._is_composing:
+                    loop.quit()
+
+            self.compositionChanged.connect(finish_when_committed)
+            QTimer.singleShot(60, loop.quit)
+            try:
+                loop.exec()
+            finally:
+                try:
+                    self.compositionChanged.disconnect(
+                        finish_when_committed
+                    )
+                except (RuntimeError, TypeError):
+                    pass
+        return True
+
+    def _nudge_cursor_for_input_commit(self):
+        """Move away and back without changing the final caret position."""
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return False
+        position = cursor.position()
+        last_position = max(0, self.document().characterCount() - 1)
+        if position < last_position:
+            virtual_keys = (0x27, 0x25)  # Right, Left
+        else:
+            virtual_keys = (0x25, 0x27)  # Left, Right
+
+        # On Windows, pass the same navigation keys through the native input
+        # stream so the Korean IME sees them just as it sees physical arrows.
+        import sys
+        if sys.platform == "win32" and self._send_windows_virtual_keys(
+            [(key, False, "") for key in virtual_keys]
+        ):
+            return True
+
+        moved = QTextCursor(cursor)
+
+        if position < last_position:
+            if not moved.movePosition(QTextCursor.MoveOperation.Right):
+                return False
+            self.setTextCursor(moved)
+            moved.movePosition(QTextCursor.MoveOperation.Left)
+        elif position > 0:
+            if not moved.movePosition(QTextCursor.MoveOperation.Left):
+                return False
+            self.setTextCursor(moved)
+            moved.movePosition(QTextCursor.MoveOperation.Right)
+        else:
+            return False
+
+        self.setTextCursor(moved)
+        return moved.position() == position
 
     def activate_input_method(self):
         """고정 지연 없이 포커스 완료 시점에 데스크톱 IME 문맥을 활성화한다."""
@@ -313,6 +405,14 @@ class SmartTextEdit(QTextEdit):
         self._custom_placeholder = text
         self.viewport().update()
 
+    def setPlainText(self, text):
+        super().setPlainText(text)
+        self._apply_ellipsis_display_formats()
+
+    def setText(self, text):
+        super().setText(text)
+        self._apply_ellipsis_display_formats()
+
     def paintEvent(self, event):
         super().paintEvent(event)
         # 여백을 무시하는 기본 placeholder 대신, 문서 여백을 계산하여 직접 그립니다.
@@ -337,17 +437,6 @@ class SmartTextEdit(QTextEdit):
         cursor = self.textCursor()
         cursor_pos = cursor.position()
 
-        # 사후 텍스트 치환 (... -> …)
-        if cursor_pos >= 3:
-            cursor.setPosition(cursor_pos - 3, QTextCursor.MoveMode.KeepAnchor)
-            if cursor.selectedText() == "...":
-                self.blockSignals(True)
-                cursor.insertText("…")
-                self.setTextCursor(cursor)
-                self.blockSignals(False)
-                return
-            cursor.setPosition(cursor_pos)
-
         # 사후 텍스트 치환 (ㄴㄴ -> 「」)
         if cursor_pos >= 2:
             cursor.setPosition(cursor_pos - 2, QTextCursor.MoveMode.KeepAnchor)
@@ -370,6 +459,14 @@ class SmartTextEdit(QTextEdit):
             cursor.setPosition(cursor_pos)
 
     def inputMethodEvent(self, event):
+        if self.isReadOnly():
+            # The custom IME shortcuts below insert text through QTextCursor,
+            # so they must not bypass QTextEdit's read-only protection.
+            super().inputMethodEvent(event)
+            return
+
+        # IME 조합으로 들어오는 텍스트는 직접 키 입력 말줄임표 규칙의 대상이 아니다.
+        self._finish_pending_ellipsis_edit()
         if (
             self._startup_ime_guard_active
             and not self._startup_ime_key_buffer
@@ -377,15 +474,21 @@ class SmartTextEdit(QTextEdit):
         ):
             self._startup_ime_guard_active = False
             SmartTextEdit._complete_startup_korean_mode()
+        previous_preedit = self._ime_preedit_text
         super().inputMethodEvent(event)
-
         preedit = event.preeditString()
+        self._ime_preedit_text = preedit
 
         # IME 조합 상태 추적 (안내 문구를 가리기 위함)
         is_composing_now = bool(preedit)
         if self._is_composing != is_composing_now:
             self._is_composing = is_composing_now
             self.viewport().update()
+        if preedit != previous_preedit:
+            # A preedit character is visible but is not yet part of
+            # QTextDocument, so QTextEdit may not emit textChanged for it.
+            # Treat the composition itself as an edit to restart autosave.
+            self.compositionChanged.emit()
         if preedit in ("ㄴ", "ㄱ"):
             cursor = self.textCursor()
             cursor_pos = cursor.position()
@@ -435,12 +538,136 @@ class SmartTextEdit(QTextEdit):
         super().resizeEvent(event)
         # 타자기 모드에서 마지막 줄까지 부드럽게 스크롤 되도록 하단 여백 추가
         doc = self.document()
-        root_frame = doc.rootFrame()
-        fmt = root_frame.frameFormat()
-        fmt.setBottomMargin(self.viewport().height() / 2)
-        root_frame.setFrameFormat(fmt)
+        was_modified = doc.isModified()
+        signals_were_blocked = self.blockSignals(True)
+        try:
+            root_frame = doc.rootFrame()
+            fmt = root_frame.frameFormat()
+            fmt.setBottomMargin(self.viewport().height() / 2)
+            root_frame.setFrameFormat(fmt)
+            doc.setModified(was_modified)
+        finally:
+            self.blockSignals(signals_were_blocked)
+
+    @staticmethod
+    def _is_direct_period_event(event):
+        blocked_modifiers = (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        )
+        return event.text() == "." and not (event.modifiers() & blocked_modifiers)
+
+    def _finish_pending_ellipsis_edit(self):
+        self._ellipsis_start = None
+        self._ellipsis_count = 0
+
+    def _pending_ellipsis_matches_cursor(self, cursor):
+        if self._ellipsis_start is None or cursor.hasSelection():
+            return False
+        if cursor.position() != self._ellipsis_start + self._ellipsis_count:
+            return False
+        probe = QTextCursor(cursor)
+        probe.setPosition(self._ellipsis_start, QTextCursor.MoveMode.KeepAnchor)
+        return probe.selectedText() == "." * self._ellipsis_count
+
+    def _ellipsis_display_format(self, base_format):
+        """줄 높이는 유지하면서 가운데 말줄임표의 점만 시각적으로 키운다."""
+        ellipsis_format = QTextCharFormat(base_format)
+        brush = base_format.foreground()
+        if brush.style() == Qt.BrushStyle.NoBrush:
+            color = self.palette().text().color()
+        else:
+            color = brush.color()
+
+        point_size = base_format.fontPointSize()
+        if point_size <= 0:
+            point_size = self.currentFont().pointSizeF()
+        if point_size <= 0:
+            point_size = 14.0
+
+        # 외곽선은 글자의 advance/ascender/descender를 바꾸지 않으므로
+        # 폰트 크기를 올릴 때처럼 해당 줄 전체가 내려앉지 않는다.
+        outline_width = max(0.75, min(1.35, point_size / 14.0))
+        outline = QPen(color, outline_width)
+        outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        ellipsis_format.setTextOutline(outline)
+        ellipsis_format.setProperty(self._ELLIPSIS_FORMAT_PROPERTY, True)
+        return ellipsis_format
+
+    def _apply_ellipsis_display_formats(self):
+        """파일에서 다시 연 문서의 말줄임표에도 표시 전용 서식을 복원한다."""
+        document = self.document()
+        undo_enabled = document.isUndoRedoEnabled()
+        signals_were_blocked = self.blockSignals(True)
+        if undo_enabled:
+            document.setUndoRedoEnabled(False)
+        try:
+            match = document.find("⋯")
+            while not match.isNull():
+                base_format = match.charFormat()
+                if not base_format.hasProperty(self._ELLIPSIS_FORMAT_PROPERTY):
+                    match.setCharFormat(self._ellipsis_display_format(base_format))
+                match = document.find("⋯", match)
+        finally:
+            if undo_enabled:
+                document.setUndoRedoEnabled(True)
+            self.blockSignals(signals_were_blocked)
+
+    def _insert_direct_period(self):
+        cursor = self.textCursor()
+        if self._pending_ellipsis_matches_cursor(cursor):
+            # 이전 점 입력의 Undo 블록에 연결하되, 매 입력마다 닫아서
+            # 화면에 점이 즉시 그려지도록 한다.
+            cursor.joinPreviousEditBlock()
+            cursor.insertText(".")
+            self._ellipsis_count += 1
+            if self._ellipsis_count == 3:
+                cursor.setPosition(self._ellipsis_start)
+                cursor.setPosition(
+                    self._ellipsis_start + 3,
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+                base_format = QTextCharFormat(cursor.charFormat())
+                cursor.insertText("⋯", self._ellipsis_display_format(base_format))
+                cursor.setCharFormat(base_format)
+                cursor.endEditBlock()
+                self._finish_pending_ellipsis_edit()
+            else:
+                cursor.endEditBlock()
+            self.setTextCursor(cursor)
+            return
+
+        self._finish_pending_ellipsis_edit()
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            cursor.removeSelectedText()
+        self._ellipsis_start = cursor.position()
+        cursor.beginEditBlock()
+        cursor.insertText(".")
+        cursor.endEditBlock()
+        self._ellipsis_count = 1
+        self.setTextCursor(cursor)
+
+    def mousePressEvent(self, event):
+        self._finish_pending_ellipsis_edit()
+        super().mousePressEvent(event)
+
+    def insertFromMimeData(self, source):
+        # 붙여넣기는 원문을 보존하며 말줄임표 치환을 적용하지 않는다.
+        self._finish_pending_ellipsis_edit()
+        super().insertFromMimeData(source)
 
     def keyPressEvent(self, event):
+        if self.isReadOnly():
+            # Smart pairs and scene separators insert directly with QTextCursor.
+            # Delegate first so a document-less/read-only editor stays immutable.
+            super().keyPressEvent(event)
+            return
+
+        if not self._is_direct_period_event(event) or self._is_composing:
+            self._finish_pending_ellipsis_edit()
+
         if self._guard_startup_ime_key(event):
             return
 
@@ -499,6 +726,10 @@ class SmartTextEdit(QTextEdit):
                 cursor.setPosition(cursor_pos)
 
         char = event.text()
+
+        if self._is_direct_period_event(event) and not self._is_composing and not self.isReadOnly():
+            self._insert_direct_period()
+            return
 
         if char == "*":
             cursor = self.textCursor()

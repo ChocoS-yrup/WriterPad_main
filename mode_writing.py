@@ -8,12 +8,13 @@ from PyQt6.QtWidgets import (
     QToolBar, QSizePolicy, QTextBrowser, QTabWidget, QFileDialog
 )
 from PyQt6.QtGui import QAction, QShortcut, QKeySequence, QPixmap, QPainter, QIcon, QFont
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QSize
 from ui_components import SmartTextEdit
 from datetime import datetime
 
 from project_manager_writing import WritingProjectManager
 from sync_manager import SyncManager, is_live_document_path
+from three_way_merge import build_conflict_report
 from writing_backup import HistoryViewerDialog
 from writing_search import GlobalSearchDialog, LocalSearchDialog
 from writing_extraction import PartialExtractionDialog, WritingExtractionMixin
@@ -49,6 +50,9 @@ from PyQt6.QtWidgets import QTreeWidget
 class BinderTreeWidget(QTreeWidget):
     itemMoved = pyqtSignal(QTreeWidgetItem, str, str) # item, old_rel_path, new_parent_rel_path
     orderChanged = pyqtSignal()
+    _BOTTOM_SPACER_ROLE = Qt.ItemDataRole.UserRole + 99
+    _BOTTOM_SPACER_HEIGHT = 220
+    _TRASH_ROOT_PATH = "메인/휴지통"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58,6 +62,67 @@ class BinderTreeWidget(QTreeWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+    def add_bottom_spacer(self):
+        """Keep a scrollable, clickable blank area below the binder contents."""
+        spacer = QTreeWidgetItem([""])
+        spacer.setData(0, self._BOTTOM_SPACER_ROLE, True)
+        spacer.setFlags(Qt.ItemFlag.NoItemFlags)
+        spacer.setSizeHint(0, QSize(0, self._BOTTOM_SPACER_HEIGHT))
+        spacer.setFirstColumnSpanned(True)
+        self.addTopLevelItem(spacer)
+
+    def is_bottom_spacer(self, item):
+        return bool(item and item.data(0, self._BOTTOM_SPACER_ROLE))
+
+    def is_trash_root(self, item):
+        return bool(
+            item
+            and item.parent() is None
+            and item.data(0, Qt.ItemDataRole.UserRole) == self._TRASH_ROOT_PATH
+        )
+
+    def _trash_root_index(self):
+        for index in range(self.topLevelItemCount()):
+            if self.is_trash_root(self.topLevelItem(index)):
+                return index
+        return -1
+
+    def ensure_trash_at_bottom(self):
+        """Keep the trash as the final real root, immediately above the spacer."""
+        trash_index = self._trash_root_index()
+        if trash_index < 0:
+            return False
+
+        content_count = self.topLevelItemCount()
+        if (
+            content_count
+            and self.is_bottom_spacer(self.topLevelItem(content_count - 1))
+        ):
+            content_count -= 1
+        desired_index = content_count - 1
+        if trash_index == desired_index:
+            return False
+
+        trash_item = self.takeTopLevelItem(trash_index)
+        insert_index = self.topLevelItemCount()
+        if (
+            insert_index
+            and self.is_bottom_spacer(self.topLevelItem(insert_index - 1))
+        ):
+            insert_index -= 1
+        self.insertTopLevelItem(insert_index, trash_item)
+        return True
+
+    def insert_root_item(self, item):
+        """Insert user-created roots before the fixed trash and bottom spacer."""
+        index = self.topLevelItemCount()
+        if index and self.is_bottom_spacer(self.topLevelItem(index - 1)):
+            index -= 1
+        trash_index = self._trash_root_index()
+        if 0 <= trash_index < index:
+            index = trash_index
+        self.insertTopLevelItem(index, item)
 
     def dropEvent(self, event):
         source_item = self.currentItem()
@@ -72,9 +137,12 @@ class BinderTreeWidget(QTreeWidget):
         if source_top.text(0) == "📚 원고":
             event.ignore()
             return
+        if self.is_trash_root(source_item):
+            event.ignore()
+            return
             
         target_item = self.itemAt(event.position().toPoint())
-        if not target_item:
+        if not target_item or self.is_bottom_spacer(target_item):
             event.ignore()
             return
             
@@ -100,6 +168,13 @@ class BinderTreeWidget(QTreeWidget):
             if target_item.text(0) == "📚 원고" and drop_indicator == QAbstractItemView.DropIndicatorPosition.AboveItem:
                 event.ignore()
                 return
+            # Other roots may be placed above trash, never below it.
+            if (
+                self.is_trash_root(target_item)
+                and drop_indicator == QAbstractItemView.DropIndicatorPosition.BelowItem
+            ):
+                event.ignore()
+                return
         else:
             # 2. 일반 항목(루트 하위)을 드래그 하는 경우
             # 타겟이 루트 노드인데 그 "위"나 "아래"에 드롭하려는 경우 (루트 밖으로 벗어나는 것 방지)
@@ -120,6 +195,7 @@ class BinderTreeWidget(QTreeWidget):
         old_parent_rel_path = source_item.parent().data(0, Qt.ItemDataRole.UserRole) if source_item.parent() else ""
         
         super().dropEvent(event)
+        self.ensure_trash_at_bottom()
         
         # QTreeWidget의 dropEvent는 아이템을 복제/삭제할 수 있으므로, 새로 선택된 아이템을 추적합니다.
         dropped_items = self.selectedItems()
@@ -146,6 +222,13 @@ class RenameDelegate(QStyledItemDelegate):
     def __init__(self, tree, parent=None):
         super().__init__(parent)
         self.tree = tree
+
+    def paint(self, painter, option, index):
+        # The bottom spacer is only scrollable blank space; it must not react
+        # visually when the pointer passes over it.
+        if self.tree.is_bottom_spacer(self.tree.itemFromIndex(index)):
+            return
+        super().paint(painter, option, index)
 
     def createEditor(self, parent, option, index):
         item = self.tree.itemFromIndex(index)
@@ -181,12 +264,16 @@ class RenameDelegate(QStyledItemDelegate):
 class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
     switchModeRequested = pyqtSignal()
     sendToAssistantRequested = pyqtSignal(str)
+    _EDITOR_VIEW_STATE_KEY = "writing_editor_view_states_v1"
+    _EDITOR_VIEW_STATE_LIMIT = 100
+    _SPLIT_MODE_STATE_KEY = "writing_split_mode_enabled"
 
     def __init__(self, pm):
         super().__init__()
         # pm: 기존 어시스턴트의 ProjectManager
         self.pm = pm
         self._initial_last_active = self.pm.global_config.get("writing_last_active_editor", "left")
+        self._initial_split_mode_enabled = self._saved_split_mode(self.pm)
         self.wpm = WritingProjectManager()
         
         # 프로젝트 초기화 (폴더 구조 생성)
@@ -197,25 +284,8 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             print(f"[DEBUG INIT] self.pm.current_project is empty. wpm id = {id(self.wpm)}")
             
         self.sync_manager = SyncManager()
-        import uuid, os
-        from runtime_profile import app_data_dir as get_app_data_dir
-        app_data_dir = get_app_data_dir()
-        os.makedirs(app_data_dir, exist_ok=True)
-        device_id_path = os.path.join(app_data_dir, ".device_id")
-        
-        if os.path.exists(device_id_path):
-            with open(device_id_path, "r", encoding="utf-8") as f:
-                self.session_id = f.read().strip()
-            try:
-                uuid.UUID(self.session_id)
-            except (ValueError, TypeError):
-                self.session_id = str(uuid.uuid4())
-                with open(device_id_path, "w", encoding="utf-8") as f:
-                    f.write(self.session_id)
-        else:
-            self.session_id = str(uuid.uuid4())
-            with open(device_id_path, "w", encoding="utf-8") as f:
-                f.write(self.session_id)
+        from sync_manager import load_or_create_device_id
+        self.session_id = load_or_create_device_id()
 
         if self.pm.current_project:
             self.sync_manager.configure_v2(
@@ -232,7 +302,8 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         from writing_controller import WritingController
         self.controller = WritingController(
             self.wpm, self.sync_manager, self.pm, self.session_id,
-            self.get_active_paths, self.get_editor_content
+            self.get_active_paths, self.get_editor_content,
+            self.on_idle_autosave_persisted,
         )
         self.controller.start_timers()
         
@@ -241,7 +312,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         if app:
             app.aboutToQuit.connect(self.controller.release_all_locks)
             app.aboutToQuit.connect(self.controller.wait_all_workers)
-            app.aboutToQuit.connect(self.sync_manager.wait_all_workers)
+            app.aboutToQuit.connect(self.sync_manager.shutdown)
         
         self.init_ui()
         self.sync_manager.syncStateChanged.connect(self.update_storage_status)
@@ -275,12 +346,124 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         if self.right_editor_container.isVisible() and self.current_loaded_file_right:
             paths.append(self.current_loaded_file_right)
         return paths
-        
+
+    def _remember_editor_view_state(self, editor, rel_path=None):
+        if editor is getattr(self, "left_editor", None):
+            side = "left"
+            rel_path = rel_path or getattr(self, "current_loaded_file_left", None)
+        elif editor is getattr(self, "right_editor", None):
+            side = "right"
+            rel_path = rel_path or getattr(self, "current_loaded_file_right", None)
+        else:
+            return False
+        project_name = str(getattr(self.pm, "current_project", "") or "")
+        if not project_name or not rel_path:
+            return False
+
+        rel_path = str(rel_path).replace("\\", "/")
+        all_states = self.pm.global_config.get(self._EDITOR_VIEW_STATE_KEY)
+        if not isinstance(all_states, dict):
+            all_states = {}
+        project_states = all_states.get(project_name)
+        if not isinstance(project_states, dict):
+            project_states = {}
+            all_states[project_name] = project_states
+        side_states = project_states.get(side)
+        if not isinstance(side_states, dict):
+            side_states = {}
+            project_states[side] = side_states
+
+        # Reinsert the path so dictionary order acts as a small LRU list.
+        side_states.pop(rel_path, None)
+        side_states[rel_path] = {
+            "cursor": editor.textCursor().position(),
+            "vertical_scroll": editor.verticalScrollBar().value(),
+            "horizontal_scroll": editor.horizontalScrollBar().value(),
+        }
+        while len(side_states) > self._EDITOR_VIEW_STATE_LIMIT:
+            side_states.pop(next(iter(side_states)))
+        self.pm.global_config[self._EDITOR_VIEW_STATE_KEY] = all_states
+        return True
+
+    def _saved_editor_view_state(self, editor, rel_path):
+        if editor is getattr(self, "left_editor", None):
+            side = "left"
+        elif editor is getattr(self, "right_editor", None):
+            side = "right"
+        else:
+            return None
+        project_name = str(getattr(self.pm, "current_project", "") or "")
+        all_states = self.pm.global_config.get(self._EDITOR_VIEW_STATE_KEY, {})
+        if not isinstance(all_states, dict):
+            return None
+        project_states = all_states.get(project_name, {})
+        if not isinstance(project_states, dict):
+            return None
+        side_states = project_states.get(side, {})
+        if not isinstance(side_states, dict):
+            return None
+        state = side_states.get(str(rel_path).replace("\\", "/"))
+        return state if isinstance(state, dict) else None
+
+    def _restore_editor_view_state(self, editor, rel_path):
+        state = self._saved_editor_view_state(editor, rel_path)
+        if not state:
+            return False
+        try:
+            cursor_position = int(state.get("cursor", 0))
+            vertical_scroll = int(state.get("vertical_scroll", 0))
+            horizontal_scroll = int(state.get("horizontal_scroll", 0))
+        except (TypeError, ValueError):
+            return False
+
+        from PyQt6.QtGui import QTextCursor
+
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(max(0, min(cursor_position, len(editor.toPlainText()))))
+        editor.setTextCursor(cursor)
+
+        def restore_scrollbars():
+            if editor is getattr(self, "left_editor", None):
+                current_path = getattr(self, "current_loaded_file_left", None)
+            else:
+                current_path = getattr(self, "current_loaded_file_right", None)
+            if current_path != rel_path:
+                return
+            editor.verticalScrollBar().setValue(vertical_scroll)
+            editor.horizontalScrollBar().setValue(horizontal_scroll)
+
+        # QTextDocument layout and scrollbar ranges settle on the next event turn.
+        QTimer.singleShot(0, restore_scrollbars)
+        return True
+
+    def persist_editor_view_states(self):
+        remembered = False
+        for editor in (
+            getattr(self, "left_editor", None),
+            getattr(self, "right_editor", None),
+        ):
+            if editor is not None:
+                remembered = self._remember_editor_view_state(editor) or remembered
+        if remembered:
+            self.pm.save_global_config()
+
+    def closeEvent(self, event):
+        self.persist_editor_view_states()
+        super().closeEvent(event)
+
+    @staticmethod
+    def _editor_text_for_save(editor):
+        """Make an active IME preedit part of the document before reading it."""
+        commit_input = getattr(editor, "commit_pending_input_method", None)
+        if callable(commit_input):
+            commit_input()
+        return editor.toPlainText()
+
     def get_editor_content(self, path):
         if path == self.current_loaded_file_left and getattr(self, 'left_editor', None) and not self.left_editor.isReadOnly():
-            return self.left_editor.toPlainText()
+            return WritingModeWidget._editor_text_for_save(self.left_editor)
         if path == self.current_loaded_file_right and getattr(self, 'right_editor', None) and not self.right_editor.isReadOnly():
-            return self.right_editor.toPlainText()
+            return WritingModeWidget._editor_text_for_save(self.right_editor)
 
     def get_remote_sync_protected_paths(self):
         protected = set()
@@ -423,7 +606,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         
         self.btn_toggle_split = QPushButton("좌우분할모드")
         self.btn_toggle_split.setCheckable(True)
-        self.btn_toggle_split.setChecked(True)
+        self.btn_toggle_split.setChecked(self._initial_split_mode_enabled)
         self.btn_toggle_split.setMinimumHeight(30)
         self.btn_toggle_split.setStyleSheet(btn_style)
         self.btn_toggle_split.clicked.connect(self.toggle_split_mode)
@@ -506,7 +689,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.lbl_storage_status.setFixedHeight(24)
         self.lbl_storage_status.setMinimumWidth(76)
         self.lbl_storage_status.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.lbl_storage_status.clicked.connect(self._retry_storage_sync)
+        self.lbl_storage_status.clicked.connect(self._show_storage_status_details)
         self.top_toolbar.addWidget(self.lbl_storage_status)
 
         status_spacer = QWidget()
@@ -626,6 +809,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.left_editor.setPlaceholderText("바인더에서 문서를 선택해주세요")
         self.left_editor.setReadOnly(True)
         self.left_editor.textChanged.connect(self.on_editor_text_changed)
+        self.left_editor.compositionChanged.connect(
+            self.on_editor_text_changed
+        )
         self.left_editor.selectionChanged.connect(self.update_editor_statistics)
         
         # 포커스 이벤트 가로채기를 위한 이벤트 필터 설치
@@ -675,6 +861,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.right_editor.setPlaceholderText("바인더에서 문서를 선택해주세요")
         self.right_editor.setReadOnly(True)
         self.right_editor.textChanged.connect(self.on_editor_text_changed)
+        self.right_editor.compositionChanged.connect(
+            self.on_editor_text_changed
+        )
         self.right_editor.selectionChanged.connect(self.update_editor_statistics)
         self.right_editor.installEventFilter(self)
         
@@ -695,6 +884,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         
         self.editor_splitter.addWidget(self.left_editor_container)
         self.editor_splitter.addWidget(self.right_editor_container)
+        self.right_editor_container.setVisible(
+            self._initial_split_mode_enabled
+        )
         
         # 스플리터 비율 설정
         self.main_splitter.addWidget(self.binder_tree)
@@ -717,6 +909,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             lambda _position, _index: self._binder_width_save_timer.start()
         )
         self.editor_splitter.setSizes([400, 400])
+        self.editor_splitter.splitterMoved.connect(self._snap_editor_splitter_to_center)
         
         main_layout.addWidget(self.main_splitter, stretch=1)
 
@@ -740,19 +933,114 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.pm.global_config["writing_binder_width"] = width
         self.pm.save_global_config()
 
+    def _snap_editor_splitter_to_center(self, _position, _index):
+        """Give the two-pane divider a small, tactile snap point at center."""
+        if getattr(self, "_editor_splitter_snapping", False):
+            return
+
+        left_width, right_width = self.editor_splitter.sizes()
+        if abs(left_width - right_width) > 24:
+            return
+
+        total_width = left_width + right_width
+        if total_width <= 0:
+            return
+
+        self._editor_splitter_snapping = True
+        try:
+            left_width = total_width // 2
+            self.editor_splitter.setSizes([left_width, total_width - left_width])
+        finally:
+            self._editor_splitter_snapping = False
+
     def update_storage_status(self, state, detail="", pending_count=0):
         labels = {
-            "saved": ("● 저장됨", "#86efac", "#163522"),
-            "backup": ("● 자동백업 중", "#fcd34d", "#3b3017"),
-            "syncing": ("● 서버 동기화 중", "#7dd3fc", "#173449"),
-            "offline": ("● 오프라인 임시 저장됨", "#fdba74", "#422a18"),
-            "lease": ("● 다른 기기 편집 중", "#fde68a", "#443615"),
-            "failed": ("● 동기화 실패 — 재시도 필요", "#fca5a5", "#451f24"),
-            "conflict": ("● 충돌 해결 필요", "#fecaca", "#5f1d2b"),
+            "saved": ("● 로컬 저장 완료", "#86efac", "#163522"),
+            "backup": (
+                "● 로컬 저장 완료 · 복구본 생성 중",
+                "#7dd3fc",
+                "#173449",
+            ),
+            "syncing": ("● 로컬 저장 완료 · 서버 전송 중", "#7dd3fc", "#173449"),
+            "offline": ("● 로컬 저장 완료 · 오프라인", "#fdba74", "#422a18"),
+            "auth_required": (
+                "● 로컬 저장 완료 · 로그인 필요",
+                "#fcd34d",
+                "#3b3017",
+            ),
+            "lease": (
+                "● 로컬 저장 완료 · 다른 기기 편집 중",
+                "#fde68a",
+                "#443615",
+            ),
+            "failed": (
+                "● 로컬 저장 완료 · 서버 전송 대기",
+                "#fca5a5",
+                "#451f24",
+            ),
+            "empty_guard": (
+                "● 전체 삭제 확인 필요",
+                "#fcd34d",
+                "#3b3017",
+            ),
+            "conflict": (
+                "● 로컬 저장 완료 · 충돌 해결 필요",
+                "#fecaca",
+                "#5f1d2b",
+            ),
+            "project_trashed": (
+                "● 서버 휴지통 · 동기화 중지",
+                "#fdba74",
+                "#422a18",
+            ),
+            "project_purged": (
+                "● 서버 영구 삭제 · 로컬 사본",
+                "#fca5a5",
+                "#451f24",
+            ),
         }
         text, color, background = labels.get(state, labels["saved"])
-        if pending_count:
-            text = f"{text} · {pending_count}건 대기"
+        unsaved_editor_count = WritingModeWidget._unsaved_editor_count(self)
+        editor_dirty = unsaved_editor_count > 0
+        if editor_dirty and state != "empty_guard":
+            dirty_suffix = {
+                "offline": " · 오프라인",
+                "auth_required": " · 로그인 필요",
+                "lease": " · 다른 기기 편집 중",
+                "failed": " · 서버 전송 대기",
+                "conflict": " · 충돌 확인 필요",
+                "project_trashed": " · 서버 휴지통",
+                "project_purged": " · 서버 영구 삭제",
+            }.get(state, "")
+            text = f"● 로컬 저장 대기 {unsaved_editor_count}건" + dirty_suffix
+            color, background = "#fcd34d", "#3b3017"
+        elif pending_count:
+            if state == "syncing":
+                text = f"● 로컬 저장 완료 · 서버 전송 중 {pending_count}건"
+            elif state == "offline":
+                text = (
+                    f"● 로컬 저장 완료 · 서버 전송 대기 {pending_count}건"
+                    " · 오프라인"
+                )
+            elif state == "auth_required":
+                text = (
+                    f"● 로컬 저장 완료 · 서버 전송 대기 {pending_count}건"
+                    " · 로그인 필요"
+                )
+            elif state == "lease":
+                text = (
+                    f"● 로컬 저장 완료 · 서버 전송 대기 {pending_count}건"
+                    " · 다른 기기 편집 중"
+                )
+            elif state == "failed":
+                text = (
+                    f"● 로컬 저장 완료 · 서버 전송 대기 {pending_count}건"
+                    " · 재시도 필요"
+                )
+            elif state == "conflict":
+                text = f"● 로컬 저장 완료 · 충돌 {pending_count}건"
+            else:
+                text = f"{text} · {pending_count}건 대기"
         account_email = ""
         try:
             manager = getattr(self, "sync_manager", None)
@@ -760,65 +1048,318 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 account_email = manager.authenticated_email()
         except Exception:
             account_email = ""
-        if account_email:
-            text = f"{text} · 클라우드 로그인됨"
+        if account_email and state == "saved" and not editor_dirty and not pending_count:
+            text = "● 동기화 완료"
         self._storage_pending_count = pending_count
         self._storage_state = state
+        self._storage_detail = detail
+        self._storage_editor_dirty_count = unsaved_editor_count
+        self._storage_account_email = account_email
         self.lbl_storage_status.setText(text)
         self.lbl_storage_status.setStyleSheet(
             f"QPushButton {{ color: {color}; background-color: {background}; border: 1px solid {color}; "
             "border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: bold; }}"
             f"QPushButton:hover {{ background-color: {background}; }}"
         )
-        tooltip = detail or text
+        guidance = WritingModeWidget._storage_status_guidance(
+            state,
+            detail,
+            pending_count,
+            unsaved_editor_count,
+            bool(account_email),
+        )
+        tooltip = (
+            f"{guidance['summary']}\n"
+            f"다음 할 일: {guidance['action']}\n"
+            "클릭하면 원인과 해결 방법을 확인할 수 있습니다."
+        )
         if account_email:
             tooltip = f"클라우드 자동 로그인됨: {account_email}\n{tooltip}"
-        if pending_count:
-            if state == "conflict":
-                tooltip += "\n클릭하면 충돌 폴더를 엽니다."
-            elif state == "lease":
-                tooltip += "\n다른 기기에서 문서를 닫은 뒤 클릭하면 다시 시도합니다."
-            else:
-                tooltip += "\n클릭하면 지금 재시도합니다."
         self.lbl_storage_status.setToolTip(tooltip)
 
+    @staticmethod
+    def _storage_status_guidance(
+        state, detail="", pending_count=0, dirty_count=0, logged_in=False
+    ):
+        """Translate internal sync state into plain-language cause and action."""
+        pending_count = max(0, int(pending_count or 0))
+        dirty_count = max(0, int(dirty_count or 0))
+        if state == "empty_guard":
+            return {
+                "title": "전체 삭제 확인 필요",
+                "summary": "빈 내용이 기존 원고를 덮어쓰지 않도록 자동저장을 멈췄습니다.",
+                "cause": detail or "문서 전체가 비어 있어 의도적인 삭제인지 확인이 필요합니다.",
+                "action": "내용을 확인한 뒤 Ctrl+S로 직접 저장해주세요.",
+                "action_code": "manual_save",
+                "warning": True,
+            }
+        if dirty_count:
+            return {
+                "title": "로컬 저장 대기",
+                "summary": f"변경한 문서 {dirty_count}건이 로컬 저장을 기다리고 있습니다.",
+                "cause": "입력 중에는 원고가 계속 바뀌므로 잠시 기다렸다가 자동저장합니다.",
+                "action": "입력을 잠시 멈추거나 Ctrl+S를 눌러 바로 저장해주세요.",
+                "action_code": "manual_save",
+                "warning": False,
+            }
+
+        pending_text = f" {pending_count}건" if pending_count else ""
+        guidance = {
+            "saved": {
+                "title": "동기화 완료" if logged_in else "로컬 저장 완료",
+                "summary": (
+                    "원고가 로컬과 클라우드에 모두 반영되었습니다."
+                    if logged_in else "원고가 이 컴퓨터에 안전하게 저장되었습니다."
+                ),
+                "cause": "현재 처리하거나 기다리는 저장 작업이 없습니다.",
+                "action": "계속 집필하시면 됩니다.",
+                "action_code": "",
+                "warning": False,
+            },
+            "backup": {
+                "title": "로컬 저장 완료",
+                "summary": "현재 원고는 저장됐고 복구용 사본을 만드는 중입니다.",
+                "cause": "예기치 않은 종료에 대비한 자동 복구본을 생성하고 있습니다.",
+                "action": "계속 집필하셔도 됩니다.",
+                "action_code": "",
+                "warning": False,
+            },
+            "syncing": {
+                "title": "서버 전송 중",
+                "summary": f"로컬 저장은 완료됐고 서버로{pending_text} 전송 중입니다.",
+                "cause": "클라우드에 최신 원고를 반영하고 있습니다.",
+                "action": "잠시 기다려주세요. 집필은 계속할 수 있습니다.",
+                "action_code": "",
+                "warning": False,
+            },
+            "offline": {
+                "title": "오프라인 · 서버 전송 대기",
+                "summary": f"원고는 로컬에 저장됐고 서버 전송{pending_text}이 대기 중입니다.",
+                "cause": detail or "현재 서버 또는 인터넷에 연결할 수 없습니다.",
+                "action": "인터넷 연결을 확인하세요. 연결되면 자동 재시도됩니다.",
+                "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "auth_required": {
+                "title": "클라우드 로그인 필요",
+                "summary": f"원고는 로컬에 저장됐고 서버 전송{pending_text}이 대기 중입니다.",
+                "cause": "클라우드 로그인 세션을 자동으로 갱신하지 못했습니다.",
+                "action": "설정 탭에서 클라우드 계정에 다시 로그인해주세요.",
+                "action_code": "",
+                "warning": True,
+            },
+            "conflict": {
+                "title": "문서 충돌 확인 필요",
+                "summary": "로컬 원고는 보존됐지만 다른 기기의 변경과 자동 병합하지 못했습니다.",
+                "cause": detail or "같은 문서를 여러 기기에서 서로 다르게 수정했습니다.",
+                "action": "충돌 폴더에서 두 내용을 비교하고 사용할 원고를 선택해주세요.",
+                "action_code": "open_conflicts",
+                "warning": True,
+            },
+            "failed": {
+                "title": "서버 전송 대기 · 재시도 필요",
+                "summary": f"원고는 로컬에 저장됐고 서버 전송{pending_text}이 대기 중입니다.",
+                "cause": detail or "서버가 변경 내용을 처리하지 못했습니다.",
+                "action": "상세 원인을 확인한 뒤 지금 다시 시도할 수 있습니다.",
+                "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "lease": {
+                "title": "다른 기기에서 편집 중",
+                "summary": f"원고는 로컬에 저장됐고 서버 전송{pending_text}이 대기 중입니다.",
+                "cause": "다른 기기가 같은 문서의 편집 권한을 사용하고 있습니다.",
+                "action": "다른 기기에서 문서를 닫은 뒤 다시 시도해주세요.",
+                "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "project_trashed": {
+                "title": "서버 휴지통 작품",
+                "summary": "원고는 로컬에 보존되지만 이 작품의 서버 동기화는 중지됐습니다.",
+                "cause": detail or "작품이 서버 휴지통에 있습니다.",
+                "action": "서버 작품 관리에서 작품을 복원해야 동기화를 재개할 수 있습니다.",
+                "action_code": "",
+                "warning": True,
+            },
+            "project_purged": {
+                "title": "서버에서 영구 삭제된 작품",
+                "summary": "현재 원고는 이 컴퓨터의 로컬 사본으로 보존됩니다.",
+                "cause": detail or "서버 작품이 영구 삭제되어 기존 연결을 사용할 수 없습니다.",
+                "action": "로컬 사본을 새 서버 작품으로 등록하려면 별도 가져오기 절차가 필요합니다.",
+                "action_code": "",
+                "warning": True,
+            },
+        }
+        return guidance.get(state, guidance["saved"])
+
+    def _show_storage_status_details(self):
+        guidance = WritingModeWidget._storage_status_guidance(
+            getattr(self, "_storage_state", "saved"),
+            getattr(self, "_storage_detail", ""),
+            getattr(self, "_storage_pending_count", 0),
+            getattr(self, "_storage_editor_dirty_count", 0),
+            bool(getattr(self, "_storage_account_email", "")),
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle(guidance["title"])
+        box.setIcon(
+            QMessageBox.Icon.Warning
+            if guidance["warning"]
+            else QMessageBox.Icon.Information
+        )
+        box.setText(guidance["summary"])
+        box.setInformativeText(
+            f"원인\n{guidance['cause']}\n\n다음 할 일\n{guidance['action']}"
+        )
+        action_button = None
+        action_code = guidance["action_code"]
+        if action_code == "retry":
+            action_button = box.addButton(
+                "지금 다시 시도", QMessageBox.ButtonRole.ActionRole
+            )
+        elif action_code == "open_conflicts":
+            action_button = box.addButton(
+                "충돌 폴더 열기", QMessageBox.ButtonRole.ActionRole
+            )
+        elif action_code == "manual_save":
+            action_button = box.addButton(
+                "지금 저장", QMessageBox.ButtonRole.ActionRole
+            )
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if action_button is not None and box.clickedButton() is action_button:
+            if action_code == "retry":
+                self._retry_storage_sync()
+            elif action_code == "open_conflicts":
+                self.open_conflict_folder()
+            elif action_code == "manual_save":
+                self.manual_save()
+
+    @staticmethod
+    def _unsaved_editor_count(target):
+        count = 0
+        editor_pairs = (
+            ("is_dirty_left", "left_editor"),
+            ("is_dirty_right", "right_editor"),
+        )
+        for dirty_name, editor_name in editor_pairs:
+            dirty = bool(getattr(target, dirty_name, False))
+            editor = getattr(target, editor_name, None)
+            if not dirty and editor is not None:
+                try:
+                    dirty = bool(editor.document().isModified())
+                except (AttributeError, RuntimeError):
+                    dirty = False
+            if dirty:
+                count += 1
+        return count
+
+    @staticmethod
+    def _editor_has_unsaved_changes(target):
+        return WritingModeWidget._unsaved_editor_count(target) > 0
+
+    def _refresh_storage_status_for_editor_state(self):
+        self.update_storage_status(
+            getattr(self, "_storage_state", "saved"),
+            getattr(self, "_storage_detail", ""),
+            getattr(self, "_storage_pending_count", 0),
+        )
+
     def _retry_storage_sync(self):
+        if getattr(self, "_storage_state", "") in {
+            "project_trashed", "project_purged"
+        }:
+            return
         if getattr(self, "_storage_state", "") == "conflict":
             # A conflict can coexist with independent pending documents. Give
             # those durable queue items a chance to run before opening the
             # conflict artifacts. If only conflicts remain, open the folder.
-            if not self.sync_manager.retry_pending_syncs():
+            if not self.sync_manager.retry_pending_syncs(manual=True):
                 self.open_conflict_folder()
             return
+        if getattr(self, "_storage_state", "") == "empty_guard":
+            self.manual_save()
+            return
         if getattr(self, "_storage_pending_count", 0):
-            self.sync_manager.retry_pending_syncs()
+            # 사용자가 누른 재시도는 예약된 자동 재시도 대기 시간을 건너뛴다.
+            # 큐 항목은 삭제하거나 다시 만들지 않고, 기존 최신 작업을 그대로 실행한다.
+            self.sync_manager.retry_pending_syncs(manual=True)
 
     def manual_save(self):
         """수동 저장 처리"""
         saved_left = False
         saved_right = False
-        
+        content_left = None
+        content_right = None
+        force_empty_left = False
+        force_empty_right = False
+
         if (
             self.current_loaded_file_left
             and is_live_document_path(self.current_loaded_file_left)
             and self.sync_manager.can_save_path(self.current_loaded_file_left)
+            and (
+                self.is_dirty_left
+                or self.left_editor.document().isModified()
+            )
         ):
-            content_left = self.left_editor.toPlainText()
-            self.wpm.write_text_file(self.current_loaded_file_left, content_left)
-            self.is_dirty_left = False
-            self.left_editor.document().setModified(False)
-            saved_left = True
+            content_left = WritingModeWidget._editor_text_for_save(
+                self.left_editor
+            )
+            force_empty_left = WritingModeWidget._confirm_empty_document_save(
+                self, self.current_loaded_file_left, content_left,
+                user_initiated=WritingModeWidget._allows_intentional_empty_save(
+                    self, self.current_loaded_file_left, content_left
+                ),
+            )
+            if force_empty_left is None:
+                return
+            if force_empty_left:
+                WritingModeWidget._backup_before_empty_save(
+                    self, self.current_loaded_file_left
+                )
+            if self.wpm.write_text_file(
+                self.current_loaded_file_left, content_left
+            ):
+                self.is_dirty_left = False
+                self.left_editor.document().setModified(False)
+                WritingModeWidget._accept_persisted_snapshot(
+                    self, self.current_loaded_file_left, content_left
+                )
+                saved_left = True
             
         if (
             self.current_loaded_file_right
             and is_live_document_path(self.current_loaded_file_right)
             and self.sync_manager.can_save_path(self.current_loaded_file_right)
+            and (
+                self.is_dirty_right
+                or self.right_editor.document().isModified()
+            )
         ):
-            content_right = self.right_editor.toPlainText()
-            self.wpm.write_text_file(self.current_loaded_file_right, content_right)
-            self.is_dirty_right = False
-            self.right_editor.document().setModified(False)
-            saved_right = True
+            content_right = WritingModeWidget._editor_text_for_save(
+                self.right_editor
+            )
+            force_empty_right = WritingModeWidget._confirm_empty_document_save(
+                self, self.current_loaded_file_right, content_right,
+                user_initiated=WritingModeWidget._allows_intentional_empty_save(
+                    self, self.current_loaded_file_right, content_right
+                ),
+            )
+            if force_empty_right is None:
+                return
+            if force_empty_right:
+                WritingModeWidget._backup_before_empty_save(
+                    self, self.current_loaded_file_right
+                )
+            if self.wpm.write_text_file(
+                self.current_loaded_file_right, content_right
+            ):
+                self.is_dirty_right = False
+                self.right_editor.document().setModified(False)
+                WritingModeWidget._accept_persisted_snapshot(
+                    self, self.current_loaded_file_right, content_right
+                )
+                saved_right = True
             
         # v2는 현재 문서만 UUID/revision 기반 영구 큐에 넣는다.
         queued_paths = set()
@@ -828,16 +1369,18 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 self.wpm,
                 self.pm.current_project,
                 self.current_loaded_file_left,
-                self.left_editor.toPlainText(),
+                content_left,
                 callback=self.on_sync_finished,
+                force_overwrite=force_empty_left,
             )
         if saved_right and self.current_loaded_file_right and self.current_loaded_file_right not in queued_paths:
             self.sync_manager.upload_content_async(
                 self.wpm,
                 self.pm.current_project,
                 self.current_loaded_file_right,
-                self.right_editor.toPlainText(),
+                content_right,
                 callback=self.on_sync_finished,
+                force_overwrite=force_empty_right,
             )
             
         if saved_left:
@@ -867,6 +1410,57 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(1500, restore_label_r)
+
+    def _confirm_empty_document_save(
+        self, relative_path, content, user_initiated=False
+    ):
+        """Authorize a whole-document deletion or confirm an ambiguous one.
+
+        Returns True for a known user deletion or confirmed fallback, False
+        when no guard is needed, and None when the fallback was cancelled.
+        """
+        if self.sync_manager.would_erase_nonempty_document(
+            relative_path, content
+        ) is not True:
+            return False
+        if user_initiated:
+            return True
+        self.sync_manager.report_empty_content_guard(relative_path)
+        answer = QMessageBox.warning(
+            self,
+            "문서 전체 삭제 확인",
+            "기존 내용이 있는 문서가 완전히 비어 있습니다.\n\n"
+            "이 상태로 저장하면 다른 기기에서도 문서 전체 내용이 "
+            "삭제됩니다.\n정말 빈 문서로 저장할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+        return True
+
+    @staticmethod
+    def _allows_intentional_empty_save(target, relative_path, content):
+        controller = getattr(target, "controller", None)
+        checker = getattr(controller, "allows_intentional_empty_save", None)
+        return bool(
+            callable(checker) and checker(relative_path, content)
+        )
+
+    @staticmethod
+    def _accept_persisted_snapshot(target, relative_path, content):
+        controller = getattr(target, "controller", None)
+        accept = getattr(controller, "accept_persisted_snapshot", None)
+        if callable(accept):
+            accept(relative_path, content)
+
+    def _backup_before_empty_save(self, relative_path):
+        """Keep the last local text recoverable before an intentional erase."""
+        previous_content = self.wpm.read_text_file(relative_path)
+        if previous_content:
+            self.sync_manager.upload_autosave_async(
+                self.wpm, relative_path, previous_content
+            )
             
     def eventFilter(self, obj, event):
         from PyQt6.QtCore import QEvent
@@ -926,16 +1520,22 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
     def apply_editor_margins(self):
         for editor in [self.left_editor, self.right_editor]:
             doc = editor.document()
-            root_frame = doc.rootFrame()
-            fmt = root_frame.frameFormat()
-            fmt.setLeftMargin(self.pad_h)
-            fmt.setRightMargin(self.pad_h)
-            fmt.setTopMargin(self.pad_v)
-            if editor.typewriter_enabled:
-                fmt.setBottomMargin(editor.viewport().height() / 2)
-            else:
-                fmt.setBottomMargin(self.pad_v)
-            root_frame.setFrameFormat(fmt)
+            was_modified = doc.isModified()
+            signals_were_blocked = editor.blockSignals(True)
+            try:
+                root_frame = doc.rootFrame()
+                fmt = root_frame.frameFormat()
+                fmt.setLeftMargin(self.pad_h)
+                fmt.setRightMargin(self.pad_h)
+                fmt.setTopMargin(self.pad_v)
+                if editor.typewriter_enabled:
+                    fmt.setBottomMargin(editor.viewport().height() / 2)
+                else:
+                    fmt.setBottomMargin(self.pad_v)
+                root_frame.setFrameFormat(fmt)
+                doc.setModified(was_modified)
+            finally:
+                editor.blockSignals(signals_were_blocked)
 
     def show_padding_dialog(self):
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QSpinBox, QDialogButtonBox
@@ -977,10 +1577,19 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.left_editor.typewriter_enabled = tw_enabled
         self.right_editor.typewriter_enabled = tw_enabled
 
+    @classmethod
+    def _saved_split_mode(cls, project_manager):
+        return bool(
+            project_manager.global_config.get(cls._SPLIT_MODE_STATE_KEY, True)
+        )
+
     def toggle_split_mode(self, checked):
+        checked = bool(checked)
         self.right_editor_container.setVisible(checked)
         if not checked and self.active_editor == self.right_editor:
             self.set_active_editor(self.left_editor)
+        self.pm.global_config[self._SPLIT_MODE_STATE_KEY] = checked
+        self.pm.save_global_config()
 
     def _open_file_by_path(self, rel_path):
         full_path = os.path.join(self.wpm.writing_root_path, rel_path)
@@ -989,6 +1598,8 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 self.set_active_editor(self.left_editor)
                 
             editor = self.active_editor
+            if self._remember_editor_view_state(editor):
+                self.pm.save_global_config()
             
             # 설정값 다시 불러와서 양쪽 에디터에 대입 (매 문서 오픈 시마다 최신 상태 반영)
             self.update_typewriter_setting()
@@ -996,32 +1607,78 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             # 기존 내용이 수정된 상태라면 로컬 저장 및 클라우드 동기화 (백그라운드)
             if editor == self.left_editor and getattr(self, 'current_loaded_file_left', None):
                 if getattr(self, 'is_dirty_left', False):
-                    content_to_save = editor.toPlainText()
+                    content_to_save = WritingModeWidget._editor_text_for_save(
+                        editor
+                    )
+                    force_empty = WritingModeWidget._confirm_empty_document_save(
+                        self,
+                        self.current_loaded_file_left, content_to_save,
+                        user_initiated=WritingModeWidget._allows_intentional_empty_save(
+                            self, self.current_loaded_file_left, content_to_save
+                        ),
+                    )
+                    if force_empty is None:
+                        return
+                    if force_empty:
+                        WritingModeWidget._backup_before_empty_save(
+                            self, self.current_loaded_file_left
+                        )
                     if self.sync_manager.can_save_path(self.current_loaded_file_left):
-                        self.wpm.write_text_file(self.current_loaded_file_left, content_to_save)
+                        if not self.wpm.write_text_file(
+                            self.current_loaded_file_left, content_to_save
+                        ):
+                            return
                         self.sync_manager.upload_content_async(
                             self.wpm, self.pm.current_project, self.current_loaded_file_left, content_to_save,
                             callback=self.on_sync_finished,
-                            local_updated_at=self.loaded_versions.get(self.current_loaded_file_left)
+                            local_updated_at=self.loaded_versions.get(self.current_loaded_file_left),
+                            force_overwrite=force_empty,
+                        )
+                        WritingModeWidget._accept_persisted_snapshot(
+                            self, self.current_loaded_file_left, content_to_save
                         )
                     editor.document().setModified(False)
                     self.is_dirty_left = False
+                    self._refresh_storage_status_for_editor_state()
                 
                 # 이전 파일 락 해제
                 self.controller.release_lock(self.current_loaded_file_left)
                 
             elif editor == self.right_editor and getattr(self, 'current_loaded_file_right', None):
                 if getattr(self, 'is_dirty_right', False):
-                    content_to_save = editor.toPlainText()
+                    content_to_save = WritingModeWidget._editor_text_for_save(
+                        editor
+                    )
+                    force_empty = WritingModeWidget._confirm_empty_document_save(
+                        self,
+                        self.current_loaded_file_right, content_to_save,
+                        user_initiated=WritingModeWidget._allows_intentional_empty_save(
+                            self, self.current_loaded_file_right, content_to_save
+                        ),
+                    )
+                    if force_empty is None:
+                        return
+                    if force_empty:
+                        WritingModeWidget._backup_before_empty_save(
+                            self, self.current_loaded_file_right
+                        )
                     if self.sync_manager.can_save_path(self.current_loaded_file_right):
-                        self.wpm.write_text_file(self.current_loaded_file_right, content_to_save)
+                        if not self.wpm.write_text_file(
+                            self.current_loaded_file_right, content_to_save
+                        ):
+                            return
                         self.sync_manager.upload_content_async(
                             self.wpm, self.pm.current_project, self.current_loaded_file_right, content_to_save,
                             callback=self.on_sync_finished,
-                            local_updated_at=self.loaded_versions.get(self.current_loaded_file_right)
+                            local_updated_at=self.loaded_versions.get(self.current_loaded_file_right),
+                            force_overwrite=force_empty,
+                        )
+                        WritingModeWidget._accept_persisted_snapshot(
+                            self, self.current_loaded_file_right, content_to_save
                         )
                     editor.document().setModified(False)
                     self.is_dirty_right = False
+                    self._refresh_storage_status_for_editor_state()
                     
                 # 이전 파일 락 해제
                 self.controller.release_lock(self.current_loaded_file_right)
@@ -1043,10 +1700,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             elif editor == self.right_editor:
                 self.is_dirty_right = False
                 
-            from PyQt6.QtGui import QTextCursor
-            cursor = editor.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            editor.setTextCursor(cursor)
+            if not self._restore_editor_view_state(editor, rel_path):
+                from PyQt6.QtGui import QTextCursor
+                cursor = editor.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                editor.setTextCursor(cursor)
             
             editor.blockSignals(False)
 
@@ -1064,49 +1722,22 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                     self.current_loaded_file_right = rel_path
                     self.pm.global_config["writing_last_right_file"] = rel_path
                 self.controller.notify_file_opened(rel_path, content)
-                from ui_components import save_config
-                save_config("writing_last_left_file", self.pm.global_config.get("writing_last_left_file"))
-                save_config("writing_last_right_file", self.pm.global_config.get("writing_last_right_file"))
+                self.pm.save_global_config()
                 return
             
-            # 락 획득 전까지 임시로 읽기 전용 처리
-            editor.setReadOnly(True)
-            editor.setPlaceholderText("로딩 중 (서버 락 확인)...")
-            
-            # 비동기 락 검사 (컨트롤러에 위임)
-            def on_lock_acquired(success, msg, server_updated_at):
-                # 콜백 도중 사용자가 이미 다른 탭으로 이동했는지 검증
-                is_still_viewing = False
-                if editor == self.left_editor and getattr(self, 'current_loaded_file_left', None) == rel_path:
-                    is_still_viewing = True
-                elif editor == self.right_editor and getattr(self, 'current_loaded_file_right', None) == rel_path:
-                    is_still_viewing = True
-                    
-                if not is_still_viewing:
-                    # 탭을 이동했다면 불필요하게 획득한 락 즉시 반환
-                    if success:
-                        self.controller.release_lock(rel_path)
-                    return
-                    
-                if not success:
-                    QMessageBox.warning(self, "편집 불가", msg)
-                    editor.setReadOnly(True)
-                    editor.setPlaceholderText("텍스트 입력 (읽기 전용)")
-                else:
-                    self.loaded_versions[rel_path] = server_updated_at
-                    editor.setReadOnly(False)
-                    editor.setPlaceholderText("텍스트 입력")
+            # 파일을 여는 것만으로는 lease를 획득하지 않는다. 첫 실제
+            # textChanged에서 WritingController가 비동기로 획득한다.
+            # 잠금 대기 중에도 로컬 입력은 편집기에 그대로 보존된다.
+            editor.setReadOnly(False)
+            editor.setPlaceholderText("텍스트 입력")
 
-                    from PyQt6.QtWidgets import QAbstractItemView
-                    if (
-                        editor is self.active_editor
-                        and self.isVisible()
-                        and self.binder_tree.state() != QAbstractItemView.State.EditingState
-                    ):
-                        editor.activate_input_method()
-                    if msg == "Lock acquired.":
-                        QTimer.singleShot(0, self.sync_manager.retry_pending_syncs)
-            self.controller.acquire_lock_async(rel_path, on_lock_acquired)
+            from PyQt6.QtWidgets import QAbstractItemView
+            if (
+                editor is self.active_editor
+                and self.isVisible()
+                and self.binder_tree.state() != QAbstractItemView.State.EditingState
+            ):
+                editor.activate_input_method()
             
             if editor == self.left_editor:
                 self.lbl_current_doc.setText(os.path.basename(rel_path))
@@ -1119,9 +1750,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 self.controller.notify_file_opened(rel_path, content)
                 self.pm.global_config["writing_last_right_file"] = rel_path
                 
-            from ui_components import save_config
-            save_config("writing_last_left_file", self.pm.global_config.get("writing_last_left_file"))
-            save_config("writing_last_right_file", self.pm.global_config.get("writing_last_right_file"))
+            self.pm.save_global_config()
             
     def activate_current_editor_input(self):
         editor = self.active_editor or self.left_editor
@@ -1146,7 +1775,8 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         else:
             self.set_active_editor(self.left_editor)
             
-        self.on_editor_text_changed()
+        self.update_editor_statistics()
+        self._refresh_storage_status_for_editor_state()
 
     def send_to_assistant(self):
         if not self.active_editor: return
@@ -1186,8 +1816,43 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             has_content = len(editor.toPlainText().strip()) > 0
             self.update_tree_icon(self.current_loaded_file_right, has_content)
             self.controller.notify_text_changed(self.current_loaded_file_right)
-            
+
+        refresh_status = getattr(
+            self, "_refresh_storage_status_for_editor_state", None
+        )
+        if callable(refresh_status):
+            refresh_status()
         self.update_editor_statistics()
+
+    def on_idle_autosave_persisted(self, path, content, success):
+        """Clear dirty state only when the editor still matches the saved snapshot."""
+        if not success:
+            return
+        pairs = (
+            (
+                "current_loaded_file_left",
+                "left_editor",
+                "is_dirty_left",
+            ),
+            (
+                "current_loaded_file_right",
+                "right_editor",
+                "is_dirty_right",
+            ),
+        )
+        for path_attr, editor_attr, dirty_attr in pairs:
+            if getattr(self, path_attr, None) != path:
+                continue
+            editor = getattr(self, editor_attr, None)
+            if editor is None or editor.toPlainText() != content:
+                continue
+            setattr(self, dirty_attr, False)
+            editor.document().setModified(False)
+        refresh_status = getattr(
+            self, "_refresh_storage_status_for_editor_state", None
+        )
+        if callable(refresh_status):
+            refresh_status()
 
     @staticmethod
     def _format_editor_statistics(side, text, selected_count):
@@ -1348,6 +2013,31 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             new_path = change.get("new_local_path") or old_path
             if not new_path:
                 continue
+            if (
+                change.get("kind") == "folder_identity_rename"
+                and old_path
+                and old_path != new_path
+            ):
+                self.controller.rename_path(old_path, new_path)
+                remapped_versions = {}
+                for path, version in list(self.loaded_versions.items()):
+                    if path == old_path or path.startswith(old_path + "/"):
+                        self.loaded_versions.pop(path, None)
+                        remapped_versions[
+                            new_path + path[len(old_path):]
+                        ] = version
+                self.loaded_versions.update(remapped_versions)
+                for side in ("left", "right"):
+                    path_attr = f"current_loaded_file_{side}"
+                    current_path = getattr(self, path_attr, None)
+                    if current_path and current_path.startswith(old_path + "/"):
+                        setattr(
+                            self,
+                            path_attr,
+                            new_path + current_path[len(old_path):],
+                        )
+                tree_changed = True
+                continue
             revision = change.get("revision", 0)
             is_deleted = bool(change.get("is_deleted"))
 
@@ -1384,12 +2074,24 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                     continue
 
                 setattr(self, path_attr, new_path)
-                editor.blockSignals(True)
-                editor.setPlainText(change.get("content") or "")
-                editor.document().setModified(False)
-                editor.blockSignals(False)
+                remote_content = change.get("content") or ""
+                if editor.toPlainText() != remote_content:
+                    editor.blockSignals(True)
+                    editor.setPlainText(remote_content)
+                    editor.document().setModified(False)
+                    editor.blockSignals(False)
+                else:
+                    editor.document().setModified(False)
                 setattr(self, dirty_attr, False)
-                self.controller.notify_file_opened(new_path, change.get("content") or "")
+                accept_remote = getattr(
+                    self.controller, "accept_remote_snapshot", None
+                )
+                if callable(accept_remote):
+                    accept_remote(new_path, remote_content)
+                else:
+                    self.controller.notify_file_opened(
+                        new_path, remote_content
+                    )
                 display_name = os.path.basename(new_path)
                 label.setText(display_name)
                 label.setStyleSheet(
@@ -1402,6 +2104,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
 
         if tree_changed:
             self._schedule_remote_tree_refresh()
+        refresh_status = getattr(
+            self, "_refresh_storage_status_for_editor_state", None
+        )
+        if callable(refresh_status):
+            refresh_status()
 
     def on_conflict_detected(self, payload, *legacy_args):
         """Keep the local manuscript untouched and surface a diff3 conflict artifact."""
@@ -1410,12 +2117,16 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         if isinstance(payload, dict):
             operation = payload.get("operation", {})
             rel_path = operation.get("local_path", "문서.txt")
+            base_content = payload.get(
+                "base_content", operation.get("base_content", "")
+            )
             merged_content = payload.get("merged_content", "")
             local_content = payload.get("local_content", operation.get("content", ""))
             server_content = (payload.get("remote") or {}).get("content", "")
         else:
             project_name = payload
             rel_path, local_content, server_content = legacy_args
+            base_content = None
             merged_content = (
                 "<<<<<<< 내 로컬 편집본\n" + local_content +
                 "\n=======\n" + server_content + "\n>>>>>>> 서버 최신본\n"
@@ -1435,9 +2146,17 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         server_path = os.path.join(
             conflict_dir, f"{base} (서버 최신본 {now_str}){ext}"
         ).replace("\\", "/")
+        comparison_path = os.path.join(
+            conflict_dir, f"{base} (차이점 비교 {now_str}).txt"
+        ).replace("\\", "/")
         self.wpm.write_text_file(merge_path, merged_content)
         self.wpm.write_text_file(local_path, local_content)
         self.wpm.write_text_file(server_path, server_content)
+        if base_content is not None:
+            self.wpm.write_text_file(
+                comparison_path,
+                build_conflict_report(base_content, local_content, server_content),
+            )
 
         target_label = self.lbl_current_doc
         if getattr(self, "current_loaded_file_right", None) == rel_path:
