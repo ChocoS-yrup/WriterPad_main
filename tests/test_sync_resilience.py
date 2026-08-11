@@ -48,7 +48,7 @@ class SyncResilienceTestCase(unittest.TestCase):
         )
         self.manager._auth_retry_blocked = False
         self.manager._auth_refresh_generation = 0
-        self.manager._shutting_down = False
+        self.manager.reset_shutdown_state()
 
     def tearDown(self):
         (
@@ -57,6 +57,8 @@ class SyncResilienceTestCase(unittest.TestCase):
             self.manager._auth_refresh_generation,
             self.manager._shutting_down,
         ) = self.previous
+        # 싱글턴이므로 종료 예산을 남겨두면 이후 테스트의 worker wait 이 0ms 가 된다.
+        self.manager.reset_shutdown_state()
 
     def test_expired_jwt_refreshes_once_persists_tokens_and_retries_call(self):
         client = _Client()

@@ -5,6 +5,7 @@ import re
 import stat
 import sys
 import threading
+import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
@@ -40,6 +41,12 @@ TREE_ORDER_DOCUMENT_PATH = "__antigravity__/tree-order.json"
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
 LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
 NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
+# 종료는 하나의 예산 안에서만 원격 작업을 시도한다. 예산이 끝나면 새 요청을
+# 만들지 않고 다음 실행으로 미룬다.
+SHUTDOWN_BUDGET_MS = 5000
+# 예산이 끝나도 실행 중인 QThread 는 강제 종료하지 않는다. HTTP timeout(5초)이
+# 끝날 때까지만 더 기다려 스레드 파괴로 인한 종료 크래시를 막는다.
+SHUTDOWN_GRACE_MS = 6000
 MAX_WINDOWS_COMPONENT_UTF16_UNITS = 255
 MAX_WINDOWS_DIRECTORY_PATH = 247
 TREE_ROOT_STORAGE_NAMES = ROOT_STORAGE_NAMES
@@ -498,6 +505,9 @@ class SyncManager(QObject):
         self._auth_refresh_generation = 0
         self._auth_retry_blocked = False
         self._shutting_down = False
+        self._draining = False
+        self._shutdown_deadline = None
+        self._shutdown_timer_stoppers = []
         self._diagnostics = SyncDiagnosticLog()
         self._last_diagnostic_state_signature = None
         self._cloud_config = None
@@ -1565,10 +1575,67 @@ class SyncManager(QObject):
             return False
         return True
 
-    def flush_pending_syncs(self, timeout_ms=8000):
+    def register_shutdown_timer_stopper(self, stopper):
+        """Register a callable that stops periodic work when shutdown begins."""
+        if callable(stopper) and stopper not in self._shutdown_timer_stoppers:
+            self._shutdown_timer_stoppers.append(stopper)
+        return stopper
+
+    def begin_shutdown(self, budget_ms=None):
+        """Freeze periodic work and open one bounded shutdown window.
+
+        Idempotent: the first call fixes the deadline so every later shutdown
+        step shares the same budget instead of adding its own timeout.
+        """
+        if self._shutdown_deadline is None:
+            budget = SHUTDOWN_BUDGET_MS if budget_ms is None else budget_ms
+            self._shutdown_deadline = time.monotonic() + max(0, int(budget)) / 1000.0
+        self._draining = True
+        try:
+            self._v2_retry_timer.stop()
+        except RuntimeError:
+            pass
+        self._v2_retry_context = None
+        for stopper in list(self._shutdown_timer_stoppers):
+            try:
+                stopper()
+            except (RuntimeError, TypeError):
+                pass
+        return self._shutdown_deadline
+
+    def reset_shutdown_state(self):
+        """Reopen normal operation on the reused singleton (long-lived tests)."""
+        self._shutting_down = False
+        self._draining = False
+        self._shutdown_deadline = None
+
+    def shutdown_remaining_ms(self):
+        """Milliseconds left in the shutdown budget, or None if not shutting down."""
+        if self._shutdown_deadline is None:
+            return None
+        return max(0, int(round((self._shutdown_deadline - time.monotonic()) * 1000)))
+
+    def _shutdown_budget_exhausted(self):
+        remaining = self.shutdown_remaining_ms()
+        return remaining is not None and remaining <= 0
+
+    def flush_pending_syncs(self, timeout_ms=None):
         """Give durable Sync V2 operations a bounded chance to finish before exit."""
+        # 주기 타이머를 먼저 멈춰야 아래 중첩 이벤트 루프가 도는 동안 새 워커가
+        # 생기지 않는다.
+        begin_shutdown = getattr(self, "begin_shutdown", None)
+        if callable(begin_shutdown):
+            begin_shutdown()
+        if timeout_ms is None:
+            remaining = getattr(self, "shutdown_remaining_ms", None)
+            timeout_ms = remaining() if callable(remaining) else None
+            if timeout_ms is None:
+                timeout_ms = SHUTDOWN_BUDGET_MS
         if not getattr(self, "cloud_network_enabled", True):
             return True
+        if getattr(self, "_last_cloud_error_kind", "") == "dns":
+            # 이름 해석이 이미 실패한 상태라면 재시도해도 timeout 만 소모한다.
+            return False
         if not self.is_v2_enabled:
             return True
         server_state = str(
@@ -6370,7 +6437,8 @@ class SyncManager(QObject):
         
         return worker
 
-    def wait_all_workers(self):
+    def _unique_workers(self):
+        """Collect every tracked worker once, keeping a strong reference."""
         lists = [
             getattr(self, '_workers', []),
             getattr(self, '_bulk_workers', []),
@@ -6383,26 +6451,63 @@ class SyncManager(QObject):
             getattr(self, '_server_action_workers', []),
             list(getattr(self, 'active_workers', set())),
         ]
+        seen = set()
+        workers = []
         for worker_list in lists:
             for worker in list(worker_list):
-                try:
-                    if worker.isRunning():
-                        worker.wait()
-                except RuntimeError:
-                    pass
+                if id(worker) in seen:
+                    continue
+                seen.add(id(worker))
+                workers.append(worker)
+        return workers
+
+    def wait_all_workers(self, timeout_ms=None):
+        """Wait for tracked threads, never terminating them.
+
+        Returns True when every worker finished. With no timeout and no open
+        shutdown window the wait stays unbounded, as long-running callers rely
+        on that.
+        """
+        if timeout_ms is None:
+            timeout_ms = self.shutdown_remaining_ms()
+        deadline = (
+            None
+            if timeout_ms is None
+            else time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+        )
+        drained = True
+        for worker in self._unique_workers():
+            try:
+                if not worker.isRunning():
+                    continue
+                if deadline is None:
+                    worker.wait()
+                    continue
+                remaining = int(round((deadline - time.monotonic()) * 1000))
+                if remaining <= 0 or not worker.wait(remaining):
+                    drained = False
+            except RuntimeError:
+                pass
+        return drained
 
     def shutdown(self):
-        """Stop retries, drain bounded background work, and close HTTP pools."""
+        """Stop retries, drain background work in budget, and close HTTP pools."""
+        self.begin_shutdown()
         self._shutting_down = True
-        self._v2_retry_timer.stop()
-        self._v2_retry_context = None
         self._autosave_followups.clear()
         with self._autosave_followup_lock:
             self._autosave_ready_followups.clear()
-        self.wait_all_workers()
-        self._diagnostics.flush()
-        if self.supabase is not None:
+        drained = self.wait_all_workers()
+        if not drained:
+            # 예산이 끝나도 스레드를 terminate() 하지 않는다. 실행 중인 QThread 를
+            # 파괴하면 종료가 크래시로 끝나므로 in-flight HTTP timeout 만큼만 더
+            # 기다린 뒤 남은 작업은 다음 실행으로 넘긴다.
+            drained = self.wait_all_workers(SHUTDOWN_GRACE_MS)
+        self._diagnostics.flush(timeout_ms=SHUTDOWN_GRACE_MS)
+        if drained and self.supabase is not None:
+            # 워커가 아직 client 를 쓰고 있을 수 있으므로 완전히 비었을 때만 닫는다.
             self._close_supabase_client(self.supabase)
+        return drained
 
 class RetentionWorker(QThread):
     resultReady = pyqtSignal(bool, str)

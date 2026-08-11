@@ -836,6 +836,15 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
     def _flush_writing_sync_before_close(self):
         writing_mode = getattr(self, "writing_mode", None)
         sync_manager = getattr(writing_mode, "sync_manager", None)
+        # 종료가 확정된 뒤에만 호출된다. 주기 작업을 먼저 멈추고 로컬 상태를
+        # 영속화한 다음에야 원격 전송을 시도해, 사용자가 대기 중 강제 종료해도
+        # 로컬 원고와 뷰 상태가 남게 한다.
+        begin_shutdown = getattr(sync_manager, "begin_shutdown", None)
+        if callable(begin_shutdown):
+            begin_shutdown()
+        persist_views = getattr(writing_mode, "persist_editor_view_states", None)
+        if callable(persist_views):
+            persist_views()
         if getattr(sync_manager, "cloud_network_enabled", None) is False:
             return True
         flush = getattr(sync_manager, "flush_pending_syncs", None)

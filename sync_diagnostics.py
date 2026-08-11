@@ -3,6 +3,7 @@ import os
 import queue
 import re
 import threading
+import time
 from datetime import datetime
 
 from runtime_profile import app_data_dir
@@ -151,8 +152,23 @@ class SyncDiagnosticLog:
                 "log_path": self.path,
             }
 
-    def flush(self):
-        self._queue.join()
+    def flush(self, timeout_ms=None):
+        """Wait for queued entries to be written.
+
+        Bounded when timeout_ms is given so a stalled log file cannot hold up
+        application shutdown. Returns True when the queue drained in time.
+        """
+        if timeout_ms is None:
+            self._queue.join()
+            return True
+        deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._queue.all_tasks_done.wait(remaining)
+        return True
 
     def _rotate(self):
         if self.backup_count <= 0:

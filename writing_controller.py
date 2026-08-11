@@ -1,3 +1,5 @@
+import time
+
 from PyQt6.QtCore import QObject, QTimer
 from datetime import datetime, timedelta
 
@@ -152,25 +154,54 @@ class WritingController(QObject):
             self.locked_paths.discard(path)
 
     def release_all_locks(self):
-        """현재 쥐고 있는 모든 락을 해제합니다. (앱 종료 시 등)"""
+        """현재 쥐고 있는 모든 락을 해제합니다. (앱 종료 시 등)
+
+        종료 예산이 남아 있을 때만 서버 요청을 만든다. 예산이 끝났거나
+        클라우드를 쓸 수 없으면 서버 lease 는 TTL 로 만료되게 두고 종료를
+        지연시키지 않는다.
+        """
+        if getattr(self.sync_manager, "cloud_network_enabled", True) is False:
+            self.locked_paths.clear()
+            return
+        remaining = getattr(self.sync_manager, "shutdown_remaining_ms", None)
+        if callable(remaining) and remaining() == 0:
+            self.locked_paths.clear()
+            return
         paths = set(self.locked_paths)
         if bool(getattr(self.sync_manager, "is_v2_enabled", False)):
             paths.update(self.get_active_paths() or [])
         for path in list(paths):
             self.release_lock(path)
-            
-    def wait_all_workers(self):
+
+    def wait_all_workers(self, timeout_ms=None):
+        """락 워커가 끝나기를 기다린다. 스레드를 강제 종료하지는 않는다."""
         self.stop_timers()
+        if timeout_ms is None:
+            remaining = getattr(self.sync_manager, "shutdown_remaining_ms", None)
+            timeout_ms = remaining() if callable(remaining) else None
+        deadline = (
+            None
+            if timeout_ms is None
+            else time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+        )
+        drained = True
         lists = [
             getattr(self, '_lock_workers', [])
         ]
         for worker_list in lists:
             for worker in list(worker_list):
                 try:
-                    if worker.isRunning():
+                    if not worker.isRunning():
+                        continue
+                    if deadline is None:
                         worker.wait()
+                        continue
+                    left = int(round((deadline - time.monotonic()) * 1000))
+                    if left <= 0 or not worker.wait(left):
+                        drained = False
                 except RuntimeError:
                     pass
+        return drained
 
     def stop_timers(self):
         for timer in (

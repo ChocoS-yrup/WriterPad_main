@@ -311,9 +311,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         from PyQt6.QtWidgets import QApplication
         app = QApplication.instance()
         if app:
+            # 예산을 먼저 열어 주기 타이머를 멈춘 뒤에만 lease 를 해제한다.
+            # 그래야 해제 도중 autosave/heartbeat/pull 워커가 새로 뜨지 않는다.
+            app.aboutToQuit.connect(self.sync_manager.begin_shutdown)
             app.aboutToQuit.connect(self.controller.release_all_locks)
             app.aboutToQuit.connect(self.controller.wait_all_workers)
             app.aboutToQuit.connect(self.sync_manager.shutdown)
+        self.sync_manager.register_shutdown_timer_stopper(self.controller.stop_timers)
+        self.sync_manager.register_shutdown_timer_stopper(self._stop_remote_pull_timer)
         
         self.init_ui()
         self.sync_manager.syncStateChanged.connect(self.update_storage_status)
@@ -448,6 +453,12 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 remembered = self._remember_editor_view_state(editor) or remembered
         if remembered:
             self.pm.save_global_config()
+
+    def _stop_remote_pull_timer(self):
+        """종료 예산이 열리면 5초 주기 원격 pull 을 멈춘다."""
+        timer = getattr(self, "remote_pull_timer", None)
+        if timer is not None:
+            timer.stop()
 
     def closeEvent(self, event):
         self.persist_editor_view_states()

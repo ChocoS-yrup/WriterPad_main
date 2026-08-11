@@ -90,7 +90,7 @@ class LongRunResourceTestCase(unittest.TestCase):
 
     def setUp(self):
         self.manager = SyncManager()
-        self.manager._shutting_down = False
+        self.manager.reset_shutdown_state()
         self.manager._v2_store = None
         self.manager._v2_context = None
         self.manager._v2_device_id = None
