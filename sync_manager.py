@@ -44,6 +44,9 @@ NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
 # 종료는 하나의 예산 안에서만 원격 작업을 시도한다. 예산이 끝나면 새 요청을
 # 만들지 않고 다음 실행으로 미룬다.
 SHUTDOWN_BUDGET_MS = 5000
+# remote flush 가 예산을 다 쓰면 lease 해제와 worker 정리에 쓸 시간이 없다.
+# 나머지는 종료 후반부를 위해 남긴다.
+SHUTDOWN_FLUSH_BUDGET_MS = 3500
 # 예산이 끝나도 실행 중인 QThread 는 강제 종료하지 않는다. HTTP timeout(5초)이
 # 끝날 때까지만 더 기다려 스레드 파괴로 인한 종료 크래시를 막는다.
 SHUTDOWN_GRACE_MS = 6000
@@ -1619,6 +1622,13 @@ class SyncManager(QObject):
         remaining = self.shutdown_remaining_ms()
         return remaining is not None and remaining <= 0
 
+    def remote_calls_are_pointless(self):
+        """True when a further server request can only burn the shutdown budget."""
+        if not getattr(self, "cloud_network_enabled", True):
+            return True
+        # 이름 해석이 이미 실패했다면 재시도해도 timeout 만 소모한다.
+        return getattr(self, "_last_cloud_error_kind", "") == "dns"
+
     def flush_pending_syncs(self, timeout_ms=None):
         """Give durable Sync V2 operations a bounded chance to finish before exit."""
         # 주기 타이머를 먼저 멈춰야 아래 중첩 이벤트 루프가 도는 동안 새 워커가
@@ -1631,10 +1641,11 @@ class SyncManager(QObject):
             timeout_ms = remaining() if callable(remaining) else None
             if timeout_ms is None:
                 timeout_ms = SHUTDOWN_BUDGET_MS
+            timeout_ms = min(timeout_ms, SHUTDOWN_FLUSH_BUDGET_MS)
         if not getattr(self, "cloud_network_enabled", True):
             return True
-        if getattr(self, "_last_cloud_error_kind", "") == "dns":
-            # 이름 해석이 이미 실패한 상태라면 재시도해도 timeout 만 소모한다.
+        pointless = getattr(self, "remote_calls_are_pointless", None)
+        if callable(pointless) and pointless():
             return False
         if not self.is_v2_enabled:
             return True

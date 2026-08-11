@@ -160,7 +160,8 @@ class WritingController(QObject):
         클라우드를 쓸 수 없으면 서버 lease 는 TTL 로 만료되게 두고 종료를
         지연시키지 않는다.
         """
-        if getattr(self.sync_manager, "cloud_network_enabled", True) is False:
+        pointless = getattr(self.sync_manager, "remote_calls_are_pointless", None)
+        if callable(pointless) and pointless():
             self.locked_paths.clear()
             return
         remaining = getattr(self.sync_manager, "shutdown_remaining_ms", None)

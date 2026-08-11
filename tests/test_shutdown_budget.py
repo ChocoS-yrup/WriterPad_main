@@ -14,7 +14,11 @@ from tests.qt_app import APP
 from mode_assistant import AssistantModeWidget
 from mode_writing import WritingModeWidget
 from sync_diagnostics import SyncDiagnosticLog
-from sync_manager import SHUTDOWN_BUDGET_MS, SyncManager
+from sync_manager import (
+    SHUTDOWN_BUDGET_MS,
+    SHUTDOWN_FLUSH_BUDGET_MS,
+    SyncManager,
+)
 from writing_controller import WritingController
 
 
@@ -125,6 +129,17 @@ class ShutdownBudgetTestCase(unittest.TestCase):
 
         self.assertFalse(completed)
         self.assertLess(elapsed_ms, SHUTDOWN_BUDGET_MS * 1.5)
+
+    def test_flush_leaves_budget_for_lease_release_and_worker_drain(self):
+        self._enable_stuck_v2_queue()
+
+        self.manager.flush_pending_syncs()
+
+        # 큐가 끝내 비지 않아도 종료 후반부에 쓸 예산이 남아야 한다.
+        self.assertGreater(self.manager.shutdown_remaining_ms(), 0)
+        self.assertLessEqual(
+            SHUTDOWN_FLUSH_BUDGET_MS, SHUTDOWN_BUDGET_MS
+        )
 
     def test_second_begin_shutdown_does_not_extend_the_deadline(self):
         first = self.manager.begin_shutdown(budget_ms=400)
@@ -324,7 +339,7 @@ class ShutdownBudgetTestCase(unittest.TestCase):
 
     def test_release_all_locks_is_skipped_once_the_budget_is_gone(self):
         sync_manager = MagicMock()
-        sync_manager.cloud_network_enabled = True
+        sync_manager.remote_calls_are_pointless.return_value = False
         sync_manager.is_v2_enabled = True
         sync_manager.shutdown_remaining_ms.return_value = 0
         controller = self._controller(sync_manager, ["메인/원고/1권/001화.txt"])
@@ -337,7 +352,7 @@ class ShutdownBudgetTestCase(unittest.TestCase):
 
     def test_release_all_locks_is_skipped_when_cloud_is_unusable(self):
         sync_manager = MagicMock()
-        sync_manager.cloud_network_enabled = False
+        sync_manager.remote_calls_are_pointless.return_value = True
         controller = self._controller(sync_manager, ["메인/원고/1권/001화.txt"])
         controller.locked_paths.add("메인/원고/1권/001화.txt")
 
@@ -346,9 +361,23 @@ class ShutdownBudgetTestCase(unittest.TestCase):
         sync_manager.release_lock_async.assert_not_called()
         self.assertEqual(controller.locked_paths, set())
 
+    def test_confirmed_dns_failure_also_skips_lease_release(self):
+        self.manager.cloud_config_state = "ready"
+        self.manager.supabase = SimpleNamespace()
+        self.manager._last_cloud_error_kind = "dns"
+        self.assertTrue(self.manager.remote_calls_are_pointless())
+
+        controller = self._controller(self.manager, ["메인/원고/1권/001화.txt"])
+        controller.locked_paths.add("메인/원고/1권/001화.txt")
+        with patch.object(self.manager, "release_lock_async") as release:
+            controller.release_all_locks()
+
+        release.assert_not_called()
+        self.assertEqual(controller.locked_paths, set())
+
     def test_release_all_locks_still_runs_inside_the_budget(self):
         sync_manager = MagicMock()
-        sync_manager.cloud_network_enabled = True
+        sync_manager.remote_calls_are_pointless.return_value = False
         sync_manager.is_v2_enabled = True
         sync_manager.shutdown_remaining_ms.return_value = 900
         path = "메인/원고/1권/001화.txt"
