@@ -8,6 +8,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sync_contract import (
     CANONICAL_CONTRACT_BYTES,
@@ -445,6 +446,208 @@ class ContractStoreTests(unittest.TestCase):
         self.assertEqual(
             self.store.get_folder_by_id(child["folder_id"])["local_path"],
             "메인/메모장/새 이름",
+        )
+
+    def test_contract_path_batch_rolls_back_batch_and_snapshot_together(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        child = self._folder_snapshot(
+            "메인/메모장/이전", parent_id=parent["folder_id"], revision=3
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, child]
+        )
+        old_path = Path(manager._v2_wpm.writing_root_path, child["local_path"])
+        new_path = old_path.with_name("이후")
+        old_path.mkdir(parents=True)
+        old_path.rename(new_path)
+        operations = manager.record_path_change(
+            child["local_path"], "메인/메모장/이후", retry=False
+        )
+
+        with patch.object(
+            self.store, "move_folder_paths",
+            side_effect=RuntimeError("injected snapshot failure"),
+        ), self.assertRaises(RuntimeError):
+            manager.queue_contract_path_change_with_order(
+                operations, {"메인/메모장": ["이후"]}, retry=False
+            )
+
+        self.assertIsNotNone(
+            self.store.get_folder_by_path(
+                self.context["local_key"], child["local_path"]
+            )
+        )
+        self.assertIsNone(
+            self.store.get_folder_by_path(
+                self.context["local_key"], "메인/메모장/이후"
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sync_contract_batches"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_combined_rename_move_supersedes_predecessor_once(self):
+        manager = self._contract_manager()
+        source = self._folder_snapshot("메인/메모장/원본")
+        target = self._folder_snapshot("메인/메모장/대상")
+        child = self._folder_snapshot(
+            "메인/메모장/원본/이전",
+            parent_id=source["folder_id"],
+            revision=5,
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [source, target, child]
+        )
+        predecessor = self.store.create_structure_batch(
+            self.context,
+            DEVICE_ID,
+            [{
+                "entity_kind": "folder",
+                "entity_id": child["folder_id"],
+                "intent_kind": "rename",
+                "base_revision": 5,
+                "payload": {"name": "대기 중"},
+            }],
+        )["ordered_intents"][0]
+        old_path = Path(manager._v2_wpm.writing_root_path, child["local_path"])
+        new_rel_path = "메인/메모장/대상/이후"
+        new_path = Path(manager._v2_wpm.writing_root_path, new_rel_path)
+        old_path.mkdir(parents=True)
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.rename(new_path)
+
+        operations = manager.record_path_change(
+            child["local_path"], new_rel_path, retry=False
+        )
+        request = manager.queue_contract_path_change_with_order(
+            operations,
+            {"메인/메모장/대상": ["이후"]},
+            retry=False,
+        )
+        rename, move, _order = request["ordered_intents"]
+        self.assertEqual(
+            rename["supersedes_operation_id"], predecessor["operation_id"]
+        )
+        self.assertNotIn("supersedes_operation_id", move)
+        self.assertEqual(
+            self.store.operation(predecessor["operation_id"])["status"],
+            "cancelled",
+        )
+
+    def test_folder_create_delete_restore_are_atomic_lifecycle_batches(self):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent]
+        )
+        created_path = "메인/메모장/새 폴더"
+        Path(
+            manager._v2_wpm.writing_root_path, created_path
+        ).mkdir(parents=True)
+        create_operations = manager.record_path_change(
+            created_path, created_path, retry=False
+        )
+        create_request = manager.queue_contract_path_change_with_order(
+            create_operations,
+            {"메인/메모장": ["새 폴더"]},
+            retry=False,
+        )
+        self.assertEqual(
+            [item["intent_kind"] for item in create_request["ordered_intents"]],
+            ["create", "reorder"],
+        )
+        created = self.store.get_folder_by_path(
+            self.context["local_key"], created_path
+        )
+        self.assertIsNotNone(created)
+
+        # Simulate the server-proven revision used by later lifecycle intents.
+        snapshots = [parent, {
+            "folder_id": created["folder_id"],
+            "parent_folder_id": parent["folder_id"],
+            "local_path": created_path,
+            "name": "새 폴더",
+            "revision": 1,
+            "is_deleted": False,
+        }]
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], snapshots
+        )
+        delete_operations = manager.record_tombstone(
+            created_path, "메인/휴지통/새 폴더", retry=False
+        )
+        delete_request = manager.queue_contract_path_change_with_order(
+            delete_operations,
+            {"메인/메모장": []},
+            retry=False,
+        )
+        self.assertEqual(
+            [item["intent_kind"] for item in delete_request["ordered_intents"]],
+            ["delete", "reorder"],
+        )
+        self.assertTrue(
+            self.store.get_folder_by_id(created["folder_id"])["is_deleted"]
+        )
+
+        restored_path = "메인/메모장/복원 폴더"
+        restore_operations = manager.record_restore(
+            "메인/휴지통/새 폴더",
+            restored_path,
+            original_rel_path=created_path,
+            retry=False,
+        )
+        restore_request = manager.queue_contract_path_change_with_order(
+            restore_operations,
+            {"메인/메모장": ["복원 폴더"]},
+            retry=False,
+        )
+        self.assertEqual(
+            [item["intent_kind"] for item in restore_request["ordered_intents"]],
+            ["restore", "reorder"],
+        )
+        restored = self.store.get_folder_by_id(created["folder_id"])
+        self.assertEqual(restored["local_path"], restored_path)
+        self.assertFalse(restored["is_deleted"])
+
+    def test_compatible_legacy_uses_protocol_three_without_promotion(self):
+        project = self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = {**self.context, **project}
+        manager._v2_device_id = DEVICE_ID
+        manager._v2_wpm = SimpleNamespace(
+            writing_root_path=str(Path(self.temp.name) / "writing"),
+            read_text_file=lambda _path: None,
+            project_settings={"tree_order": {}},
+            save_settings=lambda: True,
+        )
+        parent = self._folder_snapshot("메인/메모장")
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent]
+        )
+
+        request = manager.record_tree_order(
+            {"메인/메모장": []}, retry=False
+        )
+
+        self.assertEqual(request["project_sync_mode"], "LEGACY")
+        self.assertEqual(request["migration_epoch"], 0)
+        stored = self.store.get_project(self.context["local_key"])
+        self.assertEqual(
+            (stored["project_sync_mode"], stored["migration_epoch"]),
+            ("LEGACY", 0),
         )
 
     def test_contract_document_move_and_order_share_one_atomic_batch(self):

@@ -209,6 +209,69 @@ class WritingDataTestCase(unittest.TestCase):
         )
         self.assertEqual(saved["메인/메모장"][1], "새 폴더F")
 
+    def test_drag_drop_routes_path_and_order_through_one_contract_batch(self):
+        panel = WritingTreeMixin()
+        panel.wpm = SimpleNamespace(
+            move_item=MagicMock(return_value="메인/대상/문서.txt")
+        )
+        panel.sync_manager = MagicMock()
+        panel.sync_manager.local_structure_mutation.return_value = nullcontext()
+        operations = [{"contract_structure_intents": [{"intent_kind": "move"}]}]
+        panel.sync_manager.record_path_change.return_value = operations
+        panel.controller = MagicMock()
+        panel.save_tree_order_for_rename = MagicMock()
+        panel.current_loaded_file_left = None
+        panel.current_loaded_file_right = None
+        item = MagicMock()
+        item.childCount.return_value = 0
+
+        WritingTreeMixin.handle_item_moved(
+            panel, item, "메인/원본/문서.txt", "메인/대상"
+        )
+
+        panel.sync_manager.record_path_change.assert_called_once_with(
+            "메인/원본/문서.txt", "메인/대상/문서.txt", retry=False
+        )
+        panel.save_tree_order_for_rename.assert_called_once_with(
+            "메인/원본/문서.txt",
+            "메인/대상/문서.txt",
+            retry=False,
+            operations=operations,
+        )
+        panel.sync_manager.retry_pending_syncs.assert_called_once_with()
+
+    def test_drag_drop_rolls_filesystem_back_when_batch_queue_fails(self):
+        panel = WritingTreeMixin()
+        panel.wpm = SimpleNamespace(
+            move_item=MagicMock(return_value="메인/대상/문서.txt"),
+            rename_item=MagicMock(return_value=True),
+        )
+        panel.sync_manager = MagicMock()
+        panel.sync_manager.local_structure_mutation.return_value = nullcontext()
+        panel.sync_manager.record_path_change.return_value = [{
+            "contract_structure_intents": [{"intent_kind": "move"}]
+        }]
+        panel.controller = MagicMock()
+        panel.save_tree_order_for_rename = MagicMock(
+            side_effect=RuntimeError("injected batch failure")
+        )
+        panel.current_loaded_file_left = None
+        panel.current_loaded_file_right = None
+        panel.loaded_versions = {}
+        panel.load_tree_data = MagicMock()
+        item = MagicMock()
+        item.childCount.return_value = 0
+
+        with patch("writing_tree.QMessageBox.warning"):
+            WritingTreeMixin.handle_item_moved(
+                panel, item, "메인/원본/문서.txt", "메인/대상"
+            )
+
+        panel.wpm.rename_item.assert_called_once_with(
+            "메인/대상/문서.txt", "메인/원본/문서.txt"
+        )
+        panel.sync_manager.retry_pending_syncs.assert_not_called()
+
     def test_root_folder_rename_updates_logical_root_order(self):
         old_path = "메인/새 폴더1"
         new_path = "메인/새 폴더2"

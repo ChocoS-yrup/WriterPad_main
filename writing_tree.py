@@ -186,11 +186,61 @@ class WritingTreeMixin:
             is_folder = bool(item.data(0, Qt.ItemDataRole.UserRole + 1))
         except RuntimeError:
             return False
-        if rel_path and not is_folder and hasattr(self, "sync_manager"):
-            self.sync_manager.record_path_change(rel_path, rel_path)
-        self._finish_tree_item_creation(item)
-        self.save_tree_order()
-        return True
+        sync_manager = getattr(self, "sync_manager", None)
+        if not hasattr(getattr(self, "wpm", None), "project_settings"):
+            if rel_path and not is_folder and sync_manager is not None:
+                sync_manager.record_path_change(rel_path, rel_path)
+            self._finish_tree_item_creation(item)
+            self.save_tree_order()
+            return True
+        try:
+            mutation_gate = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None else nullcontext()
+            )
+            with mutation_gate:
+                operations = []
+                if rel_path and sync_manager is not None:
+                    if is_folder:
+                        operations = sync_manager.record_path_change(
+                            rel_path, rel_path, retry=False
+                        )
+                    else:
+                        operation = sync_manager.record_created_document(
+                            rel_path, retry=False
+                        )
+                        if operation:
+                            operations = [operation]
+                self._finish_tree_item_creation(item)
+                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                if operations and any(
+                    operation.get("contract_structure_intents")
+                    for operation in operations
+                    if isinstance(operation, dict)
+                ):
+                    sync_manager.queue_contract_path_change_with_order(
+                        operations, tree_order, retry=False
+                    )
+                elif operations:
+                    self.defer_tree_order_until_operations(
+                        operations, tree_order=tree_order
+                    )
+                else:
+                    WritingTreeMixin._persist_tree_order(
+                        self, tree_order, retry=False
+                    )
+            if sync_manager is not None:
+                sync_manager.retry_pending_syncs()
+            return True
+        except Exception:
+            if sync_manager is not None and rel_path:
+                sync_manager.record_structure_recovery(
+                    rel_path, rel_path, "CREATE_DURABILITY_FAILED"
+                )
+            self._finish_tree_item_creation(item)
+            if hasattr(self, "load_tree_data"):
+                self.load_tree_data()
+            return False
 
     def _finalize_current_tree_creation(self):
         item = getattr(self, "_tree_creation_item", None)
@@ -716,10 +766,18 @@ class WritingTreeMixin:
             try:
                 trash_rel_path = self.wpm.move_to_trash(rel_path)
                 if hasattr(self, "sync_manager"):
-                    self.sync_manager.record_tombstone(rel_path, trash_rel_path)
+                    operations = self.sync_manager.record_tombstone(
+                        rel_path, trash_rel_path, retry=False
+                    )
+                else:
+                    operations = []
                 if hasattr(self, "controller"):
                     self.controller.forget_path(rel_path)
-                self._cleanup_after_delete(rel_path, item)
+                self._cleanup_after_delete(
+                    rel_path, item, operations=operations
+                )
+                if hasattr(self, "sync_manager"):
+                    self.sync_manager.retry_pending_syncs()
 
                 # 휴지통 노드 시각적 갱신
                 for i in range(self.binder_tree.topLevelItemCount()):
@@ -734,6 +792,18 @@ class WritingTreeMixin:
                                 QTreeWidgetItem(trash_item, ["<dummy>"])
                         break
             except Exception as e:
+                if 'trash_rel_path' in locals():
+                    try:
+                        self.wpm.restore_from_trash(trash_rel_path)
+                    except Exception:
+                        sync_manager = getattr(self, "sync_manager", None)
+                        if sync_manager is not None:
+                            sync_manager.record_structure_recovery(
+                                rel_path,
+                                trash_rel_path,
+                                "DELETE_ROLLBACK_FAILED",
+                            )
+                    self.load_tree_data()
                 QMessageBox.warning(self, "오류", f"삭제 실패: {e}")
 
     def restore_trash_item(self, item, choose_location=False):
@@ -757,17 +827,59 @@ class WritingTreeMixin:
             destination_parent = os.path.relpath(selected, self.wpm.writing_root_path).replace("\\", "/")
 
         try:
+            trash_entry = next(
+                (
+                    entry for entry in self.wpm.list_trash_items()
+                    if entry.get("trash_path") == rel_path
+                ),
+                {},
+            )
+            original_rel_path = trash_entry.get("original_path")
             restored_path = self.wpm.restore_from_trash(rel_path, destination_parent)
             if hasattr(self, "sync_manager"):
-                self.sync_manager.record_restore(rel_path, restored_path)
+                operations = self.sync_manager.record_restore(
+                    rel_path,
+                    restored_path,
+                    original_rel_path=original_rel_path,
+                    retry=False,
+                )
+            else:
+                operations = []
             if hasattr(self, "controller"):
                 self.controller.rename_path(rel_path, restored_path)
             self.load_tree_data()
+            if operations and hasattr(self, "sync_manager"):
+                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                if any(
+                    operation.get("contract_structure_intents")
+                    for operation in operations
+                    if isinstance(operation, dict)
+                ):
+                    self.sync_manager.queue_contract_path_change_with_order(
+                        operations, tree_order, retry=False
+                    )
+                else:
+                    self.defer_tree_order_until_operations(
+                        operations, tree_order=tree_order
+                    )
+                self.sync_manager.retry_pending_syncs()
             QMessageBox.information(self, "복원 완료", f"다음 위치로 복원했습니다.\n{restored_path}")
         except Exception as e:
+            if 'restored_path' in locals():
+                try:
+                    self.wpm.move_to_trash(restored_path)
+                except Exception:
+                    sync_manager = getattr(self, "sync_manager", None)
+                    if sync_manager is not None:
+                        sync_manager.record_structure_recovery(
+                            rel_path,
+                            restored_path,
+                            "RESTORE_ROLLBACK_FAILED",
+                        )
+                self.load_tree_data()
             QMessageBox.warning(self, "복원 실패", str(e))
 
-    def _cleanup_after_delete(self, rel_path, item):
+    def _cleanup_after_delete(self, rel_path, item, operations=None):
         parent = item.parent()
         if parent:
             parent.removeChild(item)
@@ -797,7 +909,22 @@ class WritingTreeMixin:
             self.is_dirty_right = False
             self.right_editor.document().setModified(False)
 
-        self.save_tree_order()
+        if not hasattr(getattr(self, "wpm", None), "project_settings"):
+            self.save_tree_order()
+            return
+        tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+        if operations and any(
+            operation.get("contract_structure_intents")
+            for operation in operations
+            if isinstance(operation, dict)
+        ):
+            self.sync_manager.queue_contract_path_change_with_order(
+                operations, tree_order, retry=False
+            )
+        else:
+            WritingTreeMixin._persist_tree_order(
+                self, tree_order, retry=False
+            )
 
     def empty_trash(self):
         reply = QMessageBox.question(self, "휴지통 비우기", "휴지통의 모든 항목을 영구적으로 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -819,40 +946,122 @@ class WritingTreeMixin:
                 QMessageBox.warning(self, "오류", f"휴지통 비우기 실패: {e}")
 
     def handle_item_moved(self, item, old_rel_path, new_parent_rel_path):
+        new_rel_path = None
+        filesystem_changed = False
         try:
-            new_rel_path = self.wpm.move_item(old_rel_path, new_parent_rel_path)
-            if hasattr(self, "sync_manager"):
-                self.sync_manager.record_path_change(old_rel_path, new_rel_path)
-            if hasattr(self, "controller"):
-                self.controller.rename_path(old_rel_path, new_rel_path)
+            sync_manager = getattr(self, "sync_manager", None)
+            mutation_gate = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None else nullcontext()
+            )
+            with mutation_gate:
+                new_rel_path = self.wpm.move_item(
+                    old_rel_path, new_parent_rel_path
+                )
+                filesystem_changed = True
+                path_operations = []
+                if sync_manager is not None:
+                    path_operations = sync_manager.record_path_change(
+                        old_rel_path, new_rel_path, retry=False
+                    )
+                if hasattr(self, "controller"):
+                    self.controller.rename_path(old_rel_path, new_rel_path)
 
-            # 하위 항목들의 rel_path도 전부 업데이트
-            def update_paths(node, current_rel_path):
-                node.setData(0, Qt.ItemDataRole.UserRole, current_rel_path)
-                for i in range(node.childCount()):
-                    child = node.child(i)
-                    if child.text(0) == "<dummy>": continue
-                    child_basename = os.path.basename(child.data(0, Qt.ItemDataRole.UserRole))
-                    update_paths(child, os.path.join(current_rel_path, child_basename).replace("\\", "/"))
+                # 하위 항목들의 rel_path도 전부 업데이트
+                def update_paths(node, current_rel_path):
+                    node.setData(0, Qt.ItemDataRole.UserRole, current_rel_path)
+                    for i in range(node.childCount()):
+                        child = node.child(i)
+                        if child.text(0) == "<dummy>":
+                            continue
+                        child_basename = os.path.basename(
+                            child.data(0, Qt.ItemDataRole.UserRole)
+                        )
+                        update_paths(
+                            child,
+                            os.path.join(
+                                current_rel_path, child_basename
+                            ).replace("\\", "/"),
+                        )
 
-            update_paths(item, new_rel_path)
+                update_paths(item, new_rel_path)
 
-            def update_loaded_file(attr_name):
-                current_path = getattr(self, attr_name, None)
-                if current_path:
-                    if current_path == old_rel_path:
-                        setattr(self, attr_name, new_rel_path)
-                    elif current_path.startswith(old_rel_path + "/"):
-                        setattr(self, attr_name, current_path.replace(old_rel_path, new_rel_path, 1))
+                def update_loaded_file(attr_name):
+                    current_path = getattr(self, attr_name, None)
+                    if current_path:
+                        if current_path == old_rel_path:
+                            setattr(self, attr_name, new_rel_path)
+                        elif current_path.startswith(old_rel_path + "/"):
+                            setattr(
+                                self,
+                                attr_name,
+                                current_path.replace(
+                                    old_rel_path, new_rel_path, 1
+                                ),
+                            )
 
-            update_loaded_file('current_loaded_file_left')
-            update_loaded_file('current_loaded_file_right')
+                update_loaded_file('current_loaded_file_left')
+                update_loaded_file('current_loaded_file_right')
 
-            self.save_tree_order()
+                self.save_tree_order_for_rename(
+                    old_rel_path,
+                    new_rel_path,
+                    retry=False,
+                    operations=path_operations,
+                )
+            if sync_manager is not None:
+                sync_manager.retry_pending_syncs()
 
         except Exception as e:
+            if filesystem_changed and new_rel_path:
+                self._rollback_structure_path(new_rel_path, old_rel_path)
             QMessageBox.warning(self, "이동 실패", f"항목을 이동할 수 없습니다:\n{e}")
             self.load_tree_data() # UI 원복
+
+    def _rollback_structure_path(self, current_rel_path, original_rel_path):
+        """Restore filesystem and UI projection after durable queue failure."""
+        try:
+            self.wpm.rename_item(current_rel_path, original_rel_path)
+            if hasattr(self, "controller"):
+                self.controller.rename_path(
+                    current_rel_path, original_rel_path
+                )
+            for attr_name in (
+                "current_loaded_file_left", "current_loaded_file_right"
+            ):
+                current_path = getattr(self, attr_name, None)
+                if current_path == current_rel_path:
+                    setattr(self, attr_name, original_rel_path)
+                elif current_path and current_path.startswith(
+                    current_rel_path + "/"
+                ):
+                    setattr(
+                        self,
+                        attr_name,
+                        current_path.replace(
+                            current_rel_path, original_rel_path, 1
+                        ),
+                    )
+            versions = getattr(self, "loaded_versions", {})
+            restored = {}
+            for path in list(versions):
+                if path == current_rel_path or path.startswith(
+                    current_rel_path + "/"
+                ):
+                    restored[path.replace(
+                        current_rel_path, original_rel_path, 1
+                    )] = versions.pop(path)
+            versions.update(restored)
+            return True
+        except Exception:
+            sync_manager = getattr(self, "sync_manager", None)
+            if sync_manager is not None:
+                sync_manager.record_structure_recovery(
+                    original_rel_path,
+                    current_rel_path,
+                    "FILESYSTEM_ROLLBACK_FAILED",
+                )
+            return False
 
     def _current_tree_order_snapshot(self):
         saved_order = self.wpm.project_settings.get("tree_order", {})
@@ -1335,6 +1544,7 @@ class WritingTreeMixin:
                 print(f"[DEBUG] wpm object id = {id(self.wpm)}")
 
                 if self.wpm.writing_root_path:
+                    filesystem_changed = False
                     try:
                         sync_manager = getattr(self, "sync_manager", None)
                         mutation_gate = (
@@ -1344,6 +1554,7 @@ class WritingTreeMixin:
                         )
                         with mutation_gate:
                             self.wpm.rename_item(old_rel_path, new_rel_path)
+                            filesystem_changed = True
                             path_operations = []
                             if sync_manager is not None:
                                 path_operations = sync_manager.record_path_change(
@@ -1432,6 +1643,10 @@ class WritingTreeMixin:
                         from PyQt6.QtCore import QTimer
                         QTimer.singleShot(10, _set_active)
                     except Exception as e:
+                        if filesystem_changed:
+                            self._rollback_structure_path(
+                                new_rel_path, old_rel_path
+                            )
                         if was_creating:
                             self._finish_tree_item_creation(item)
                         print(f"[DEBUG] rename_item 실패! old={old_rel_path!r}, new={new_rel_path!r}, error={e!r}")

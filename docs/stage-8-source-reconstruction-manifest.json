@@ -1,8 +1,18 @@
 {
   "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+  "source_entry_snapshot_head": "833820d075bcb95cfba943893d64621fe2abac58",
   "stacked_pr_base_branch": "codex/stage-8-windows-contract-implementation",
   "local_history_reused": false,
-  "source_manifest_sha256": "8d9a38fb06b3a2e91a017a4825cd151ff85b8c5dd79529c33ba85b373a9158ab",
+  "source_entries_digest_sha256": "8d9a38fb06b3a2e91a017a4825cd151ff85b8c5dd79529c33ba85b373a9158ab",
+  "source_entries_digest_canonicalization": {
+    "entry_order": "path ascending",
+    "entry_encoding": "UTF-8",
+    "entry_record": "<path>\\u0000<decimal byte_count>\\u0000<lowercase output_sha256>\\n",
+    "excluded_paths": [
+      "docs/*",
+      "docs/stage-8-source-reconstruction-manifest.json"
+    ]
+  },
   "source_entry_count": 37,
   "safety_gate": {
     "utf8_text_only": true,
@@ -21,7 +31,9 @@
   },
   "validation": {
     "baseline_at_pr_1_head": "126 passed; 9 skipped",
-    "final_regression": "365 passed; 1 skipped",
+    "corrective_pr_1_head": "2a560c724d7f75bd455328e72c3a9c3cc39b7211",
+    "final_regression": "382 passed; 1 skipped; two consecutive full runs",
+    "backup_coalescing_repetition": "30 of 30 rounds passed with ManualWorker and real QThread coverage",
     "contract_release": "0.2.0",
     "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670"
   },

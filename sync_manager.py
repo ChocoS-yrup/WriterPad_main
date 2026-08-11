@@ -9,12 +9,15 @@ import unicodedata
 import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, QMutex, QMutexLocker, QTimer
+from PyQt6.QtCore import (
+    QObject, QThread, pyqtSignal, pyqtSlot, QMutex, QMutexLocker, QTimer,
+    QMetaObject, Qt,
+)
 
 from datetime import datetime
 
 from runtime_profile import is_forced_offline
-from sync_contract import SyncContractError
+from sync_contract import SyncContractError, require_server_compatibility
 from binder_order import (
     ROOT_STORAGE_NAMES,
     canonical_manuscript_children,
@@ -477,6 +480,8 @@ class SyncManager(QObject):
         self._autosave_workers = []
         self._autosave_workers_by_path = {}
         self._autosave_followups = {}
+        self._autosave_ready_followups = []
+        self._autosave_followup_lock = threading.Lock()
         self._retention_workers = []
         self._rename_workers = []
         self._retention_worker = None
@@ -780,31 +785,79 @@ class SyncManager(QObject):
             finally:
                 self._local_structure_generation += 1
 
-    def _uses_contract_structure(self):
-        return bool(
-            self.is_v2_enabled
-            and self._v2_context.get("project_sync_mode", "LEGACY") != "LEGACY"
+    def record_structure_recovery(
+        self, old_rel_path, new_rel_path, error_code="RECOVERY_FAILED"
+    ):
+        if not self.is_v2_enabled:
+            return None
+        recovery_id = self._v2_store.record_structure_recovery(
+            self._v2_context["local_key"],
+            old_rel_path,
+            new_rel_path,
+            error_code,
         )
+        self._publish_sync_state()
+        return recovery_id
 
-    def _folder_id_for_path(self, path, *, required=True):
+    def _uses_contract_structure(self):
+        if not self.is_v2_enabled:
+            return False
+        project = self._v2_store.get_project(self._v2_context["local_key"])
+        if not project:
+            return False
+        try:
+            require_server_compatibility(
+                project_sync_mode=project["project_sync_mode"],
+                migration_epoch=int(project["migration_epoch"] or 0),
+                server_protocol_version=int(project["server_protocol_version"] or 0),
+                server_contract_sha256=project["active_contract_sha256"] or "",
+                server_capabilities=json.loads(
+                    project["server_capabilities_json"] or "[]"
+                ),
+            )
+        except (SyncContractError, TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _path_before_local_change(path, aliases):
+        path = str(path or "").replace("\\", "/").strip("/")
+        for new_prefix, old_prefix in aliases or []:
+            if path == new_prefix:
+                return old_prefix
+            if path.startswith(new_prefix + "/"):
+                return old_prefix + path[len(new_prefix):]
+        return path
+
+    def _folder_id_for_path(
+        self, path, *, required=True, aliases=None, pending_folders=None
+    ):
         path = self._safe_relative_path(path) if path else ""
         if not path or path == "<root>":
             return None
+        pending = (pending_folders or {}).get(path)
+        if pending:
+            return pending["folder_id"]
+        lookup_path = self._path_before_local_change(path, aliases)
         folder = self._v2_store.get_folder_by_path(
-            self._v2_context["local_key"], path
+            self._v2_context["local_key"], lookup_path
         )
         if folder is None and required:
             raise SyncContractError("CONTRACT_STRUCTURE_IDS_REQUIRED")
         return folder["folder_id"] if folder else None
 
-    def _contract_tree_order_intents(self, tree_order):
+    def _contract_tree_order_intents(
+        self, tree_order, *, aliases=None, pending_folders=None
+    ):
         intents = []
         local_key = self._v2_context["local_key"]
         project_uuid = uuid.UUID(self._v2_context["project_id"])
         for raw_parent, raw_children in self._normalized_tree_order(tree_order).items():
             parent_path = canonical_tree_parent_path(raw_parent)
             parent_folder_id = self._folder_id_for_path(
-                "" if parent_path == "<root>" else parent_path
+                "" if parent_path == "<root>" else parent_path,
+                aliases=aliases,
+                pending_folders=pending_folders,
             )
             children = []
             for child_name in raw_children:
@@ -813,16 +866,28 @@ class SyncManager(QObject):
                     if parent_path == "<root>"
                     else f"{parent_path}/{child_name}"
                 )
-                folder = self._v2_store.get_folder_by_path(local_key, child_path)
+                pending = (pending_folders or {}).get(child_path)
+                if pending:
+                    children.append(pending["folder_id"])
+                    continue
+                lookup_path = self._path_before_local_change(
+                    child_path, aliases
+                )
+                folder = self._v2_store.get_folder_by_path(
+                    local_key, lookup_path
+                )
                 if folder:
                     children.append(folder["folder_id"])
                     continue
-                document = self._v2_store.get_document(local_key, child_path)
+                document = self._v2_store.get_document(local_key, lookup_path)
                 if document:
                     children.append(document["document_id"])
                     continue
                 raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
-            existing = self._v2_store.get_tree_order(local_key, parent_path)
+            existing = self._v2_store.get_tree_order(
+                local_key,
+                self._path_before_local_change(parent_path, aliases),
+            )
             tree_order_id = (
                 existing["tree_order_id"] if existing else
                 str(uuid.uuid5(
@@ -858,10 +923,40 @@ class SyncManager(QObject):
         self, path_operations, tree_order, retry=True
     ):
         intents = []
+        path_changes = []
+        aliases = []
+        pending_folders = {}
         for operation in path_operations or []:
             intents.extend(operation.get("contract_structure_intents") or [])
-        intents.extend(self._contract_tree_order_intents(tree_order))
-        return self.queue_contract_structure_intents(intents, retry=retry)
+            change = operation.get("contract_path_change")
+            if change:
+                path_changes.append(change)
+                old_path = change.get("old_path")
+                new_path = change.get("new_path")
+                if old_path and new_path and old_path != new_path:
+                    aliases.append((new_path, old_path))
+                pending = change.get("pending_folder")
+                if pending:
+                    pending_folders[pending["local_path"]] = pending
+                for pending in change.get("pending_folders") or []:
+                    pending_folders[pending["local_path"]] = pending
+        intents.extend(self._contract_tree_order_intents(
+            tree_order,
+            aliases=aliases,
+            pending_folders=pending_folders,
+        ))
+        if not intents:
+            return None
+        request = self._v2_store.create_structure_batch_with_path_changes(
+            self._v2_context,
+            self._v2_device_id,
+            intents,
+            path_changes,
+        )
+        self._publish_sync_state()
+        if retry:
+            self.retry_pending_syncs()
+        return request
 
     def record_tree_order(self, tree_order, retry=True):
         """Persist project binder order as one hidden revisioned v2 document."""
@@ -5740,20 +5835,12 @@ class SyncManager(QObject):
                 self._autosave_workers_by_path.pop(worker_key, None)
             followup = self._autosave_followups.pop(worker_key, None)
             if followup and not self._shutting_down:
-                next_wpm, next_path, next_content, callbacks = followup
-
-                def notify_callbacks(success, error_msg):
-                    for pending_callback in callbacks:
-                        pending_callback(success, error_msg)
-
-                QTimer.singleShot(
-                    0,
-                    lambda: self.upload_autosave_async(
-                        next_wpm,
-                        next_path,
-                        next_content,
-                        notify_callbacks if callbacks else None,
-                    ),
+                with self._autosave_followup_lock:
+                    self._autosave_ready_followups.append(followup)
+                QMetaObject.invokeMethod(
+                    self,
+                    "_drain_autosave_followups",
+                    Qt.ConnectionType.QueuedConnection,
                 )
                 
         def handle_finished(success, error_msg):
@@ -5768,11 +5855,40 @@ class SyncManager(QObject):
         self._active_backups += 1
         self._publish_sync_state()
         worker.resultReady.connect(handle_finished)
-        worker.finished.connect(cleanup_worker)
+        worker.finished.connect(
+            cleanup_worker,
+            Qt.ConnectionType.DirectConnection,
+        )
         worker.finished.connect(worker.deleteLater)
         self._start_worker(worker)
         
         return worker
+
+    def _start_autosave_followup(
+        self, wpm, relative_path, content, callbacks
+    ):
+        if self._shutting_down:
+            return None
+
+        def notify_callbacks(success, error_msg):
+            for pending_callback in callbacks or []:
+                pending_callback(success, error_msg)
+
+        return self.upload_autosave_async(
+            wpm,
+            relative_path,
+            content,
+            notify_callbacks if callbacks else None,
+        )
+
+    @pyqtSlot()
+    def _drain_autosave_followups(self):
+        while True:
+            with self._autosave_followup_lock:
+                if not self._autosave_ready_followups:
+                    return
+                followup = self._autosave_ready_followups.pop(0)
+            self._start_autosave_followup(*followup)
 
     def rename_item_async(self, project_name, old_rel_path, new_rel_path, callback=None):
         if self.is_v2_enabled:
@@ -5810,16 +5926,20 @@ class SyncManager(QObject):
         old_name = old_rel_path.rsplit("/", 1)[-1]
         new_name = new_rel_path.rsplit("/", 1)[-1]
         intents = []
+        pending_folder = None
 
         folder = self._v2_store.get_folder_by_path(local_key, old_rel_path)
         if folder is None and os.path.isdir(new_full_path):
             parent_folder_id = self._folder_id_for_path(
                 "" if new_parent in {"", "메인"} else new_parent
             )
-            folder = self._v2_store.ensure_local_folder(
-                local_key, old_rel_path if old_rel_path == new_rel_path else new_rel_path,
-                parent_folder_id=parent_folder_id,
-            )
+            folder = {
+                "folder_id": str(uuid.uuid4()),
+                "local_path": new_rel_path,
+                "parent_folder_id": parent_folder_id,
+                "revision": 0,
+            }
+            pending_folder = dict(folder)
         if folder is not None:
             parent_folder_id = self._folder_id_for_path(
                 "" if new_parent in {"", "메인"} else new_parent
@@ -5855,9 +5975,6 @@ class SyncManager(QObject):
                         "base_revision": revision,
                         "payload": {"parent_folder_id": parent_folder_id},
                     })
-            self._v2_store.move_folder_paths(
-                local_key, old_rel_path, new_rel_path
-            )
         else:
             document = self._v2_store.get_document(local_key, old_rel_path)
             if document is not None and int(document.get("revision") or 0) > 0:
@@ -5881,13 +5998,93 @@ class SyncManager(QObject):
                         "payload": {"parent_folder_id": new_parent_id},
                     })
 
+        superseded_entities = set()
         for intent in intents:
+            entity_id = intent["entity_id"]
+            if entity_id not in superseded_entities:
+                previous = self._v2_store.latest_active_structure_operation(
+                    entity_id
+                )
+                if previous:
+                    intent["supersedes_operation_id"] = previous["operation_id"]
+                superseded_entities.add(entity_id)
+        return intents, pending_folder
+
+    def _contract_folder_lifecycle_plan(
+        self, old_rel_path, new_rel_path, intent_kind
+    ):
+        old_rel_path = self._safe_relative_path(old_rel_path)
+        new_rel_path = self._safe_relative_path(new_rel_path)
+        folders = [
+            folder for folder in self._v2_store.list_folders(
+                self._v2_context["local_key"]
+            )
+            if folder["local_path"] == old_rel_path
+            or folder["local_path"].startswith(old_rel_path + "/")
+        ]
+        if intent_kind == "delete":
+            folders = [folder for folder in folders if not folder["is_deleted"]]
+            folders.sort(key=lambda item: item["local_path"].count("/"), reverse=True)
+        else:
+            folders = [folder for folder in folders if folder["is_deleted"]]
+            folders.sort(key=lambda item: item["local_path"].count("/"))
+        if not folders:
+            return None
+
+        intents = []
+        updates = []
+        pending_folders = []
+        for folder in folders:
+            suffix = folder["local_path"][len(old_rel_path):]
+            updated_path = new_rel_path + suffix
+            parent_id = folder.get("parent_folder_id")
+            payload = {}
+            if intent_kind == "restore":
+                if not suffix:
+                    parent_path = (
+                        new_rel_path.rsplit("/", 1)[0]
+                        if "/" in new_rel_path else ""
+                    )
+                    parent_id = self._folder_id_for_path(
+                        "" if parent_path in {"", "메인"} else parent_path
+                    )
+                payload = {
+                    "name": updated_path.rsplit("/", 1)[-1],
+                    "parent_folder_id": parent_id,
+                }
+                pending_folders.append({
+                    "folder_id": folder["folder_id"],
+                    "local_path": updated_path,
+                    "parent_folder_id": parent_id,
+                })
+            intent = {
+                "entity_kind": "folder",
+                "entity_id": folder["folder_id"],
+                "intent_kind": intent_kind,
+                "base_revision": int(folder["revision"]),
+                "payload": payload,
+            }
             previous = self._v2_store.latest_active_structure_operation(
-                intent["entity_id"]
+                folder["folder_id"]
             )
             if previous:
                 intent["supersedes_operation_id"] = previous["operation_id"]
-        return intents
+            intents.append(intent)
+            updates.append({
+                "folder_id": folder["folder_id"],
+                "local_path": updated_path,
+                "parent_folder_id": parent_id,
+                "is_deleted": intent_kind == "delete",
+            })
+        return {
+            "contract_structure_intents": intents,
+            "contract_path_change": {
+                "old_path": old_rel_path,
+                "new_path": old_rel_path,
+                "folder_updates": updates,
+                "pending_folders": pending_folders,
+            },
+        }
 
     def record_path_change(self, old_rel_path, new_rel_path, retry=True):
         if not self.is_v2_enabled:
@@ -5895,10 +6092,20 @@ class SyncManager(QObject):
         if not is_live_document_path(old_rel_path) or not is_live_document_path(new_rel_path):
             return []
         with self._structure_mutation_gate:
-            contract_intents = (
+            contract_plan = (
                 self._contract_path_change_intents(old_rel_path, new_rel_path)
-                if self._uses_contract_structure() else []
+                if self._uses_contract_structure() else None
             )
+            if contract_plan is not None:
+                contract_intents, pending_folder = contract_plan
+                return [{
+                    "contract_structure_intents": contract_intents,
+                    "contract_path_change": {
+                        "old_path": self._safe_relative_path(old_rel_path),
+                        "new_path": self._safe_relative_path(new_rel_path),
+                        "pending_folder": pending_folder,
+                    },
+                }]
             moved = self._v2_store.move_local_path(
                 self._v2_context["local_key"], old_rel_path, new_rel_path
             )
@@ -5941,10 +6148,6 @@ class SyncManager(QObject):
                                 )
                                 moved.append({**document, "local_path": local_path})
 
-            if self._uses_contract_structure() and contract_intents:
-                self._publish_sync_state()
-                return [{"contract_structure_intents": contract_intents}]
-
             operations = []
             for document in moved:
                 local_path = document["local_path"]
@@ -5961,9 +6164,14 @@ class SyncManager(QObject):
             self.retry_pending_syncs()
         return operations
 
-    def record_tombstone(self, old_rel_path, trash_rel_path):
+    def record_tombstone(self, old_rel_path, trash_rel_path, retry=True):
         if not self.is_v2_enabled:
             return []
+        folder_operation = None
+        if self._uses_contract_structure():
+            folder_operation = self._contract_folder_lifecycle_plan(
+                old_rel_path, old_rel_path, "delete"
+            )
         # A previously deleted UUID may still reserve the same local trash path
         # even when its physical copy was removed. Relocate the new copy before
         # updating SQLite so repeated delete/restore cycles cannot violate the
@@ -6006,12 +6214,21 @@ class SyncManager(QObject):
                     is_deleted=True,
                 )
         self._publish_sync_state()
-        self.retry_pending_syncs()
-        return moved
+        if retry:
+            self.retry_pending_syncs()
+        return ([folder_operation] if folder_operation else []) + moved
 
-    def record_restore(self, trash_rel_path, restored_rel_path):
+    def record_restore(
+        self, trash_rel_path, restored_rel_path,
+        original_rel_path=None, retry=True,
+    ):
         if not self.is_v2_enabled:
             return []
+        folder_operation = None
+        if self._uses_contract_structure() and original_rel_path:
+            folder_operation = self._contract_folder_lifecycle_plan(
+                original_rel_path, restored_rel_path, "restore"
+            )
         moved = self._v2_store.move_local_path(
             self._v2_context["local_key"], trash_rel_path, restored_rel_path
         )
@@ -6026,8 +6243,9 @@ class SyncManager(QObject):
                     is_deleted=False,
                 )
         self._publish_sync_state()
-        self.retry_pending_syncs()
-        return moved
+        if retry:
+            self.retry_pending_syncs()
+        return ([folder_operation] if folder_operation else []) + moved
 
     def run_retention_async(self, wpm, callback=None):
         if self._retention_worker is not None:
@@ -6049,7 +6267,10 @@ class SyncManager(QObject):
                 
         if callback:
             worker.resultReady.connect(callback)
-        worker.finished.connect(cleanup_worker)
+        worker.finished.connect(
+            cleanup_worker,
+            Qt.ConnectionType.DirectConnection,
+        )
         worker.finished.connect(worker.deleteLater)
         self._start_worker(worker)
         
@@ -6082,6 +6303,8 @@ class SyncManager(QObject):
         self._v2_retry_timer.stop()
         self._v2_retry_context = None
         self._autosave_followups.clear()
+        with self._autosave_followup_lock:
+            self._autosave_ready_followups.clear()
         self.wait_all_workers()
         self._diagnostics.flush()
         if self.supabase is not None:

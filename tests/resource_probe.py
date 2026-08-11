@@ -23,6 +23,28 @@ class _NoopSyncManager:
         return None
 
 
+class _ManualSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback, *_args):
+        self.callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in list(self.callbacks):
+            callback(*args)
+
+
+class _ManualAutoSaveWorker:
+    def __init__(self, *_args, **_kwargs):
+        self.resultReady = _ManualSignal()
+        self.finished = _ManualSignal()
+        self.deleted = False
+
+    def deleteLater(self):
+        self.deleted = True
+
+
 def _controller(active_paths):
     return WritingController(
         SimpleNamespace(),
@@ -158,6 +180,30 @@ def _wait_until(predicate, timeout_ms=10000):
     loop.exec()
 
 
+def _wait_until_stable(predicate, stable_ms=250, timeout_ms=30000):
+    loop = QEventLoop()
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    stable_since = [None]
+
+    def poll():
+        now = time.monotonic()
+        if predicate():
+            if stable_since[0] is None:
+                stable_since[0] = now
+            if now - stable_since[0] >= stable_ms / 1000:
+                loop.quit()
+                return
+        else:
+            stable_since[0] = None
+        if now >= deadline:
+            loop.quit()
+        else:
+            QTimer.singleShot(5, poll)
+
+    QTimer.singleShot(0, poll)
+    loop.exec()
+
+
 def measure_finished_worker_retention(manager):
     with tempfile.TemporaryDirectory() as temp_dir:
         wpm = SimpleNamespace(
@@ -167,23 +213,18 @@ def measure_finished_worker_retention(manager):
         manager._v2_store = None
         manager._v2_context = None
         manager._v2_device_id = None
-        workers = [
-            manager.upload_autosave_async(
-                wpm, f"메인/원고/{index:04d}.txt", "백업 본문"
-            )
-            for index in range(120)
-        ]
-
-        def all_stopped():
+        with patch("sync_manager.AutoSaveWorker", _ManualAutoSaveWorker), patch.object(
+            manager, "_start_worker"
+        ):
+            workers = [
+                manager.upload_autosave_async(
+                    wpm, f"메인/원고/{index:04d}.txt", "백업 본문"
+                )
+                for index in range(120)
+            ]
             for worker in workers:
-                try:
-                    if worker.isRunning():
-                        return False
-                except RuntimeError:
-                    continue
-            return True
-
-        _wait_until(all_stopped)
+                worker.resultReady.emit(True, "")
+                worker.finished.emit()
         QCoreApplication.processEvents()
         retained_immediately = len(manager._autosave_workers)
         wait_loop = QEventLoop()

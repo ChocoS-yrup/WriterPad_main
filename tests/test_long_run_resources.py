@@ -61,6 +61,25 @@ class _SlowResultWorker(QThread):
         self.resultReady.emit(True, "")
 
 
+class _BlockingAutoSaveWorker(QThread):
+    resultReady = pyqtSignal(bool, str)
+    instances = []
+    started_events = [threading.Event(), threading.Event()]
+    release_events = [threading.Event(), threading.Event()]
+
+    def __init__(self, _wpm, _path, content):
+        super().__init__()
+        self.content = content
+        self.worker_index = len(type(self).instances)
+        type(self).instances.append(self)
+
+    def run(self):
+        index = self.worker_index
+        type(self).started_events[index].set()
+        type(self).release_events[index].wait(5)
+        self.resultReady.emit(True, "")
+
+
 class LongRunResourceTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -81,6 +100,7 @@ class LongRunResourceTestCase(unittest.TestCase):
         self.manager._autosave_workers.clear()
         self.manager._autosave_workers_by_path.clear()
         self.manager._autosave_followups.clear()
+        self.manager._autosave_ready_followups.clear()
         self.manager._retention_workers.clear()
         self.manager._rename_workers.clear()
         self.manager.active_workers.clear()
@@ -136,7 +156,7 @@ class LongRunResourceTestCase(unittest.TestCase):
             def __init__(self):
                 self.callbacks = []
 
-            def connect(self, callback):
+            def connect(self, callback, *_args):
                 self.callbacks.append(callback)
 
             def emit(self, *args):
@@ -161,9 +181,6 @@ class LongRunResourceTestCase(unittest.TestCase):
 
         with patch("sync_manager.AutoSaveWorker", ManualWorker), patch.object(
             self.manager, "_start_worker"
-        ), patch(
-            "sync_manager.QTimer.singleShot",
-            side_effect=lambda _delay, callback: callback(),
         ):
             first = self.manager.upload_autosave_async(wpm, path, "본문-0")
             returned = [
@@ -182,6 +199,7 @@ class LongRunResourceTestCase(unittest.TestCase):
 
             first.resultReady.emit(True, "")
             first.finished.emit()
+            self.manager._drain_autosave_followups()
             self.assertEqual(len(ManualWorker.instances), 2)
             followup = ManualWorker.instances[-1]
             self.assertEqual(followup.content, "본문-719")
@@ -200,6 +218,64 @@ class LongRunResourceTestCase(unittest.TestCase):
         self.assertEqual(self.manager._autosave_workers, [])
         self.assertEqual(self.manager._autosave_workers_by_path, {})
         self.assertEqual(self.manager._autosave_followups, {})
+
+    def test_real_qthread_same_document_backup_runs_active_then_latest(self):
+        _BlockingAutoSaveWorker.instances.clear()
+        for event in (
+            *_BlockingAutoSaveWorker.started_events,
+            *_BlockingAutoSaveWorker.release_events,
+        ):
+            event.clear()
+
+        def release_test_workers():
+            for event in _BlockingAutoSaveWorker.release_events:
+                event.set()
+            for worker in list(_BlockingAutoSaveWorker.instances):
+                try:
+                    worker.wait(5000)
+                except RuntimeError:
+                    pass
+
+        self.addCleanup(release_test_workers)
+        wpm = SimpleNamespace()
+        path = "메인/원고/실제스레드.txt"
+
+        with patch("sync_manager.AutoSaveWorker", _BlockingAutoSaveWorker):
+            first = self.manager.upload_autosave_async(wpm, path, "본문-0")
+            self.assertTrue(
+                _BlockingAutoSaveWorker.started_events[0].wait(2)
+            )
+            returned = [
+                self.manager.upload_autosave_async(
+                    wpm, path, f"본문-{index}"
+                )
+                for index in range(1, 100)
+            ]
+            self.assertTrue(all(worker is first for worker in returned))
+            self.assertEqual(len(self.manager._autosave_workers), 1)
+
+            _BlockingAutoSaveWorker.release_events[0].set()
+            self.assertTrue(first.wait(5000))
+            self.assertTrue(_wait_until(
+                lambda: len(_BlockingAutoSaveWorker.instances) == 2
+                and _BlockingAutoSaveWorker.started_events[1].is_set(),
+                timeout_ms=5000,
+            ))
+            followup = _BlockingAutoSaveWorker.instances[1]
+            self.assertEqual(followup.content, "본문-99")
+            self.assertIs(
+                self.manager._autosave_workers_by_path[(id(wpm), path)],
+                followup,
+            )
+
+            _BlockingAutoSaveWorker.release_events[1].set()
+            self.assertTrue(followup.wait(5000))
+            self.assertTrue(_wait_until(
+                lambda: not self.manager._autosave_workers
+                and not self.manager._autosave_workers_by_path
+                and not self.manager._autosave_followups,
+                timeout_ms=5000,
+            ))
 
     def test_retention_and_heartbeat_workers_do_not_duplicate(self):
         _SlowResultWorker.started_count = 0

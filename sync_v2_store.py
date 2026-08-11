@@ -33,7 +33,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8003
+STAGE8_USER_VERSION = 8004
 
 
 def _utc_now():
@@ -58,6 +58,7 @@ class SyncV2Store:
         self.db_path = os.path.abspath(db_path)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._schema_lock = threading.Lock()
+        self._transaction_state = threading.local()
         self._initialize()
 
     def _connect(self):
@@ -70,7 +71,12 @@ class SyncV2Store:
 
     @contextmanager
     def _transaction(self):
+        active = getattr(self._transaction_state, "connection", None)
+        if active is not None:
+            yield active
+            return
         connection = self._connect()
+        self._transaction_state.connection = connection
         try:
             connection.execute("BEGIN IMMEDIATE")
             yield connection
@@ -79,6 +85,7 @@ class SyncV2Store:
             connection.rollback()
             raise
         finally:
+            self._transaction_state.connection = None
             connection.close()
 
     @contextmanager
@@ -388,6 +395,16 @@ class SyncV2Store:
                 recorded_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS sync_structure_recovery (
+                recovery_id TEXT PRIMARY KEY,
+                local_key TEXT NOT NULL
+                    REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                old_path TEXT NOT NULL,
+                new_path TEXT NOT NULL,
+                error_code TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS sync_contract_batches_ready_idx
                 ON sync_contract_batches(local_key, created_at);
             CREATE INDEX IF NOT EXISTS sync_structure_operations_batch_idx
@@ -581,6 +598,16 @@ class SyncV2Store:
             BEFORE DELETE ON sync_contract_batch_results
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_BATCH_RESULT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_structure_recovery_no_update
+            BEFORE UPDATE ON sync_structure_recovery
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_RECOVERY');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_structure_recovery_no_delete
+            BEFORE DELETE ON sync_structure_recovery
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_RECOVERY');
             END;
             """
         )
@@ -1334,6 +1361,31 @@ class SyncV2Store:
                         tree_order_id, local_key, parent_folder_id, parent_path,
                         canonical_json(children), revision, now, now,
                     ),
+                )
+
+    def move_tree_order_paths(self, local_key, old_path, new_path):
+        old_path = _normalize_path(old_path)
+        new_path = _normalize_path(new_path)
+        now = _utc_now()
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT tree_order_id, parent_path FROM sync_tree_orders
+                WHERE local_key = ?
+                  AND (parent_path = ? OR parent_path LIKE ?)
+                ORDER BY length(parent_path)
+                """,
+                (local_key, old_path, old_path + "/%"),
+            ).fetchall()
+            for row in rows:
+                suffix = row["parent_path"][len(old_path):]
+                connection.execute(
+                    """
+                    UPDATE sync_tree_orders
+                    SET parent_path = ?, updated_at = ?
+                    WHERE tree_order_id = ?
+                    """,
+                    (new_path + suffix, now, row["tree_order_id"]),
                 )
 
     def list_folders(self, local_key):
@@ -2370,6 +2422,88 @@ class SyncV2Store:
                 moved.append({**dict(row), "old_local_path": row["local_path"], "local_path": updated_path})
         return moved
 
+    def create_structure_batch_with_path_changes(
+        self,
+        context,
+        writer_device_id,
+        ordered_intents,
+        path_changes,
+        *,
+        batch_id=None,
+    ):
+        """Persist one contract batch and its local path projection atomically."""
+        with self._transaction():
+            request = self.create_structure_batch(
+                context,
+                writer_device_id,
+                ordered_intents,
+                batch_id=batch_id,
+            )
+            for change in path_changes or []:
+                pending = change.get("pending_folder")
+                if pending:
+                    self.ensure_local_folder(
+                        context["local_key"],
+                        pending["local_path"],
+                        folder_id=pending["folder_id"],
+                        parent_folder_id=pending.get("parent_folder_id"),
+                    )
+                old_path = change.get("old_path")
+                new_path = change.get("new_path")
+                if old_path and new_path and old_path != new_path:
+                    self.move_folder_paths(
+                        context["local_key"], old_path, new_path
+                    )
+                    self.move_local_path(
+                        context["local_key"], old_path, new_path
+                    )
+                    self.move_tree_order_paths(
+                        context["local_key"], old_path, new_path
+                    )
+                for update in change.get("folder_updates") or []:
+                    name = str(update["local_path"]).rsplit("/", 1)[-1]
+                    with self._transaction() as connection:
+                        connection.execute(
+                            """
+                            UPDATE sync_folders
+                            SET parent_folder_id = ?, local_path = ?, name = ?,
+                                storage_name_key = ?, is_deleted = ?,
+                                updated_at = ?
+                            WHERE folder_id = ? AND local_key = ?
+                            """,
+                            (
+                                update.get("parent_folder_id"),
+                                _normalize_path(update["local_path"]),
+                                name,
+                                normalize_storage_name(name).normalized,
+                                int(bool(update["is_deleted"])),
+                                _utc_now(),
+                                update["folder_id"],
+                                context["local_key"],
+                            ),
+                        )
+            return request
+
+    def record_structure_recovery(
+        self, local_key, old_path, new_path, error_code
+    ):
+        with self._transaction() as connection:
+            recovery_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO sync_structure_recovery (
+                    recovery_id, local_key, old_path, new_path,
+                    error_code, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    recovery_id, local_key, _normalize_path(old_path),
+                    _normalize_path(new_path), str(error_code or "RECOVERY_FAILED")[:80],
+                    _utc_now(),
+                ),
+            )
+            return recovery_id
+
     def move_destination_conflicts(self, local_key, old_path, new_path):
         """Return documents that already reserve a destination of a prefix move."""
         old_path = _normalize_path(old_path)
@@ -2559,6 +2693,13 @@ class SyncV2Store:
                     json_sha256(request), now,
                 ),
             )
+            superseded_ids = [
+                intent.get("supersedes_operation_id")
+                for intent in request["ordered_intents"]
+                if intent.get("supersedes_operation_id")
+            ]
+            if len(superseded_ids) != len(set(superseded_ids)):
+                raise SyncContractError("INVALID_ARGUMENT")
             for intent in request["ordered_intents"]:
                 connection.execute(
                     """
