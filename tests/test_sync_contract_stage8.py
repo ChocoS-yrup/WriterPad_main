@@ -818,6 +818,24 @@ class ContractStoreTests(unittest.TestCase):
         )
         self.assertEqual((migrating["project_sync_mode"], migrating["migration_epoch"]), ("MIGRATING", 1))
 
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                "UPDATE sync_projects SET project_sync_mode = ?, migration_epoch = ? WHERE local_key = ?",
+                ("MIGRATING", 1, self.context["local_key"]),
+            )
+            for mode, epoch in (
+                ("MIGRATING", 2),
+                ("ID_BASED", 2),
+                ("LEGACY", 0),
+            ):
+                with self.subTest(
+                    sql_from="MIGRATING/1", sql_mode=mode, sql_epoch=epoch
+                ), self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE sync_projects SET project_sync_mode = ?, migration_epoch = ? WHERE local_key = ?",
+                        (mode, epoch, self.context["local_key"]),
+                    )
+
         for mode, epoch in (("MIGRATING", 2), ("ID_BASED", 2)):
             with self.subTest(mode=mode, epoch=epoch), self.assertRaises(SyncContractError) as raised:
                 self.store.activate_contract_project(
@@ -837,12 +855,31 @@ class ContractStoreTests(unittest.TestCase):
         self.assertEqual((completed["project_sync_mode"], completed["migration_epoch"]), ("ID_BASED", 1))
 
         with closing(sqlite3.connect(self.db_path)) as connection:
-            for mode, epoch in (("LEGACY", 1), ("MIGRATING", 0), ("ID_BASED", 0)):
-                with self.subTest(sql_mode=mode, sql_epoch=epoch), self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE sync_projects SET project_sync_mode = ?, migration_epoch = ? WHERE local_key = ?",
+                ("ID_BASED", 1, self.context["local_key"]),
+            )
+            for mode, epoch in (
+                ("ID_BASED", 2),
+                ("MIGRATING", 1),
+                ("LEGACY", 0),
+                ("LEGACY", 1),
+                ("MIGRATING", 0),
+                ("ID_BASED", 0),
+            ):
+                with self.subTest(
+                    sql_from="ID_BASED/1", sql_mode=mode, sql_epoch=epoch
+                ), self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
                         "UPDATE sync_projects SET project_sync_mode = ?, migration_epoch = ? WHERE local_key = ?",
                         (mode, epoch, self.context["local_key"]),
                     )
+            pair = connection.execute(
+                "SELECT project_sync_mode, migration_epoch FROM sync_projects WHERE local_key = ?",
+                (self.context["local_key"],),
+            ).fetchone()
+            self.assertEqual(pair, ("ID_BASED", 1))
+
     def test_restart_recovery_is_append_only_and_reuses_operation_id(self):
         operation = self.store.enqueue(self.context, "메인/원고/001화.txt", "offline")
         self.store.mark_attempt(operation["operation_id"])
