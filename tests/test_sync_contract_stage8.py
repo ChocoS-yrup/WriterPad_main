@@ -186,6 +186,49 @@ class ContractPrimitiveTests(unittest.TestCase):
                 require_server_compatibility(**candidate)
             self.assertEqual(raised.exception.code, expected)
 
+    def test_server_compatibility_rejects_invalid_mode_epoch_pairs(self):
+        common = {
+            "server_protocol_version": 3,
+            "server_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "server_capabilities": SERVER_CAPABILITIES,
+        }
+        for mode, epoch in (
+            ("LEGACY", 1),
+            ("MIGRATING", 0),
+            ("ID_BASED", 0),
+            ("MIGRATING", -1),
+        ):
+            with self.subTest(mode=mode, epoch=epoch), self.assertRaises(SyncContractError) as raised:
+                require_server_compatibility(
+                    project_sync_mode=mode,
+                    migration_epoch=epoch,
+                    **common,
+                )
+            self.assertEqual(raised.exception.code, "STALE_MIGRATION_EPOCH")
+
+    def test_document_failure_requires_nonempty_string_message(self):
+        cases = load_json(
+            contract_root() / "conformance_vectors" / "document-commit.json"
+        )["cases"]
+        case = next(
+            item for item in cases
+            if item["response"]["kind"] == "document_commit_failure"
+            and "request" in item
+        )
+        request = case["request"]
+        for message in (None, "", 123):
+            response = copy.deepcopy(case["response"])
+            response["error"]["message"] = message
+            with self.subTest(message=message), self.assertRaises(SyncContractError) as raised:
+                validate_document_commit_response(request, response)
+            self.assertEqual(raised.exception.code, "INVALID_DOCUMENT_RESPONSE")
+
+        missing = copy.deepcopy(case["response"])
+        del missing["error"]["message"]
+        with self.assertRaises(SyncContractError) as raised:
+            validate_document_commit_response(request, missing)
+        self.assertEqual(raised.exception.code, "INVALID_DOCUMENT_RESPONSE")
+
     def test_partial_success_response_is_rejected(self):
         case = load_json(
             contract_root() / "conformance_vectors" / "atomic-structure-commit.json"
@@ -543,7 +586,60 @@ class ContractStoreTests(unittest.TestCase):
                 self.context["local_key"], "tree_order"
             )
         )
+    def test_mode_epoch_transition_and_sqlite_pair_constraints(self):
+        common = {
+            "server_protocol_version": 3,
+            "server_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "server_capabilities": SERVER_CAPABILITIES,
+        }
+        for mode, epoch, expected in (
+            ("LEGACY", 1, "STALE_MIGRATION_EPOCH"),
+            ("MIGRATING", 0, "STALE_MIGRATION_EPOCH"),
+            ("MIGRATING", 2, "STALE_MIGRATION_EPOCH"),
+            ("ID_BASED", 1, "INVALID_PROJECT_MODE_TRANSITION"),
+        ):
+            with self.subTest(mode=mode, epoch=epoch), self.assertRaises(SyncContractError) as raised:
+                self.store.activate_contract_project(
+                    self.context["local_key"],
+                    project_sync_mode=mode,
+                    migration_epoch=epoch,
+                    **common,
+                )
+            self.assertEqual(raised.exception.code, expected)
 
+        migrating = self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="MIGRATING",
+            migration_epoch=1,
+            **common,
+        )
+        self.assertEqual((migrating["project_sync_mode"], migrating["migration_epoch"]), ("MIGRATING", 1))
+
+        for mode, epoch in (("MIGRATING", 2), ("ID_BASED", 2)):
+            with self.subTest(mode=mode, epoch=epoch), self.assertRaises(SyncContractError) as raised:
+                self.store.activate_contract_project(
+                    self.context["local_key"],
+                    project_sync_mode=mode,
+                    migration_epoch=epoch,
+                    **common,
+                )
+            self.assertEqual(raised.exception.code, "STALE_MIGRATION_EPOCH")
+
+        completed = self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="ID_BASED",
+            migration_epoch=1,
+            **common,
+        )
+        self.assertEqual((completed["project_sync_mode"], completed["migration_epoch"]), ("ID_BASED", 1))
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            for mode, epoch in (("LEGACY", 1), ("MIGRATING", 0), ("ID_BASED", 0)):
+                with self.subTest(sql_mode=mode, sql_epoch=epoch), self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE sync_projects SET project_sync_mode = ?, migration_epoch = ? WHERE local_key = ?",
+                        (mode, epoch, self.context["local_key"]),
+                    )
     def test_restart_recovery_is_append_only_and_reuses_operation_id(self):
         operation = self.store.enqueue(self.context, "메인/원고/001화.txt", "offline")
         self.store.mark_attempt(operation["operation_id"])
