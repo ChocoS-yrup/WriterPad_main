@@ -117,7 +117,7 @@ sha256: 52af8e2fa002b2b6d1acec6be36c22c7c14bcb0a62668f115c6f8f1f5717e454
 smoke_test: process remained running for 5 seconds in a disposable directory, then was stopped
 ```
 
-CI definition `.github/workflows/windows-contract.yml` verifies the exact PR head, checks out contract content commit `7f05f32d...`, runs the official verifier on Python 3.12.13, runs Windows tests on Python 3.11.9, builds the executable, and prints its digest.
+CI definition `.github/workflows/windows-contract.yml` verifies the exact PR head, checks out contract content commit `7f05f32d...`, runs the official verifier on the latest available Python 3.12 patch release, runs Windows tests on Python 3.11.9, builds the executable, and prints its digest. The local pinned verifier evidence above used Python 3.12.13 exactly.
 
 ## Not verified / required follow-up
 
