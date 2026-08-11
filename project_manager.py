@@ -3,6 +3,20 @@ import sys
 import json
 from PyQt6.QtCore import QMutex, QMutexLocker
 
+
+VALID_STARTUP_MODES = frozenset({"assistant", "writing"})
+
+
+def startup_mode_from_config(config):
+    """Return a safe startup mode without loading or mutating configuration."""
+    if not isinstance(config, dict):
+        return "assistant"
+    startup_mode = config.get("startup_mode")
+    if not isinstance(startup_mode, str) or startup_mode not in VALID_STARTUP_MODES:
+        return "assistant"
+    return startup_mode
+
+
 class ProjectManager:
     def __init__(self):
         self.mutex = QMutex()

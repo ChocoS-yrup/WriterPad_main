@@ -5,6 +5,7 @@ from PyQt6.QtCore import QEvent, Qt
 
 from mode_assistant import AssistantModeWidget, SingleApplication
 from mode_writing import WritingModeWidget
+from project_manager import startup_mode_from_config
 from text_editor import SmartTextEdit
 from ui_components import get_saved_font
 
@@ -73,7 +74,39 @@ class MainWindow(QMainWindow):
         # F11 단축키로 모드 전환
         self.shortcut_toggle_mode = QShortcut(QKeySequence("F11"), self)
         self.shortcut_toggle_mode.activated.connect(self.toggle_mode)
-        
+
+        self._startup_writing_pending = False
+        self._apply_startup_mode()
+
+    def _apply_startup_mode(self):
+        startup_mode = startup_mode_from_config(
+            self.assistant_mode.pm.global_config
+        )
+        if startup_mode == "assistant":
+            self.switch_to_assistant()
+            return
+
+        if getattr(self.writing_mode, "_saved_files_loaded", False):
+            self.switch_to_writing()
+            return
+
+        self._startup_writing_pending = True
+        self.writing_mode.editorSessionRestored.connect(
+            self._complete_startup_writing
+        )
+
+    def _complete_startup_writing(self):
+        if not self._startup_writing_pending:
+            return
+        self._startup_writing_pending = False
+        try:
+            self.writing_mode.editorSessionRestored.disconnect(
+                self._complete_startup_writing
+            )
+        except (TypeError, RuntimeError):
+            pass
+        self.switch_to_writing()
+
     def switch_to_writing(self):
         self.mode_stack.setCurrentWidget(self.writing_mode)
         self.writing_mode.activate_current_editor_input()

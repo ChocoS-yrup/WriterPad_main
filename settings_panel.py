@@ -12,6 +12,7 @@ from PyQt6.QtCore import pyqtSignal, Qt, QSettings, QTimer, QThread
 from app_config import get_saved_font, save_font_to_json
 from cloud_config import classify_cloud_error
 from llm_provider import load_model_catalog, resolve_model_selection
+from project_manager import startup_mode_from_config
 
 
 class SupabaseLoginWorker(QThread):
@@ -223,7 +224,7 @@ class SettingsPanel(QWidget):
         self.combo_startup_mode.setMaximumWidth(280)
         self.combo_startup_mode.addItem("AI 어시스턴트 모드", "assistant")
         self.combo_startup_mode.addItem("집필 모드", "writing")
-        startup_mode = self.pm.global_config.get("startup_mode", "assistant")
+        startup_mode = startup_mode_from_config(self.pm.global_config)
         startup_index = self.combo_startup_mode.findData(startup_mode)
         self.combo_startup_mode.setCurrentIndex(
             startup_index if startup_index >= 0 else 0

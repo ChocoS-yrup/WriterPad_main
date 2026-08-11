@@ -264,6 +264,7 @@ class RenameDelegate(QStyledItemDelegate):
 class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
     switchModeRequested = pyqtSignal()
     sendToAssistantRequested = pyqtSignal(str)
+    editorSessionRestored = pyqtSignal()
     _EDITOR_VIEW_STATE_KEY = "writing_editor_view_states_v1"
     _EDITOR_VIEW_STATE_LIMIT = 100
     _SPLIT_MODE_STATE_KEY = "writing_split_mode_enabled"
@@ -337,6 +338,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         QTimer.singleShot(900, self.request_remote_sync)
         
         self.active_editor = None
+        self._saved_files_loaded = False
         
         QTimer.singleShot(100, self.load_saved_files)
         
@@ -1758,15 +1760,26 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             editor.activate_input_method()
 
     def load_saved_files(self):
+        if self._saved_files_loaded:
+            return
         left_file = self.pm.global_config.get("writing_last_left_file")
         right_file = self.pm.global_config.get("writing_last_right_file")
         last_active = getattr(self, "_initial_last_active", "left")
+        writing_root_path = getattr(self.wpm, "writing_root_path", None)
         
-        if left_file and os.path.exists(os.path.join(self.wpm.writing_root_path, left_file)):
+        if (
+            writing_root_path
+            and left_file
+            and os.path.exists(os.path.join(writing_root_path, left_file))
+        ):
             self.set_active_editor(self.left_editor)
             self._open_file_by_path(left_file)
             
-        if right_file and os.path.exists(os.path.join(self.wpm.writing_root_path, right_file)):
+        if (
+            writing_root_path
+            and right_file
+            and os.path.exists(os.path.join(writing_root_path, right_file))
+        ):
             self.set_active_editor(self.right_editor)
             self._open_file_by_path(right_file)
             
@@ -1777,6 +1790,8 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             
         self.update_editor_statistics()
         self._refresh_storage_status_for_editor_state()
+        self._saved_files_loaded = True
+        self.editorSessionRestored.emit()
 
     def send_to_assistant(self):
         if not self.active_editor: return
