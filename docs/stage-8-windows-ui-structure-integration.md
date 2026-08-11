@@ -34,8 +34,8 @@ rebased.
 ## Provenance and exclusions
 
 - Source manifest: `docs/stage-8-source-reconstruction-manifest.json`
-- Source entries: `35`
-- Source manifest SHA-256: `171a534c6b81de600a39ecaaccea85037d46141a533b9062a0e7309233647657`
+- Source entries: `36`
+- Source manifest SHA-256: `43515eb7a3fcab5c253480b944bd2f6f14e19c53b9951459290d0db7071949ea`
 - All included files passed UTF-8 text, forbidden-path, binary, 1 MiB and secret-rule gates.
 - Excluded: local 50-commit history, `.env`, historic secret material,
   `saves/project_data.json`, real work content, DB/WAL/SHM, EXE/DLL,
@@ -54,6 +54,11 @@ The original dirty worktree remained unchanged:
 - Final Windows Python regression: `365 passed, 1 skipped`.
 - One long-run backup-coalescing test failed once during the first full run,
   passed alone immediately, and the complete suite then passed on rerun.
+- Initial PR CI run `31487006626` exposed a Windows unittest fixture issue:
+  a process-lifetime `QCoreApplication` could precede widget tests and cause a
+  silent exit code 1. A module-held offscreen `QApplication` fixture now keeps
+  the Qt application type and lifetime deterministic. The exact failing test
+  order and the complete suite passed locally after the correction.
 - Contract verifier: 7 schemas, contract `0.2.0`, 12 transition vectors,
   15 Unicode 15.0 storage-name vectors, 4 atomic wire cases and 7 document wire cases passed.
 - Canonical bytes: `23256`.

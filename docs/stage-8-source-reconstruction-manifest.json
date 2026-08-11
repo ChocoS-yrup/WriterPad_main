@@ -2,8 +2,8 @@
   "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
   "stacked_pr_base_branch": "codex/stage-8-windows-contract-implementation",
   "local_history_reused": false,
-  "source_manifest_sha256": "171a534c6b81de600a39ecaaccea85037d46141a533b9062a0e7309233647657",
-  "source_entry_count": 35,
+  "source_manifest_sha256": "43515eb7a3fcab5c253480b944bd2f6f14e19c53b9951459290d0db7071949ea",
+  "source_entry_count": 36,
   "safety_gate": {
     "utf8_text_only": true,
     "forbidden_path_findings": 0,
@@ -61,11 +61,11 @@
     },
     {
       "path": "mode_assistant.py",
-      "bytes": 40152,
-      "output_sha256": "ab4c3ddcdabcffffec7e5d7a416af248f5c5d54629746ca25ef576d6f5be2ebb",
       "provenance": "local committed Git object read as text only",
       "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
-      "source_sha256": "ab4c3ddcdabcffffec7e5d7a416af248f5c5d54629746ca25ef576d6f5be2ebb"
+      "source_sha256": "ab4c3ddcdabcffffec7e5d7a416af248f5c5d54629746ca25ef576d6f5be2ebb",
+      "bytes": 40152,
+      "output_sha256": "ab4c3ddcdabcffffec7e5d7a416af248f5c5d54629746ca25ef576d6f5be2ebb"
     },
     {
       "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
@@ -173,6 +173,12 @@
       "output_sha256": "87177897298c544796e2016698f0a6ba24fd6c12e12a84256fcd7a22b13d37db"
     },
     {
+      "path": "tests/qt_app.py",
+      "bytes": 242,
+      "output_sha256": "4773cba84e9a1a8c58e95ced0d5300713ee4b41c2ae78c6eee25fd6ad46d8225",
+      "provenance": "reviewed UTF-8 source/test reconstruction"
+    },
+    {
       "path": "tests/resource_probe.py",
       "provenance": "read-only untracked text source",
       "source_sha256": "aba5206a158dd0b0917c5c64fef3f7ae3ac25fac85ad9ff86d81bb13dd2727e4",
@@ -181,17 +187,17 @@
     },
     {
       "path": "tests/test_folder_identity_migration.py",
-      "bytes": 2932,
-      "output_sha256": "411e0794b5f793047aff51b9e608aac73a138ee078ef50e7475d93e08c217f52",
       "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
-      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219"
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "bytes": 2932,
+      "output_sha256": "411e0794b5f793047aff51b9e608aac73a138ee078ef50e7475d93e08c217f52"
     },
     {
       "path": "tests/test_long_run_resources.py",
       "provenance": "read-only untracked text source",
       "source_sha256": "7f115fe3ecefb7a05c2f021428feef08920d15fee9db0ff68edc295edc5bec4e",
-      "bytes": 8787,
-      "output_sha256": "b3a3e53119ef5e2eec1a08a053b5c3f1e865822d58df14f35372fde34c599f32"
+      "bytes": 8981,
+      "output_sha256": "3faf6dc6b7294efeff340c8b2314bccfff6e6de7c0e9dd4b94f171171b5e22ce"
     },
     {
       "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
@@ -245,10 +251,10 @@
     },
     {
       "path": "tests/test_sync_contract_stage8.py",
-      "bytes": 43335,
-      "output_sha256": "712be150069a0f19d190a758e421053476637fdfb11932a85987378e360240af",
       "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
-      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219"
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "bytes": 43335,
+      "output_sha256": "712be150069a0f19d190a758e421053476637fdfb11932a85987378e360240af"
     },
     {
       "path": "tests/test_sync_diagnostics.py",
@@ -311,19 +317,19 @@
     },
     {
       "path": "text_editor.py",
-      "bytes": 31602,
-      "output_sha256": "0be24969e5d8dc550d9b7f3e7c3789745c070935b3510ac05b2feef0576d6c53",
       "provenance": "local committed Git object read as text only",
       "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
-      "source_sha256": "0be24969e5d8dc550d9b7f3e7c3789745c070935b3510ac05b2feef0576d6c53"
+      "source_sha256": "0be24969e5d8dc550d9b7f3e7c3789745c070935b3510ac05b2feef0576d6c53",
+      "bytes": 31602,
+      "output_sha256": "0be24969e5d8dc550d9b7f3e7c3789745c070935b3510ac05b2feef0576d6c53"
     },
     {
       "path": "three_way_merge.py",
-      "bytes": 5638,
-      "output_sha256": "b987b0fa34240b865af4eba04a2a4c9119dcfd13833cbb171a546ef751c0cbd1",
       "provenance": "local committed Git object read as text only",
       "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
-      "source_sha256": "b987b0fa34240b865af4eba04a2a4c9119dcfd13833cbb171a546ef751c0cbd1"
+      "source_sha256": "b987b0fa34240b865af4eba04a2a4c9119dcfd13833cbb171a546ef751c0cbd1",
+      "bytes": 5638,
+      "output_sha256": "b987b0fa34240b865af4eba04a2a4c9119dcfd13833cbb171a546ef751c0cbd1"
     },
     {
       "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
@@ -345,20 +351,3 @@
     }
   ]
 }
-warning: in the working copy of 'mode_assistant.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'mode_writing.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'project_dialogs.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'project_manager.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'project_manager_writing.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'settings_panel.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sync_manager.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sync_v2_store.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'tests/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'tests/test_sync_contract_stage8.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'tests/test_sync_state.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'tests/test_sync_v2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'tests/test_writing_data.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'text_editor.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'three_way_merge.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'writing_controller.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'writing_tree.py', LF will be replaced by CRLF the next time Git touches it

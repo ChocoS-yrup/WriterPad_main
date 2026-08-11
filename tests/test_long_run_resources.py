@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from PyQt6.QtCore import QCoreApplication, QEventLoop, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEventLoop, QThread, QTimer, pyqtSignal
 
 from sync_manager import (
     AutoSaveWorker,
@@ -26,6 +26,7 @@ from tests.resource_probe import (
     measure_snapshot_cache,
     measure_status_db_work,
 )
+from tests.qt_app import APP
 from writing_controller import WritingController
 
 
@@ -63,7 +64,10 @@ class _SlowResultWorker(QThread):
 class LongRunResourceTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QCoreApplication.instance() or QCoreApplication([])
+        # Keep a real QApplication alive in a module for the full process.
+        # A QCoreApplication cannot be upgraded later; widget tests otherwise
+        # terminate the interpreter without a Python traceback on Windows CI.
+        cls.app = APP
 
     def setUp(self):
         self.manager = SyncManager()
