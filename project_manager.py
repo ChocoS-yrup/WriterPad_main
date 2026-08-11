@@ -44,7 +44,22 @@ class ProjectManager:
     def get_all_projects(self):
         os.makedirs(self.workspace_dir, exist_ok=True)
         # 실제 존재하는 폴더 목록
-        existing_projects = [d for d in os.listdir(self.workspace_dir) if os.path.isdir(os.path.join(self.workspace_dir, d))]
+        from project_paths import IMPORT_MARKER_FILENAME
+        existing_projects = []
+        for name in os.listdir(self.workspace_dir):
+            project_path = os.path.join(self.workspace_dir, name)
+            if not os.path.isdir(project_path):
+                continue
+            marker_path = os.path.join(project_path, IMPORT_MARKER_FILENAME)
+            if os.path.exists(marker_path):
+                try:
+                    with open(marker_path, "r", encoding="utf-8") as marker_file:
+                        marker = json.load(marker_file)
+                    if marker.get("state") != "complete":
+                        continue
+                except (AttributeError, json.JSONDecodeError, OSError):
+                    continue
+            existing_projects.append(name)
         
         # 저장된 순서 가져오기
         saved_order = self.global_config.get("project_order", [])
@@ -282,6 +297,7 @@ class ProjectManager:
     API_PRICING = {
         "Gemini 3.1 Pro": {"input": 2.00, "output": 12.00},
         "Claude Opus 4.8": {"input": 5.00, "output": 25.00},
+        "Claude Opus 5": {"input": 5.00, "output": 25.00},
         "GPT-4o": {"input": 2.50, "output": 10.00},
         "GPT-5.6 Sol": {"input": 5.00, "output": 30.00},
         "GPT-5.6 Terra": {"input": 2.50, "output": 15.00},

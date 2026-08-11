@@ -747,6 +747,8 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
                     writing_mode_needs_save = True
                 
         if not has_unsaved:
+            if is_final_quit:
+                self._flush_writing_sync_before_close()
             return True
             
         msg_box = QMessageBox(self)
@@ -774,6 +776,8 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
                         loop = QEventLoop()
                         worker.finished.connect(loop.quit)
                         loop.exec()
+            if is_final_quit:
+                self._flush_writing_sync_before_close()
                     
             self.status_bar.showMessage("모든 변경사항이 저장되었습니다.", 2000)
             return True
@@ -795,6 +799,22 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
             return False
             
         return True
+
+    def _flush_writing_sync_before_close(self):
+        writing_mode = getattr(self, "writing_mode", None)
+        sync_manager = getattr(writing_mode, "sync_manager", None)
+        flush = getattr(sync_manager, "flush_pending_syncs", None)
+        if not callable(flush):
+            return True
+        if flush():
+            return True
+        QMessageBox.information(
+            self,
+            "로컬 저장 완료",
+            "원고는 로컬과 동기화 대기열에 안전하게 저장되었습니다.\n"
+            "서버 전송은 완료되지 않아 다음 실행 때 자동으로 재시도합니다.",
+        )
+        return False
 
     def closeEvent(self, event):
         """메인 윈도우의 닫기(X) 버튼을 눌렀을 때 호출되는 이벤트"""

@@ -24,6 +24,8 @@ jobs:
     runs-on: windows-latest
     env:
       EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
       WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
     steps:
       - name: Check out exact Windows client head

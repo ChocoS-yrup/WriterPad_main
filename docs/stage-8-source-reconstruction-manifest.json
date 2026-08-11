@@ -1,0 +1,388 @@
+{
+  "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+  "source_entry_snapshot_head": "ec0d0181526f0aaede6c65459fc1cd61595ca8fd",
+  "stacked_pr_base_branch": "codex/stage-8-windows-contract-implementation",
+  "local_history_reused": false,
+  "source_entries_digest_sha256": "64dec2ee55e2e3656e4ee66dfd8f8e86b002d7b66d3ddfffb12a366930d38573",
+  "source_entries_digest_canonicalization": {
+    "entry_order": "path ascending",
+    "entry_encoding": "UTF-8",
+    "entry_record": "<path>\\u0000<decimal byte_count>\\u0000<lowercase output_sha256>\\n",
+    "excluded_paths": [
+      "docs/*",
+      "docs/stage-8-source-reconstruction-manifest.json"
+    ],
+    "file_byte_source": "git show <source_entry_snapshot_head>:<path>",
+    "line_endings": "hash committed Git blob bytes; do not hash checkout-specific CRLF bytes"
+  },
+  "source_entry_count": 39,
+  "safety_gate": {
+    "utf8_text_only": true,
+    "forbidden_path_findings": 0,
+    "binary_findings": 0,
+    "over_1_mib_findings": 0,
+    "secret_rule_findings": 0
+  },
+  "original_dirty_fingerprint": {
+    "head": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+    "status_sha256": "3813c67544e1ca7cc955e7025c89284ba34193020d90b76653d8c68f4fd381dd",
+    "status_z_sha256": "129c1dcfadc4c37dc57f1c857bb29527e6fbfef1c536f2487af626bd51a74ae8",
+    "unstaged_binary_diff_sha256": "4adeb539208a1d94edc01448321f9da9b098bfbffb9bc4ffcceac3384d73442a",
+    "staged_binary_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "status_record_count": 280
+  },
+  "validation": {
+    "baseline_at_pr_1_head": "126 passed; 9 skipped",
+    "corrective_pr_1_head": "2a560c724d7f75bd455328e72c3a9c3cc39b7211",
+    "final_regression": "380 passed; 1 conditional symlink skip; two consecutive exact-source runs",
+    "backup_coalescing_repetition": "30 of 30 rounds passed with ManualWorker and real QThread coverage",
+    "contract_release": "0.2.0",
+    "canonical_contract_sha256": "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+    "corrective_pr_1_local_commit": "b81051c: SQLite OLD -> NEW transition trigger and direct-SQL tests",
+    "source_entry_snapshot_validation": "380 passed; 1 conditional symlink skip; two consecutive exact-source runs",
+    "exact_source_pyinstaller": "6.21.0 passed; 78591142 bytes; dca6130240809723624ff3ddba6c7bdcf390a796fb0502b546d3636990875b0c"
+  },
+  "excluded": [
+    {
+      "scope": "50 local commits",
+      "reason": "history contains tracked secret/binary/cache provenance and was not grafted"
+    },
+    {
+      "scope": ".env and historic secret material",
+      "reason": "forbidden"
+    },
+    {
+      "scope": "saves/project_data.json and actual work content",
+      "reason": "user data forbidden"
+    },
+    {
+      "scope": "DB/WAL/SHM",
+      "reason": "preserved evidence forbidden"
+    },
+    {
+      "scope": "EXE/DLL/build/dist/cache and files classified unsafe in provenance review",
+      "reason": "binary or generated artifacts forbidden"
+    },
+    {
+      "scope": "reference Supabase migration SQL and its old migration-dependent test",
+      "reason": "server scope excluded; Windows test re-authored against SQLite behavior"
+    }
+  ],
+  "entries": [
+    {
+      "path": ".github/workflows/windows-contract.yml",
+      "provenance": "reviewed UTF-8 CI configuration",
+      "bytes": 3132,
+      "output_sha256": "68932ea33f54052e70af29d681abcb1852494777eccae1c7a7f7d2df2d6211e5"
+    },
+    {
+      "path": "binder_order.py",
+      "provenance": "read-only untracked text source",
+      "source_sha256": "a248e4d92eb3939b1fe83e1976f72b48a4c273a16f6dc59159a797efd3b11689",
+      "bytes": 2989,
+      "output_sha256": "a248e4d92eb3939b1fe83e1976f72b48a4c273a16f6dc59159a797efd3b11689"
+    },
+    {
+      "path": "mode_assistant.py",
+      "provenance": "local committed Git object read as text only",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "ab4c3ddcdabcffffec7e5d7a416af248f5c5d54629746ca25ef576d6f5be2ebb",
+      "bytes": 40152,
+      "output_sha256": "ab4c3ddcdabcffffec7e5d7a416af248f5c5d54629746ca25ef576d6f5be2ebb"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "4c0139167e343d569dded2b4b7e80846dd1efb10a53d7dacbc39708b70d77435",
+      "path": "mode_writing.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "47437e62b813b471b26203ce2560c56bc0debdf0a815cbd4dbcbef10fcf72df4",
+      "bytes": 99857,
+      "output_sha256": "47437e62b813b471b26203ce2560c56bc0debdf0a815cbd4dbcbef10fcf72df4"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "935e053d1dba7dd817db07b06f1512453300ee2e692335b55fb702379a8e8b6f",
+      "path": "project_dialogs.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "65050b4ec1bda65d632764d6c627dc2ef57f8d0e4e5066cba5792b53f776a52c",
+      "bytes": 49977,
+      "output_sha256": "65050b4ec1bda65d632764d6c627dc2ef57f8d0e4e5066cba5792b53f776a52c"
+    },
+    {
+      "path": "project_manager.py",
+      "provenance": "local committed Git object",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "75cff9e3855423c0be1898b66a8c6a1dbe432ceb3b6064c096edc915d6c05825",
+      "bytes": 14943,
+      "output_sha256": "75cff9e3855423c0be1898b66a8c6a1dbe432ceb3b6064c096edc915d6c05825"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "74d3856e39d62123e3f7bd189cdedf82d2c00a0042346e90ccbdecd6f9732df5",
+      "path": "project_manager_writing.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "5e987c15aca9f8a36da1a62a46c1cff7f804021e244be20019e705495c0f2ac0",
+      "bytes": 26606,
+      "output_sha256": "5e987c15aca9f8a36da1a62a46c1cff7f804021e244be20019e705495c0f2ac0"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "d7ab1d07699b5b3cfb98372faa945b3f8bedb2ad18cf3d4eb8de3439338e0782",
+      "path": "project_paths.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "7d4a0e07f54e7f647d03c9d66f44d397941eea5e0805c3400e1da2aae7073348",
+      "bytes": 3873,
+      "output_sha256": "7d4a0e07f54e7f647d03c9d66f44d397941eea5e0805c3400e1da2aae7073348"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "8d2f87ffcd989606c5ba828493f00cb2a5f80dd2d81e4d14458d9e77f40ea8c9",
+      "path": "project_trash.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "03fb2f09020991389d2401e2764ec58be62fb00c86790735e10774bb6120187d",
+      "bytes": 20534,
+      "output_sha256": "3985881f19b20540d0e1eab900100a9b5e997934022e4507aefeb0a981c1987e"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "da9d18a1b6f10fd10bda7aee96107230c525b81a7284d4cdee0495ff7f26e917",
+      "path": "server_project_import.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "0bfcd4272c66440d9a42780c457bc5ebdbdc08ca66556d44c41c215292ac6691",
+      "bytes": 19614,
+      "output_sha256": "0bfcd4272c66440d9a42780c457bc5ebdbdc08ca66556d44c41c215292ac6691"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "bc315c517142afa71a8e32fd770c6b90f35b7491f6cdd0e9e477091d5f4b432b",
+      "path": "settings_panel.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "0d41a9a8f10b2eb75a692bf1e9dcf3f6f9f1c34730ce29bbf635ff52c2fbf4cc",
+      "bytes": 42728,
+      "output_sha256": "0d41a9a8f10b2eb75a692bf1e9dcf3f6f9f1c34730ce29bbf635ff52c2fbf4cc"
+    },
+    {
+      "path": "sync_diagnostics.py",
+      "provenance": "read-only untracked text source",
+      "source_sha256": "0d4531796a93ea91ff6b0bc66d120c39eaf927c0bf6ac43133a2bccf546baace",
+      "bytes": 8788,
+      "output_sha256": "0d4531796a93ea91ff6b0bc66d120c39eaf927c0bf6ac43133a2bccf546baace"
+    },
+    {
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "base_sha256": "87de59d09f9ae5ecbb35c567602502c3fbb05ad7b3a5467b38490b5b551e15ed",
+      "dirty_source_sha256": "2a415ae9ee85cc719ca82cb8e686cc28565aca708aa2a77e2d5d16fda23d75b6",
+      "path": "sync_manager.py",
+      "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
+      "bytes": 276572,
+      "output_sha256": "cb67bd46bf6ef05727bd0391a083d6326401a6811eff64fb1e4be88e5bb03f6f"
+    },
+    {
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "base_sha256": "95b319b55d9bdf2ed222d1dcfc89e6afbce694cac5a9a525c977ad62ec4a7cfa",
+      "dirty_source_sha256": "be2a1bbd6765ea1c7cad458eb1883223011711296e697009929bbb295f807daf",
+      "path": "sync_v2_store.py",
+      "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
+      "bytes": 143397,
+      "output_sha256": "79938f0a8d5e064ef89ce66cf71426dccc775ceb8a323dd9901b424abe6e71c2"
+    },
+    {
+      "path": "test_flags.py",
+      "provenance": "reviewed UTF-8 manual test probe; guarded by __main__ to avoid unittest discovery side effects",
+      "bytes": 575,
+      "output_sha256": "df1173324b37ab3cd06da326c6efd448f1c874a8ada08789753dddb6f7811d18"
+    },
+    {
+      "path": "test_rename.py",
+      "provenance": "reviewed UTF-8 manual test probe; guarded by __main__ to avoid unittest discovery side effects",
+      "bytes": 1600,
+      "output_sha256": "5515097d5abdb2b3528115e2864f9baaacf8175183be914303271aed04978fa1"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "92f2958445302acab60be583fe05ebfa9d0b7f02a1b02b681b506fcd11d2a788",
+      "path": "tests/__init__.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "87177897298c544796e2016698f0a6ba24fd6c12e12a84256fcd7a22b13d37db",
+      "bytes": 368,
+      "output_sha256": "87177897298c544796e2016698f0a6ba24fd6c12e12a84256fcd7a22b13d37db"
+    },
+    {
+      "path": "tests/qt_app.py",
+      "provenance": "reviewed UTF-8 source/test reconstruction",
+      "bytes": 242,
+      "output_sha256": "4773cba84e9a1a8c58e95ced0d5300713ee4b41c2ae78c6eee25fd6ad46d8225"
+    },
+    {
+      "path": "tests/resource_probe.py",
+      "provenance": "read-only untracked text source",
+      "source_sha256": "aba5206a158dd0b0917c5c64fef3f7ae3ac25fac85ad9ff86d81bb13dd2727e4",
+      "bytes": 7021,
+      "output_sha256": "273cbe540b98f1376511d18bc46d674ba2920226ba018037c5b10640ec34d9ab"
+    },
+    {
+      "path": "tests/test_folder_identity_migration.py",
+      "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "bytes": 2932,
+      "output_sha256": "411e0794b5f793047aff51b9e608aac73a138ee078ef50e7475d93e08c217f52"
+    },
+    {
+      "path": "tests/test_long_run_resources.py",
+      "provenance": "read-only untracked text source",
+      "source_sha256": "7f115fe3ecefb7a05c2f021428feef08920d15fee9db0ff68edc295edc5bec4e",
+      "bytes": 13170,
+      "output_sha256": "bc8e61c3743546e52f3ff245abfe0f57d8455ebf7ab349e69061e55cf17d754f"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "370b0c6ac74d2a38758d0334709302cf98b24c9abdf4ef73db735ea1bc89df37",
+      "path": "tests/test_project_paths.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "6f5cce723ab2d880139b1168c7f7b797243a93a52164c5ba123674de6099b79a",
+      "bytes": 5155,
+      "output_sha256": "6f5cce723ab2d880139b1168c7f7b797243a93a52164c5ba123674de6099b79a"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "8d75bd344c1ac4c6e704c4b338aa86867715d2952c7746f3caa43c0bf3bb8048",
+      "path": "tests/test_project_trash.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "aeaf319176f341df4a5796026502270381df137e685893d758f3c548b7e54a7e",
+      "bytes": 15767,
+      "output_sha256": "24c0649010de56a417621aa19f3351c82227ead1c8c47f505f1f63cbad4d323c"
+    },
+    {
+      "path": "tests/test_project_trash_ui.py",
+      "provenance": "local committed Git object",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "f70d97e374db79948b4f2dd31d537ac9620dc779c9f91d22c29147106d203d76",
+      "bytes": 11810,
+      "output_sha256": "f70d97e374db79948b4f2dd31d537ac9620dc779c9f91d22c29147106d203d76"
+    },
+    {
+      "path": "tests/test_server_project_catalog.py",
+      "provenance": "local committed Git object",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "d3183d8a47267fc3bf2ab14c16605a24e44b41f67e5205b972916251b6a92c35",
+      "bytes": 8982,
+      "output_sha256": "d3183d8a47267fc3bf2ab14c16605a24e44b41f67e5205b972916251b6a92c35"
+    },
+    {
+      "path": "tests/test_server_project_import.py",
+      "provenance": "local committed Git object",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "162cb8e7c5b80a9d3a2fa2e51cd2b035b168debab4508f2e66ed62efd488dfdb",
+      "bytes": 26663,
+      "output_sha256": "ef34f5cab6716b8265ba495ef76f2c4e1acb70c13daef45a4e6ac0a693d71450"
+    },
+    {
+      "path": "tests/test_server_project_import_ui.py",
+      "provenance": "local committed Git object",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "05329d496415c3bf6fc93c6d1e9fe8a9bee4c7f19235b734b75781196bc7f40f",
+      "bytes": 13590,
+      "output_sha256": "05329d496415c3bf6fc93c6d1e9fe8a9bee4c7f19235b734b75781196bc7f40f"
+    },
+    {
+      "path": "tests/test_sync_contract_stage8.py",
+      "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "bytes": 64809,
+      "output_sha256": "72a784817e8f53c45f3f4ee0b78095004844ffb467bb55481e3f326d479d9945"
+    },
+    {
+      "path": "tests/test_sync_diagnostics.py",
+      "provenance": "read-only untracked text source",
+      "source_sha256": "1a6df59d48ac7c9ec00ec6be3132af0d765752151cc50a8616052b0bdcffa519",
+      "bytes": 6250,
+      "output_sha256": "1a6df59d48ac7c9ec00ec6be3132af0d765752151cc50a8616052b0bdcffa519"
+    },
+    {
+      "path": "tests/test_sync_resilience.py",
+      "provenance": "read-only untracked text source",
+      "source_sha256": "24af9389038169c398a4109588cef4ca6cbdc56396c5c25019b176e4750c264d",
+      "bytes": 6817,
+      "output_sha256": "3692bbc974dfe758869acf9f7e8c2a0ffb5190c4040dca061a8ba84134c1243d"
+    },
+    {
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "base_sha256": "9f7508116d674c37606a2c93c3ef457a4ea8bfdb00eec790598d8349ad51e301",
+      "dirty_source_sha256": "49e2de7c79ca41f77490d479f8e7f8babd448ed04c376a75f1b7bc902be09be8",
+      "path": "tests/test_sync_state.py",
+      "provenance": "function/hunk reconstruction over PR #1 exact head",
+      "bytes": 28778,
+      "output_sha256": "5815facc5f59a5be5ad7442d24fddc3375da725af0650f0d1e9ae9de4f2fda3f"
+    },
+    {
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "base_sha256": "503cd20b85e3662c3577b7c106fc195c94a9a240361c4028cb173cfe20c04c80",
+      "dirty_source_sha256": "0b509dc8709925b0984078d170dcfda5ad81f7325bb82369f2f91ca0084547a6",
+      "path": "tests/test_sync_v2.py",
+      "provenance": "function/hunk reconstruction over PR #1 exact head",
+      "bytes": 209914,
+      "output_sha256": "7b34a5216d5499a8b30bded213626850a7a20dd9dac485323d63efabedba9950"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "a711020b219819e21d283dc1d8d4cca834ecf04d8472026ab3deb4c8f8cd82e3",
+      "path": "tests/test_writing_autosave.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "96c868fef2547eee94273972052066303506cd769a2ea6f13b4943769296f90d",
+      "bytes": 16684,
+      "output_sha256": "96c868fef2547eee94273972052066303506cd769a2ea6f13b4943769296f90d"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "e9a07ed3bdfa8bee6915acc49f7b980dfd1b5ee9cfcb1eabdcc2b0986951e3cc",
+      "path": "tests/test_writing_binder_order.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "e3c2624ed9971fdba5a7c0425310f4727449284555fe37b31f7f7fa627c7ace6",
+      "bytes": 12344,
+      "output_sha256": "e3c2624ed9971fdba5a7c0425310f4727449284555fe37b31f7f7fa627c7ace6"
+    },
+    {
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "base_sha256": "627bdcdbe27c8c4d39303829c154dcec8003f1ca894b1091f08708b491981a10",
+      "path": "tests/test_writing_data.py",
+      "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
+      "source_sha256": "d533310bbaadd8aec1ef93f5571a3c9c9043e9838380092030fb0e098d8d3f16",
+      "bytes": 35792,
+      "output_sha256": "3d72e21e48a39373c78b79fd420d2a5c2ffe03ce6b4b26ce8402b18deb210cde"
+    },
+    {
+      "path": "text_editor.py",
+      "provenance": "local committed Git object read as text only",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "0be24969e5d8dc550d9b7f3e7c3789745c070935b3510ac05b2feef0576d6c53",
+      "bytes": 31602,
+      "output_sha256": "0be24969e5d8dc550d9b7f3e7c3789745c070935b3510ac05b2feef0576d6c53"
+    },
+    {
+      "path": "three_way_merge.py",
+      "provenance": "local committed Git object read as text only",
+      "source_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "source_sha256": "b987b0fa34240b865af4eba04a2a4c9119dcfd13833cbb171a546ef751c0cbd1",
+      "bytes": 5638,
+      "output_sha256": "b987b0fa34240b865af4eba04a2a4c9119dcfd13833cbb171a546ef751c0cbd1"
+    },
+    {
+      "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
+      "base_sha256": "911fc9fcc67f941397ae3a6af70c3d27cc9ed1f092dcb09eee982f02fd8e7ccd",
+      "path": "writing_controller.py",
+      "provenance": "read-only dirty tracked source over local committed object",
+      "source_sha256": "aabef1502d1ef98ce6a34dd1c48636e754cd10a87082334a5d79a4be82e87498",
+      "bytes": 18444,
+      "output_sha256": "aabef1502d1ef98ce6a34dd1c48636e754cd10a87082334a5d79a4be82e87498"
+    },
+    {
+      "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
+      "base_sha256": "c102a427cec09915ae5a7c60d722f3b846d3ee4ab30444f85af8971a41e417ce",
+      "path": "writing_tree.py",
+      "provenance": "function/hunk reconstruction and new integration coverage over PR #1 exact head",
+      "source_sha256": "5ca063adc68c3a5a069549200401ce7a69b7b60c0423af10d56b9c472e6936ac",
+      "bytes": 84858,
+      "output_sha256": "02855f44273f29ca6f3a65cf3056bba873a00e7d4d16e3292bd3708c28440b53"
+    }
+  ]
+}

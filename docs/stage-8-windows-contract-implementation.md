@@ -7,7 +7,7 @@
 - Baseline freshness: confirmed by `git fetch origin main` on 2026-08-11
 - Branch: `codex/stage-8-windows-contract-implementation`
 - Contract 0.2 initial implementation commit: `f0de952d180babf56798ce27e00fa2e455cbbd15`
-- Mode/epoch corrective head: the commit containing this handoff
+- Local mode/epoch corrective commit: `b81051c` (publication and CI pending)
 - Review status: Draft PR #1, `CLEAN/MERGEABLE`; local implementation and Windows CI passed, staging client round trip not authorized
 - Production Supabase writes: none
 - Staging Supabase writes during Stage 8: none
