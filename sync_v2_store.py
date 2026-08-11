@@ -2455,9 +2455,10 @@ class SyncV2Store:
         ordered_intents,
         path_changes,
         *,
+        document_changes=None,
         batch_id=None,
     ):
-        """Persist one contract batch and its local path projection atomically."""
+        """Persist one contract batch and every local projection atomically."""
         with self._transaction():
             request = self.create_structure_batch(
                 context,
@@ -2465,6 +2466,41 @@ class SyncV2Store:
                 ordered_intents,
                 batch_id=batch_id,
             )
+            # A restored folder must be visible before its documents rebuild
+            # parent identity. A deleted folder must remain visible until its
+            # document tombstones have captured that same parent identity.
+            for change in path_changes or []:
+                for update in change.get("folder_updates") or []:
+                    if update.get("is_deleted"):
+                        continue
+                    self._apply_local_folder_update(
+                        context["local_key"], update
+                    )
+            for change in document_changes or []:
+                document_id = str(uuid.UUID(str(change["document_id"])))
+                old_path = _normalize_path(change["old_local_path"])
+                new_path = _normalize_path(change["new_local_path"])
+                with self._transaction() as connection:
+                    document = connection.execute(
+                        "SELECT * FROM sync_documents "
+                        "WHERE document_id = ? AND local_key = ?",
+                        (document_id, context["local_key"]),
+                    ).fetchone()
+                    if document is None or document["local_path"] != old_path:
+                        raise SyncContractError("INVALID_ARGUMENT")
+                    connection.execute(
+                        "UPDATE sync_documents SET local_path = ?, updated_at = ? "
+                        "WHERE document_id = ?",
+                        (new_path, _utc_now(), document_id),
+                    )
+                if change.get("enqueue", True):
+                    self.enqueue(
+                        context,
+                        new_path,
+                        change["content"],
+                        relative_path=change["relative_path"],
+                        is_deleted=bool(change.get("is_deleted")),
+                    )
             for change in path_changes or []:
                 pending = change.get("pending_folder")
                 if pending:
@@ -2487,28 +2523,32 @@ class SyncV2Store:
                         context["local_key"], old_path, new_path
                     )
                 for update in change.get("folder_updates") or []:
-                    name = str(update["local_path"]).rsplit("/", 1)[-1]
-                    with self._transaction() as connection:
-                        connection.execute(
-                            """
-                            UPDATE sync_folders
-                            SET parent_folder_id = ?, local_path = ?, name = ?,
-                                storage_name_key = ?, is_deleted = ?,
-                                updated_at = ?
-                            WHERE folder_id = ? AND local_key = ?
-                            """,
-                            (
-                                update.get("parent_folder_id"),
-                                _normalize_path(update["local_path"]),
-                                name,
-                                normalize_storage_name(name).normalized,
-                                int(bool(update["is_deleted"])),
-                                _utc_now(),
-                                update["folder_id"],
-                                context["local_key"],
-                            ),
-                        )
+                    if not update.get("is_deleted"):
+                        continue
+                    self._apply_local_folder_update(
+                        context["local_key"], update
+                    )
             return request
+
+    def _apply_local_folder_update(self, local_key, update):
+        name = str(update["local_path"]).rsplit("/", 1)[-1]
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE sync_folders
+                SET parent_folder_id = ?, local_path = ?, name = ?,
+                    storage_name_key = ?, is_deleted = ?, updated_at = ?
+                WHERE folder_id = ? AND local_key = ?
+                """,
+                (
+                    update.get("parent_folder_id"),
+                    _normalize_path(update["local_path"]),
+                    name,
+                    normalize_storage_name(name).normalized,
+                    int(bool(update["is_deleted"])),
+                    _utc_now(), update["folder_id"], local_key,
+                ),
+            )
 
     def record_structure_recovery(
         self, local_key, old_path, new_path, error_code

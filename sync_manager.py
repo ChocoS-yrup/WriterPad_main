@@ -924,10 +924,14 @@ class SyncManager(QObject):
     ):
         intents = []
         path_changes = []
+        document_changes = []
         aliases = []
         pending_folders = {}
         for operation in path_operations or []:
             intents.extend(operation.get("contract_structure_intents") or [])
+            document_changes.extend(
+                operation.get("contract_document_changes") or []
+            )
             change = operation.get("contract_path_change")
             if change:
                 path_changes.append(change)
@@ -946,12 +950,15 @@ class SyncManager(QObject):
             pending_folders=pending_folders,
         ))
         if not intents:
+            if document_changes:
+                raise SyncContractError("CONTRACT_STRUCTURE_IDS_REQUIRED")
             return None
         request = self._v2_store.create_structure_batch_with_path_changes(
             self._v2_context,
             self._v2_device_id,
             intents,
             path_changes,
+            document_changes=document_changes,
         )
         self._publish_sync_state()
         if retry:
@@ -6167,51 +6174,94 @@ class SyncManager(QObject):
     def record_tombstone(self, old_rel_path, trash_rel_path, retry=True):
         if not self.is_v2_enabled:
             return []
-        folder_operation = None
-        if self._uses_contract_structure():
-            folder_operation = self._contract_folder_lifecycle_plan(
-                old_rel_path, old_rel_path, "delete"
-            )
-        # A previously deleted UUID may still reserve the same local trash path
-        # even when its physical copy was removed. Relocate the new copy before
-        # updating SQLite so repeated delete/restore cycles cannot violate the
-        # UNIQUE(local_key, local_path) constraint.
-        for _ in range(100):
-            conflicts = self._v2_store.move_destination_conflicts(
-                self._v2_context["local_key"], old_rel_path, trash_rel_path
-            )
-            if not conflicts:
-                break
-            trash_rel_path = self._v2_wpm.relocate_trash_item(trash_rel_path)
-        else:
-            raise RuntimeError("휴지통 문서 경로를 안전하게 확보하지 못했습니다.")
-        moved = self._v2_store.move_local_path(
-            self._v2_context["local_key"], old_rel_path, trash_rel_path
-        )
-        if moved:
-            self._v2_wpm.update_trash_metadata(
-                trash_rel_path,
-                document_id=min(
-                    str(document.get("document_id") or "") for document in moved
-                ),
-            )
-        for document in moved:
-            # A just-created file can be deleted before its create RPC finishes.
-            # Keep a dependent tombstone behind that create instead of dropping
-            # the deletion and allowing another device to resurrect the file.
-            if (
-                document["revision"] == 0
-                and not self._v2_store.has_active_operations(document["document_id"])
-            ):
-                continue
-            content = self._v2_wpm.read_text_file(document["local_path"])
-            if content is not None:
-                self._v2_store.enqueue(
-                    self._v2_context,
-                    document["local_path"],
-                    content,
-                    relative_path=document["server_path"],
-                    is_deleted=True,
+        with self._structure_mutation_gate:
+            folder_operation = None
+            contract_structure = self._uses_contract_structure()
+            if contract_structure:
+                folder_operation = self._contract_folder_lifecycle_plan(
+                    old_rel_path, old_rel_path, "delete"
+                ) or {
+                    "contract_structure_intents": [],
+                    "contract_path_change": None,
+                }
+            # A previously deleted UUID may still reserve the same local trash path
+            # even when its physical copy was removed. Relocate the new copy before
+            # updating SQLite so repeated delete/restore cycles cannot violate the
+            # UNIQUE(local_key, local_path) constraint.
+            for _ in range(100):
+                conflicts = self._v2_store.move_destination_conflicts(
+                    self._v2_context["local_key"], old_rel_path, trash_rel_path
+                )
+                if not conflicts:
+                    break
+                trash_rel_path = self._v2_wpm.relocate_trash_item(trash_rel_path)
+            else:
+                raise RuntimeError("휴지통 문서 경로를 안전하게 확보하지 못했습니다.")
+
+            source_documents = [
+                document for document in self._v2_store.list_documents(
+                    self._v2_context["local_key"]
+                )
+                if document["local_path"] == old_rel_path
+                or document["local_path"].startswith(old_rel_path + "/")
+            ]
+            if contract_structure:
+                document_changes = []
+                for document in source_documents:
+                    suffix = document["local_path"][len(old_rel_path):]
+                    new_local_path = trash_rel_path + suffix
+                    content = self._v2_wpm.read_text_file(new_local_path)
+                    if content is None:
+                        continue
+                    document_changes.append({
+                        "document_id": document["document_id"],
+                        "old_local_path": document["local_path"],
+                        "new_local_path": new_local_path,
+                        "relative_path": document["server_path"],
+                        "content": content,
+                        "is_deleted": True,
+                        "enqueue": not (
+                            document["revision"] == 0
+                            and not self._v2_store.has_active_operations(
+                                document["document_id"]
+                            )
+                        ),
+                    })
+                folder_operation["contract_document_changes"] = document_changes
+                moved = [{
+                    **document,
+                    "old_local_path": document["local_path"],
+                    "local_path": trash_rel_path
+                    + document["local_path"][len(old_rel_path):],
+                } for document in source_documents]
+            else:
+                moved = self._v2_store.move_local_path(
+                    self._v2_context["local_key"], old_rel_path, trash_rel_path
+                )
+                for document in moved:
+                    # Keep a dependent tombstone behind an unfinished create.
+                    if (
+                        document["revision"] == 0
+                        and not self._v2_store.has_active_operations(
+                            document["document_id"]
+                        )
+                    ):
+                        continue
+                    content = self._v2_wpm.read_text_file(document["local_path"])
+                    if content is not None:
+                        self._v2_store.enqueue(
+                            self._v2_context,
+                            document["local_path"],
+                            content,
+                            relative_path=document["server_path"],
+                            is_deleted=True,
+                        )
+            if moved:
+                self._v2_wpm.update_trash_metadata(
+                    trash_rel_path,
+                    document_id=min(
+                        str(document.get("document_id") or "") for document in moved
+                    ),
                 )
         self._publish_sync_state()
         if retry:
@@ -6224,24 +6274,62 @@ class SyncManager(QObject):
     ):
         if not self.is_v2_enabled:
             return []
-        folder_operation = None
-        if self._uses_contract_structure() and original_rel_path:
-            folder_operation = self._contract_folder_lifecycle_plan(
-                original_rel_path, restored_rel_path, "restore"
-            )
-        moved = self._v2_store.move_local_path(
-            self._v2_context["local_key"], trash_rel_path, restored_rel_path
-        )
-        for document in moved:
-            content = self._v2_wpm.read_text_file(document["local_path"])
-            if content is not None:
-                self._v2_store.enqueue(
-                    self._v2_context,
-                    document["local_path"],
-                    content,
-                    relative_path=document["local_path"],
-                    is_deleted=False,
+        with self._structure_mutation_gate:
+            folder_operation = None
+            contract_structure = self._uses_contract_structure()
+            if contract_structure and not original_rel_path:
+                raise SyncContractError("CONTRACT_STRUCTURE_IDS_REQUIRED")
+            if contract_structure and original_rel_path:
+                folder_operation = self._contract_folder_lifecycle_plan(
+                    original_rel_path, restored_rel_path, "restore"
+                ) or {
+                    "contract_structure_intents": [],
+                    "contract_path_change": None,
+                }
+            source_documents = [
+                document for document in self._v2_store.list_documents(
+                    self._v2_context["local_key"]
                 )
+                if document["local_path"] == trash_rel_path
+                or document["local_path"].startswith(trash_rel_path + "/")
+            ]
+            if contract_structure and folder_operation is not None:
+                document_changes = []
+                for document in source_documents:
+                    suffix = document["local_path"][len(trash_rel_path):]
+                    new_local_path = restored_rel_path + suffix
+                    content = self._v2_wpm.read_text_file(new_local_path)
+                    if content is None:
+                        continue
+                    document_changes.append({
+                        "document_id": document["document_id"],
+                        "old_local_path": document["local_path"],
+                        "new_local_path": new_local_path,
+                        "relative_path": new_local_path,
+                        "content": content,
+                        "is_deleted": False,
+                    })
+                folder_operation["contract_document_changes"] = document_changes
+                moved = [{
+                    **document,
+                    "old_local_path": document["local_path"],
+                    "local_path": restored_rel_path
+                    + document["local_path"][len(trash_rel_path):],
+                } for document in source_documents]
+            else:
+                moved = self._v2_store.move_local_path(
+                    self._v2_context["local_key"], trash_rel_path, restored_rel_path
+                )
+                for document in moved:
+                    content = self._v2_wpm.read_text_file(document["local_path"])
+                    if content is not None:
+                        self._v2_store.enqueue(
+                            self._v2_context,
+                            document["local_path"],
+                            content,
+                            relative_path=document["local_path"],
+                            is_deleted=False,
+                        )
         self._publish_sync_state()
         if retry:
             self.retry_pending_syncs()

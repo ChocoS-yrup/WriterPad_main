@@ -614,6 +614,210 @@ class ContractStoreTests(unittest.TestCase):
         self.assertEqual(restored["local_path"], restored_path)
         self.assertFalse(restored["is_deleted"])
 
+    def _contract_lifecycle_with_documents(self, *, deleted):
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        original_path = "메인/메모장/원고 묶음"
+        folder = self._folder_snapshot(
+            original_path, parent_id=parent["folder_id"]
+        )
+        folder["is_deleted"] = deleted
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, folder]
+        )
+        self.store.replace_tree_order_snapshots(
+            self.context["local_key"], [{
+                "tree_order_id": str(uuid.uuid4()),
+                "parent_folder_id": parent["folder_id"],
+                "children": [] if deleted else [folder["folder_id"]],
+                "revision": 1,
+            }]
+        )
+        source_root = (
+            "메인/휴지통/원고 묶음" if deleted else original_path
+        )
+        document_ids = []
+        document_names = []
+        for name in ("첫째.txt", "둘째.txt"):
+            local_path = f"{source_root}/{name}"
+            document = self.store.ensure_document(
+                self.context["local_key"], local_path, f"{name} 내용"
+            )
+            document_ids.append(document["document_id"])
+            document_names.append(name)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            for document_id, name in zip(document_ids, document_names):
+                connection.execute(
+                    "UPDATE sync_documents SET revision = 1, "
+                    "structure_revision = 1, parent_folder_id = ?, "
+                    "storage_name_key = ?, is_deleted = ?, server_path = "
+                    "replace(local_path, '메인/휴지통/원고 묶음', "
+                    "'메인/메모장/원고 묶음') WHERE document_id = ?",
+                    (
+                        folder["folder_id"],
+                        normalize_storage_name(name).normalized,
+                        int(deleted),
+                        document_id,
+                    ),
+                )
+            connection.commit()
+        manager._v2_wpm.read_text_file = lambda path: f"{path} 내용"
+        manager._v2_wpm.update_trash_metadata = lambda *args, **kwargs: True
+        manager._v2_wpm.relocate_trash_item = lambda path: path + "-relocated"
+        return manager, parent, folder, document_ids
+
+    def _assert_lifecycle_sqlite_rollback(
+        self, manager, operations, tree_order, document_ids, expected_paths,
+    ):
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            before_operations = connection.execute(
+                "SELECT count(*) FROM sync_operations"
+            ).fetchone()[0]
+            before_batches = connection.execute(
+                "SELECT count(*) FROM sync_contract_batches"
+            ).fetchone()[0]
+        real_enqueue = self.store.enqueue
+        call_count = 0
+
+        def fail_after_first_document(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("injected lifecycle batch failure")
+            return real_enqueue(*args, **kwargs)
+
+        with patch.object(
+            self.store, "enqueue", side_effect=fail_after_first_document
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "injected lifecycle batch failure"
+            ):
+                manager.queue_contract_path_change_with_order(
+                    operations, tree_order, retry=False
+                )
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(
+            [
+                self.store.get_document_by_id(document_id)["local_path"]
+                for document_id in document_ids
+            ],
+            expected_paths,
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM sync_operations"
+                ).fetchone()[0],
+                before_operations,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM sync_contract_batches"
+                ).fetchone()[0],
+                before_batches,
+            )
+
+    def test_nonempty_folder_delete_batch_failure_rolls_back_sqlite(self):
+        manager, _parent, folder, document_ids = (
+            self._contract_lifecycle_with_documents(deleted=False)
+        )
+        original_path = folder["local_path"]
+        trash_path = "메인/휴지통/원고 묶음"
+        operations = manager.record_tombstone(
+            original_path, trash_path, retry=False
+        )
+
+        self._assert_lifecycle_sqlite_rollback(
+            manager,
+            operations,
+            {"메인/메모장": []},
+            document_ids,
+            [f"{original_path}/첫째.txt", f"{original_path}/둘째.txt"],
+        )
+        stored_folder = self.store.get_folder_by_id(folder["folder_id"])
+        self.assertEqual(stored_folder["local_path"], original_path)
+        self.assertFalse(stored_folder["is_deleted"])
+
+    def test_nonempty_folder_restore_batch_failure_rolls_back_sqlite(self):
+        manager, _parent, folder, document_ids = (
+            self._contract_lifecycle_with_documents(deleted=True)
+        )
+        trash_path = "메인/휴지통/원고 묶음"
+        restored_path = "메인/메모장/복원 원고"
+        operations = manager.record_restore(
+            trash_path,
+            restored_path,
+            original_rel_path=folder["local_path"],
+            retry=False,
+        )
+
+        self._assert_lifecycle_sqlite_rollback(
+            manager,
+            operations,
+            {"메인/메모장": ["복원 원고"]},
+            document_ids,
+            [f"{trash_path}/첫째.txt", f"{trash_path}/둘째.txt"],
+        )
+        stored_folder = self.store.get_folder_by_id(folder["folder_id"])
+        self.assertEqual(stored_folder["local_path"], folder["local_path"])
+        self.assertTrue(stored_folder["is_deleted"])
+
+    def test_nonempty_folder_delete_and_restore_commit_all_sqlite_projections(self):
+        manager, _parent, folder, document_ids = (
+            self._contract_lifecycle_with_documents(deleted=False)
+        )
+        original_path = folder["local_path"]
+        trash_path = "메인/휴지통/원고 묶음"
+        delete_operations = manager.record_tombstone(
+            original_path, trash_path, retry=False
+        )
+        manager.queue_contract_path_change_with_order(
+            delete_operations, {"메인/메모장": []}, retry=False
+        )
+
+        self.assertTrue(
+            self.store.get_folder_by_id(folder["folder_id"])["is_deleted"]
+        )
+        self.assertEqual(
+            [
+                self.store.get_document_by_id(document_id)["local_path"]
+                for document_id in document_ids
+            ],
+            [f"{trash_path}/첫째.txt", f"{trash_path}/둘째.txt"],
+        )
+        restored_path = "메인/메모장/복원 원고"
+        restore_operations = manager.record_restore(
+            trash_path,
+            restored_path,
+            original_rel_path=original_path,
+            retry=False,
+        )
+        manager.queue_contract_path_change_with_order(
+            restore_operations,
+            {"메인/메모장": ["복원 원고"]},
+            retry=False,
+        )
+
+        restored = self.store.get_folder_by_id(folder["folder_id"])
+        self.assertEqual(restored["local_path"], restored_path)
+        self.assertFalse(restored["is_deleted"])
+        self.assertEqual(
+            [
+                self.store.get_document_by_id(document_id)["local_path"]
+                for document_id in document_ids
+            ],
+            [f"{restored_path}/첫째.txt", f"{restored_path}/둘째.txt"],
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            rows = connection.execute(
+                "SELECT document_id, is_deleted FROM sync_operations "
+                "ORDER BY queue_id"
+            ).fetchall()
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([row[1] for row in rows], [1, 1, 0, 0])
+        self.assertEqual({row[0] for row in rows}, set(document_ids))
+
     def test_compatible_legacy_uses_protocol_three_without_promotion(self):
         project = self.store.activate_contract_project(
             self.context["local_key"],

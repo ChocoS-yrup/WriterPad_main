@@ -764,20 +764,26 @@ class WritingTreeMixin:
         reply = QMessageBox.question(self, "삭제 확인", f"'{item.text(0)}'을(를) 휴지통으로 이동하시겠습니까?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                trash_rel_path = self.wpm.move_to_trash(rel_path)
-                if hasattr(self, "sync_manager"):
-                    operations = self.sync_manager.record_tombstone(
-                        rel_path, trash_rel_path, retry=False
-                    )
-                else:
-                    operations = []
-                if hasattr(self, "controller"):
-                    self.controller.forget_path(rel_path)
-                self._cleanup_after_delete(
-                    rel_path, item, operations=operations
+                sync_manager = getattr(self, "sync_manager", None)
+                mutation_gate = (
+                    sync_manager.local_structure_mutation()
+                    if sync_manager is not None else nullcontext()
                 )
-                if hasattr(self, "sync_manager"):
-                    self.sync_manager.retry_pending_syncs()
+                with mutation_gate:
+                    trash_rel_path = self.wpm.move_to_trash(rel_path)
+                    if sync_manager is not None:
+                        operations = sync_manager.record_tombstone(
+                            rel_path, trash_rel_path, retry=False
+                        )
+                    else:
+                        operations = []
+                    if hasattr(self, "controller"):
+                        self.controller.forget_path(rel_path)
+                    self._cleanup_after_delete(
+                        rel_path, item, operations=operations
+                    )
+                if sync_manager is not None:
+                    sync_manager.retry_pending_syncs()
 
                 # 휴지통 노드 시각적 갱신
                 for i in range(self.binder_tree.topLevelItemCount()):
@@ -793,16 +799,21 @@ class WritingTreeMixin:
                         break
             except Exception as e:
                 if 'trash_rel_path' in locals():
-                    try:
-                        self.wpm.restore_from_trash(trash_rel_path)
-                    except Exception:
-                        sync_manager = getattr(self, "sync_manager", None)
-                        if sync_manager is not None:
-                            sync_manager.record_structure_recovery(
-                                rel_path,
-                                trash_rel_path,
-                                "DELETE_ROLLBACK_FAILED",
-                            )
+                    sync_manager = getattr(self, "sync_manager", None)
+                    rollback_gate = (
+                        sync_manager.local_structure_mutation()
+                        if sync_manager is not None else nullcontext()
+                    )
+                    with rollback_gate:
+                        try:
+                            self.wpm.restore_from_trash(trash_rel_path)
+                        except Exception:
+                            if sync_manager is not None:
+                                sync_manager.record_structure_recovery(
+                                    rel_path,
+                                    trash_rel_path,
+                                    "DELETE_ROLLBACK_FAILED",
+                                )
                     self.load_tree_data()
                 QMessageBox.warning(self, "오류", f"삭제 실패: {e}")
 
@@ -827,6 +838,11 @@ class WritingTreeMixin:
             destination_parent = os.path.relpath(selected, self.wpm.writing_root_path).replace("\\", "/")
 
         try:
+            sync_manager = getattr(self, "sync_manager", None)
+            mutation_gate = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None else nullcontext()
+            )
             trash_entry = next(
                 (
                     entry for entry in self.wpm.list_trash_items()
@@ -835,47 +851,57 @@ class WritingTreeMixin:
                 {},
             )
             original_rel_path = trash_entry.get("original_path")
-            restored_path = self.wpm.restore_from_trash(rel_path, destination_parent)
-            if hasattr(self, "sync_manager"):
-                operations = self.sync_manager.record_restore(
-                    rel_path,
-                    restored_path,
-                    original_rel_path=original_rel_path,
-                    retry=False,
+            with mutation_gate:
+                restored_path = self.wpm.restore_from_trash(
+                    rel_path, destination_parent
                 )
-            else:
-                operations = []
-            if hasattr(self, "controller"):
-                self.controller.rename_path(rel_path, restored_path)
-            self.load_tree_data()
-            if operations and hasattr(self, "sync_manager"):
-                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
-                if any(
-                    operation.get("contract_structure_intents")
-                    for operation in operations
-                    if isinstance(operation, dict)
-                ):
-                    self.sync_manager.queue_contract_path_change_with_order(
-                        operations, tree_order, retry=False
+                if sync_manager is not None:
+                    operations = sync_manager.record_restore(
+                        rel_path,
+                        restored_path,
+                        original_rel_path=original_rel_path,
+                        retry=False,
                     )
                 else:
-                    self.defer_tree_order_until_operations(
-                        operations, tree_order=tree_order
-                    )
-                self.sync_manager.retry_pending_syncs()
+                    operations = []
+                if hasattr(self, "controller"):
+                    self.controller.rename_path(rel_path, restored_path)
+                self.load_tree_data()
+                if operations and sync_manager is not None:
+                    tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                    if any(
+                        operation.get("contract_structure_intents")
+                        or operation.get("contract_document_changes")
+                        for operation in operations
+                        if isinstance(operation, dict)
+                    ):
+                        sync_manager.queue_contract_path_change_with_order(
+                            operations, tree_order, retry=False
+                        )
+                    else:
+                        self.defer_tree_order_until_operations(
+                            operations, tree_order=tree_order
+                        )
+            if operations and sync_manager is not None:
+                sync_manager.retry_pending_syncs()
             QMessageBox.information(self, "복원 완료", f"다음 위치로 복원했습니다.\n{restored_path}")
         except Exception as e:
             if 'restored_path' in locals():
-                try:
-                    self.wpm.move_to_trash(restored_path)
-                except Exception:
-                    sync_manager = getattr(self, "sync_manager", None)
-                    if sync_manager is not None:
-                        sync_manager.record_structure_recovery(
-                            rel_path,
-                            restored_path,
-                            "RESTORE_ROLLBACK_FAILED",
-                        )
+                sync_manager = getattr(self, "sync_manager", None)
+                rollback_gate = (
+                    sync_manager.local_structure_mutation()
+                    if sync_manager is not None else nullcontext()
+                )
+                with rollback_gate:
+                    try:
+                        self.wpm.move_to_trash(restored_path)
+                    except Exception:
+                        if sync_manager is not None:
+                            sync_manager.record_structure_recovery(
+                                rel_path,
+                                restored_path,
+                                "RESTORE_ROLLBACK_FAILED",
+                            )
                 self.load_tree_data()
             QMessageBox.warning(self, "복원 실패", str(e))
 
@@ -915,6 +941,7 @@ class WritingTreeMixin:
         tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
         if operations and any(
             operation.get("contract_structure_intents")
+            or operation.get("contract_document_changes")
             for operation in operations
             if isinstance(operation, dict)
         ):

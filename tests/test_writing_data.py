@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from PyQt6.QtCore import QMutex, Qt
+from PyQt6.QtWidgets import QMessageBox
 
 from mode_writing import WritingModeWidget
 from project_manager import ProjectManager
@@ -471,6 +472,110 @@ class WritingDataTestCase(unittest.TestCase):
         self.assertFalse(panel.is_dirty_left)
         self.assertFalse(panel.is_dirty_right)
         panel.save_tree_order.assert_called_once_with()
+
+    def test_folder_delete_batch_failure_records_durable_recovery(self):
+        live_path = "메인/메모장/삭제 실패 폴더"
+        trash_path = "메인/휴지통/삭제 실패 폴더"
+        item = MagicMock()
+        item.data.return_value = live_path
+        item.parent.return_value = None
+        item.text.return_value = "삭제 실패 폴더"
+        item_top = item
+        item_top.text.return_value = "삭제 실패 폴더"
+        manager = MagicMock()
+        manager.local_structure_mutation.return_value = nullcontext()
+        manager.record_tombstone.return_value = [{
+            "contract_structure_intents": [{"intent_kind": "delete"}],
+            "contract_document_changes": [{"document_id": "document-id"}],
+        }]
+        wpm = MagicMock()
+        wpm.move_to_trash.return_value = trash_path
+        wpm.restore_from_trash.side_effect = RuntimeError(
+            "injected filesystem rollback failure"
+        )
+        panel = SimpleNamespace(
+            wpm=wpm,
+            sync_manager=manager,
+            controller=MagicMock(),
+            binder_tree=MagicMock(),
+            load_tree_data=MagicMock(),
+        )
+
+        with patch(
+            "writing_tree.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch(
+            "writing_tree.QMessageBox.warning"
+        ), patch.object(
+            WritingTreeMixin,
+            "_cleanup_after_delete",
+            side_effect=RuntimeError("injected SQLite batch failure"),
+        ):
+            WritingTreeMixin.delete_tree_item(panel, item)
+
+        self.assertEqual(manager.local_structure_mutation.call_count, 2)
+        manager.record_tombstone.assert_called_once_with(
+            live_path, trash_path, retry=False
+        )
+        wpm.restore_from_trash.assert_called_once_with(trash_path)
+        manager.record_structure_recovery.assert_called_once_with(
+            live_path, trash_path, "DELETE_ROLLBACK_FAILED"
+        )
+        panel.load_tree_data.assert_called_once_with()
+
+    def test_folder_restore_batch_failure_records_durable_recovery(self):
+        trash_path = "메인/휴지통/복원 실패 폴더"
+        restored_path = "메인/메모장/복원 실패 폴더"
+        original_path = "메인/메모장/원래 폴더"
+        item = MagicMock()
+        item.data.return_value = trash_path
+        manager = MagicMock()
+        manager.local_structure_mutation.return_value = nullcontext()
+        manager.record_restore.return_value = [{
+            "contract_structure_intents": [{"intent_kind": "restore"}],
+            "contract_document_changes": [{"document_id": "document-id"}],
+        }]
+        manager.queue_contract_path_change_with_order.side_effect = RuntimeError(
+            "injected SQLite batch failure"
+        )
+        wpm = MagicMock()
+        wpm.list_trash_items.return_value = [{
+            "trash_path": trash_path,
+            "original_path": original_path,
+        }]
+        wpm.restore_from_trash.return_value = restored_path
+        wpm.move_to_trash.side_effect = RuntimeError(
+            "injected filesystem rollback failure"
+        )
+        panel = SimpleNamespace(
+            wpm=wpm,
+            sync_manager=manager,
+            controller=MagicMock(),
+            binder_tree=MagicMock(),
+            load_tree_data=MagicMock(),
+        )
+
+        with patch.object(
+            WritingTreeMixin,
+            "_current_tree_order_snapshot",
+            return_value={"메인/메모장": ["복원 실패 폴더"]},
+        ), patch(
+            "writing_tree.QMessageBox.warning"
+        ):
+            WritingTreeMixin.restore_trash_item(panel, item)
+
+        self.assertEqual(manager.local_structure_mutation.call_count, 2)
+        manager.record_restore.assert_called_once_with(
+            trash_path,
+            restored_path,
+            original_rel_path=original_path,
+            retry=False,
+        )
+        wpm.move_to_trash.assert_called_once_with(restored_path)
+        manager.record_structure_recovery.assert_called_once_with(
+            trash_path, restored_path, "RESTORE_ROLLBACK_FAILED"
+        )
+        panel.load_tree_data.assert_called()
 
     def test_volumes_create_exactly_twenty_five_sequential_chapters(self):
         first_volume = self.wpm.add_volume()
