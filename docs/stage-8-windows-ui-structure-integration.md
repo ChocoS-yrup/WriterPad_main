@@ -93,10 +93,14 @@ top-level status record while it remains mounted:
 - PR #1 corrective head `2a560c7`: `136 passed`; Windows CI run
   `31516134432` passed contract vectors, client tests and executable build.
 - Final Windows Python regression: `382 passed, 1 skipped`, twice
-  consecutively without retries (`69.327s`, then `68.754s`).
+  consecutively without retries after the final correction (`66.137s`, then
+  `66.148s`).
 - Backup coalescing: ManualWorker and real QThread coverage passed `30/30`
   repeated rounds. The QThread test uses signals/events and bounded waits, not
   fixed sleeps.
+- Concurrent same-UUID import passed `30/30` repeated rounds. Its event wait
+  and worker join are bounded, and release/join now run in `finally` even when
+  the runner is unusually slow.
 - Exact conditional skip:
   `RemoteTreeOrderMaterializationTestCase.test_remote_tree_order_never_follows_symbolic_link`.
   Windows returned `WinError 1314` because this process lacks symlink creation
@@ -107,6 +111,12 @@ top-level status record while it remains mounted:
   unittest discovery. Cleanup now has an explicit thread boundary, and the
   manual probes run only under `__main__`; the final two full runs above are
   from the resulting unchanged code.
+- Initial stacked CI run `31520691616` passed the Python 3.12 contract verifier
+  but exposed the concurrent-import fixture's old 5-second pre-cleanup
+  assertion on a slow hosted disk. One functional assertion and the temp-dir
+  cleanup error had the same cause. The fixture now uses a 30-second bounded
+  event timeout and unconditional release/join; production import code was not
+  changed for this CI-only finding.
 - Initial PR CI run `31487006626` exposed a Windows unittest fixture issue:
   a process-lifetime `QCoreApplication` could precede widget tests and cause a
   silent exit code 1. A module-held offscreen `QApplication` fixture now keeps

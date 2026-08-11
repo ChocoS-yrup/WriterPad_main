@@ -644,14 +644,17 @@ class ServerProjectImportTestCase(unittest.TestCase):
 
         thread = threading.Thread(target=run_first)
         thread.start()
-        self.assertTrue(self.client.block_started.wait(timeout=5))
         try:
+            self.assertTrue(
+                self.client.block_started.wait(timeout=30),
+                "first import did not reach the bounded fake remote read",
+            )
             with self.assertRaises(ServerProjectImportError) as caught:
                 service.import_project(project_id, "동시 작품")
             self.assertEqual(caught.exception.code, IMPORT_IN_PROGRESS)
         finally:
             self.client.block_release.set()
-            thread.join(timeout=5)
+            thread.join(timeout=30)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(first_result), 1)
