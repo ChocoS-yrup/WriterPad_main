@@ -10,6 +10,7 @@ from PyQt6.QtGui import QFont, QTextCursor, QGuiApplication, QTextDocument
 from PyQt6.QtCore import pyqtSignal, Qt, QSettings, QTimer, QThread
 
 from app_config import get_saved_font, save_font_to_json
+from cloud_config import classify_cloud_error
 from llm_provider import load_model_catalog, resolve_model_selection
 
 
@@ -37,7 +38,7 @@ class SupabaseLogoutWorker(QThread):
             SyncManager().sign_out()
             self.resultReady.emit(True, "")
         except Exception as error:
-            self.resultReady.emit(False, str(error))
+            self.resultReady.emit(False, classify_cloud_error(error).message)
 
 
 class SettingsPanel(QWidget):
@@ -716,6 +717,19 @@ class SettingsPanel(QWidget):
         self.traySettingChanged.emit(enabled)
 
     def login_supabase(self):
+        from sync_manager import SyncManager
+
+        manager = SyncManager()
+        config_state, config_message = manager.cloud_configuration_status()
+        if config_state != "ready":
+            self.edit_supabase_password.clear()
+            self.lbl_supabase_status.setText(config_message)
+            self._style_cloud_status(
+                "disconnected" if config_state == "disabled" else "error"
+            )
+            self.btn_supabase_login.setEnabled(False)
+            self.btn_supabase_logout.setEnabled(False)
+            return
         email = self.edit_supabase_email.text().strip()
         password = self.edit_supabase_password.text()
         if not email or not password:
@@ -782,9 +796,25 @@ class SettingsPanel(QWidget):
         if email is None:
             try:
                 from sync_manager import SyncManager
-                email = SyncManager().authenticated_email()
+
+                manager = SyncManager()
+                config_state, config_message = manager.cloud_configuration_status()
+                if config_state != "ready":
+                    self.lbl_supabase_status.setText(config_message)
+                    SettingsPanel._style_cloud_status(
+                        self,
+                        "disconnected" if config_state == "disabled" else "error",
+                    )
+                    self.btn_supabase_login.setText("동기화 로그인")
+                    self.btn_supabase_login.setEnabled(False)
+                    logout_button = getattr(self, "btn_supabase_logout", None)
+                    if logout_button is not None:
+                        logout_button.setEnabled(False)
+                    return
+                email = manager.authenticated_email()
             except Exception:
                 email = ""
+        self.btn_supabase_login.setEnabled(True)
         email = (email or "").strip()
         if email:
             self.lbl_supabase_status.setText(

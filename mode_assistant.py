@@ -803,6 +803,8 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
     def _flush_writing_sync_before_close(self):
         writing_mode = getattr(self, "writing_mode", None)
         sync_manager = getattr(writing_mode, "sync_manager", None)
+        if getattr(sync_manager, "cloud_network_enabled", None) is False:
+            return True
         flush = getattr(sync_manager, "flush_pending_syncs", None)
         if not callable(flush):
             return True

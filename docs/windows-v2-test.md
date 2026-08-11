@@ -9,7 +9,7 @@ Supabase SQL Editor에서 순서대로 실행한다.
 
 이미 첫 번째 SQL을 적용했다면 두 번째 SQL만 추가 실행해도 된다.
 
-Supabase Authentication의 Users 화면에서 테스트할 이메일 사용자를 만든다. 앱의 `.env`에는 `SUPABASE_URL`과 publishable `SUPABASE_KEY`만 둔다. service role key는 사용하지 않는다.
+Supabase Authentication의 Users 화면에서 테스트할 이메일 사용자를 만든다. 승인된 배포 빌드는 `release_cloud_config.json`에 공개 Supabase URL과 publishable key만 넣는다. `.env`, 사용자 이메일·비밀번호, JWT, refresh token, secret/service-role key는 패키지 설정으로 사용하지 않는다.
 
 ## 2. Windows 앱 실행
 
@@ -70,7 +70,7 @@ python windows_v2_dual_test.py new
 - 같은 Supabase `project_id`
 - 처음 생성된 `충돌테스트.txt`의 같은 `document_id`
 
-원고 폴더, device UUID, SQLite 큐, 로그인 세션, 단일 실행 키는 서로 분리된다. `.env`에 테스트 계정이 없으면 두 창에서 각각 설정 → 프로그램 설정 → Supabase v2 계정 로그인을 한다.
+원고 폴더, device UUID, SQLite 큐, 로그인 세션, 단일 실행 키는 서로 분리된다. 두 창에서 각각 설정 → 프로그램 설정 → Supabase v2 계정 로그인을 한다. 로그인 세션은 각 Windows Credential Manager 프로필에만 저장된다.
 
 ### 최초 기준본
 

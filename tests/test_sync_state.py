@@ -227,10 +227,15 @@ class SyncManagerStateTestCase(unittest.TestCase):
     def test_windows_build_includes_public_supabase_configuration(self):
         spec = Path("Antigravity_AI_Writer.spec").read_text(encoding="utf-8")
 
-        self.assertIn("config_source = '.env' if os.path.exists('.env') else '.env.example'", spec)
+        self.assertNotIn(".env", spec)
+        self.assertIn("config_source = 'release_cloud_config.json'", spec)
+        self.assertIn("assert_release_config_buildable(config_source)", spec)
         self.assertIn("(config_source, '.')", spec)
         source = Path("sync_manager.py").read_text(encoding="utf-8")
-        self.assertIn('os.path.join(supabase_config_dir(), ".env.example")', source)
+        self.assertNotIn("SUPABASE_EMAIL", source)
+        self.assertNotIn("SUPABASE_PASSWORD", source)
+        self.assertNotIn("SUPABASE_ACCESS_TOKEN", source)
+        self.assertNotIn("SUPABASE_REFRESH_TOKEN", source)
 
     def test_trashed_project_status_stops_retry_and_preserves_queue(self):
         class _Rpc:
@@ -540,6 +545,29 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             "설정탭 / 클라우드 계정 로그인을 확인해주세요.",
         )
         self.assertEqual(target.btn_supabase_login.text, "동기화 로그인")
+        self.assertFalse(target.btn_supabase_logout.enabled)
+
+    def test_settings_panel_explicitly_disables_unconfigured_cloud(self):
+        target = SimpleNamespace(
+            lbl_supabase_status=_FakeLabel(),
+            btn_supabase_login=_FakeLabel(),
+            btn_supabase_logout=_FakeLabel(),
+        )
+        manager = SimpleNamespace(
+            cloud_configuration_status=lambda: (
+                "disabled",
+                "이 빌드는 클라우드 동기화가 구성되지 않았습니다.",
+            )
+        )
+
+        with patch("sync_manager.SyncManager", return_value=manager):
+            SettingsPanel.refresh_supabase_account_status(target)
+
+        self.assertEqual(
+            target.lbl_supabase_status.text,
+            "이 빌드는 클라우드 동기화가 구성되지 않았습니다.",
+        )
+        self.assertFalse(target.btn_supabase_login.enabled)
         self.assertFalse(target.btn_supabase_logout.enabled)
 
     def test_compact_status_button_retries_only_when_items_are_pending(self):

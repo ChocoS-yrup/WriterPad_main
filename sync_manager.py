@@ -16,6 +16,11 @@ from PyQt6.QtCore import (
 
 from datetime import datetime
 
+from cloud_config import (
+    CLOUD_INVALID_MESSAGE,
+    classify_cloud_error,
+    load_cloud_client_config,
+)
 from runtime_profile import is_forced_offline
 from sync_contract import SyncContractError, require_server_compatibility
 from binder_order import (
@@ -495,6 +500,10 @@ class SyncManager(QObject):
         self._shutting_down = False
         self._diagnostics = SyncDiagnosticLog()
         self._last_diagnostic_state_signature = None
+        self._cloud_config = None
+        self.cloud_config_state = "disabled"
+        self.cloud_config_message = ""
+        self._last_cloud_error_kind = ""
         
         self.supabase = None
         self.init_supabase()
@@ -1558,6 +1567,8 @@ class SyncManager(QObject):
 
     def flush_pending_syncs(self, timeout_ms=8000):
         """Give durable Sync V2 operations a bounded chance to finish before exit."""
+        if not getattr(self, "cloud_network_enabled", True):
+            return True
         if not self.is_v2_enabled:
             return True
         server_state = str(
@@ -1644,102 +1655,77 @@ class SyncManager(QObject):
         return server_success, effective_error
         
     @staticmethod
-    def create_supabase_client():
+    def create_supabase_client(config=None):
+        config = config or load_cloud_client_config(supabase_config_dir())
+        if not config.is_ready:
+            return None
+        custom_httpx_client = None
         try:
-            from supabase import create_client, Client, ClientOptions
+            from supabase import create_client, ClientOptions
             import httpx
-            import os
-            
-            # PyInstaller exposes bundled data from _MEIPASS. Source runs use
-            # this module's directory, so both paths load the same public
-            # Supabase URL/publishable-key configuration.
-            env_path = os.path.join(supabase_config_dir(), ".env")
-            if not os.path.exists(env_path):
-                env_path = os.path.join(supabase_config_dir(), ".env.example")
-            if os.path.exists(env_path):
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            key, val = line.split("=", 1)
-                            os.environ[key.strip()] = val.strip()
-            
-            url: str = os.environ.get("SUPABASE_URL", "https://dummy.supabase.co")
-            key: str = os.environ.get("SUPABASE_KEY", "dummy-key")
-            
-            if url != "https://dummy.supabase.co":
-                custom_httpx_client = httpx.Client(
-                    timeout=5.0,
-                    limits=httpx.Limits(max_keepalive_connections=5)
-                )
-                options = ClientOptions(httpx_client=custom_httpx_client)
-                client = create_client(url, key, options=options)
+
+            custom_httpx_client = httpx.Client(
+                timeout=5.0,
+                limits=httpx.Limits(max_keepalive_connections=5),
+            )
+            options = ClientOptions(httpx_client=custom_httpx_client)
+            client = create_client(
+                config.url,
+                config.publishable_key,
+                options=options,
+            )
+            client._antigravity_httpx_client = custom_httpx_client
+
+            try:
+                from security_manager import SecurityManager
+                access_token, refresh_token = SecurityManager.get_supabase_session()
+            except Exception:
+                access_token, refresh_token = "", ""
+
+            authenticated = False
+            try:
+                auth_response = None
+                if access_token and refresh_token:
+                    auth_response = client.auth.set_session(access_token, refresh_token)
+                session = getattr(auth_response, "session", None) if auth_response else None
+                if session:
+                    SyncManager._persist_supabase_session(session)
+                    authenticated = True
+                    user = getattr(session, "user", None)
+                    client._antigravity_email = getattr(user, "email", "") or ""
+            except Exception as auth_error:
+                classified = classify_cloud_error(auth_error)
+                client._antigravity_restore_error_kind = classified.kind
                 try:
-                    client._antigravity_httpx_client = custom_httpx_client
+                    from security_manager import SecurityManager
+                    SecurityManager.clear_supabase_session()
                 except Exception:
                     pass
-                access_token = os.environ.get("SUPABASE_ACCESS_TOKEN", "")
-                refresh_token = os.environ.get("SUPABASE_REFRESH_TOKEN", "")
-                if not (access_token and refresh_token):
-                    try:
-                        from security_manager import SecurityManager
-                        access_token, refresh_token = SecurityManager.get_supabase_session()
-                    except Exception:
-                        access_token, refresh_token = "", ""
-                authenticated = False
-                try:
-                    if access_token and refresh_token:
-                        auth_response = client.auth.set_session(access_token, refresh_token)
-                    else:
-                        email = os.environ.get("SUPABASE_EMAIL", "").strip()
-                        password = os.environ.get("SUPABASE_PASSWORD", "")
-                        auth_response = None
-                        if email and password:
-                            auth_response = client.auth.sign_in_with_password({
-                                "email": email,
-                                "password": password,
-                            })
-                    session = getattr(auth_response, "session", None) if auth_response else None
-                    if session:
+
+            client._antigravity_authenticated = authenticated
+
+            try:
+                def persist_auth_event(event, session):
+                    event_name = str(getattr(event, "value", event) or "").upper()
+                    if session and event_name in {
+                        "SIGNED_IN", "TOKEN_REFRESHED", "USER_UPDATED"
+                    }:
                         SyncManager._persist_supabase_session(session)
-                        authenticated = True
+                        client._antigravity_authenticated = True
                         user = getattr(session, "user", None)
                         client._antigravity_email = getattr(user, "email", "") or ""
-                except Exception as auth_error:
-                    print(f"Supabase authentication unavailable: {auth_error}")
-                    message = str(auth_error).lower()
-                    if "refresh token" in message or "refresh_token" in message:
-                        try:
-                            from security_manager import SecurityManager
-                            SecurityManager.clear_supabase_session()
-                        except Exception:
-                            pass
+
+                client.auth.on_auth_state_change(persist_auth_event)
+                client._antigravity_auth_callback = persist_auth_event
+            except Exception:
+                pass
+            return client
+        except Exception:
+            if custom_httpx_client is not None:
                 try:
-                    client._antigravity_authenticated = authenticated
+                    custom_httpx_client.close()
                 except Exception:
                     pass
-                try:
-                    def persist_auth_event(event, session):
-                        event_name = str(getattr(event, "value", event) or "").upper()
-                        if session and event_name in {
-                            "SIGNED_IN", "TOKEN_REFRESHED", "USER_UPDATED"
-                        }:
-                            SyncManager._persist_supabase_session(session)
-                            client._antigravity_authenticated = True
-                            user = getattr(session, "user", None)
-                            client._antigravity_email = (
-                                getattr(user, "email", "") or ""
-                            )
-
-                    client.auth.on_auth_state_change(persist_auth_event)
-                    client._antigravity_auth_callback = persist_auth_event
-                except Exception as callback_error:
-                    print(f"Supabase auth callback unavailable: {callback_error}")
-                return client
-            else:
-                return None
-        except Exception as e:
-            print(f"Failed to create Supabase client: {e}")
             return None
 
     @staticmethod
@@ -1755,7 +1741,7 @@ class SyncManager(QObject):
         except Exception as error:
             # Keep the valid in-memory session alive even if Windows Credential
             # Manager is temporarily unavailable. The next auth event retries it.
-            print(f"Supabase session persistence unavailable: {error}")
+            print("Supabase session persistence unavailable.")
             return False
 
     @staticmethod
@@ -1775,7 +1761,8 @@ class SyncManager(QObject):
             except Exception:
                 pass
         if error:
-            print(f"Supabase session recovery paused: {error}")
+            self._last_cloud_error_kind = classify_cloud_error(error).kind
+            print("Supabase session recovery paused.")
 
     def ensure_session_valid(self, client=None, force_refresh=False):
         """Validate one shared session and serialize token refresh attempts."""
@@ -1838,19 +1825,36 @@ class SyncManager(QObject):
 
     def init_supabase(self):
         old_client = self.supabase
-        self.supabase = self.create_supabase_client()
+        self._cloud_config = load_cloud_client_config(supabase_config_dir())
+        self.cloud_config_state = self._cloud_config.state
+        self.cloud_config_message = (
+            "" if self._cloud_config.is_ready else self._cloud_config.user_message
+        )
+        self.supabase = (
+            self.create_supabase_client(self._cloud_config)
+            if self._cloud_config.is_ready
+            else None
+        )
         if old_client is not None and old_client is not self.supabase:
             self._close_supabase_client(old_client)
-        if not self.supabase:
-            print("Warning: Supabase credentials not found in env. Running in mock mode.")
+        if self._cloud_config.is_ready and not self.supabase:
+            self.cloud_config_state = "invalid"
+            self.cloud_config_message = CLOUD_INVALID_MESSAGE
+
+    @property
+    def cloud_network_enabled(self):
+        return self.cloud_config_state == "ready" and self.supabase is not None
+
+    def cloud_configuration_status(self):
+        return self.cloud_config_state, self.cloud_config_message
 
     def sign_in(self, email, password):
         if not email or not password:
             return False, "이메일과 비밀번호를 입력해주세요."
-        if not self.supabase:
+        if not self.cloud_network_enabled:
             self.init_supabase()
-        if not self.supabase:
-            return False, "Supabase 주소와 publishable key를 먼저 설정해주세요."
+        if not self.cloud_network_enabled:
+            return False, self.cloud_config_message or CLOUD_INVALID_MESSAGE
         try:
             response = self.supabase.auth.sign_in_with_password({
                 "email": email.strip(),
@@ -1874,7 +1878,9 @@ class SyncManager(QObject):
             self.supabase._antigravity_email = signed_in_email
             return True, signed_in_email
         except Exception as error:
-            return False, str(error)
+            classified = classify_cloud_error(error)
+            self._last_cloud_error_kind = classified.kind
+            return False, classified.message
 
     def sign_out(self):
         try:

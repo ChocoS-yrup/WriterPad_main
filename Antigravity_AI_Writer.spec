@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import os
+from cloud_config import assert_release_config_buildable
 
 
-config_source = '.env' if os.path.exists('.env') else '.env.example'
+config_source = 'release_cloud_config.json'
+assert_release_config_buildable(config_source)
 
 
 a = Analysis(
@@ -14,7 +15,8 @@ a = Analysis(
         ('style.qss', '.'),
         ('app_icon.ico', '.'),
         ('model_catalog.json', '.'),
-        # URL and publishable key only. User sessions remain in Windows Credential Manager.
+        # This validated file contains URL and publishable key fields only.
+        # User sessions remain in Windows Credential Manager.
         (config_source, '.'),
     ],
     hiddenimports=['markdown', 'keyring', 'unicodedata2'],
