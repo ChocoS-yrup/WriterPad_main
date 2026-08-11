@@ -170,6 +170,19 @@ def require_uuid(value, field: str) -> str:
         raise SyncContractError("INVALID_ARGUMENT", f"invalid {field}") from exc
 
 
+def _valid_project_mode_epoch(project_sync_mode, migration_epoch) -> bool:
+    try:
+        migration_epoch = int(migration_epoch)
+    except (TypeError, ValueError):
+        return False
+    return (
+        project_sync_mode == "LEGACY" and migration_epoch == 0
+    ) or (
+        project_sync_mode in {"MIGRATING", "ID_BASED"}
+        and migration_epoch >= 1
+    )
+
+
 def require_server_compatibility(
     *,
     project_sync_mode: str,
@@ -178,7 +191,7 @@ def require_server_compatibility(
     server_contract_sha256: str,
     server_capabilities,
 ):
-    if project_sync_mode not in PROJECT_MODES or int(migration_epoch) < 0:
+    if not _valid_project_mode_epoch(project_sync_mode, migration_epoch):
         raise SyncContractError("STALE_MIGRATION_EPOCH")
     if int(server_protocol_version) < SYNC_PROTOCOL_VERSION:
         raise SyncContractError("PROTOCOL_TOO_OLD")
@@ -196,7 +209,7 @@ def build_atomic_structure_request(
     project_id = require_uuid(project_id, "project_id")
     writer_device_id = require_uuid(writer_device_id, "writer_device_id")
     batch_id = require_uuid(batch_id or uuid.uuid4(), "batch_id")
-    if project_sync_mode not in PROJECT_MODES or int(migration_epoch) < 0:
+    if not _valid_project_mode_epoch(project_sync_mode, migration_epoch):
         raise SyncContractError("INVALID_ARGUMENT")
     if not isinstance(ordered_intents, list) or not ordered_intents:
         raise SyncContractError("INVALID_ARGUMENT")
@@ -265,7 +278,7 @@ def build_document_commit_request(
     document_id = require_uuid(document_id, "document_id")
     operation_id = require_uuid(operation_id or uuid.uuid4(), "operation_id")
     batch_id = require_uuid(batch_id or uuid.uuid4(), "batch_id")
-    if project_sync_mode not in PROJECT_MODES or int(migration_epoch) < 0:
+    if not _valid_project_mode_epoch(project_sync_mode, migration_epoch):
         raise SyncContractError("INVALID_ARGUMENT")
     if intent_kind not in {"create", "update", "delete", "restore"}:
         raise SyncContractError("INVALID_ARGUMENT")
@@ -452,6 +465,8 @@ def validate_document_commit_response(request, response):
             or not isinstance(error, dict)
             or set(error) != {"code", "message", "failed_sequence"}
             or not _ERROR_CODE.fullmatch(str(error.get("code") or ""))
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
             or error.get("failed_sequence") not in {None, 1}
         ):
             raise SyncContractError("INVALID_DOCUMENT_RESPONSE")

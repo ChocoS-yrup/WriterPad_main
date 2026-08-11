@@ -32,7 +32,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8002
+STAGE8_USER_VERSION = 8003
 
 
 def _utc_now():
@@ -412,8 +412,47 @@ class SyncV2Store:
             """
         )
 
+        invalid_project = connection.execute(
+            """
+            SELECT local_key FROM sync_projects
+            WHERE NOT (
+                (project_sync_mode = 'LEGACY' AND migration_epoch = 0)
+                OR
+                (project_sync_mode IN ('MIGRATING', 'ID_BASED')
+                    AND migration_epoch >= 1)
+            )
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_project is not None:
+            raise RuntimeError("INVALID_PROJECT_MODE_EPOCH")
+
         connection.executescript(
             """
+            CREATE TRIGGER IF NOT EXISTS sync_projects_mode_epoch_insert
+            BEFORE INSERT ON sync_projects
+            WHEN NOT (
+                (NEW.project_sync_mode = 'LEGACY' AND NEW.migration_epoch = 0)
+                OR
+                (NEW.project_sync_mode IN ('MIGRATING', 'ID_BASED')
+                    AND NEW.migration_epoch >= 1)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'INVALID_PROJECT_MODE_EPOCH');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS sync_projects_mode_epoch_update
+            BEFORE UPDATE OF project_sync_mode, migration_epoch ON sync_projects
+            WHEN NOT (
+                (NEW.project_sync_mode = 'LEGACY' AND NEW.migration_epoch = 0)
+                OR
+                (NEW.project_sync_mode IN ('MIGRATING', 'ID_BASED')
+                    AND NEW.migration_epoch >= 1)
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'INVALID_PROJECT_MODE_EPOCH');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS sync_operations_intent_immutable
             BEFORE UPDATE OF operation_id, local_key, project_id, document_id,
                 local_path, relative_path, base_revision, base_content, content,
@@ -789,9 +828,11 @@ class SyncV2Store:
             }
             if (old_mode, project_sync_mode) not in allowed:
                 raise SyncContractError("INVALID_PROJECT_MODE_TRANSITION")
-            if int(migration_epoch) < old_epoch:
-                raise SyncContractError("STALE_MIGRATION_EPOCH")
-            if project_sync_mode == "LEGACY" and int(migration_epoch) != 0:
+            new_epoch = int(migration_epoch)
+            expected_epoch = old_epoch
+            if old_mode == "LEGACY" and project_sync_mode == "MIGRATING":
+                expected_epoch = old_epoch + 1
+            if new_epoch != expected_epoch:
                 raise SyncContractError("STALE_MIGRATION_EPOCH")
             connection.execute(
                 """
@@ -803,7 +844,7 @@ class SyncV2Store:
                 WHERE local_key = ?
                 """,
                 (
-                    project_sync_mode, int(migration_epoch),
+                    project_sync_mode, new_epoch,
                     int(server_protocol_version), server_contract_sha256,
                     canonical_json(sorted(set(server_capabilities))), now, now,
                     local_key,
