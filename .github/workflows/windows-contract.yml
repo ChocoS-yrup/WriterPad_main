@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ChocoS-yrup/Writerpad
-          ref: 7f05f32dd385ce0e1922b88d688742fca2a503fa
+          ref: 7bcb5d25c5376b02469666df7318b90b456ffee6
           path: contract-source
           persist-credentials: false
 

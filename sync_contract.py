@@ -1,4 +1,4 @@
-"""Released WriterPad sync-contract 0.1.0 client primitives.
+"""Released WriterPad sync-contract 0.2.0 client primitives.
 
 This module intentionally contains no Supabase credentials and never accepts
 document bodies in diagnostics.  Contract-native writes fail closed unless the
@@ -15,18 +15,18 @@ import uuid
 from dataclasses import dataclass
 
 
-CONTRACT_VERSION = "0.1.0"
-CONTRACT_GIT_COMMIT = "45d18cff62cc48e29d0e6efcfc634fec96150198"
-CONTRACT_CONTENT_COMMIT = "7f05f32dd385ce0e1922b88d688742fca2a503fa"
-CANONICAL_CONTRACT_BYTES = 19473
+CONTRACT_VERSION = "0.2.0"
+CONTRACT_GIT_COMMIT = "fcd99b7098b9a04bd93c585d89b16588aa482530"
+CONTRACT_CONTENT_COMMIT = "7bcb5d25c5376b02469666df7318b90b456ffee6"
+CANONICAL_CONTRACT_BYTES = 23256
 CANONICAL_CONTRACT_SHA256 = (
-    "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46"
+    "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670"
 )
 SYNC_PROTOCOL_VERSION = 3
 STORAGE_NAME_ALGORITHM = "storage-name-v1"
 STORAGE_NAME_UNICODE_VERSION = "15.0.0"
 CLIENT_BUILD_ID = os.environ.get(
-    "WRITERPAD_BUILD_ID", "writerpad-windows-stage8-contract-0.1.0"
+    "WRITERPAD_BUILD_ID", "writerpad-windows-stage8-contract-0.2.0"
 )
 
 CLIENT_CAPABILITIES = (
@@ -37,6 +37,7 @@ CLIENT_CAPABILITIES = (
     "operation_attempt_history",
     "operation_state_events",
     "storage_name_v1",
+    "document_commit_v1",
 )
 SERVER_CAPABILITIES = (
     "atomic_structure_commit",
@@ -46,6 +47,7 @@ SERVER_CAPABILITIES = (
     "id_tree_validation",
     "legacy_epoch_zero_adapter",
     "storage_name_v1",
+    "document_commit_v1",
 )
 
 PROJECT_MODES = ("LEGACY", "MIGRATING", "ID_BASED")
@@ -251,6 +253,85 @@ def build_atomic_structure_request(
     }
 
 
+def build_document_commit_request(
+    *, project_id, project_sync_mode, migration_epoch, writer_device_id,
+    document_id, intent_kind, base_revision, parent_folder_id, name, content,
+    is_deleted, structure_revision, operation_id=None, batch_id=None,
+    supersedes_operation_id=None, client_build_id=CLIENT_BUILD_ID,
+):
+    """Build the normative protocol-3 immutable document commit request."""
+    project_id = require_uuid(project_id, "project_id")
+    writer_device_id = require_uuid(writer_device_id, "writer_device_id")
+    document_id = require_uuid(document_id, "document_id")
+    operation_id = require_uuid(operation_id or uuid.uuid4(), "operation_id")
+    batch_id = require_uuid(batch_id or uuid.uuid4(), "batch_id")
+    if project_sync_mode not in PROJECT_MODES or int(migration_epoch) < 0:
+        raise SyncContractError("INVALID_ARGUMENT")
+    if intent_kind not in {"create", "update", "delete", "restore"}:
+        raise SyncContractError("INVALID_ARGUMENT")
+    if not isinstance(content, str) or len(content.encode("utf-8")) > 10_485_760:
+        raise SyncContractError("INVALID_ARGUMENT")
+    base_revision = int(base_revision)
+    structure_revision = int(structure_revision)
+    if base_revision < 0 or structure_revision < 1:
+        raise SyncContractError("INVALID_ARGUMENT")
+    if (
+        (intent_kind == "create" and base_revision != 0)
+        or (intent_kind != "create" and base_revision < 1)
+        or (intent_kind == "delete") != bool(is_deleted)
+    ):
+        raise SyncContractError("INVALID_ARGUMENT")
+    normalized_name = str(name)
+    normalize_storage_name(normalized_name)
+    parent_folder_id = (
+        require_uuid(parent_folder_id, "parent_folder_id")
+        if parent_folder_id is not None else None
+    )
+    body = content.encode("utf-8")
+    payload = {
+        "parent_folder_id": parent_folder_id,
+        "name": normalized_name,
+        "content": content,
+        "content_sha256": hashlib.sha256(body).hexdigest(),
+        "content_byte_count": len(body),
+        "is_deleted": bool(is_deleted),
+        "structure_revision": structure_revision,
+    }
+    intent = {
+        "sequence": 1,
+        "operation_id": operation_id,
+        "batch_id": batch_id,
+        "entity_kind": "document",
+        "document_id": document_id,
+        "intent_kind": intent_kind,
+        "base_revision": base_revision,
+        "payload_sha256": json_sha256(payload),
+        "payload": payload,
+    }
+    if supersedes_operation_id:
+        intent["supersedes_operation_id"] = require_uuid(
+            supersedes_operation_id, "supersedes_operation_id"
+        )
+    intents = [intent]
+    return {
+        "kind": "document_commit_request",
+        "project_id": project_id,
+        "project_sync_mode": project_sync_mode,
+        "migration_epoch": int(migration_epoch),
+        "batch": {
+            "batch_id": batch_id,
+            "writer_device_id": writer_device_id,
+            "client_build_id": str(client_build_id),
+            "sync_protocol_version": SYNC_PROTOCOL_VERSION,
+            "contract_version": CONTRACT_VERSION,
+            "canonical_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "client_capabilities": list(CLIENT_CAPABILITIES),
+            "batch_payload_sha256": json_sha256(intents),
+        },
+        "ordered_intents": intents,
+    }
+
+
 def validate_atomic_structure_response(request, response):
     """Reject partial, mismatched or capability-incompatible wire responses."""
     if not isinstance(request, dict) or not isinstance(response, dict):
@@ -300,6 +381,8 @@ def validate_atomic_structure_response(request, response):
             or not isinstance(error, dict)
             or set(error) != {"code", "message", "failed_sequence"}
             or not _ERROR_CODE.fullmatch(str(error.get("code") or ""))
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
         ):
             raise SyncContractError("INVALID_ATOMIC_RESPONSE")
         failed = error.get("failed_sequence")
@@ -308,6 +391,72 @@ def validate_atomic_structure_response(request, response):
         return response
 
     raise SyncContractError("INVALID_ATOMIC_RESPONSE")
+
+
+def validate_document_commit_response(request, response):
+    """Reject partial or mismatched document responses before local apply."""
+    if not isinstance(request, dict) or not isinstance(response, dict):
+        raise SyncContractError("INVALID_DOCUMENT_RESPONSE")
+    batch = request.get("batch") or {}
+    intents = request.get("ordered_intents") or []
+    if (
+        request.get("kind") != "document_commit_request"
+        or len(intents) != 1
+        or response.get("batch_id") != batch.get("batch_id")
+        or response.get("batch_payload_sha256") != batch.get("batch_payload_sha256")
+    ):
+        raise SyncContractError("INVALID_DOCUMENT_RESPONSE")
+    results = response.get("results")
+    if response.get("kind") == "document_commit_success":
+        if set(response) != {
+            "kind", "batch_id", "batch_payload_sha256", "status", "applied", "results"
+        } or response.get("status") not in {"committed", "replayed"} or response.get("applied") is not True:
+            raise SyncContractError("INVALID_DOCUMENT_RESPONSE")
+        if not isinstance(results, list) or len(results) != 1:
+            raise SyncContractError("PARTIAL_BATCH_RESPONSE")
+        result = results[0]
+        intent = intents[0]
+        payload = intent.get("payload") or {}
+        expected_keys = {
+            "sequence", "operation_id", "document_id", "result_revision",
+            "structure_revision", "parent_folder_id", "name", "content_sha256",
+            "content_byte_count", "is_deleted",
+        }
+        if not isinstance(result, dict) or set(result) != expected_keys:
+            raise SyncContractError("INVALID_DOCUMENT_RESPONSE")
+        if (
+            result.get("sequence") != 1
+            or result.get("operation_id") != intent.get("operation_id")
+            or result.get("document_id") != intent.get("document_id")
+            or not isinstance(result.get("result_revision"), int)
+            or result["result_revision"] < 1
+            or result.get("structure_revision") != payload.get("structure_revision")
+            or result.get("parent_folder_id") != payload.get("parent_folder_id")
+            or result.get("name") != payload.get("name")
+            or result.get("content_sha256") != payload.get("content_sha256")
+            or result.get("content_byte_count") != payload.get("content_byte_count")
+            or result.get("is_deleted") is not payload.get("is_deleted")
+        ):
+            raise SyncContractError("PARTIAL_BATCH_RESPONSE")
+        return response
+    if response.get("kind") == "document_commit_failure":
+        error = response.get("error")
+        if (
+            set(response) != {
+                "kind", "batch_id", "batch_payload_sha256", "status",
+                "applied", "error", "results",
+            }
+            or response.get("status") != "rejected"
+            or response.get("applied") is not False
+            or results != []
+            or not isinstance(error, dict)
+            or set(error) != {"code", "message", "failed_sequence"}
+            or not _ERROR_CODE.fullmatch(str(error.get("code") or ""))
+            or error.get("failed_sequence") not in {None, 1}
+        ):
+            raise SyncContractError("INVALID_DOCUMENT_RESPONSE")
+        return response
+    raise SyncContractError("INVALID_DOCUMENT_RESPONSE")
 
 
 _TRACE_KEYS = {

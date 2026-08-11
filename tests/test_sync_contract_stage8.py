@@ -17,10 +17,12 @@ from sync_contract import (
     SERVER_CAPABILITIES,
     SyncContractError,
     build_atomic_structure_request,
+    build_document_commit_request,
     normalize_storage_name,
     require_server_compatibility,
     safe_trace,
     validate_atomic_structure_response,
+    validate_document_commit_response,
 )
 from sync_manager import SyncManager
 from sync_v2_store import STAGE8_USER_VERSION, SyncV2Store
@@ -49,13 +51,13 @@ def load_json(path):
 
 class ContractPrimitiveTests(unittest.TestCase):
     def test_release_pin_is_exact(self):
-        self.assertEqual(CONTRACT_VERSION, "0.1.0")
-        self.assertEqual(CONTRACT_GIT_COMMIT, "45d18cff62cc48e29d0e6efcfc634fec96150198")
-        self.assertEqual(CONTRACT_CONTENT_COMMIT, "7f05f32dd385ce0e1922b88d688742fca2a503fa")
-        self.assertEqual(CANONICAL_CONTRACT_BYTES, 19473)
+        self.assertEqual(CONTRACT_VERSION, "0.2.0")
+        self.assertEqual(CONTRACT_GIT_COMMIT, "fcd99b7098b9a04bd93c585d89b16588aa482530")
+        self.assertEqual(CONTRACT_CONTENT_COMMIT, "7bcb5d25c5376b02469666df7318b90b456ffee6")
+        self.assertEqual(CANONICAL_CONTRACT_BYTES, 23256)
         self.assertEqual(
             CANONICAL_CONTRACT_SHA256,
-            "fae86b4e6385ee37fbeb99f9256194ec319b64bfda92974ce90a3eb70d2e7a46",
+            "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
         )
 
     def test_all_storage_name_vectors(self):
@@ -98,7 +100,7 @@ class ContractPrimitiveTests(unittest.TestCase):
             writer_device_id=DEVICE_ID,
             ordered_intents=sources,
             batch_id=BATCH_ID,
-            client_build_id="conformance-0.1.0",
+            client_build_id="conformance-0.2.0",
         )
         self.assertEqual(request, first["request"])
         self.assertEqual(
@@ -109,6 +111,47 @@ class ContractPrimitiveTests(unittest.TestCase):
         validate_atomic_structure_response(request, cases[1]["response"])
         validate_atomic_structure_response(request, cases[2]["response"])
         validate_atomic_structure_response(cases[3]["request"], cases[3]["response"])
+
+    def test_all_document_wire_cases_and_exact_payload_hash(self):
+        cases = load_json(
+            contract_root() / "conformance_vectors" / "document-commit.json"
+        )["cases"]
+        self.assertEqual(len(cases), 7)
+        first_request = cases[0]["request"]
+        intent = first_request["ordered_intents"][0]
+        payload = intent["payload"]
+        request = build_document_commit_request(
+            project_id=first_request["project_id"],
+            project_sync_mode=first_request["project_sync_mode"],
+            migration_epoch=first_request["migration_epoch"],
+            writer_device_id=first_request["batch"]["writer_device_id"],
+            document_id=intent["document_id"],
+            intent_kind=intent["intent_kind"],
+            base_revision=intent["base_revision"],
+            parent_folder_id=payload["parent_folder_id"],
+            name=payload["name"],
+            content=payload["content"],
+            is_deleted=payload["is_deleted"],
+            structure_revision=payload["structure_revision"],
+            operation_id=intent["operation_id"],
+            batch_id=first_request["batch"]["batch_id"],
+            client_build_id="conformance-0.2.0",
+        )
+        self.assertEqual(request, first_request)
+        self.assertEqual(
+            request["batch"]["batch_payload_sha256"],
+            "e2571bcb8611ea13c058753470871eb61fb6117d8dd8adbd36688eac0cd5d34d",
+        )
+        requests = {
+            case["case_id"]: case["request"]
+            for case in cases
+            if "request" in case
+        }
+        for case in cases:
+            source_id = case.get("request_from") or case.get("replay_of")
+            source_request = case.get("request") or requests[source_id]
+            with self.subTest(case=case["case_id"]):
+                validate_document_commit_response(source_request, case["response"])
 
     def test_all_transition_vectors_are_the_pinned_release(self):
         vectors = [load_json(path) for path in sorted((contract_root() / "test_vectors").glob("*.json"))]
@@ -230,6 +273,30 @@ class ContractStoreTests(unittest.TestCase):
             for item in request["ordered_intents"]
         ]
 
+    @staticmethod
+    def _document_success(request, status="committed", revision=1):
+        intent = request["ordered_intents"][0]
+        payload = intent["payload"]
+        return {
+            "kind": "document_commit_success",
+            "batch_id": request["batch"]["batch_id"],
+            "batch_payload_sha256": request["batch"]["batch_payload_sha256"],
+            "status": status,
+            "applied": True,
+            "results": [{
+                "sequence": 1,
+                "operation_id": intent["operation_id"],
+                "document_id": intent["document_id"],
+                "result_revision": revision,
+                "structure_revision": payload["structure_revision"],
+                "parent_folder_id": payload["parent_folder_id"],
+                "name": payload["name"],
+                "content_sha256": payload["content_sha256"],
+                "content_byte_count": payload["content_byte_count"],
+                "is_deleted": payload["is_deleted"],
+            }],
+        }
+
     def test_new_database_is_legacy_epoch_zero_and_user_version_is_additive(self):
         project = self.store.get_project(self.context["local_key"])
         self.assertEqual(project["project_sync_mode"], "LEGACY")
@@ -257,6 +324,155 @@ class ContractStoreTests(unittest.TestCase):
             [item["event_type"] for item in reopened.operation_events(operation["operation_id"])],
             ["enqueued", "dispatch_started", "retry_scheduled"],
         )
+
+    def test_contract_document_commit_uses_exact_wire_and_applies_complete_result(self):
+        self._activate_id_based()
+        self.context["writer_device_id"] = DEVICE_ID
+        operation = self.store.enqueue(
+            self.context, "Empty.md", "", relative_path="Empty.md"
+        )
+        request = self.store.structure_batch_request(operation["batch_id"])
+        self.assertEqual(request["kind"], "document_commit_request")
+        self.assertEqual(request["ordered_intents"][0]["intent_kind"], "create")
+        self.assertEqual(request["ordered_intents"][0]["payload"]["content"], "")
+        self.assertIn("document_commit_v1", request["batch"]["client_capabilities"])
+        response = self._document_success(request)
+
+        class RpcCall:
+            def __init__(inner_self, data):
+                inner_self.data = data
+
+            def execute(inner_self):
+                return type("Response", (), {"data": inner_self.data})()
+
+        class Client:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            def rpc(inner_self, name, params):
+                inner_self.calls.append((name, params))
+                return RpcCall({"project_id": PROJECT_ID} if name == "ensure_project" else response)
+
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = dict(self.context)
+        manager._v2_device_id = DEVICE_ID
+        manager.supabase = Client()
+        self.store.mark_attempt(operation["operation_id"])
+        result = manager._process_v2_operation(operation["operation_id"])
+        self.assertEqual(result["kind"], "committed")
+        self.assertEqual(
+            manager.supabase.calls[-1],
+            ("document_commit", {"p_request": request}),
+        )
+        self.store.mark_success(operation["operation_id"], result["result"])
+        completed = self.store.operation(operation["operation_id"])
+        document = self.store.get_document_by_id(operation["document_id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual((document["revision"], document["structure_revision"]), (1, 1))
+
+    def test_contract_document_response_loss_reuses_recorded_result(self):
+        self._activate_id_based()
+        self.context["writer_device_id"] = DEVICE_ID
+        operation = self.store.enqueue(self.context, "Draft.md", "body")
+        request = self.store.structure_batch_request(operation["batch_id"])
+        response = self._document_success(request)
+        self.store.mark_attempt(operation["operation_id"])
+        self.store.record_document_batch_response(operation["batch_id"], response)
+
+        reopened = SyncV2Store(self.db_path)
+        recovered = reopened.next_ready_operation(self.context["local_key"])
+        self.assertEqual(recovered["operation_id"], operation["operation_id"])
+
+        class RpcCall:
+            def execute(inner_self):
+                return type("Response", (), {"data": {"project_id": PROJECT_ID}})()
+
+        class Client:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            def rpc(inner_self, name, params):
+                inner_self.calls.append((name, params))
+                if name == "document_commit":
+                    raise AssertionError("recorded response must prevent duplicate apply")
+                return RpcCall()
+
+        manager = SyncManager()
+        manager._v2_store = reopened
+        manager._v2_context = dict(self.context)
+        manager._v2_device_id = DEVICE_ID
+        manager.supabase = Client()
+        reopened.mark_attempt(operation["operation_id"])
+        result = manager._process_v2_operation(operation["operation_id"])
+        self.assertEqual(result["kind"], "committed")
+        self.assertEqual([name for name, _ in manager.supabase.calls], ["ensure_project"])
+
+    def test_contract_document_partial_response_is_not_recorded_or_applied(self):
+        self._activate_id_based()
+        self.context["writer_device_id"] = DEVICE_ID
+        operation = self.store.enqueue(self.context, "Draft.md", "body")
+        request = self.store.structure_batch_request(operation["batch_id"])
+        partial = self._document_success(request)
+        partial["results"] = []
+        self.store.mark_attempt(operation["operation_id"])
+        with self.assertRaises(SyncContractError) as raised:
+            self.store.record_document_batch_response(operation["batch_id"], partial)
+        self.assertEqual(raised.exception.code, "PARTIAL_BATCH_RESPONSE")
+        self.assertIsNone(self.store.document_batch_response(operation["batch_id"]))
+        self.assertEqual(self.store.operation(operation["operation_id"])["status"], "inflight")
+
+    def test_contract_document_committed_then_replayed_response_is_equivalent(self):
+        self._activate_id_based()
+        self.context["writer_device_id"] = DEVICE_ID
+        operation = self.store.enqueue(self.context, "Draft.md", "body")
+        request = self.store.structure_batch_request(operation["batch_id"])
+        committed = self._document_success(request)
+        replayed = self._document_success(request, status="replayed")
+        self.assertEqual(
+            self.store.record_document_batch_response(
+                operation["batch_id"], committed
+            ),
+            committed,
+        )
+        self.assertEqual(
+            self.store.record_document_batch_response(
+                operation["batch_id"], replayed
+            ),
+            committed,
+        )
+
+    def test_contract_document_requires_server_proven_folder_identity(self):
+        self._activate_id_based()
+        self.context["writer_device_id"] = DEVICE_ID
+        with self.assertRaises(SyncContractError) as raised:
+            self.store.enqueue(self.context, "메인/원고/Draft.md", "body")
+        self.assertEqual(raised.exception.code, "CONTRACT_STRUCTURE_IDS_REQUIRED")
+        folder_id = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(self.context["local_key"], [{
+            "folder_id": folder_id,
+            "parent_folder_id": None,
+            "local_path": "메인/원고",
+            "name": "원고",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        operation = self.store.enqueue(
+            self.context, "메인/원고/Draft.md", "body"
+        )
+        request = self.store.structure_batch_request(operation["batch_id"])
+        self.assertEqual(
+            request["ordered_intents"][0]["payload"]["parent_folder_id"],
+            folder_id,
+        )
+
+    def test_contract_document_rejects_normalized_sibling_collision(self):
+        self._activate_id_based()
+        self.context["writer_device_id"] = DEVICE_ID
+        self.store.enqueue(self.context, "Ｆｏｏ.md", "first")
+        with self.assertRaises(SyncContractError) as raised:
+            self.store.enqueue(self.context, "foo.MD", "second")
+        self.assertEqual(raised.exception.code, "PATH_CONFLICT")
 
     def test_intent_is_immutable_and_rebase_creates_successor(self):
         original = self.store.enqueue(self.context, "메인/원고/001화.txt", "local")

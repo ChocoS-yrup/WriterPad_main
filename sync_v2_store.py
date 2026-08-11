@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from sync_contract import (
     CANONICAL_CONTRACT_SHA256,
+    CLIENT_CAPABILITIES,
     CLIENT_BUILD_ID,
     CONTRACT_VERSION,
     EVENT_STATE,
@@ -16,11 +17,14 @@ from sync_contract import (
     TERMINAL_STATES,
     SyncContractError,
     build_atomic_structure_request,
+    build_document_commit_request,
     canonical_json,
     json_sha256,
+    normalize_storage_name,
     require_server_compatibility,
     safe_trace,
     validate_atomic_structure_response,
+    validate_document_commit_response,
 )
 
 
@@ -28,7 +32,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8001
+STAGE8_USER_VERSION = 8002
 
 
 def _utc_now():
@@ -117,6 +121,25 @@ class SyncV2Store:
                 CREATE INDEX IF NOT EXISTS sync_documents_project_idx
                     ON sync_documents(local_key, document_id);
 
+                CREATE TABLE IF NOT EXISTS sync_folders (
+                    folder_id TEXT PRIMARY KEY,
+                    local_key TEXT NOT NULL
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    parent_folder_id TEXT,
+                    local_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    storage_name_key TEXT,
+                    revision INTEGER NOT NULL CHECK (revision >= 1),
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                        CHECK (is_deleted IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(local_key, local_path)
+                );
+
+                CREATE INDEX IF NOT EXISTS sync_folders_project_idx
+                    ON sync_folders(local_key, folder_id);
+
                 CREATE TABLE IF NOT EXISTS sync_operations (
                     queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     operation_id TEXT NOT NULL UNIQUE,
@@ -197,6 +220,29 @@ class SyncV2Store:
             "legacy_attempt_count INTEGER NOT NULL DEFAULT 0",
         ):
             self._add_column(connection, "sync_operations", definition)
+
+        for definition in (
+            "parent_folder_id TEXT",
+            "structure_revision INTEGER",
+            "name TEXT",
+            "storage_name_key TEXT",
+        ):
+            self._add_column(connection, "sync_documents", definition)
+
+        self._add_column(connection, "sync_folders", "storage_name_key TEXT")
+
+        connection.executescript(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS sync_folders_storage_name_idx
+                ON sync_folders(
+                    local_key, COALESCE(parent_folder_id, ''), storage_name_key
+                ) WHERE storage_name_key IS NOT NULL AND is_deleted = 0;
+            CREATE UNIQUE INDEX IF NOT EXISTS sync_documents_storage_name_idx
+                ON sync_documents(
+                    local_key, COALESCE(parent_folder_id, ''), storage_name_key
+                ) WHERE storage_name_key IS NOT NULL AND is_deleted = 0;
+            """
+        )
 
         connection.executescript(
             """
@@ -818,6 +864,107 @@ class SyncV2Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_folder_by_id(self, folder_id):
+        try:
+            folder_id = str(uuid.UUID(str(folder_id)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_folders WHERE folder_id = ?", (folder_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_folders(self, local_key):
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_folders WHERE local_key = ? ORDER BY folder_id",
+                (local_key,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def replace_folder_snapshots(self, local_key, snapshots):
+        """Replace the server-proven folder ID projection without inventing IDs."""
+        normalized = []
+        for snapshot in snapshots or []:
+            folder_id = str(uuid.UUID(str(snapshot["folder_id"])))
+            parent_id = snapshot.get("parent_folder_id")
+            parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+            local_path = _normalize_path(snapshot.get("local_path"))
+            name = str(snapshot.get("name") or "")
+            revision = int(snapshot.get("revision") or 0)
+            if not local_path or not name or revision < 1:
+                raise SyncContractError("INVALID_FOLDER_SNAPSHOT")
+            storage_name_key = normalize_storage_name(name).normalized
+            normalized.append((
+                folder_id, parent_id, local_path, name, storage_name_key, revision,
+                int(bool(snapshot.get("is_deleted"))),
+            ))
+        if len({item[0] for item in normalized}) != len(normalized):
+            raise SyncContractError("FOLDER_IDENTITY_CONFLICT")
+        if len({item[2] for item in normalized}) != len(normalized):
+            raise SyncContractError("FOLDER_PATH_IDENTITY_CONFLICT")
+
+        now = _utc_now()
+        with self._transaction() as connection:
+            existing = {
+                row["folder_id"]: row["local_key"]
+                for row in connection.execute(
+                    "SELECT folder_id, local_key FROM sync_folders"
+                ).fetchall()
+            }
+            if any(
+                folder_id in existing and existing[folder_id] != local_key
+                for folder_id, *_ in normalized
+            ):
+                raise SyncContractError("FOLDER_PROJECT_IDENTITY_CONFLICT")
+            folder_ids = {item[0] for item in normalized}
+            if folder_ids:
+                placeholders = ",".join("?" for _ in folder_ids)
+                connection.execute(
+                    f"DELETE FROM sync_folders WHERE local_key = ? "
+                    f"AND folder_id NOT IN ({placeholders})",
+                    (local_key, *sorted(folder_ids)),
+                )
+                for folder_id in sorted(folder_ids):
+                    connection.execute(
+                        "UPDATE sync_folders SET local_path = ? "
+                        "WHERE folder_id = ? AND local_key = ?",
+                        (f"__folder_transition__/{folder_id}", folder_id, local_key),
+                    )
+            else:
+                connection.execute(
+                    "DELETE FROM sync_folders WHERE local_key = ?", (local_key,)
+                )
+            for item in normalized:
+                (
+                    folder_id, parent_id, local_path, name, storage_name_key,
+                    revision, is_deleted,
+                ) = item
+                connection.execute(
+                    """
+                    INSERT INTO sync_folders (
+                        folder_id, local_key, parent_folder_id, local_path,
+                        name, storage_name_key, revision, is_deleted,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(folder_id) DO UPDATE SET
+                        local_key = excluded.local_key,
+                        parent_folder_id = excluded.parent_folder_id,
+                        local_path = excluded.local_path,
+                        name = excluded.name,
+                        storage_name_key = excluded.storage_name_key,
+                        revision = excluded.revision,
+                        is_deleted = excluded.is_deleted,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        folder_id, local_key, parent_id, local_path, name,
+                        storage_name_key, revision, is_deleted, now, now,
+                    ),
+                )
+        return self.list_folders(local_key)
+
     def _has_active_connection(self, connection, document_id):
         rows = connection.execute(
             "SELECT operation_id FROM sync_operations WHERE document_id = ?",
@@ -870,6 +1017,9 @@ class SyncV2Store:
         revision,
         is_deleted=False,
         local_path=None,
+        parent_folder_id=None,
+        name=None,
+        structure_revision=None,
     ):
         """Record a newer clean server snapshot without disturbing queued local work."""
         document_id = str(uuid.UUID(str(document_id)))
@@ -879,6 +1029,15 @@ class SyncV2Store:
         revision = int(revision or 0)
         now = _utc_now()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if parent_folder_id:
+            parent_folder_id = str(uuid.UUID(str(parent_folder_id)))
+        name = str(name) if name is not None else None
+        structure_revision = (
+            int(structure_revision) if structure_revision is not None else None
+        )
+        storage_name_key = (
+            normalize_storage_name(name).normalized if name is not None else None
+        )
 
         with self._transaction() as connection:
             existing = connection.execute(
@@ -905,8 +1064,9 @@ class SyncV2Store:
                     INSERT INTO sync_documents (
                         document_id, local_key, local_path, server_path, revision,
                         base_content, base_hash, is_deleted, sync_state, last_error,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', '', ?, ?)
+                        parent_folder_id, name, storage_name_key,
+                        structure_revision, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', '', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         document_id,
@@ -917,6 +1077,10 @@ class SyncV2Store:
                         content,
                         content_hash,
                         int(bool(is_deleted)),
+                        parent_folder_id,
+                        name,
+                        storage_name_key,
+                        structure_revision,
                         now,
                         now,
                     ),
@@ -930,6 +1094,10 @@ class SyncV2Store:
                     SET local_path = ?, server_path = ?, revision = ?,
                         base_content = ?, base_hash = ?, is_deleted = ?,
                         sync_state = 'synced', last_error = '',
+                        parent_folder_id = COALESCE(?, parent_folder_id),
+                        name = COALESCE(?, name),
+                        storage_name_key = COALESCE(?, storage_name_key),
+                        structure_revision = COALESCE(?, structure_revision),
                         conflict_base = NULL, conflict_local = NULL,
                         conflict_remote = NULL, conflict_merged = NULL,
                         updated_at = ?
@@ -942,6 +1110,10 @@ class SyncV2Store:
                         content,
                         content_hash,
                         int(bool(is_deleted)),
+                        parent_folder_id,
+                        name,
+                        storage_name_key,
+                        structure_revision,
                         now,
                         document_id,
                     ),
@@ -1018,6 +1190,82 @@ class SyncV2Store:
             return "NETWORK_ERROR"
         return "CLIENT_ERROR"
 
+    def _document_contract_structure(
+        self, connection, document, relative_path, base_revision
+    ):
+        """Resolve only server-proven folder identity for a document request."""
+        relative_path = _normalize_path(relative_path)
+        name = relative_path.rsplit("/", 1)[-1]
+        parent_path = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
+        parent_folder_id = None
+        if parent_path:
+            folder = connection.execute(
+                """
+                SELECT * FROM sync_folders
+                WHERE local_key = ? AND local_path = ? AND is_deleted = 0
+                """,
+                (document["local_key"], parent_path),
+            ).fetchone()
+            if folder is None:
+                raise SyncContractError("CONTRACT_STRUCTURE_IDS_REQUIRED")
+            parent_folder_id = folder["folder_id"]
+        structure_revision = document["structure_revision"]
+        if structure_revision is None:
+            if int(base_revision or 0) != 0:
+                raise SyncContractError("CONTRACT_STRUCTURE_REVISION_REQUIRED")
+            structure_revision = 1
+        storage_name_key = normalize_storage_name(name).normalized
+        folder_collision = connection.execute(
+            """
+            SELECT 1 FROM sync_folders
+            WHERE local_key = ? AND parent_folder_id IS ?
+              AND storage_name_key = ? AND is_deleted = 0
+            LIMIT 1
+            """,
+            (document["local_key"], parent_folder_id, storage_name_key),
+        ).fetchone()
+        document_collision = connection.execute(
+            """
+            SELECT 1 FROM sync_documents
+            WHERE local_key = ? AND parent_folder_id IS ?
+              AND storage_name_key = ? AND is_deleted = 0
+              AND document_id <> ?
+            LIMIT 1
+            """,
+            (
+                document["local_key"], parent_folder_id, storage_name_key,
+                document["document_id"],
+            ),
+        ).fetchone()
+        pending_collision = False
+        pending_rows = connection.execute(
+            """
+            SELECT operation_id, document_id, relative_path, is_deleted
+            FROM sync_operations
+            WHERE local_key = ? AND document_id <> ?
+            """,
+            (document["local_key"], document["document_id"]),
+        ).fetchall()
+        for pending in pending_rows:
+            if bool(pending["is_deleted"]):
+                continue
+            if self_state := self._derived_state(connection, pending["operation_id"]):
+                if self_state not in CONTRACT_ACTIVE_STATES:
+                    continue
+            pending_path = _normalize_path(pending["relative_path"])
+            pending_parent = (
+                pending_path.rsplit("/", 1)[0] if "/" in pending_path else ""
+            )
+            if pending_parent != parent_path:
+                continue
+            pending_name = pending_path.rsplit("/", 1)[-1]
+            if normalize_storage_name(pending_name).normalized == storage_name_key:
+                pending_collision = True
+                break
+        if folder_collision or document_collision or pending_collision:
+            raise SyncContractError("PATH_CONFLICT")
+        return parent_folder_id, name, storage_name_key, int(structure_revision)
+
     def _insert_document_operation(
         self,
         connection,
@@ -1048,35 +1296,51 @@ class SyncV2Store:
         contract_version = None
         contract_sha256 = None
         capabilities_json = canonical_json(["folders_authoritative", "tombstones"])
-        if mode != "LEGACY":
+        intent_kind = (
+            "delete" if is_deleted else
+            "create" if int(base_revision or 0) == 0 else "update"
+        )
+        if mode != "LEGACY" and base_revision is None:
+            provenance = "LOCAL_DEFERRED"
+            protocol_version = SYNC_PROTOCOL_VERSION
+            capabilities_json = canonical_json(list(CLIENT_CAPABILITIES))
+        elif mode != "LEGACY":
             provenance = "CONTRACT_BATCH"
             protocol_version = SYNC_PROTOCOL_VERSION
             contract_version = CONTRACT_VERSION
             contract_sha256 = CANONICAL_CONTRACT_SHA256
-            capabilities_json = canonical_json([
-                "folders_authoritative", "tree_order_ids", "tombstones",
-                "immutable_batch_contract_metadata", "operation_attempt_history",
-                "operation_state_events", "storage_name_v1",
-            ])
-            request = build_atomic_structure_request(
+            capabilities_json = canonical_json(list(CLIENT_CAPABILITIES))
+            parent_folder_id, name, storage_name_key, structure_revision = (
+                self._document_contract_structure(
+                    connection, document, relative_path, base_revision
+                )
+            )
+            if is_deleted:
+                intent_kind = "delete"
+            elif bool(document["is_deleted"]):
+                intent_kind = "restore"
+            elif int(base_revision or 0) == 0:
+                intent_kind = "create"
+            else:
+                intent_kind = "update"
+            request = build_document_commit_request(
                 project_id=context["project_id"],
                 project_sync_mode=mode,
                 migration_epoch=int(project["migration_epoch"] or 0),
                 writer_device_id=context.get("writer_device_id") or uuid.uuid4(),
-                ordered_intents=[{
-                    "operation_id": operation_id,
-                    "entity_kind": "document",
-                    "entity_id": document["document_id"],
-                    "intent_kind": (
-                        "delete" if is_deleted else
-                        "create" if int(base_revision or 0) == 0 else "update"
-                    ),
-                    "base_revision": int(base_revision or 0),
-                    "payload": payload,
-                    "supersedes_operation_id": supersedes_operation_id,
-                }],
+                document_id=document["document_id"],
+                intent_kind=intent_kind,
+                base_revision=int(base_revision or 0),
+                parent_folder_id=parent_folder_id,
+                name=name,
+                content=content,
+                is_deleted=bool(is_deleted),
+                structure_revision=structure_revision,
+                operation_id=operation_id,
+                supersedes_operation_id=supersedes_operation_id,
                 client_build_id=CLIENT_BUILD_ID,
             )
+            payload = request["ordered_intents"][0]["payload"]
             batch = request["batch"]
             batch_id = batch["batch_id"]
             connection.execute(
@@ -1102,10 +1366,6 @@ class SyncV2Store:
             )
 
         now = _utc_now()
-        intent_kind = (
-            "delete" if is_deleted else
-            "create" if int(base_revision or 0) == 0 else "update"
-        )
         connection.execute(
             """
             INSERT INTO sync_operations (
@@ -1251,6 +1511,8 @@ class SyncV2Store:
             rpc_name = (
                 "atomic_structure_commit"
                 if operation.get("queue_kind") == "structure"
+                else "document_commit"
+                if operation.get("provenance_kind") == "CONTRACT_BATCH"
                 else "commit_document"
             )
             return self._append_event(
@@ -1344,11 +1606,18 @@ class SyncV2Store:
                     (operation["document_id"], operation_id),
                 ).fetchall()
             )
+            result_name = result.get("name")
+            storage_name_key = (
+                normalize_storage_name(result_name).normalized
+                if result_name is not None else None
+            )
             connection.execute(
                 """
                 UPDATE sync_documents
                 SET server_path = ?, revision = ?, base_content = ?, base_hash = ?,
-                    is_deleted = ?, sync_state = ?, last_error = '', updated_at = ?
+                    is_deleted = ?, sync_state = ?, last_error = '',
+                    parent_folder_id = ?, structure_revision = ?, name = ?,
+                    storage_name_key = ?, updated_at = ?
                 WHERE document_id = ?
                 """,
                 (
@@ -1358,6 +1627,10 @@ class SyncV2Store:
                     result.get("content_hash", hashlib.sha256(operation["content"].encode("utf-8")).hexdigest()),
                     operation["is_deleted"],
                     "pending" if still_pending else "synced",
+                    result.get("parent_folder_id"),
+                    result.get("structure_revision"),
+                    result_name,
+                    storage_name_key,
                     now,
                     operation["document_id"],
                 ),
@@ -1377,6 +1650,14 @@ class SyncV2Store:
                     "local_key": dependent["local_key"],
                     "project_id": dependent["project_id"],
                 }
+                if operation["batch_id"]:
+                    previous_batch = connection.execute(
+                        "SELECT writer_device_id FROM sync_contract_batches "
+                        "WHERE batch_id = ?",
+                        (operation["batch_id"],),
+                    ).fetchone()
+                    if previous_batch:
+                        context["writer_device_id"] = previous_batch["writer_device_id"]
                 successor = self._insert_document_operation(
                     connection,
                     context=context,
@@ -1798,6 +2079,57 @@ class SyncV2Store:
                 (batch_id,),
             ).fetchone()
             return json.loads(row["request_json"]) if row else None
+
+    def document_batch_response(self, batch_id):
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT response_json FROM sync_contract_batch_results "
+                "WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            return json.loads(row["response_json"]) if row else None
+
+    def record_document_batch_response(self, batch_id, response):
+        """Validate and append a complete document result before local apply."""
+        with self._transaction() as connection:
+            batch = connection.execute(
+                "SELECT * FROM sync_contract_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise KeyError(batch_id)
+            request = json.loads(batch["request_json"])
+            validated = validate_document_commit_response(request, response)
+            existing = connection.execute(
+                "SELECT * FROM sync_contract_batch_results WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if existing:
+                recorded = json.loads(existing["response_json"])
+                same = recorded == validated
+                if not same and all(
+                    item.get("kind") == "document_commit_success"
+                    for item in (recorded, validated)
+                ):
+                    left = dict(recorded)
+                    right = dict(validated)
+                    left["status"] = right["status"] = "committed"
+                    same = left == right
+                if not same:
+                    raise SyncContractError("BATCH_ID_REUSED")
+                return recorded
+            connection.execute(
+                """
+                INSERT INTO sync_contract_batch_results (
+                    batch_id, response_json, response_sha256, applied, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id, canonical_json(validated), json_sha256(validated),
+                    int(bool(validated["applied"])), _utc_now(),
+                ),
+            )
+            return validated
 
     def mark_structure_batch_attempt(self, batch_id):
         with self._transaction() as connection:

@@ -938,7 +938,10 @@ class SyncManager(QObject):
             "LEASE_CONFLICT", "LEASE_EXPIRED", "PATH_CONFLICT",
             "CONTRACT_NOT_ALLOWED", "CONTRACT_DIGEST_MISMATCH",
             "PROTOCOL_TOO_OLD", "CAPABILITY_MISMATCH",
-            "CONTRACT_DOCUMENT_RPC_UNAVAILABLE", "PARTIAL_BATCH_RESPONSE",
+            "PROJECT_MIGRATING", "MIGRATION_LOCKED",
+            "STALE_MIGRATION_EPOCH", "BATCH_ID_REUSED",
+            "CONTENT_SIZE_MISMATCH", "CONTENT_DIGEST_MISMATCH",
+            "STRUCTURE_REVISION_CONFLICT", "PARTIAL_BATCH_RESPONSE",
         ):
             if code in message:
                 return code
@@ -1525,10 +1528,34 @@ class SyncManager(QObject):
         operation = self._v2_store.operation(operation_id)
         if not operation:
             return {"kind": "retry", "error": "대기 작업을 찾을 수 없습니다."}
-        if operation.get("provenance_kind") == "CONTRACT_BATCH":
-            error = "CONTRACT_DOCUMENT_RPC_UNAVAILABLE"
-            self._v2_store.mark_blocked(operation_id, error)
-            return {"kind": "blocked", "error": error, "operation": operation}
+        is_contract_document = (
+            operation.get("provenance_kind") == "CONTRACT_BATCH"
+        )
+
+        def contract_result(response):
+            if response.get("kind") == "document_commit_success":
+                wire_result = response["results"][0]
+                return {
+                    "kind": "committed",
+                    "result": {
+                        "revision": wire_result["result_revision"],
+                        "content_hash": wire_result["content_sha256"],
+                        "status": response["status"],
+                        "structure_revision": wire_result["structure_revision"],
+                        "parent_folder_id": wire_result["parent_folder_id"],
+                        "name": wire_result["name"],
+                    },
+                    "operation": operation,
+                }
+            error_code = response["error"]["code"]
+            if error_code in {"REVISION_CONFLICT", "DOCUMENT_ALREADY_EXISTS"}:
+                raise RuntimeError(error_code)
+            self._v2_store.mark_blocked(operation_id, error_code)
+            return {
+                "kind": "blocked", "error": error_code,
+                "operation": operation,
+            }
+
         if is_forced_offline():
             error = "테스트 오프라인 모드"
             return {"kind": "retry", "error": error, "operation": operation}
@@ -1539,6 +1566,26 @@ class SyncManager(QObject):
 
         try:
             self._ensure_remote_project(client)
+            if is_contract_document:
+                cached = self._v2_store.document_batch_response(
+                    operation["batch_id"]
+                )
+                if cached:
+                    return contract_result(cached)
+                request = self._v2_store.structure_batch_request(
+                    operation["batch_id"]
+                )
+                if not request:
+                    raise RuntimeError("CONTRACT_BATCH_NOT_FOUND")
+                response = client.rpc(
+                    "document_commit", {"p_request": request}
+                ).execute()
+                wire_response = self._response_data(response) or {}
+                wire_response = self._v2_store.record_document_batch_response(
+                    operation["batch_id"], wire_response
+                )
+                return contract_result(wire_response)
+
             lease_token = None
             if operation["base_revision"] > 0:
                 lease_token = self._acquire_v2_lease(operation["document_id"], client).get("lease_token")
