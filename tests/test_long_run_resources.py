@@ -132,15 +132,40 @@ class LongRunResourceTestCase(unittest.TestCase):
         self.assertEqual(result["retained_after_2_2s"], 0)
 
     def test_repeated_same_document_backups_coalesce_to_active_and_latest(self):
-        _SlowResultWorker.started_count = 0
-        _SlowResultWorker.started_event.clear()
-        _SlowResultWorker.release_event.clear()
+        class ManualSignal:
+            def __init__(self):
+                self.callbacks = []
+
+            def connect(self, callback):
+                self.callbacks.append(callback)
+
+            def emit(self, *args):
+                for callback in list(self.callbacks):
+                    callback(*args)
+
+        class ManualWorker:
+            instances = []
+
+            def __init__(self, _wpm, _path, content):
+                self.content = content
+                self.resultReady = ManualSignal()
+                self.finished = ManualSignal()
+                self.deleted = False
+                type(self).instances.append(self)
+
+            def deleteLater(self):
+                self.deleted = True
+
         wpm = SimpleNamespace()
         path = "메인/원고/장시간.txt"
 
-        with patch("sync_manager.AutoSaveWorker", _SlowResultWorker):
+        with patch("sync_manager.AutoSaveWorker", ManualWorker), patch.object(
+            self.manager, "_start_worker"
+        ), patch(
+            "sync_manager.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callback(),
+        ):
             first = self.manager.upload_autosave_async(wpm, path, "본문-0")
-            self.assertTrue(_SlowResultWorker.started_event.wait(1))
             returned = [
                 self.manager.upload_autosave_async(
                     wpm, path, f"본문-{index}"
@@ -155,13 +180,26 @@ class LongRunResourceTestCase(unittest.TestCase):
                 "본문-719",
             )
 
-            _SlowResultWorker.release_event.set()
-            self.assertTrue(_wait_until(
-                lambda: not self.manager._autosave_workers
-                and not self.manager._autosave_followups
-            ))
+            first.resultReady.emit(True, "")
+            first.finished.emit()
+            self.assertEqual(len(ManualWorker.instances), 2)
+            followup = ManualWorker.instances[-1]
+            self.assertEqual(followup.content, "본문-719")
+            self.assertIs(
+                self.manager._autosave_workers_by_path[
+                    (id(wpm), path)
+                ],
+                followup,
+            )
 
-        self.assertEqual(_SlowResultWorker.started_count, 2)
+            followup.resultReady.emit(True, "")
+            followup.finished.emit()
+
+        self.assertEqual(len(ManualWorker.instances), 2)
+        self.assertTrue(all(worker.deleted for worker in ManualWorker.instances))
+        self.assertEqual(self.manager._autosave_workers, [])
+        self.assertEqual(self.manager._autosave_workers_by_path, {})
+        self.assertEqual(self.manager._autosave_followups, {})
 
     def test_retention_and_heartbeat_workers_do_not_duplicate(self):
         _SlowResultWorker.started_count = 0

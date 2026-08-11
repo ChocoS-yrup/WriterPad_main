@@ -2,7 +2,7 @@
   "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
   "stacked_pr_base_branch": "codex/stage-8-windows-contract-implementation",
   "local_history_reused": false,
-  "source_manifest_sha256": "43515eb7a3fcab5c253480b944bd2f6f14e19c53b9951459290d0db7071949ea",
+  "source_manifest_sha256": "09904026c6a065fbf04618e2daee3d872c48b19ce4382288a4d6b239987a7ce8",
   "source_entry_count": 36,
   "safety_gate": {
     "utf8_text_only": true,
@@ -174,9 +174,9 @@
     },
     {
       "path": "tests/qt_app.py",
+      "provenance": "reviewed UTF-8 source/test reconstruction",
       "bytes": 242,
-      "output_sha256": "4773cba84e9a1a8c58e95ced0d5300713ee4b41c2ae78c6eee25fd6ad46d8225",
-      "provenance": "reviewed UTF-8 source/test reconstruction"
+      "output_sha256": "4773cba84e9a1a8c58e95ced0d5300713ee4b41c2ae78c6eee25fd6ad46d8225"
     },
     {
       "path": "tests/resource_probe.py",
@@ -196,8 +196,8 @@
       "path": "tests/test_long_run_resources.py",
       "provenance": "read-only untracked text source",
       "source_sha256": "7f115fe3ecefb7a05c2f021428feef08920d15fee9db0ff68edc295edc5bec4e",
-      "bytes": 8981,
-      "output_sha256": "3faf6dc6b7294efeff340c8b2314bccfff6e6de7c0e9dd4b94f171171b5e22ce"
+      "bytes": 10242,
+      "output_sha256": "89e97b074593243f57a9e6aa55deb7db70e37ebf458576aa83d62ccb7c8fd575"
     },
     {
       "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",
@@ -267,8 +267,8 @@
       "path": "tests/test_sync_resilience.py",
       "provenance": "read-only untracked text source",
       "source_sha256": "24af9389038169c398a4109588cef4ca6cbdc56396c5c25019b176e4750c264d",
-      "bytes": 6592,
-      "output_sha256": "24af9389038169c398a4109588cef4ca6cbdc56396c5c25019b176e4750c264d"
+      "bytes": 6817,
+      "output_sha256": "3692bbc974dfe758869acf9f7e8c2a0ffb5190c4040dca061a8ba84134c1243d"
     },
     {
       "base_commit": "5b8f0b2b2867fe5340e98d0d4c5b460e1c442219",
@@ -285,8 +285,8 @@
       "dirty_source_sha256": "0b509dc8709925b0984078d170dcfda5ad81f7325bb82369f2f91ca0084547a6",
       "path": "tests/test_sync_v2.py",
       "provenance": "function/hunk reconstruction over PR #1 exact head",
-      "bytes": 210298,
-      "output_sha256": "f2673945d060de4ef4d973bbf32c47063d2554eccd1524a36f0d37c57be59db5"
+      "bytes": 209914,
+      "output_sha256": "7b34a5216d5499a8b30bded213626850a7a20dd9dac485323d63efabedba9950"
     },
     {
       "base_commit": "77c57b8d39ce726f6aad0a565a0397b7a5a98fc3",

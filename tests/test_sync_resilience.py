@@ -151,18 +151,23 @@ class SyncResilienceTestCase(unittest.TestCase):
         sync_manager.would_erase_nonempty_document.return_value = False
         sync_manager.upload_content_async.side_effect = RuntimeError("queue busy")
         persisted = MagicMock()
-        controller = WritingController(
-            wpm,
-            sync_manager,
-            SimpleNamespace(current_project="작품"),
-            "device",
-            lambda: [path],
-            lambda requested: "안전하게 저장된 본문" if requested == path else None,
-            persisted,
-        )
-        controller.pending_autosave_paths.add(path)
+        timer = MagicMock()
+        timer.isActive.return_value = False
+        with patch("writing_controller.QTimer", return_value=timer):
+            controller = WritingController(
+                wpm,
+                sync_manager,
+                SimpleNamespace(current_project="작품"),
+                "device",
+                lambda: [path],
+                lambda requested: (
+                    "안전하게 저장된 본문" if requested == path else None
+                ),
+                persisted,
+            )
+            controller.pending_autosave_paths.add(path)
 
-        controller.sync_file()
+            controller.sync_file()
 
         wpm.write_text_file.assert_called_once_with(path, "안전하게 저장된 본문")
         persisted.assert_called_once_with(path, "안전하게 저장된 본문", True)

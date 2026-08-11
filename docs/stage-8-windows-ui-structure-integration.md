@@ -35,7 +35,7 @@ rebased.
 
 - Source manifest: `docs/stage-8-source-reconstruction-manifest.json`
 - Source entries: `36`
-- Source manifest SHA-256: `43515eb7a3fcab5c253480b944bd2f6f14e19c53b9951459290d0db7071949ea`
+- Source manifest SHA-256: `09904026c6a065fbf04618e2daee3d872c48b19ce4382288a4d6b239987a7ce8`
 - All included files passed UTF-8 text, forbidden-path, binary, 1 MiB and secret-rule gates.
 - Excluded: local 50-commit history, `.env`, historic secret material,
   `saves/project_data.json`, real work content, DB/WAL/SHM, EXE/DLL,
@@ -59,6 +59,12 @@ The original dirty worktree remained unchanged:
   silent exit code 1. A module-held offscreen `QApplication` fixture now keeps
   the Qt application type and lifetime deterministic. The exact failing test
   order and the complete suite passed locally after the correction.
+- Follow-up CI run `31488020552` confirmed two remaining headless-only test
+  harness dependencies: a real `QTimer` in a queue-failure unit test and a
+  focused `QLineEdit`/`QTest` interaction in a durable rename regression. They
+  now test the same state transitions with a fake timer and direct durable
+  handler. The autosave coalescing resource test also uses manual signals so
+  worker cleanup and latest-follow-up semantics are deterministic.
 - Contract verifier: 7 schemas, contract `0.2.0`, 12 transition vectors,
   15 Unicode 15.0 storage-name vectors, 4 atomic wire cases and 7 document wire cases passed.
 - Canonical bytes: `23256`.
