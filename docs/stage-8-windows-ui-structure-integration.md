@@ -5,9 +5,12 @@
 - Repository: `ChocoS-yrup/WriterPad_main`
 - Contract stacked base: `codex/stage-8-windows-contract-implementation`
 - Original reconstruction base: `5b8f0b2b2867fe5340e98d0d4c5b460e1c442219`
-- Corrective PR #1 head merged into this branch: `2a560c724d7f75bd455328e72c3a9c3cc39b7211`
-- Stacked-base merge commit: `eccef7c` (full SHA is available from this branch history)
-- Integration branch: `codex/stage-8-windows-ui-structure-integration`
+- Published corrective PR #1 head previously merged into this branch: `2a560c724d7f75bd455328e72c3a9c3cc39b7211`
+- Local PR #1 mode/epoch correction: `b81051c` (publication pending)
+- Local stacked-base merge commit: `d70aa3a054bb6a8edc451f37e748ecfe2904de9f`
+- Exact source snapshot commit: `ec0d0181526f0aaede6c65459fc1cd61595ca8fd`
+- Local integration branch: `codex/stage-8-windows-ui-structure-fixes`
+- Published Draft PR branch remains: `codex/stage-8-windows-ui-structure-integration`
 - Contract version: `0.2.0`
 - Canonical contract SHA-256: `416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670`
 - Local 50-commit history reused: `false`
@@ -37,16 +40,23 @@ rebased.
 ## Provenance and exclusions
 
 - Source manifest: `docs/stage-8-source-reconstruction-manifest.json`
-- Source entries: `37`
-- Source entry snapshot head: `833820d075bcb95cfba943893d64621fe2abac58`
-- Source entries digest SHA-256: `8d9a38fb06b3a2e91a017a4825cd151ff85b8c5dd79529c33ba85b373a9158ab`
+- Source entries: `39`
+- Source entry snapshot head: `ec0d0181526f0aaede6c65459fc1cd61595ca8fd`
+- Source entries digest SHA-256: `64dec2ee55e2e3656e4ee66dfd8f8e86b002d7b66d3ddfffb12a366930d38573`
 - Digest rule: sort entries by path, then SHA-256 the concatenated UTF-8
   records `<path>\\0<decimal byte_count>\\0<lowercase output_sha256>\\n`.
   `docs/*` and the manifest itself are excluded from that entry-set digest.
-- Exact-head manifest file SHA-256 before this corrective update:
-  `671865ed0364f3efde81a89993a96dc2995bfbb0374a2d8e128775cc8dac60fd`.
-- Corrected manifest file SHA-256:
-  `94d63b3cd608252eab2f1aa220cb246c8a8da10cc2b1ba860befea7c40bcfc64`.
+- Each entry's byte count and output hash use the committed Git blob returned
+  by `git show <source_entry_snapshot_head>:<path>`. Checkout-specific CRLF
+  conversion is never part of the hash, so Windows and macOS reproduce the
+  same values.
+- `test_flags.py` and `test_rename.py` are included as reviewed UTF-8 manual
+  probes. Both are guarded by `__main__` and cannot mutate Qt state during
+  unittest discovery.
+- The manifest file's own SHA-256 is recorded below after the final manifest
+  bytes are fixed; it is intentionally not self-embedded.
+- Canonical LF/UTF-8 manifest file: `19,285` bytes, SHA-256
+  `0b3b65de2df2314a8e53b74272c2eee4f87ac7a0be043ebf7273146cbe047d0e`.
 - All included files passed UTF-8 text, forbidden-path, binary, 1 MiB and secret-rule gates.
 - Excluded: local 50-commit history, `.env`, historic secret material,
   `saves/project_data.json`, real work content, DB/WAL/SHM, EXE/DLL,
@@ -81,6 +91,13 @@ top-level status record while it remains mounted:
 - Batch insertion and local folder/document/order projections share one SQLite
   transaction. Filesystem-first failures roll back filesystem and SQLite state;
   rollback failure creates append-only durable structure-recovery evidence.
+- Folder delete/restore carries document path projections and immutable
+  document operations as an uncommitted plan until the ordered lifecycle/order
+  batch is created. Failure after the first document operation rolls back every
+  document path, operation, structure batch and folder snapshot together.
+- Delete, restore and their filesystem compensation paths are serialized by
+  `local_structure_mutation()`; compensation failure appends durable recovery
+  evidence instead of silently claiming success.
 - A predecessor can be superseded only once within the combined operation set;
   duplicate predecessor relations are rejected before persistence.
 - Rename-only, move-only, combined rename+move, lifecycle, validation failure,
@@ -92,9 +109,9 @@ top-level status record while it remains mounted:
 - Baseline at PR #1 exact head: `126 passed, 9 skipped`.
 - PR #1 corrective head `2a560c7`: `136 passed`; Windows CI run
   `31516134432` passed contract vectors, client tests and executable build.
-- Final Windows Python regression: `382 passed, 1 skipped`, twice
-  consecutively without retries after the final correction (`66.137s`, then
-  `66.148s`).
+- Final Windows Python regression: `380 passed, 1 conditional symlink skip`,
+  twice consecutively without retries at exact source snapshot `ec0d018`
+  (`66.885s`, then `67.523s`).
 - Backup coalescing: ManualWorker and real QThread coverage passed `30/30`
   repeated rounds. The QThread test uses signals/events and bounded waits, not
   fixed sleeps.
@@ -134,11 +151,14 @@ top-level status record while it remains mounted:
   verifier because it exposes Unicode 14.0; PR CI uses pinned Python 3.12.
 - Canonical bytes: `23256`.
 - PyInstaller `6.21.0` Windows build: passed.
-- Local corrective EXE SHA-256:
-  `328d1439bcc5d31eadb8da13e04045e8107f51d6a3d32ffc3a13e1a5eede4f4b`.
-- Local corrective EXE size: `78,590,180` bytes; `build/` and `dist/` remained
+- Exact-source local EXE SHA-256:
+  `dca6130240809723624ff3ddba6c7bdcf390a796fb0502b546d3636990875b0c`.
+- Exact-source local EXE size: `78,591,142` bytes; `build/` and `dist/` remained
   ignored and are not PR content.
 - `git diff --check`: passed.
+- New PR #1/PR #2 heads and hosted CI: pending publication because the local
+  GitHub CLI credential is currently invalid; no older CI result is represented
+  as validation of `b81051c` or `ec0d018`.
 - Staging/production access or writes: `none`.
 - Contract allowlist changes: `none`.
 - Existing project promotion: `none`.
@@ -146,6 +166,8 @@ top-level status record while it remains mounted:
 ## Remaining gates
 
 - The stacked pull request must remain Draft.
+- Publish PR #1 correction first, wait for its CI, then publish the ordinary
+  stacked merge plus `ec0d018` and this evidence update to PR #2.
 - PR #1 must not be rebased, updated, readied or merged by this work.
 - Staging client connection and allowlist activation require separate approval.
 - Stage 9 must not begin until Stage 8 review, merge and approved staging validation complete.
