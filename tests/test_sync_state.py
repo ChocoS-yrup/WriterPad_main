@@ -8,6 +8,7 @@ from mode_writing import WritingModeWidget
 from project_manager_writing import WritingProjectManager
 from settings_panel import SettingsPanel
 from sync_manager import SaveWorker, SyncManager
+from sync_v2_store import SyncV2Store
 
 
 class SyncManagerStateTestCase(unittest.TestCase):
@@ -72,6 +73,56 @@ class SyncManagerStateTestCase(unittest.TestCase):
         self.manager._retry_queue.clear()
         self.manager._publish_sync_state()
         self.assertEqual(self.states[-1][0], "saved")
+
+    def test_missing_rpc_grant_shows_actionable_message_instead_of_raw_json(self):
+        path = "메인/원고/1권/006화.txt"
+        document = {"document_id": "document-id", "revision": 1}
+        self.manager._v2_store = MagicMock()
+        self.manager._v2_store.get_document.return_value = document
+        self.manager._v2_store.ensure_document.return_value = document
+        self.manager._v2_store.has_tombstone_for_server_path.return_value = False
+        self.manager._v2_context = {"local_key": "project-key"}
+        self.manager._v2_device_id = "device-id"
+        raw_error = {
+            "message": "permission denied for function acquire_edit_lease",
+            "code": "42501",
+            "hint": None,
+            "details": None,
+        }
+
+        with patch.object(
+            self.manager, "_acquire_v2_lease", side_effect=RuntimeError(raw_error)
+        ):
+            success, message = self.manager.check_and_acquire_lock(
+                "서버 작품", path, "session-id", client=object()
+            )
+
+        self.assertFalse(success)
+        self.assertIn("서버 동기화 권한 설정", message)
+        self.assertNotIn("42501", message)
+        self.assertNotIn("permission denied", message)
+
+    def test_logged_out_client_shows_cloud_login_guidance_before_lease_rpc(self):
+        path = "메인/원고/1권/006화.txt"
+        document = {"document_id": "document-id", "revision": 1}
+        self.manager._v2_store = MagicMock()
+        self.manager._v2_store.ensure_document.return_value = document
+        self.manager._v2_context = {"local_key": "project-key"}
+        self.manager._v2_device_id = "device-id"
+        client = SimpleNamespace(_antigravity_authenticated=False)
+
+        with patch.object(self.manager, "_acquire_v2_lease") as acquire:
+            success, message = self.manager.check_and_acquire_lock(
+                "서버 작품", path, "session-id", client=client
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(
+            message,
+            "클라우드 동기화 계정에 로그인이 되어있지 않습니다.\n"
+            "설정탭 / 클라우드 계정 로그인을 확인해주세요.",
+        )
+        acquire.assert_not_called()
 
     def test_retry_queue_keeps_only_the_latest_content_for_each_file(self):
         key = ("content", "작품", "메인/원고/1권/001화.txt")
@@ -146,7 +197,7 @@ class SyncManagerStateTestCase(unittest.TestCase):
             result = []
 
             worker = SaveWorker(None, wpm, "테스트 작품", relative_path, "로컬에는 반드시 남을 내용")
-            worker.finished.connect(lambda *args: result.append(args))
+            worker.resultReady.connect(lambda *args: result.append(args))
             with patch.object(SyncManager, "create_supabase_client", return_value=None):
                 worker.run()
 
@@ -176,7 +227,93 @@ class SyncManagerStateTestCase(unittest.TestCase):
     def test_windows_build_includes_public_supabase_configuration(self):
         spec = Path("Antigravity_AI_Writer.spec").read_text(encoding="utf-8")
 
-        self.assertIn("('.env', '.')", spec)
+        self.assertIn("config_source = '.env' if os.path.exists('.env') else '.env.example'", spec)
+        self.assertIn("(config_source, '.')", spec)
+        source = Path("sync_manager.py").read_text(encoding="utf-8")
+        self.assertIn('os.path.join(supabase_config_dir(), ".env.example")', source)
+
+    def test_trashed_project_status_stops_retry_and_preserves_queue(self):
+        class _Rpc:
+            def execute(self):
+                return SimpleNamespace(data={"state": "trashed"})
+
+        class _Client:
+            def rpc(self, name, params):
+                self.last_call = (name, params)
+                return _Rpc()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            project_id = "f6e37e0a-9f93-40d5-860e-3a5c81c61961"
+            context = store.configure_project(
+                str(Path(temp_dir, "작품", "집필모드")),
+                "작품",
+                project_id,
+            )
+            store.enqueue(
+                context, "메인/원고/001화.txt", "보존할 로컬 원고"
+            )
+            self.manager._v2_store = store
+            self.manager._v2_context = context
+            self.manager._v2_wpm = SimpleNamespace()
+            self.manager._v2_device_id = "device"
+            self.manager.supabase = _Client()
+
+            with self.assertRaisesRegex(RuntimeError, "PROJECT_TRASHED"):
+                self.manager._fetch_v2_project_documents()
+
+            self.assertEqual(
+                self.manager._v2_context["server_state"], "trashed"
+            )
+            self.assertEqual(
+                store.get_project_by_id(project_id)["server_state"],
+                "trashed",
+            )
+            self.assertFalse(self.manager.retry_pending_syncs())
+            self.assertEqual(store.counts(context["local_key"])["pending"], 1)
+            self.assertEqual(
+                self.manager.current_sync_state, "project_trashed"
+            )
+
+    def test_project_status_falls_back_to_existing_trash_rpc(self):
+        project_id = "0b49107c-0807-486e-bd7d-693f97ceddb4"
+
+        class _Rpc:
+            def __init__(self, name):
+                self.name = name
+
+            def execute(self):
+                if self.name == "get_project_status":
+                    raise RuntimeError("function does not exist")
+                return SimpleNamespace(data=[{
+                    "project_id": project_id,
+                    "name": "휴지통 작품",
+                    "trashed_at": "2026-07-29T10:00:00Z",
+                }])
+
+        class _Client:
+            def rpc(self, name, params):
+                return _Rpc(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            context = store.configure_project(
+                str(Path(temp_dir, "작품", "집필모드")),
+                "작품",
+                project_id,
+            )
+            self.manager._v2_store = store
+            self.manager._v2_context = context
+            self.manager._v2_wpm = SimpleNamespace()
+            self.manager._v2_device_id = "device"
+            self.manager.supabase = _Client()
+
+            self.assertEqual(
+                self.manager._fetch_v2_project_status(), "trashed"
+            )
+            self.assertEqual(
+                self.manager._v2_context["server_state"], "trashed"
+            )
 
 
 class _FakeLabel:
@@ -184,6 +321,7 @@ class _FakeLabel:
         self.text = ""
         self.style = ""
         self.tooltip = ""
+        self.enabled = True
 
     def setText(self, value):
         self.text = value
@@ -194,26 +332,43 @@ class _FakeLabel:
     def setToolTip(self, value):
         self.tooltip = value
 
+    def setEnabled(self, value):
+        self.enabled = bool(value)
+
 
 class StorageStatusLabelTestCase(unittest.TestCase):
     def test_all_user_visible_status_labels(self):
         target = SimpleNamespace(lbl_storage_status=_FakeLabel())
         expected = {
-            "saved": "저장됨",
-            "backup": "자동백업 중",
-            "syncing": "서버 동기화 중",
-            "offline": "오프라인 임시 저장됨",
+            "saved": "로컬 저장 완료",
+            "backup": "복구본 생성 중",
+            "syncing": "서버 전송 중",
+            "offline": "로컬 저장 완료",
+            "auth_required": "로그인 필요",
             "lease": "다른 기기 편집 중",
-            "failed": "동기화 실패 — 재시도 필요",
+            "failed": "서버 전송 대기",
+            "conflict": "충돌",
+            "project_trashed": "서버 휴지통 · 동기화 중지",
+            "project_purged": "서버 영구 삭제 · 로컬 사본",
         }
 
         for state, label in expected.items():
             WritingModeWidget.update_storage_status(
-                target, state, "상세 상태", 1 if state in {"offline", "lease", "failed"} else 0
+                target,
+                state,
+                "상세 상태",
+                1 if state in {
+                    "offline", "auth_required", "lease", "failed", "conflict",
+                    "project_trashed", "project_purged",
+                } else 0,
             )
             self.assertIn(label, target.lbl_storage_status.text)
 
-        self.assertIn("클릭하면 지금 재시도", target.lbl_storage_status.tooltip)
+        self.assertIn("원인과 해결 방법", target.lbl_storage_status.tooltip)
+        WritingModeWidget.update_storage_status(
+            target, "failed", "상세 상태", 1
+        )
+        self.assertIn("다시 시도", target.lbl_storage_status.tooltip)
 
     def test_storage_status_makes_restored_cloud_login_visible(self):
         target = SimpleNamespace(
@@ -225,13 +380,142 @@ class StorageStatusLabelTestCase(unittest.TestCase):
 
         WritingModeWidget.update_storage_status(target, "saved", "", 0)
 
-        self.assertIn("클라우드 로그인됨", target.lbl_storage_status.text)
+        self.assertEqual("● 동기화 완료", target.lbl_storage_status.text)
         self.assertIn("writer@example.com", target.lbl_storage_status.tooltip)
+
+    def test_dirty_editor_shows_one_background_save_waiting(self):
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(authenticated_email=lambda: ""),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertIn("로컬 저장 대기 1건", target.lbl_storage_status.text)
+        self.assertNotIn("수정 중", target.lbl_storage_status.text)
+        self.assertNotIn("저장 완료", target.lbl_storage_status.text)
+        self.assertIn("입력을 잠시 멈추", target.lbl_storage_status.tooltip)
+        self.assertIn("Ctrl+S", target.lbl_storage_status.tooltip)
+
+    def test_empty_document_guard_is_not_hidden_by_generic_pending_text(self):
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(authenticated_email=lambda: ""),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target,
+            "empty_guard",
+            "기존 내용이 있는 문서의 자동저장을 중단했습니다.",
+            0,
+        )
+
+        self.assertIn("전체 삭제 확인 필요", target.lbl_storage_status.text)
+        self.assertNotIn("로컬 저장 대기 1건", target.lbl_storage_status.text)
+
+    def test_dirty_editor_keeps_important_offline_context_visible(self):
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=True,
+            sync_manager=SimpleNamespace(authenticated_email=lambda: ""),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "offline", "서버 연결 없음", 1
+        )
+
+        self.assertEqual(
+            target.lbl_storage_status.text,
+            "● 로컬 저장 대기 1건 · 오프라인",
+        )
+
+    def test_clean_editor_shows_local_save_and_one_server_document(self):
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(authenticated_email=lambda: ""),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "syncing", "서버에 변경 내용을 올리는 중입니다.", 1
+        )
+
+        self.assertEqual(
+            target.lbl_storage_status.text,
+            "● 로컬 저장 완료 · 서버 전송 중 1건",
+        )
+
+    def test_guidance_distinguishes_seven_primary_storage_states(self):
+        cases = {
+            "saved": ("동기화 완료", "모두 반영"),
+            "syncing": ("서버 전송 중", "로컬 저장은 완료"),
+            "failed": ("서버 전송 대기", "로컬에 저장"),
+            "offline": ("오프라인", "로컬에 저장"),
+            "auth_required": ("로그인 필요", "로컬에 저장"),
+            "conflict": ("충돌", "로컬 원고는 보존"),
+        }
+        for state, (title_text, safe_text) in cases.items():
+            guidance = WritingModeWidget._storage_status_guidance(
+                state,
+                "상세 원인",
+                1 if state != "saved" else 0,
+                0,
+                state == "saved",
+            )
+            self.assertIn(title_text, guidance["title"])
+            self.assertIn(safe_text, guidance["summary"])
+            self.assertTrue(guidance["action"])
+
+        local_pending = WritingModeWidget._storage_status_guidance(
+            "saved", "", 0, 2, True
+        )
+        self.assertEqual(local_pending["title"], "로컬 저장 대기")
+        self.assertIn("2건", local_pending["summary"])
+        self.assertEqual(local_pending["action_code"], "manual_save")
+
+        offline = WritingModeWidget._storage_status_guidance(
+            "offline", "인터넷 연결 없음", 1, 0, True
+        )
+        login_required = WritingModeWidget._storage_status_guidance(
+            "auth_required", "JWT expired", 1, 0, False
+        )
+        self.assertEqual(offline["action_code"], "retry")
+        self.assertEqual(login_required["action_code"], "")
+        self.assertIn("다시 로그인", login_required["action"])
+
+    def test_status_detail_dialog_runs_retry_only_after_user_selects_it(self):
+        retry = MagicMock()
+        target = SimpleNamespace(
+            _storage_state="failed",
+            _storage_detail="서버 응답 오류",
+            _storage_pending_count=1,
+            _storage_editor_dirty_count=0,
+            _storage_account_email="writer@example.com",
+            _retry_storage_sync=retry,
+        )
+        action_button = object()
+        with patch("mode_writing.QMessageBox") as message_box:
+            box = message_box.return_value
+            box.addButton.side_effect = [action_button, object()]
+            box.clickedButton.return_value = action_button
+
+            WritingModeWidget._show_storage_status_details(target)
+
+        self.assertIn("원인", box.setInformativeText.call_args.args[0])
+        self.assertIn("다음 할 일", box.setInformativeText.call_args.args[0])
+        retry.assert_called_once_with()
 
     def test_settings_panel_labels_automatic_login_without_showing_password(self):
         target = SimpleNamespace(
             lbl_supabase_status=_FakeLabel(),
             btn_supabase_login=_FakeLabel(),
+            btn_supabase_logout=_FakeLabel(),
         )
 
         SettingsPanel.refresh_supabase_account_status(target, "writer@example.com")
@@ -239,12 +523,32 @@ class StorageStatusLabelTestCase(unittest.TestCase):
         self.assertIn("자동 로그인됨: writer@example.com", target.lbl_supabase_status.text)
         self.assertIn("비밀번호는 저장하지 않고", target.lbl_supabase_status.text)
         self.assertEqual(target.btn_supabase_login.text, "계정 변경")
+        self.assertTrue(target.btn_supabase_logout.enabled)
+
+    def test_settings_panel_logged_out_message_uses_cloud_login_guidance(self):
+        target = SimpleNamespace(
+            lbl_supabase_status=_FakeLabel(),
+            btn_supabase_login=_FakeLabel(),
+            btn_supabase_logout=_FakeLabel(),
+        )
+
+        SettingsPanel.refresh_supabase_account_status(target, "")
+
+        self.assertEqual(
+            target.lbl_supabase_status.text,
+            "클라우드 동기화 계정에 로그인이 되어있지 않습니다.\n"
+            "설정탭 / 클라우드 계정 로그인을 확인해주세요.",
+        )
+        self.assertEqual(target.btn_supabase_login.text, "동기화 로그인")
+        self.assertFalse(target.btn_supabase_logout.enabled)
 
     def test_compact_status_button_retries_only_when_items_are_pending(self):
         calls = []
         target = SimpleNamespace(
             _storage_pending_count=0,
-            sync_manager=SimpleNamespace(retry_pending_syncs=lambda: calls.append("retry")),
+            sync_manager=SimpleNamespace(
+                retry_pending_syncs=lambda **kwargs: calls.append(kwargs)
+            ),
         )
 
         WritingModeWidget._retry_storage_sync(target)
@@ -252,7 +556,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
 
         target._storage_pending_count = 2
         WritingModeWidget._retry_storage_sync(target)
-        self.assertEqual(calls, ["retry"])
+        self.assertEqual(calls, [{"manual": True}])
 
     def test_conflict_status_retries_independent_queue_before_opening_folder(self):
         retry = MagicMock(return_value=True)
@@ -265,14 +569,14 @@ class StorageStatusLabelTestCase(unittest.TestCase):
 
         WritingModeWidget._retry_storage_sync(target)
 
-        retry.assert_called_once_with()
+        retry.assert_called_once_with(manual=True)
         target.open_conflict_folder.assert_not_called()
 
         retry.reset_mock()
         retry.return_value = False
         WritingModeWidget._retry_storage_sync(target)
 
-        retry.assert_called_once_with()
+        retry.assert_called_once_with(manual=True)
         target.open_conflict_folder.assert_called_once_with()
 
     def test_successful_conflict_resolution_restores_document_label(self):
@@ -309,7 +613,9 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             is_dirty_right=False,
             load_tree_data=MagicMock(),
             _schedule_remote_tree_refresh=MagicMock(),
+            _refresh_storage_status_for_editor_state=MagicMock(),
         )
+        editor.toPlainText.return_value = "현재 화면의 이전 내용"
 
         WritingModeWidget.on_remote_documents_applied(target, [{
             "old_local_path": "메인/메모장/예전.txt",
@@ -324,8 +630,52 @@ class StorageStatusLabelTestCase(unittest.TestCase):
         self.assertEqual(target.lbl_current_doc.text, "새이름.txt")
         self.assertEqual(target.loaded_versions["메인/메모장/새이름.txt"], 7)
         target.controller.rename_path.assert_called_once()
+        target.controller.accept_remote_snapshot.assert_called_once_with(
+            "메인/메모장/새이름.txt", "다른 Windows에서 저장한 내용"
+        )
         target._schedule_remote_tree_refresh.assert_called_once()
+        target._refresh_storage_status_for_editor_state.assert_called_once()
         target.load_tree_data.assert_not_called()
+
+    def test_remote_folder_identity_rename_remaps_clean_open_child_path(self):
+        target = SimpleNamespace(
+            controller=MagicMock(),
+            loaded_versions={
+                "메인/옛 폴더/문서.txt": 6,
+                "메인/다른 폴더/유지.txt": 2,
+            },
+            current_loaded_file_left="메인/옛 폴더/문서.txt",
+            current_loaded_file_right=None,
+            left_editor=MagicMock(),
+            right_editor=MagicMock(),
+            lbl_current_doc=_FakeLabel(),
+            lbl_r_doc=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _schedule_remote_tree_refresh=MagicMock(),
+            _refresh_storage_status_for_editor_state=MagicMock(),
+        )
+
+        WritingModeWidget.on_remote_documents_applied(target, [{
+            "kind": "folder_identity_rename",
+            "old_local_path": "메인/옛 폴더",
+            "new_local_path": "메인/새 폴더",
+            "revision": 4,
+            "is_deleted": False,
+        }])
+
+        self.assertEqual(
+            target.current_loaded_file_left, "메인/새 폴더/문서.txt"
+        )
+        self.assertEqual(target.loaded_versions, {
+            "메인/새 폴더/문서.txt": 6,
+            "메인/다른 폴더/유지.txt": 2,
+        })
+        target.controller.rename_path.assert_called_once_with(
+            "메인/옛 폴더", "메인/새 폴더"
+        )
+        target.left_editor.setPlainText.assert_not_called()
+        target._schedule_remote_tree_refresh.assert_called_once()
 
     def test_dirty_open_editor_is_reported_as_remote_pull_protected(self):
         left_editor = MagicMock()

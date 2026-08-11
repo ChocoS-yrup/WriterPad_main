@@ -1,5 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
+
+config_source = '.env' if os.path.exists('.env') else '.env.example'
+
 
 a = Analysis(
     ['main.py'],
@@ -7,13 +12,12 @@ a = Analysis(
     binaries=[],
     datas=[
         ('style.qss', '.'),
-        ('fonts.json', '.'),
         ('app_icon.ico', '.'),
         ('model_catalog.json', '.'),
         # URL and publishable key only. User sessions remain in Windows Credential Manager.
-        ('.env', '.'),
+        (config_source, '.'),
     ],
-    hiddenimports=['markdown', 'keyring'],
+    hiddenimports=['markdown', 'keyring', 'unicodedata2'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

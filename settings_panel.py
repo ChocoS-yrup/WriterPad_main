@@ -27,6 +27,19 @@ class SupabaseLoginWorker(QThread):
         self.resultReady.emit(success, message)
 
 
+class SupabaseLogoutWorker(QThread):
+    resultReady = pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            from sync_manager import SyncManager
+
+            SyncManager().sign_out()
+            self.resultReady.emit(True, "")
+        except Exception as error:
+            self.resultReady.emit(False, str(error))
+
+
 class SettingsPanel(QWidget):
     fontChanged = pyqtSignal(object)
     traySettingChanged = pyqtSignal(bool)
@@ -201,6 +214,27 @@ class SettingsPanel(QWidget):
         # 탭 1: 프로그램 설정
         tab_program, prog_layout = self._create_scroll_page()
 
+        startup_card, startup_layout = self._create_card(
+            "시작 화면",
+            "프로그램을 실행했을 때 처음 표시할 모드를 선택합니다. 다음 실행부터 적용됩니다.",
+        )
+        self.combo_startup_mode = QComboBox()
+        self.combo_startup_mode.setMaximumWidth(280)
+        self.combo_startup_mode.addItem("AI 어시스턴트 모드", "assistant")
+        self.combo_startup_mode.addItem("집필 모드", "writing")
+        startup_mode = self.pm.global_config.get("startup_mode", "assistant")
+        startup_index = self.combo_startup_mode.findData(startup_mode)
+        self.combo_startup_mode.setCurrentIndex(
+            startup_index if startup_index >= 0 else 0
+        )
+        self.combo_startup_mode.currentIndexChanged.connect(
+            self.save_startup_mode
+        )
+        startup_layout.addWidget(
+            self.combo_startup_mode, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        prog_layout.addWidget(startup_card)
+
         font_card, font_layout = self._create_card(
             "에디터 글꼴", "집필 화면과 보조 화면에 사용할 기본 글꼴을 선택합니다."
         )
@@ -252,7 +286,7 @@ class SettingsPanel(QWidget):
         tab_cloud, cloud_layout = self._create_scroll_page()
         account_card, account_layout = self._create_card(
             "클라우드 동기화 계정",
-            "Supabase v2 계정으로 로그인하면 문서 revision, 충돌 병합, 영구 재시도 큐가 연결됩니다.",
+            "로그인하면 여러 기기에서 작품을 안전하게 동기화할 수 있습니다.",
         )
         self.lbl_supabase_status = QLabel()
         self.lbl_supabase_status.setObjectName("CloudAccountStatus")
@@ -272,11 +306,19 @@ class SettingsPanel(QWidget):
         self.btn_supabase_login.setProperty("primary", True)
         self.btn_supabase_login.setMinimumWidth(150)
         self.btn_supabase_login.clicked.connect(self.login_supabase)
+        self.btn_supabase_logout = QPushButton("계정 로그아웃")
+        self.btn_supabase_logout.setMinimumWidth(140)
+        self.btn_supabase_logout.clicked.connect(self.logout_supabase)
         sync_layout.addWidget(QLabel("이메일"), 0, 0)
         sync_layout.addWidget(self.edit_supabase_email, 0, 1)
         sync_layout.addWidget(QLabel("비밀번호"), 1, 0)
         sync_layout.addWidget(self.edit_supabase_password, 1, 1)
-        sync_layout.addWidget(self.btn_supabase_login, 2, 1, Qt.AlignmentFlag.AlignRight)
+        account_actions = QHBoxLayout()
+        account_actions.setSpacing(10)
+        account_actions.addStretch()
+        account_actions.addWidget(self.btn_supabase_login)
+        account_actions.addWidget(self.btn_supabase_logout)
+        sync_layout.addLayout(account_actions, 2, 1)
         account_layout.addLayout(sync_layout)
         cloud_layout.addWidget(account_card)
 
@@ -293,8 +335,38 @@ class SettingsPanel(QWidget):
         session_note.setStyleSheet("color: #cbd5e1;")
         security_layout.addWidget(session_note)
         cloud_layout.addWidget(security_card)
+
+        diagnostics_card, diagnostics_layout = self._create_card(
+            "동기화 진단",
+            "서버 요청 없이 이 컴퓨터에 기록된 최근 동기화 상태만 확인합니다.",
+        )
+        self.lbl_sync_diagnostics = QLabel()
+        self.lbl_sync_diagnostics.setObjectName("CloudAccountStatus")
+        self.lbl_sync_diagnostics.setWordWrap(True)
+        self.lbl_sync_diagnostics.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        diagnostics_layout.addWidget(self.lbl_sync_diagnostics)
+        diagnostic_actions = QHBoxLayout()
+        self.lbl_diagnostics_copy_status = QLabel("")
+        self.lbl_diagnostics_copy_status.setStyleSheet("color: #86efac;")
+        self.btn_refresh_sync_diagnostics = QPushButton("진단 정보 새로고침")
+        self.btn_copy_sync_diagnostics = QPushButton("진단 정보 복사")
+        self.btn_refresh_sync_diagnostics.clicked.connect(
+            self.refresh_sync_diagnostics
+        )
+        self.btn_copy_sync_diagnostics.clicked.connect(
+            self.copy_sync_diagnostics
+        )
+        diagnostic_actions.addWidget(self.lbl_diagnostics_copy_status)
+        diagnostic_actions.addStretch()
+        diagnostic_actions.addWidget(self.btn_refresh_sync_diagnostics)
+        diagnostic_actions.addWidget(self.btn_copy_sync_diagnostics)
+        diagnostics_layout.addLayout(diagnostic_actions)
+        cloud_layout.addWidget(diagnostics_card)
         cloud_layout.addStretch()
         self.refresh_supabase_account_status()
+        self.refresh_sync_diagnostics()
 
         extract_card, extract_card_layout = self._create_card(
             "완성본 내보내기", "완성본을 원하는 범위와 파일 형식으로 저장합니다."
@@ -490,6 +562,7 @@ class SettingsPanel(QWidget):
         self.main_tabs.addTab(tab_cloud, "클라우드 계정")
         self.main_tabs.addTab(tab_prompt, "프롬프트 설정")
         self.main_tabs.addTab(tab_api, "API · 비용")
+        self.main_tabs.currentChanged.connect(self._on_settings_tab_changed)
 
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -531,6 +604,81 @@ class SettingsPanel(QWidget):
             card_layout.addWidget(description_label)
         return card, card_layout
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.refresh_sync_diagnostics)
+
+    def _on_settings_tab_changed(self, index):
+        if index == 1:
+            self.refresh_supabase_account_status()
+            self.refresh_sync_diagnostics()
+
+    @staticmethod
+    def _diagnostic_display_text(snapshot):
+        snapshot = dict(snapshot or {})
+        state_labels = {
+            "saved": "동기화 완료",
+            "backup": "로컬 복구본 생성 중",
+            "syncing": "서버 전송 중",
+            "offline": "오프라인 · 서버 전송 대기",
+            "auth_required": "로그인 필요",
+            "conflict": "문서 충돌",
+            "lease": "다른 기기에서 편집 중",
+            "failed": "서버 전송 대기 · 재시도 필요",
+            "project_trashed": "서버 휴지통 · 동기화 중지",
+            "project_purged": "서버 영구 삭제 · 로컬 사본",
+        }
+        login_state = str(snapshot.get("login_state") or "알 수 없음")
+        state = str(snapshot.get("sync_state") or "")
+        pending_count = max(0, int(snapshot.get("pending_count") or 0))
+        success_at = str(snapshot.get("last_success_at") or "기록 없음")
+        failure_at = str(snapshot.get("last_failure_at") or "")
+        failure_reason = str(snapshot.get("last_failure_reason") or "기록 없음")
+        if failure_at:
+            failure_reason = f"{failure_reason} ({failure_at})"
+        dropped = max(0, int(snapshot.get("dropped_log_count") or 0))
+        lines = [
+            f"로그인 상태: {login_state}",
+            f"현재 상태: {state_labels.get(state, state or '알 수 없음')}",
+            f"서버 대기 문서: {pending_count}건",
+            f"마지막 동기화 성공: {success_at}",
+            f"최근 동기화 실패: {failure_reason}",
+        ]
+        if dropped:
+            lines.append(f"기록하지 못한 진단 로그: {dropped}건")
+        return "\n".join(lines)
+
+    def refresh_sync_diagnostics(self):
+        try:
+            from sync_manager import SyncManager
+
+            snapshot = SyncManager().diagnostic_snapshot()
+            text = SettingsPanel._diagnostic_display_text(snapshot)
+        except Exception:
+            text = (
+                "로그인 상태: 알 수 없음\n"
+                "현재 상태: 진단 정보를 읽을 수 없음\n"
+                "서버 대기 문서: 알 수 없음\n"
+                "마지막 동기화 성공: 기록 없음\n"
+                "최근 동기화 실패: 기록 없음"
+            )
+        self.lbl_sync_diagnostics.setText(text)
+        return text
+
+    def copy_sync_diagnostics(self):
+        try:
+            from sync_manager import SyncManager
+
+            report = SyncManager().diagnostic_report()
+        except Exception:
+            report = "작가님 힘내세요 · 동기화 진단\n진단 정보를 읽을 수 없습니다."
+        QApplication.clipboard().setText(report)
+        self.lbl_diagnostics_copy_status.setText("민감정보를 제외하고 복사했습니다.")
+        QTimer.singleShot(
+            2500, lambda: self.lbl_diagnostics_copy_status.setText("")
+        )
+        return report
+
     def on_extract_clicked(self):
         is_full = self.radio_all.isChecked()
         start = self.spin_start.value()
@@ -546,6 +694,13 @@ class SettingsPanel(QWidget):
 
     def set_chk_tray(self, value):
         self.chk_tray.setChecked(value)
+
+    def save_startup_mode(self, index):
+        startup_mode = self.combo_startup_mode.itemData(index)
+        if startup_mode not in {"assistant", "writing"}:
+            startup_mode = "assistant"
+        self.pm.global_config["startup_mode"] = startup_mode
+        self.pm.save_global_config()
 
     def change_font(self):
         saved_font = get_saved_font()
@@ -568,6 +723,7 @@ class SettingsPanel(QWidget):
             self._style_cloud_status("error")
             return
         self.btn_supabase_login.setEnabled(False)
+        self.btn_supabase_logout.setEnabled(False)
         self.lbl_supabase_status.setText("로그인 중...")
         self._style_cloud_status("working")
         self._supabase_login_worker = SupabaseLoginWorker(email, password)
@@ -577,6 +733,7 @@ class SettingsPanel(QWidget):
             self.edit_supabase_password.clear()
             if success:
                 self.refresh_supabase_account_status(message)
+                self.refresh_sync_diagnostics()
                 from sync_manager import SyncManager
                 manager = SyncManager()
                 QTimer.singleShot(0, manager._publish_sync_state)
@@ -584,9 +741,42 @@ class SettingsPanel(QWidget):
             else:
                 self.lbl_supabase_status.setText(f"로그인 실패: {message}")
                 self._style_cloud_status("error")
+                try:
+                    from sync_manager import SyncManager
+
+                    self.btn_supabase_logout.setEnabled(
+                        bool(SyncManager().authenticated_email())
+                    )
+                except Exception:
+                    self.btn_supabase_logout.setEnabled(False)
 
         self._supabase_login_worker.resultReady.connect(finished)
         self._supabase_login_worker.start()
+
+    def logout_supabase(self):
+        self.btn_supabase_login.setEnabled(False)
+        self.btn_supabase_logout.setEnabled(False)
+        self.lbl_supabase_status.setText("로그아웃 중...")
+        self._style_cloud_status("working")
+        self._supabase_logout_worker = SupabaseLogoutWorker()
+
+        def finished(success, message):
+            self.btn_supabase_login.setEnabled(True)
+            self.edit_supabase_password.clear()
+            if success:
+                self.refresh_supabase_account_status("")
+                self.refresh_sync_diagnostics()
+                from sync_manager import SyncManager
+
+                manager = SyncManager()
+                QTimer.singleShot(0, manager._publish_sync_state)
+            else:
+                self.lbl_supabase_status.setText(f"로그아웃 실패: {message}")
+                self._style_cloud_status("error")
+                self.btn_supabase_logout.setEnabled(True)
+
+        self._supabase_logout_worker.resultReady.connect(finished)
+        self._supabase_logout_worker.start()
 
     def refresh_supabase_account_status(self, email=None):
         if email is None:
@@ -602,12 +792,19 @@ class SettingsPanel(QWidget):
             )
             SettingsPanel._style_cloud_status(self, "connected")
             self.btn_supabase_login.setText("계정 변경")
+            logout_button = getattr(self, "btn_supabase_logout", None)
+            if logout_button is not None:
+                logout_button.setEnabled(True)
         else:
             self.lbl_supabase_status.setText(
-                "로그인되지 않음 · 로컬 저장과 영구 재시도 큐만 동작합니다."
+                "클라우드 동기화 계정에 로그인이 되어있지 않습니다.\n"
+                "설정탭 / 클라우드 계정 로그인을 확인해주세요."
             )
             SettingsPanel._style_cloud_status(self, "disconnected")
             self.btn_supabase_login.setText("동기화 로그인")
+            logout_button = getattr(self, "btn_supabase_logout", None)
+            if logout_button is not None:
+                logout_button.setEnabled(False)
 
     def _style_cloud_status(self, state):
         colors = {

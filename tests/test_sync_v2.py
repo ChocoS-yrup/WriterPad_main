@@ -1,14 +1,21 @@
+import copy
+import hashlib
 import json
+import os
 import tempfile
+import threading
 import unittest
+import unicodedata
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QLineEdit
 
-from mode_writing import WritingModeWidget
+from mode_writing import BinderTreeWidget, RenameDelegate, WritingModeWidget
 from project_manager_writing import WritingProjectManager
 from sync_manager import (
     LockWorker,
@@ -19,7 +26,8 @@ from sync_manager import (
     is_live_document_path,
 )
 from sync_v2_store import SyncV2Store
-from three_way_merge import three_way_merge
+from three_way_merge import build_conflict_report, three_way_merge
+from writing_controller import WritingController
 from writing_tree import WritingTreeMixin
 
 
@@ -60,6 +68,103 @@ class ThreeWayMergeTestCase(unittest.TestCase):
             remote + "\n강제 종료 후에도 남아야 하는 문장\n",
         )
 
+    def test_multiline_insertion_and_other_line_edit_merge_cleanly(self):
+        base = "첫 줄\n둘째 줄\n셋째 줄\n"
+        local = "첫 줄\n새 문장 1\n새 문장 2\n둘째 줄\n셋째 줄\n"
+        remote = "첫 줄\n둘째 줄\n셋째 줄 수정\n"
+
+        result = three_way_merge(base, local, remote)
+
+        self.assertFalse(result.has_conflicts)
+        self.assertEqual(
+            result.content,
+            "첫 줄\n새 문장 1\n새 문장 2\n둘째 줄\n셋째 줄 수정\n",
+        )
+
+    def test_separate_word_edits_on_same_line_stay_conflicted(self):
+        base = "주인공은 학교에 걸어갔다.\n"
+        local = "어제 주인공은 학교에 걸어갔다.\n"
+        remote = "주인공은 빠르게 학교에 걸어갔다.\n"
+
+        result = three_way_merge(base, local, remote)
+
+        self.assertTrue(result.has_conflicts)
+        self.assertIn(local, result.content)
+        self.assertIn(remote, result.content)
+
+    def test_different_insertions_at_same_boundary_stay_conflicted(self):
+        base = "첫 줄\n둘째 줄\n"
+        local = "첫 줄\n로컬 추가\n둘째 줄\n"
+        remote = "첫 줄\n서버 추가\n둘째 줄\n"
+
+        result = three_way_merge(base, local, remote)
+
+        self.assertTrue(result.has_conflicts)
+        self.assertIn("로컬 추가", result.content)
+        self.assertIn("서버 추가", result.content)
+
+    def test_conflict_report_is_separate_and_includes_deletions(self):
+        base = "유지할 줄\n삭제 대상\n수정 대상\n"
+        local = "유지할 줄\n로컬 수정\n"
+        remote = "유지할 줄\n삭제 대상\n서버 수정\n"
+
+        result = three_way_merge(base, local, remote)
+        report = build_conflict_report(base, local, remote)
+
+        self.assertTrue(result.has_conflicts)
+        self.assertIn("<<<<<<< 내 로컬 편집본", result.content)
+        self.assertNotIn("차이점 비교", result.content)
+        self.assertIn("-삭제 대상", report)
+        self.assertIn("+로컬 수정", report)
+        self.assertIn("+서버 수정", report)
+
+    def test_conflict_artifacts_keep_original_and_add_separate_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "충돌 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, "충돌 작품", "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            rel_path = "메인/원고/001화.txt"
+            local = "어제 주인공은 학교에 걸어갔다.\n"
+            remote = "주인공은 빠르게 학교에 걸어갔다.\n"
+            base = "주인공은 학교에 걸어갔다.\n"
+            self.assertTrue(wpm.write_text_file(rel_path, local))
+            merge = three_way_merge(base, local, remote)
+            widget = SimpleNamespace(
+                wpm=wpm,
+                current_loaded_file_left=rel_path,
+                current_loaded_file_right=None,
+                lbl_current_doc=MagicMock(),
+                lbl_r_doc=MagicMock(),
+            )
+
+            WritingModeWidget.on_conflict_detected(widget, {
+                "operation": {
+                    "local_path": rel_path,
+                    "base_content": base,
+                    "content": local,
+                },
+                "base_content": base,
+                "local_content": local,
+                "merged_content": merge.content,
+                "remote": {"content": remote},
+            })
+
+            conflict_dir = Path(wpm.writing_root_path, "백업", "충돌")
+            artifacts = list(conflict_dir.glob("001화 *"))
+            self.assertEqual(wpm.read_text_file(rel_path), local)
+            self.assertEqual(len(artifacts), 4)
+            comparison_path = next(
+                path for path in artifacts if "차이점 비교" in path.name
+            )
+            comparison = comparison_path.read_text(encoding="utf-8")
+            self.assertIn("-주인공은 학교에 걸어갔다.", comparison)
+            self.assertIn("+어제 주인공은 학교에 걸어갔다.", comparison)
+            self.assertIn("+주인공은 빠르게 학교에 걸어갔다.", comparison)
+
 
 class SyncV2StoreTestCase(unittest.TestCase):
     def setUp(self):
@@ -84,7 +189,44 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(queued["operation_id"], operation["operation_id"])
         self.assertEqual(queued["content"], "영구 보관할 내용")
 
-    def test_force_kill_resets_inflight_operation_to_pending_with_same_id(self):
+    def test_folder_rename_intent_survives_restart_and_coalesces_chain(self):
+        local_key = self.context["local_key"]
+        first = self.store.record_folder_rename_intent(
+            local_key,
+            "메인/메모장/처음 이름",
+            "메인/메모장/중간 이름",
+        )
+
+        reopened = SyncV2Store(self.db_path)
+        recovered = reopened.pending_folder_rename_intent(
+            local_key,
+            "메인/메모장/처음 이름",
+            "메인/메모장/중간 이름",
+        )
+        chained = reopened.record_folder_rename_intent(
+            local_key,
+            "메인/메모장/중간 이름",
+            "메인/메모장/최종 이름",
+        )
+
+        self.assertEqual(recovered["intent_id"], first["intent_id"])
+        self.assertEqual(chained["intent_id"], first["intent_id"])
+        self.assertIsNone(reopened.pending_folder_rename_intent(
+            local_key,
+            "메인/메모장/처음 이름",
+            "메인/메모장/중간 이름",
+        ))
+        self.assertEqual(
+            reopened.pending_folder_rename_intent(
+                local_key,
+                "메인/메모장/처음 이름",
+                "메인/메모장/최종 이름",
+            )["intent_id"],
+            first["intent_id"],
+        )
+
+
+    def test_force_kill_appends_retry_recovery_with_same_operation_id(self):
         operation = self.store.enqueue(
             self.context, "메인/원고/강제종료.txt", "종료 직전 내용"
         )
@@ -95,7 +237,11 @@ class SyncV2StoreTestCase(unittest.TestCase):
         recovered = reopened.next_ready_operation(self.context["local_key"])
 
         self.assertEqual(recovered["operation_id"], operation["operation_id"])
-        self.assertEqual(recovered["status"], "pending")
+        self.assertEqual(recovered["status"], "retry_wait")
+        self.assertEqual(
+            reopened.operation_attempts(operation["operation_id"])[0]["outcome"],
+            "transport_unknown",
+        )
 
     def test_two_offline_profiles_keep_independent_durable_queues(self):
         first_path = str(Path(self.temp.name, "first.sqlite3"))
@@ -124,8 +270,9 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(SyncV2Store(first_path).counts(context_a["local_key"])["pending"], 1)
         self.assertEqual(SyncV2Store(other_path).counts(context_b["local_key"])["pending"], 1)
 
-    def test_success_promotes_next_operation_to_returned_revision(self):
+    def test_success_supersedes_dependent_with_immutable_promoted_operation(self):
         first = self.store.enqueue(self.context, "메인/원고/001화.txt", "첫 저장")
+        self.store.mark_attempt(first["operation_id"])
         second = self.store.enqueue(self.context, "메인/원고/001화.txt", "둘째 저장")
         self.assertIsNone(second["base_revision"])
 
@@ -133,10 +280,47 @@ class SyncV2StoreTestCase(unittest.TestCase):
             "revision": 1,
             "content_hash": "a" * 64,
         })
-        promoted = self.store.operation(second["operation_id"])
+        original_dependent = self.store.operation(second["operation_id"])
+        promoted = self.store.next_ready_operation(self.context["local_key"])
 
+        self.assertEqual(original_dependent["status"], "cancelled")
+        self.assertNotEqual(promoted["operation_id"], second["operation_id"])
+        self.assertEqual(promoted["supersedes_operation_id"], second["operation_id"])
         self.assertEqual(promoted["base_revision"], 1)
         self.assertEqual(promoted["base_content"], "첫 저장")
+
+    def test_unsent_saves_for_one_document_keep_immutable_intents(self):
+        first = self.store.enqueue(
+            self.context, "메인/원고/001화.txt", "서버 전송 중"
+        )
+        self.store.mark_attempt(first["operation_id"])
+        second = self.store.enqueue(
+            self.context, "메인/원고/001화.txt", "중간 수정"
+        )
+        latest = self.store.enqueue(
+            self.context, "메인/원고/001화.txt", "가장 최신 수정"
+        )
+
+        self.assertNotEqual(latest["operation_id"], second["operation_id"])
+        self.assertEqual(
+            self.store.operation(second["operation_id"])["content"], "중간 수정"
+        )
+        self.assertEqual(latest["content"], "가장 최신 수정")
+        counts = self.store.counts(self.context["local_key"])
+        self.assertEqual(counts["inflight"], 1)
+        self.assertEqual(counts["pending"], 2)
+        self.assertEqual(counts["total"], 3)
+        self.assertEqual(counts["documents"], 1)
+
+    def test_nonempty_pending_snapshot_is_visible_to_empty_save_guard(self):
+        relative_path = "메인/원고/001화.txt"
+        queued = self.store.enqueue(
+            self.context, relative_path, "전송 대기 본문"
+        )
+
+        self.assertTrue(
+            self.store.has_nonempty_active_content(queued["document_id"])
+        )
 
     def test_uuid_survives_file_and_folder_moves(self):
         original = self.store.ensure_document(
@@ -199,14 +383,21 @@ class SyncV2StoreTestCase(unittest.TestCase):
             "content_hash": "a" * 64,
         })
         first = self.store.enqueue(self.context, "메인/원고/001화.txt", "로컬 1")
+        self.store.mark_attempt(first["operation_id"])
         stale_dependent = self.store.enqueue(self.context, "메인/원고/001화.txt", "로컬 최신")
 
-        self.store.rebase_clean_merge(first["operation_id"], 2, "서버 변경", "자동 병합본")
+        successor = self.store.rebase_clean_merge(
+            first["operation_id"], 2, "서버 변경", "자동 병합본"
+        )
 
-        rebased = self.store.operation(first["operation_id"])
+        original_intent = self.store.operation(first["operation_id"])
         cancelled = self.store.operation(stale_dependent["operation_id"])
-        self.assertEqual(rebased["base_revision"], 2)
-        self.assertEqual(rebased["content"], "자동 병합본")
+        self.assertEqual(original_intent["base_revision"], 1)
+        self.assertEqual(original_intent["content"], "로컬 1")
+        self.assertEqual(original_intent["status"], "cancelled")
+        self.assertEqual(successor["base_revision"], 2)
+        self.assertEqual(successor["content"], "자동 병합본")
+        self.assertEqual(successor["supersedes_operation_id"], first["operation_id"])
         self.assertEqual(cancelled["status"], "cancelled")
 
     def test_remote_rename_rebase_keeps_uuid_and_changes_only_server_path(self):
@@ -222,7 +413,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.store.move_local_path(
             self.context["local_key"], "메인/원고/옛이름.txt", "메인/원고/새이름.txt"
         )
-        self.store.rebase_clean_merge(
+        successor = self.store.rebase_clean_merge(
             edited["operation_id"], 2, "서버 수정", "자동 병합본",
             remote_path="메인/원고/새이름.txt",
         )
@@ -230,10 +421,12 @@ class SyncV2StoreTestCase(unittest.TestCase):
         document = self.store.get_document(
             self.context["local_key"], "메인/원고/새이름.txt"
         )
-        operation = self.store.operation(edited["operation_id"])
+        original_operation = self.store.operation(edited["operation_id"])
         self.assertEqual(document["document_id"], original["document_id"])
         self.assertEqual(document["server_path"], "메인/원고/새이름.txt")
-        self.assertEqual(operation["relative_path"], "메인/원고/새이름.txt")
+        self.assertEqual(original_operation["relative_path"], "메인/원고/옛이름.txt")
+        self.assertEqual(successor["relative_path"], "메인/원고/새이름.txt")
+        self.assertEqual(successor["supersedes_operation_id"], edited["operation_id"])
 
     def test_simultaneous_overlapping_save_is_kept_as_conflict(self):
         created = self.store.enqueue(self.context, "메인/원고/동시저장.txt", "공통 문장\n")
@@ -300,6 +493,23 @@ class _RpcCall:
                 "revision": self.params["p_base_revision"] + 1,
                 "content_hash": "b" * 64,
             })
+        if self.name == "commit_folder":
+            for row in getattr(self.client, "folder_rows", []):
+                if str(row.get("folder_id")) == str(self.params["p_folder_id"]):
+                    row["name"] = self.params["p_name"]
+                    row["parent_folder_id"] = self.params["p_parent_folder_id"]
+                    row["revision"] = self.params["p_base_revision"] + 1
+                    return _Response({
+                        "status": "committed",
+                        "folder_id": row["folder_id"],
+                        "operation_id": self.params["p_operation_id"],
+                        "operation_kind": "rename",
+                        "revision": row["revision"],
+                        "parent_folder_id": row["parent_folder_id"],
+                        "name": row["name"],
+                        "is_deleted": False,
+                    })
+            raise AssertionError("folder not found")
         raise AssertionError(self.name)
 
 
@@ -311,7 +521,232 @@ class _FakeClient:
         return _RpcCall(self, name, params)
 
 
+class _FolderQuery:
+    def __init__(self, client):
+        self.client = client
+
+    def select(self, *_args, **_kwargs):
+        return self
+
+    def eq(self, *_args, **_kwargs):
+        return self
+
+    def execute(self):
+        return _Response([dict(row) for row in self.client.folder_rows])
+
+
+class _FolderAwareClient(_FakeClient):
+    def __init__(self, folder_rows):
+        super().__init__()
+        self.folder_rows = [dict(row) for row in folder_rows]
+
+    def table(self, name):
+        if name != "folders":
+            raise AssertionError(name)
+        return _FolderQuery(self)
+
+
 class SyncV2RpcTestCase(unittest.TestCase):
+    def test_lease_conflict_retry_uses_bounded_progressive_backoff(self):
+        self.assertEqual(
+            [
+                SyncManager._v2_follow_up_delay_ms(
+                    "retry", "LEASE_CONFLICT: 다른 기기에서 편집 중", attempt
+                )
+                for attempt in (1, 2, 3, 4, 20)
+            ],
+            [3000, 5000, 10000, 30000, 30000],
+        )
+        self.assertEqual(
+            SyncManager._v2_follow_up_delay_ms("committed"),
+            0,
+        )
+        self.assertEqual(
+            SyncManager._v2_follow_up_delay_ms(
+                "retry", "NETWORK_UNAVAILABLE"
+            ),
+            5000,
+        )
+        self.assertEqual(
+            [
+                SyncManager._v2_follow_up_delay_ms(
+                    "retry", "network timeout", network_attempt=attempt
+                )
+                for attempt in (1, 2, 3, 4, 20)
+            ],
+            [5000, 15000, 30000, 60000, 60000],
+        )
+
+    def test_lease_retry_timer_is_coalesced_and_scoped_to_current_project(self):
+        manager = SyncManager()
+        previous = (
+            manager._v2_context,
+            manager._v2_retry_timer,
+            manager._v2_retry_context,
+        )
+        timer = MagicMock()
+        timer.isActive.return_value = False
+        manager._v2_context = {
+            "local_key": "project-a-local",
+            "project_id": str(uuid.uuid4()),
+            "server_state": "active",
+        }
+        manager._v2_retry_timer = timer
+        try:
+            self.assertTrue(manager._schedule_v2_retry(3000))
+            timer.start.assert_called_once_with(3000)
+
+            timer.isActive.return_value = True
+            timer.remainingTime.return_value = 1200
+            self.assertFalse(manager._schedule_v2_retry(5000))
+            timer.start.assert_called_once_with(3000)
+
+            manager._v2_context = {
+                "local_key": "project-b-local",
+                "project_id": str(uuid.uuid4()),
+                "server_state": "active",
+            }
+            self.assertTrue(manager._schedule_v2_retry(3000))
+            self.assertEqual(timer.start.call_count, 2)
+        finally:
+            (
+                manager._v2_context,
+                manager._v2_retry_timer,
+                manager._v2_retry_context,
+            ) = previous
+
+    def test_manual_retry_skips_scheduled_backoff_without_replacing_queue_item(self):
+        manager = SyncManager()
+        previous = (
+            manager._v2_context,
+            manager._v2_store,
+            manager._v2_device_id,
+            manager._v2_worker,
+            manager._v2_structure_worker,
+            manager._active_server_syncs,
+            manager._v2_retry_timer,
+            manager._v2_retry_context,
+            manager._auth_retry_blocked,
+            manager._shutting_down,
+        )
+        operation = {
+            "operation_id": str(uuid.uuid4()),
+            "content": "보존할 최신 원고",
+        }
+        timer = MagicMock()
+        timer.isActive.return_value = True
+        store = SimpleNamespace(next_ready_operation=MagicMock(return_value=operation))
+        manager._v2_context = {
+            "local_key": "project-a-local",
+            "project_id": str(uuid.uuid4()),
+            "server_state": "active",
+        }
+        manager._v2_store = store
+        manager._v2_device_id = str(uuid.uuid4())
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._active_server_syncs = 0
+        manager._v2_retry_timer = timer
+        manager._v2_retry_context = (
+            manager._v2_context["local_key"],
+            manager._v2_context["project_id"],
+        )
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
+        try:
+            with patch.object(manager, "_launch_v2_operation") as launch:
+                self.assertFalse(manager.retry_pending_syncs())
+                self.assertTrue(manager.retry_pending_syncs(manual=True))
+
+            timer.stop.assert_called_once_with()
+            store.next_ready_operation.assert_called_once_with("project-a-local")
+            launch.assert_called_once_with(operation)
+            self.assertEqual(operation["content"], "보존할 최신 원고")
+        finally:
+            (
+                manager._v2_context,
+                manager._v2_store,
+                manager._v2_device_id,
+                manager._v2_worker,
+                manager._v2_structure_worker,
+                manager._active_server_syncs,
+                manager._v2_retry_timer,
+                manager._v2_retry_context,
+                manager._auth_retry_blocked,
+                manager._shutting_down,
+            ) = previous
+
+    def test_stale_lease_retry_never_runs_after_project_switch(self):
+        manager = SyncManager()
+        previous = (
+            manager._v2_context,
+            manager._v2_retry_context,
+            manager.supabase,
+            manager.retry_pending_syncs,
+        )
+        project_a_id = str(uuid.uuid4())
+        retry = MagicMock(return_value=True)
+        try:
+            manager._v2_retry_context = ("project-a-local", project_a_id)
+            manager._v2_context = {
+                "local_key": "project-b-local",
+                "project_id": str(uuid.uuid4()),
+                "server_state": "active",
+            }
+            manager.supabase = object()
+            manager.retry_pending_syncs = retry
+
+            self.assertFalse(manager._run_scheduled_v2_retry())
+            retry.assert_not_called()
+            self.assertIsNone(manager._v2_retry_context)
+        finally:
+            (
+                manager._v2_context,
+                manager._v2_retry_context,
+                manager.supabase,
+                manager.retry_pending_syncs,
+            ) = previous
+
+    def test_project_trash_cancels_scheduled_lease_retry(self):
+        manager = SyncManager()
+        previous = (
+            manager._v2_context,
+            manager._v2_store,
+            manager._v2_retry_timer,
+            manager._v2_retry_context,
+            manager._v2_lease_retry_operation_id,
+            manager._v2_lease_retry_attempt,
+        )
+        project_id = str(uuid.uuid4())
+        timer = MagicMock()
+        manager._v2_context = {
+            "local_key": "trashed-project-local",
+            "project_id": project_id,
+            "server_state": "active",
+        }
+        manager._v2_store = None
+        manager._v2_retry_timer = timer
+        manager._v2_retry_context = ("trashed-project-local", project_id)
+        manager._v2_lease_retry_operation_id = str(uuid.uuid4())
+        manager._v2_lease_retry_attempt = 3
+        try:
+            self.assertTrue(
+                manager.mark_project_server_state(project_id, "trashed")
+            )
+            timer.stop.assert_called_once_with()
+            self.assertIsNone(manager._v2_retry_context)
+            self.assertIsNone(manager._v2_lease_retry_operation_id)
+            self.assertEqual(manager._v2_lease_retry_attempt, 0)
+        finally:
+            (
+                manager._v2_context,
+                manager._v2_store,
+                manager._v2_retry_timer,
+                manager._v2_retry_context,
+                manager._v2_lease_retry_operation_id,
+                manager._v2_lease_retry_attempt,
+            ) = previous
+
     def test_background_commit_releases_lease_after_document_switch(self):
         manager = SyncManager()
         previous = (
@@ -335,6 +770,7 @@ class SyncV2RpcTestCase(unittest.TestCase):
                 "local_path": "메인/메모장/이전에열린문서.txt",
                 "is_deleted": False,
             })
+            manager.wait_all_workers()
 
             self.assertNotIn(document_id, manager._v2_leases)
             self.assertEqual(client.calls[0][0], "release_edit_lease")
@@ -369,6 +805,7 @@ class SyncV2RpcTestCase(unittest.TestCase):
                 "local_path": active_path,
                 "is_deleted": False,
             })
+            manager.wait_all_workers()
 
             self.assertEqual(manager._v2_leases[document_id], "lease-token")
             self.assertEqual(client.calls, [])
@@ -378,6 +815,131 @@ class SyncV2RpcTestCase(unittest.TestCase):
                 manager._v2_device_id,
                 previous_leases,
                 manager._v2_active_paths_provider,
+            ) = previous
+            manager._v2_leases = previous_leases
+
+    def test_active_new_document_acquires_lease_after_create_commit(self):
+        manager = SyncManager()
+        previous = (
+            manager.supabase,
+            manager._v2_device_id,
+            dict(manager._v2_leases),
+            manager._v2_active_paths_provider,
+        )
+        document_id = str(uuid.uuid4())
+        active_path = "메인/원고/1권/새문서.txt"
+        client = _FakeClient()
+        try:
+            manager.supabase = client
+            manager._v2_device_id = str(uuid.uuid4())
+            manager._v2_leases = {}
+            manager.set_active_document_paths_provider(lambda: [active_path])
+
+            manager._finalize_v2_operation_lease("committed", {
+                "document_id": document_id,
+                "local_path": active_path,
+                "is_deleted": False,
+            })
+            manager.wait_all_workers()
+
+            self.assertIn(document_id, manager._v2_leases)
+            self.assertEqual(client.calls[0][0], "acquire_edit_lease")
+        finally:
+            (
+                manager.supabase,
+                manager._v2_device_id,
+                previous_leases,
+                manager._v2_active_paths_provider,
+            ) = previous
+            manager._v2_leases = previous_leases
+
+    def test_viewing_does_not_acquire_until_first_user_text_change(self):
+        controller = WritingController(
+            MagicMock(),
+            MagicMock(),
+            SimpleNamespace(current_project="열람 정책 작품"),
+            "device-a",
+            lambda: [],
+            lambda _path: "",
+        )
+        controller.acquire_lock_async = MagicMock()
+        path = "메인/원고/1권/열람중.txt"
+
+        controller.notify_file_opened(path, "")
+        controller.acquire_lock_async.assert_not_called()
+
+        controller.notify_text_changed(path, user_initiated=False)
+        controller.acquire_lock_async.assert_not_called()
+
+        controller.notify_text_changed(path)
+        controller.acquire_lock_async.assert_called_once()
+        controller.idle_timer.stop()
+
+    def test_v2_document_switch_releases_lease_acquired_by_retry_queue(self):
+        sync_manager = MagicMock()
+        sync_manager.is_v2_enabled = True
+        path = "메인/원고/1권/재시도후잠금.txt"
+        controller = WritingController(
+            MagicMock(),
+            sync_manager,
+            SimpleNamespace(current_project="재시도 작품"),
+            "device-a",
+            lambda: [],
+            lambda _path: "",
+        )
+
+        self.assertNotIn(path, controller.locked_paths)
+        controller.release_lock(path)
+
+        sync_manager.release_lock_async.assert_called_once_with(
+            "재시도 작품", path, "device-a"
+        )
+
+    def test_v2_heartbeat_includes_active_lease_from_retry_queue(self):
+        sync_manager = MagicMock()
+        sync_manager.is_v2_enabled = True
+        path = "메인/원고/1권/재시도후잠금.txt"
+        controller = WritingController(
+            MagicMock(),
+            sync_manager,
+            SimpleNamespace(current_project="재시도 작품"),
+            "device-a",
+            lambda: [path],
+            lambda _path: "",
+        )
+
+        self.assertNotIn(path, controller.locked_paths)
+        controller.on_heartbeat_timeout()
+
+        sync_manager.heartbeat_locks_async.assert_called_once_with(
+            "재시도 작품", {path}, "device-a"
+        )
+
+    def test_failed_release_stops_local_heartbeat_until_server_ttl_expires(self):
+        manager = SyncManager()
+        previous = (
+            manager.supabase,
+            manager._v2_device_id,
+            dict(manager._v2_leases),
+        )
+        document_id = str(uuid.uuid4())
+        client = MagicMock()
+        client.rpc.return_value.execute.side_effect = RuntimeError(
+            "network timeout"
+        )
+        try:
+            manager.supabase = client
+            manager._v2_device_id = str(uuid.uuid4())
+            manager._v2_leases = {document_id: "lease-token"}
+
+            self.assertFalse(manager._release_v2_lease(document_id))
+
+            self.assertNotIn(document_id, manager._v2_leases)
+        finally:
+            (
+                manager.supabase,
+                manager._v2_device_id,
+                previous_leases,
             ) = previous
             manager._v2_leases = previous_leases
 
@@ -418,6 +980,73 @@ class SyncV2RpcTestCase(unittest.TestCase):
             callback.assert_called_once_with(True, "", relative_path, 1)
             retry.assert_not_called()
 
+    def test_v2_upload_rejects_accidental_empty_overwrite_before_disk_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "빈 문서 방어 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, wpm.current_project, "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            relative_path = "메인/원고/1권/002화.txt"
+            original = "삭제되면 안 되는 기존 본문"
+            self.assertTrue(wpm.write_text_file(relative_path, original))
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            previous = (
+                manager._v2_store,
+                manager._v2_context,
+                manager._v2_wpm,
+                manager._v2_device_id,
+            )
+            try:
+                manager.configure_v2(
+                    wpm,
+                    wpm.current_project,
+                    str(uuid.uuid4()),
+                    store=store,
+                )
+                created = store.enqueue(
+                    manager._v2_context, relative_path, original
+                )
+                store.mark_success(created["operation_id"], {
+                    "revision": 3,
+                    "content_hash": "a" * 64,
+                })
+                callback = MagicMock()
+
+                with patch.object(manager, "retry_pending_syncs") as retry:
+                    worker = manager.upload_content_async(
+                        wpm,
+                        wpm.current_project,
+                        relative_path,
+                        "",
+                        callback=callback,
+                    )
+
+                self.assertIsNone(worker)
+                self.assertEqual(
+                    wpm.read_text_file(relative_path), original
+                )
+                self.assertEqual(
+                    store.counts(manager._v2_context["local_key"])["total"],
+                    0,
+                )
+                callback.assert_called_once()
+                self.assertIn(
+                    "자동저장을 중단",
+                    callback.call_args.args[1],
+                )
+                retry.assert_not_called()
+            finally:
+                (
+                    manager._v2_store,
+                    manager._v2_context,
+                    manager._v2_wpm,
+                    manager._v2_device_id,
+                ) = previous
+
     def test_v2_lock_worker_reuses_one_authenticated_profile_client(self):
         authenticated_client = object()
         manager = SimpleNamespace(
@@ -428,7 +1057,7 @@ class SyncV2RpcTestCase(unittest.TestCase):
         )
         worker = LockWorker(manager, "작품", "메인/메모장/문서.txt", "device-a")
         result = MagicMock()
-        worker.finished.connect(result)
+        worker.resultReady.connect(result)
 
         with patch.object(
             SyncManager,
@@ -445,7 +1074,7 @@ class SyncV2RpcTestCase(unittest.TestCase):
         )
         result.assert_called_once_with(True, "Lock acquired.", 3)
 
-    def test_existing_v2_project_recovers_three_new_unregistered_files(self):
+    def test_existing_v2_project_does_not_assign_uuids_to_empty_placeholders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wpm = WritingProjectManager()
             wpm.workspace_dir = temp_dir
@@ -462,19 +1091,21 @@ class SyncV2RpcTestCase(unittest.TestCase):
                 (memo_dir / f"새_문서 ({index}).txt").write_text("", encoding="utf-8")
 
             manager.configure_v2(wpm, wpm.current_project, str(uuid.uuid4()), store=store)
-            operations = []
-            while True:
-                operation = store.next_ready_operation(manager._v2_context["local_key"])
-                if not operation:
-                    break
-                operations.append(operation)
-                store.mark_attempt(operation["operation_id"])
+            recovered = manager._recover_untracked_local_files_after_pull([])
 
-            self.assertEqual(len(operations), 3)
-            self.assertEqual(len({item["document_id"] for item in operations}), 3)
+            self.assertEqual(recovered, 0)
+            self.assertIsNone(store.next_ready_operation(
+                manager._v2_context["local_key"]
+            ))
             self.assertEqual(
-                {item["local_path"] for item in operations},
-                {f"메인/메모장/새_문서 ({index}).txt" for index in range(3)},
+                [
+                    store.get_document(
+                        manager._v2_context["local_key"],
+                        f"메인/메모장/새_문서 ({index}).txt",
+                    )
+                    for index in range(3)
+                ],
+                [None, None, None],
             )
 
     def test_remote_tree_order_replaces_local_order_but_keeps_local_trash_order(self):
@@ -508,15 +1139,23 @@ class SyncV2RpcTestCase(unittest.TestCase):
                 "메인/휴지통": ["서버휴지통.txt"],
             })
 
-            changes = manager._apply_v2_remote_documents([{
+            remote_documents = [{
                 "document_id": document_id,
                 "relative_path": TREE_ORDER_DOCUMENT_PATH,
                 "content": content,
                 "revision": 1,
                 "is_deleted": False,
-            }])
+            }]
+            remote_documents.extend({
+                "document_id": str(uuid.uuid4()),
+                "relative_path": f"메인/메모장/{name}",
+                "content": name,
+                "revision": 1,
+                "is_deleted": False,
+            } for name in ("셋째.txt", "첫째.txt", "둘째.txt"))
+            changes = manager._apply_v2_remote_documents(remote_documents)
 
-            self.assertEqual(changes[0]["kind"], "tree_order")
+            self.assertEqual(changes[-1]["kind"], "tree_order")
             self.assertEqual(
                 wpm.project_settings["tree_order"]["메인/메모장"],
                 ["셋째.txt", "첫째.txt", "둘째.txt"],
@@ -1052,6 +1691,10 @@ class SyncV2RpcTestCase(unittest.TestCase):
         self.assertIn("resultReady", V2QueueWorker.__dict__)
         self.assertNotIn("finished", V2QueueWorker.__dict__)
 
+    def test_lock_worker_does_not_override_native_qthread_finished_signal(self):
+        self.assertIn("resultReady", LockWorker.__dict__)
+        self.assertNotIn("finished", LockWorker.__dict__)
+
     def test_new_document_uses_commit_rpc_with_stable_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wpm = WritingProjectManager()
@@ -1168,6 +1811,67 @@ class SyncV2RpcTestCase(unittest.TestCase):
                     manager._v2_protected_paths_provider,
                 ) = previous
 
+    def test_equal_revision_refreshes_clean_active_editor_after_shared_store_update(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "현재 창 갱신 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, "현재 창 갱신 작품", "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            context = store.configure_project(
+                wpm.writing_root_path,
+                wpm.current_project,
+                str(uuid.uuid4()),
+            )
+            document_id = str(uuid.uuid4())
+            relative_path = "메인/원고/1권/006화.txt"
+            content = "아이패드에서 내려온 최신 내용"
+            store.apply_remote_snapshot(
+                context, document_id, relative_path, content, 14
+            )
+            self.assertTrue(wpm.write_text_file(relative_path, content))
+
+            manager = SyncManager()
+            previous = (
+                manager._v2_store,
+                manager._v2_context,
+                manager._v2_wpm,
+                manager._v2_device_id,
+                manager._v2_protected_paths_provider,
+                manager._v2_active_paths_provider,
+            )
+            try:
+                manager._v2_store = store
+                manager._v2_context = context
+                manager._v2_wpm = wpm
+                manager._v2_device_id = str(uuid.uuid4())
+                manager._v2_protected_paths_provider = lambda: set()
+                manager._v2_active_paths_provider = lambda: [relative_path]
+
+                changes = manager._apply_v2_remote_documents([{
+                    "document_id": document_id,
+                    "relative_path": relative_path,
+                    "content": content,
+                    "revision": 14,
+                    "is_deleted": False,
+                }])
+
+                self.assertEqual(len(changes), 1)
+                self.assertEqual(changes[0]["kind"], "remote_refresh")
+                self.assertEqual(changes[0]["content"], content)
+            finally:
+                (
+                    manager._v2_store,
+                    manager._v2_context,
+                    manager._v2_wpm,
+                    manager._v2_device_id,
+                    manager._v2_protected_paths_provider,
+                    manager._v2_active_paths_provider,
+                ) = previous
+
     def test_forced_offline_mode_does_not_contact_lease_rpcs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wpm = WritingProjectManager()
@@ -1200,6 +1904,3055 @@ class SyncV2RpcTestCase(unittest.TestCase):
             self.assertIn("오프라인", message)
             self.assertTrue(released)
             self.assertEqual(manager.supabase.calls, [])
+
+
+class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        workspace = str(Path(self.temp.name, "작품목록"))
+        writing_root = str(Path(workspace, "빈 폴더 동기화", "집필모드"))
+        self.wpm = WritingProjectManager.create_detached(
+            workspace, "빈 폴더 동기화", writing_root
+        )
+        self.store = SyncV2Store(str(Path(self.temp.name, "sync.sqlite3")))
+        self.context = self.store.configure_project(
+            self.wpm.writing_root_path,
+            self.wpm.current_project,
+            str(uuid.uuid4()),
+        )
+        self.manager = SyncManager()
+        previous = (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_wpm,
+            self.manager._v2_device_id,
+            self.manager._v2_protected_paths_provider,
+        )
+        self.addCleanup(self._restore_manager, previous)
+        self.manager._v2_store = self.store
+        self.manager._v2_context = self.context
+        self.manager._v2_wpm = self.wpm
+        self.manager._v2_device_id = str(uuid.uuid4())
+        self.manager._v2_protected_paths_provider = None
+        self.tree_document_id = str(uuid.uuid5(
+            uuid.UUID(self.context["project_id"]), TREE_ORDER_DOCUMENT_PATH
+        ))
+
+    def _restore_manager(self, previous):
+        (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_wpm,
+            self.manager._v2_device_id,
+            self.manager._v2_protected_paths_provider,
+        ) = previous
+
+    def test_tree_order_protocol_canonicalizes_fixed_root_aliases(self):
+        for alias in (
+            "플롯",
+            "스토리 플롯",
+            "🗺️ 스토리 플롯",
+            "🗺️ 메인 스토리 틀",
+        ):
+            with self.subTest(alias=alias):
+                content = self.manager._tree_order_content({
+                    "<root>": ["원고", alias, "휴지통"],
+                    f"메인/{alias}": [],
+                })
+                normalized = json.loads(content)["tree_order"]
+                self.assertEqual(
+                    normalized["<root>"], ["원고", "플롯", "휴지통"]
+                )
+                self.assertIn("메인/플롯", normalized)
+                if alias != "플롯":
+                    self.assertNotIn(f"메인/{alias}", normalized)
+
+        validated = self.manager._validated_remote_tree_order({
+            "<root>": ["원고", "스토리 플롯", "휴지통"],
+            "메인/스토리 플롯": [],
+        })
+        self.assertEqual(
+            validated["<root>"], ["원고", "플롯", "휴지통"]
+        )
+        self.assertIn("메인/플롯", validated)
+        self.assertNotIn("메인/스토리 플롯", validated)
+
+    def test_add_volume_durably_queues_tree_and_all_chapters_immediately(self):
+        chapter_names = [f"{number:03d}화.txt" for number in range(1, 26)]
+        def defer_tree_order(operations, supplied_tree_order):
+            self.assertEqual(supplied_tree_order["메인/원고"], ["1권"])
+            self.assertEqual(
+                supplied_tree_order["메인/원고/1권"], chapter_names
+            )
+            self.wpm.project_settings["tree_order"] = supplied_tree_order
+            self.assertTrue(self.wpm.save_settings())
+            return self.manager.defer_tree_order_until_operations(
+                supplied_tree_order, operations
+            )
+
+        panel = SimpleNamespace(
+            wpm=self.wpm,
+            sync_manager=self.manager,
+            load_tree_data=MagicMock(),
+            defer_tree_order_until_operations=MagicMock(
+                side_effect=defer_tree_order
+            ),
+            _open_new_volume_chapters=MagicMock(),
+            binder_tree=MagicMock(),
+        )
+        with patch.object(
+            self.manager, "retry_pending_syncs", return_value=False
+        ) as retry, patch(
+            "writing_tree.QMessageBox.information"
+        ), patch("writing_tree.QTimer.singleShot"):
+            WritingTreeMixin.add_volume(panel)
+
+        panel.defer_tree_order_until_operations.assert_called_once()
+        retry.assert_called_once_with()
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["pending"], 25
+        )
+        self.assertIsNotNone(self.store.tree_order_barrier(
+            self.context["local_key"]
+        ))
+        self.assertIsNone(self.store.get_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
+        ))
+        first_operation = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.assertEqual(
+            first_operation["relative_path"], "메인/원고/1권/001화.txt"
+        )
+        chapter_documents = [
+            document
+            for document in self.store.list_documents(self.context["local_key"])
+            if document["local_path"].startswith("메인/원고/1권/")
+        ]
+        self.assertEqual(len(chapter_documents), 25)
+        self.assertTrue(all(
+            Path(self.wpm.writing_root_path, document["local_path"]).is_file()
+            for document in chapter_documents
+        ))
+
+        self.manager.supabase = _FakeClient()
+        dispatched_paths = []
+        while True:
+            queued = self.store.next_ready_operation(self.context["local_key"])
+            if queued is None:
+                break
+            dispatched = self.manager._process_v2_operation(
+                queued["operation_id"]
+            )
+            self.assertEqual(dispatched["kind"], "committed")
+            dispatched_paths.append(queued["relative_path"])
+            self.store.mark_success(queued["operation_id"], dispatched["result"])
+            self.manager._release_ready_tree_order_barrier()
+
+        self.assertEqual(len(dispatched_paths), 26)
+        self.assertEqual(dispatched_paths[-1], TREE_ORDER_DOCUMENT_PATH)
+        self.assertEqual(
+            set(dispatched_paths[:-1]),
+            {
+                f"메인/원고/1권/{number:03d}화.txt"
+                for number in range(1, 26)
+            },
+        )
+        applied_tree = self.store.get_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
+        )
+        applied_order = json.loads(applied_tree["base_content"])["tree_order"]
+        self.assertEqual(applied_order["메인/원고"], ["1권"])
+        self.assertEqual(applied_order["메인/원고/1권"], chapter_names)
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 0
+        )
+        self.assertIsNone(self.store.tree_order_barrier(
+            self.context["local_key"]
+        ))
+
+    def test_real_add_volume_barrier_contains_collapsed_chapter_order(self):
+        self.assertIsNotNone(self.app)
+        panel = WritingTreeMixin()
+        panel.wpm = self.wpm
+        panel.sync_manager = self.manager
+        panel.binder_tree = BinderTreeWidget()
+        self.addCleanup(panel.binder_tree.close)
+        panel._open_new_volume_chapters = MagicMock()
+        panel.load_tree_data()
+
+        with patch.object(
+            self.manager, "retry_pending_syncs", return_value=False
+        ), patch(
+            "writing_tree.QMessageBox.information"
+        ), patch("writing_tree.QTimer.singleShot"):
+            panel.add_volume()
+
+        barrier = self.store.tree_order_barrier(self.context["local_key"])
+        tree_order = json.loads(barrier["tree_order_content"])["tree_order"]
+        self.assertEqual(tree_order["메인/원고"], ["1권"])
+        self.assertEqual(
+            tree_order["메인/원고/1권"],
+            [f"{number:03d}화.txt" for number in range(1, 26)],
+        )
+
+    def test_root_only_remote_tree_keeps_existing_and_discovers_new_volume_order(self):
+        first_names = [f"{number:03d}화.txt" for number in range(1, 4)]
+        first_documents = [
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": f"메인/원고/1권/{name}",
+                "content": name,
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for name in first_names
+        ]
+        baseline = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권"],
+            "메인/원고/1권": first_names,
+        }
+        self._apply(baseline, first_documents, revision=1)
+
+        second_names = [f"{number:03d}화.txt" for number in range(4, 7)]
+        second_documents = [
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": f"메인/원고/2권/{name}",
+                "content": name,
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for name in reversed(second_names)
+        ]
+        root_only = {"<root>": ["원고"]}
+
+        changes = self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(root_only, revision=2),
+                *first_documents,
+                *second_documents,
+            ],
+            strict=True,
+        )
+
+        applied_order = self.wpm.project_settings["tree_order"]
+        self.assertEqual(applied_order["메인/원고"], ["1권", "2권"])
+        self.assertEqual(applied_order["메인/원고/1권"], first_names)
+        self.assertEqual(applied_order["메인/원고/2권"], second_names)
+        self.assertEqual(changes[-1]["kind"], "tree_order")
+        stored_tree = self.store.get_document_by_id(self.tree_document_id)
+        self.assertEqual(
+            json.loads(stored_tree["base_content"])["tree_order"], root_only
+        )
+
+    def test_root_only_snapshot_repairs_only_exact_generated_volume_set(self):
+        chapter_names = [f"{number:03d}화.txt" for number in range(1, 26)]
+        documents = [
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": f"메인/원고/1권/{name}",
+                "content": name,
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for name in chapter_names
+        ]
+        root_only = {"<root>": ["원고"]}
+        self._apply(root_only, documents, revision=1)
+        scrambled = [
+            chapter_names[index]
+            for index in (
+                3, 0, 1, 5, 2, 4, 7, 9, 8, 6, 10, 12, 13,
+                11, 18, 16, 14, 17, 15, 20, 19, 22, 21, 23, 24,
+            )
+        ]
+        self.wpm.project_settings["tree_order"][
+            "메인/원고/1권"
+        ] = scrambled
+        self.assertTrue(self.wpm.save_settings())
+
+        change = self._apply_direct(
+            root_only, revision=1, live_paths={
+                row["relative_path"] for row in documents
+            }
+        )
+
+        self.assertEqual(change["kind"], "tree_order")
+        self.assertEqual(
+            self.wpm.project_settings["tree_order"]["메인/원고/1권"],
+            chapter_names,
+        )
+
+    def test_tree_order_barrier_survives_retry_and_restart(self):
+        paths = [
+            "메인/원고/1권/001화.txt",
+            "메인/원고/1권/002화.txt",
+        ]
+        operations = []
+        for relative_path in paths:
+            self.assertTrue(self.wpm.write_text_file(relative_path, ""))
+            operations.append(self.manager.record_created_document(
+                relative_path, retry=False
+            ))
+        tree_order = {
+            "메인/원고": ["1권"],
+            "메인/원고/1권": ["001화.txt", "002화.txt"],
+        }
+        barrier = self.manager.defer_tree_order_until_operations(
+            tree_order, operations
+        )
+
+        self.store.mark_success(operations[0]["operation_id"], {
+            "revision": 1, "content_hash": "a" * 64,
+        })
+        self.store.mark_retry(
+            operations[1]["operation_id"], "NETWORK_UNAVAILABLE"
+        )
+        self.assertIsNone(self.manager._release_ready_tree_order_barrier())
+        self.assertIsNone(self.store.get_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
+        ))
+
+        reopened = SyncV2Store(self.store.db_path)
+        self.manager._v2_store = reopened
+        recovered_barrier = reopened.tree_order_barrier(
+            self.context["local_key"]
+        )
+        self.assertEqual(recovered_barrier["barrier_id"], barrier["barrier_id"])
+        self.assertIsNone(self.manager._release_ready_tree_order_barrier())
+
+        reopened.mark_success(operations[1]["operation_id"], {
+            "revision": 1, "content_hash": "b" * 64,
+        })
+        released = self.manager._release_ready_tree_order_barrier()
+
+        self.assertIsNotNone(released)
+        self.assertEqual(released["relative_path"], TREE_ORDER_DOCUMENT_PATH)
+        self.assertIsNone(reopened.tree_order_barrier(
+            self.context["local_key"]
+        ))
+
+    def test_project_open_adopts_remote_uuid_before_recovering_untracked_files(self):
+        remote_paths = [
+            "메인/원고/1권/001화.txt",
+            "메인/원고/1권/002화.txt",
+        ]
+        empty_local_only = "메인/원고/1권/003화.txt"
+        nonempty_local_only = "메인/원고/1권/004화.txt"
+        for relative_path in remote_paths + [empty_local_only]:
+            self.assertTrue(self.wpm.write_text_file(relative_path, ""))
+        self.assertTrue(
+            self.wpm.write_text_file(nonempty_local_only, "복구해야 할 문장")
+        )
+
+        self.manager.configure_v2(
+            self.wpm,
+            self.wpm.current_project,
+            self.manager._v2_device_id,
+            store=self.store,
+            project_id=self.context["project_id"],
+        )
+
+        for relative_path in remote_paths + [empty_local_only, nonempty_local_only]:
+            self.assertIsNone(self.store.get_document(
+                self.context["local_key"], relative_path
+            ))
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 0
+        )
+
+        remote_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        remote_documents = [
+            {
+                "document_id": document_id,
+                "relative_path": relative_path,
+                "content": "",
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for document_id, relative_path in zip(remote_ids, remote_paths)
+        ]
+        self.manager._apply_v2_remote_documents(remote_documents, strict=True)
+        recovered = self.manager._recover_untracked_local_files_after_pull(
+            remote_documents
+        )
+
+        self.assertEqual(recovered, 1)
+        for document_id, relative_path in zip(remote_ids, remote_paths):
+            adopted = self.store.get_document(
+                self.context["local_key"], relative_path
+            )
+            self.assertEqual(adopted["document_id"], document_id)
+            self.assertEqual(adopted["revision"], 1)
+            self.assertNotIn(
+                relative_path, self.manager._v2_untracked_recovery_paths
+            )
+        resumed_callback = MagicMock()
+        self.manager.upload_content_async(
+            self.wpm,
+            self.wpm.current_project,
+            remote_paths[0],
+            "",
+            callback=resumed_callback,
+        )
+        resumed_callback.assert_called_once_with(
+            True, "", remote_paths[0], 1
+        )
+        self.assertIsNone(self.store.get_document(
+            self.context["local_key"], empty_local_only
+        ))
+        recovered_document = self.store.get_document(
+            self.context["local_key"], nonempty_local_only
+        )
+        self.assertIsNotNone(recovered_document)
+        queued = self.store.next_ready_operation(self.context["local_key"])
+        self.assertEqual(queued["relative_path"], nonempty_local_only)
+        self.assertEqual(queued["content"], "복구해야 할 문장")
+
+    def test_uuid_adoption_requires_no_history_conflict_or_active_edit(self):
+        active_path = "메인/메모장/활성.txt"
+        self.assertTrue(self.wpm.write_text_file(active_path, "같은 바이트"))
+        local_active = self.store.ensure_document(
+            self.context["local_key"], active_path, "같은 바이트"
+        )
+        remote_active_id = str(uuid.uuid4())
+        self.manager._v2_active_paths_provider = lambda: {active_path}
+        remote_active = [{
+            "document_id": remote_active_id,
+            "relative_path": active_path,
+            "content": "같은 바이트",
+            "revision": 4,
+            "is_deleted": False,
+        }]
+
+        self.assertEqual(
+            self.manager._apply_v2_remote_documents(remote_active), []
+        )
+        self.assertEqual(
+            self.store.get_document(
+                self.context["local_key"], active_path
+            )["document_id"],
+            local_active["document_id"],
+        )
+        self.manager._v2_active_paths_provider = lambda: set()
+        adopted_changes = self.manager._apply_v2_remote_documents(
+            remote_active, strict=True
+        )
+        adopted = self.store.get_document(
+            self.context["local_key"], active_path
+        )
+        self.assertEqual(len(adopted_changes), 1)
+        self.assertEqual(adopted["document_id"], remote_active_id)
+        self.assertEqual(adopted["revision"], 4)
+        self.assertIsNone(self.store.get_document_by_id(
+            local_active["document_id"]
+        ))
+        reopened_store = SyncV2Store(self.store.db_path)
+        self.assertEqual(
+            reopened_store.get_document(
+                self.context["local_key"], active_path
+            )["document_id"],
+            remote_active_id,
+        )
+
+        history_path = "메인/메모장/이력.txt"
+        self.assertTrue(self.wpm.write_text_file(history_path, "이력 있음"))
+        history_operation = self.store.enqueue(
+            self.context, history_path, "이력 있음"
+        )
+        self.store.mark_success(history_operation["operation_id"], {
+            "revision": 1, "content_hash": "c" * 64,
+        })
+        history_local_id = history_operation["document_id"]
+        self.assertEqual(self.manager._apply_v2_remote_documents([{
+            "document_id": str(uuid.uuid4()),
+            "relative_path": history_path,
+            "content": "이력 있음",
+            "revision": 2,
+            "is_deleted": False,
+        }]), [])
+        self.assertEqual(
+            self.store.get_document(
+                self.context["local_key"], history_path
+            )["document_id"],
+            history_local_id,
+        )
+
+        conflict_path = "메인/메모장/충돌.txt"
+        self.assertTrue(self.wpm.write_text_file(conflict_path, "충돌 로컬"))
+        conflict_operation = self.store.enqueue(
+            self.context, conflict_path, "충돌 로컬"
+        )
+        self.store.mark_conflict(
+            conflict_operation["operation_id"],
+            2,
+            conflict_path,
+            "충돌 서버",
+            "병합 후보",
+            "충돌 로컬",
+        )
+        conflict_local_id = conflict_operation["document_id"]
+        self.assertEqual(self.manager._apply_v2_remote_documents([{
+            "document_id": str(uuid.uuid4()),
+            "relative_path": conflict_path,
+            "content": "충돌 로컬",
+            "revision": 3,
+            "is_deleted": False,
+        }]), [])
+        self.assertEqual(
+            self.store.get_document(
+                self.context["local_key"], conflict_path
+            )["document_id"],
+            conflict_local_id,
+        )
+
+    def test_project_open_never_assigns_second_uuid_to_different_local_bytes(self):
+        relative_path = "메인/원고/1권/001화.txt"
+        local_bytes = "로컬에만 있는 중요한 문장".encode("utf-8")
+        full_path = Path(self.wpm.writing_root_path, relative_path)
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(local_bytes)
+        before_hash = hashlib.sha256(full_path.read_bytes()).hexdigest()
+        self.manager.configure_v2(
+            self.wpm,
+            self.wpm.current_project,
+            self.manager._v2_device_id,
+            store=self.store,
+            project_id=self.context["project_id"],
+        )
+        remote_documents = [{
+            "document_id": str(uuid.uuid4()),
+            "relative_path": relative_path,
+            "content": "서버의 다른 문장",
+            "revision": 3,
+            "is_deleted": False,
+        }]
+
+        changes = self.manager._apply_v2_remote_documents(remote_documents)
+        recovered = self.manager._recover_untracked_local_files_after_pull(
+            remote_documents
+        )
+
+        self.assertEqual(changes, [])
+        self.assertEqual(recovered, 0)
+        self.assertIsNone(self.store.get_document(
+            self.context["local_key"], relative_path
+        ))
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 0
+        )
+        self.assertEqual(
+            hashlib.sha256(full_path.read_bytes()).hexdigest(), before_hash
+        )
+        self.assertEqual(self.manager.current_sync_state, "conflict")
+
+    def _tree_remote(self, tree_order, revision=1):
+        content = self.manager._tree_order_content(tree_order)
+        return {
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": content,
+            "revision": revision,
+            "is_deleted": False,
+        }
+
+    @staticmethod
+    def _live_remote(path, content="문서", revision=1):
+        return {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": path,
+            "content": content,
+            "revision": revision,
+            "is_deleted": False,
+        }
+
+    def _apply(self, tree_order, live_documents=None, revision=1, strict=True):
+        documents = [self._tree_remote(tree_order, revision)]
+        documents.extend(live_documents or [])
+        return self.manager._apply_v2_remote_documents(documents, strict=strict)
+
+    def _apply_direct(self, tree_order, revision=1, live_paths=None):
+        content = self.manager._tree_order_content(tree_order)
+        return self.manager._apply_remote_tree_order_document(
+            self.tree_document_id,
+            content,
+            revision,
+            remote_live_document_paths=set(live_paths or []),
+        )
+
+    def test_remote_document_rename_does_not_scramble_equivalent_volume_orders(self):
+        first_volume = [f"{number:03d}화.txt" for number in range(1, 7)]
+        second_volume = [f"{number:03d}화.txt" for number in range(7, 13)]
+        baseline_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": first_volume,
+            "메인/원고/2권": second_volume,
+        }
+        document_rows = []
+        for volume, names in (("1권", first_volume), ("2권", second_volume)):
+            for name in names:
+                document_rows.append({
+                    "document_id": str(uuid.uuid4()),
+                    "relative_path": f"메인/원고/{volume}/{name}",
+                    "content": f"보존할 원고 {volume} {name}",
+                    "revision": 1,
+                    "is_deleted": False,
+                })
+        self._apply(baseline_order, document_rows, revision=1)
+        before_hashes = {
+            row["document_id"]: hashlib.sha256(
+                Path(
+                    self.wpm.writing_root_path, row["relative_path"]
+                ).read_bytes()
+            ).hexdigest()
+            for row in document_rows
+        }
+
+        renamed_row = next(
+            row for row in document_rows
+            if row["relative_path"].endswith("002화.txt")
+        )
+        renamed_row["relative_path"] = "메인/원고/1권/002화 새 이름.txt"
+        renamed_row["revision"] = 2
+        remote_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": [
+                "005화.txt", "002화 새 이름.txt", "001화.txt",
+                "006화.txt", "003화.txt", "004화.txt",
+            ],
+            "메인/원고/2권": [
+                "011화.txt", "008화.txt", "012화.txt",
+                "007화.txt", "010화.txt", "009화.txt",
+            ],
+        }
+        remote_documents = [self._tree_remote(remote_order, revision=2)]
+        remote_documents[0]["content"] = json.dumps(
+            {"version": 1, "tree_order": remote_order}, ensure_ascii=False
+        )
+        remote_documents.extend(document_rows)
+
+        changes = self.manager._apply_v2_remote_documents(
+            remote_documents, strict=True
+        )
+
+        expected_order = copy.deepcopy(baseline_order)
+        expected_order["메인/원고/1권"][1] = "002화 새 이름.txt"
+        self.assertEqual(self.wpm.project_settings["tree_order"], expected_order)
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, "메인/원고/1권/002화.txt"
+        ).exists())
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, "메인/원고/1권/002화 새 이름.txt"
+        ).is_file())
+        self.assertEqual(
+            [change.get("kind") for change in changes], [None, "tree_order"]
+        )
+        for row in document_rows:
+            self.assertEqual(
+                hashlib.sha256(Path(
+                    self.wpm.writing_root_path, row["relative_path"]
+                ).read_bytes()).hexdigest(),
+                before_hashes[row["document_id"]],
+            )
+        stored_tree = self.store.get_document_by_id(self.tree_document_id)
+        self.assertEqual(
+            json.loads(stored_tree["base_content"])["tree_order"], remote_order
+        )
+
+        repeated = self.manager._apply_v2_remote_documents(
+            remote_documents, strict=True
+        )
+        self.assertEqual(repeated, [])
+        self.assertEqual(self.wpm.project_settings["tree_order"], expected_order)
+
+    def test_manuscript_tree_reorder_is_always_normalized_by_chapter_number(self):
+        names = ["001화.txt", "002화.txt", "003화.txt"]
+        baseline_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권"],
+            "메인/원고/1권": names,
+        }
+        documents = [
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": f"메인/원고/1권/{name}",
+                "content": name,
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for name in names
+        ]
+        self._apply(baseline_order, documents, revision=1)
+        reordered = copy.deepcopy(baseline_order)
+        reordered["메인/원고/1권"] = [
+            "003화.txt", "001화.txt", "002화.txt"
+        ]
+
+        raw_remote = self._tree_remote(reordered, revision=2)
+        raw_remote["content"] = json.dumps(
+            {"version": 1, "tree_order": reordered}, ensure_ascii=False
+        )
+        changes = self.manager._apply_v2_remote_documents(
+            [raw_remote, *documents],
+            strict=True,
+        )
+
+        self.assertEqual(changes[-1]["kind"], "tree_order")
+        self.assertEqual(self.wpm.project_settings["tree_order"], baseline_order)
+        outbound = json.loads(self.manager._tree_order_content(reordered))
+        self.assertEqual(outbound["tree_order"], baseline_order)
+
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(reordered)
+        self.assertTrue(self.wpm.save_settings())
+        repeated = self.manager._apply_v2_remote_documents(
+            [raw_remote, *documents], strict=True
+        )
+        self.assertEqual(repeated[-1]["kind"], "tree_order")
+        self.assertEqual(self.wpm.project_settings["tree_order"], baseline_order)
+
+    def test_tree_only_reorder_is_still_applied_for_freely_ordered_folder(self):
+        baseline = {"메인/메모장": ["A.txt", "B.txt", "C.txt"]}
+        reordered = {"메인/메모장": ["C.txt", "A.txt", "B.txt"]}
+        live_documents = [
+            self._live_remote(f"메인/메모장/{name}", content=name)
+            for name in baseline["메인/메모장"]
+        ]
+        self._apply(baseline, live_documents, revision=1)
+
+        changes = self._apply(reordered, live_documents, revision=2)
+
+        self.assertEqual(changes[-1]["kind"], "tree_order")
+        self.assertEqual(self.wpm.project_settings["tree_order"], reordered)
+
+    def test_remote_tree_order_materializes_nested_and_leaf_empty_folders(self):
+        tree_order = {
+            "<root>": ["13-2 테스트"],
+            "메인/13-2 테스트": ["빈 폴더"],
+            "메인/13-2 테스트/빈 폴더": ["하위 빈 폴더"],
+        }
+
+        changes = self._apply(tree_order)
+
+        root = Path(self.wpm.writing_root_path)
+        self.assertTrue(Path(root, "메인", "13-2 테스트").is_dir())
+        self.assertTrue(Path(root, "메인", "13-2 테스트", "빈 폴더").is_dir())
+        self.assertTrue(
+            Path(root, "메인", "13-2 테스트", "빈 폴더", "하위 빈 폴더").is_dir()
+        )
+        self.assertEqual([change["kind"] for change in changes], ["tree_order"])
+        self.assertEqual(self.wpm.project_settings["tree_order"], tree_order)
+        self.assertFalse(Path(root, "__antigravity__").exists())
+
+        reloaded = WritingProjectManager.create_detached(
+            self.wpm.workspace_dir,
+            self.wpm.current_project,
+            self.wpm.writing_root_path,
+        )
+        self.assertEqual(reloaded.project_settings["tree_order"], tree_order)
+        self.assertTrue(
+            Path(root, "메인", "13-2 테스트", "빈 폴더", "하위 빈 폴더").is_dir()
+        )
+
+    def test_remote_tree_order_defers_unresolved_txt_instead_of_making_folder(self):
+        live_path = "메인/13-2 테스트/문서 A.txt"
+        blocked_path = "메인/13-2 테스트/대기.txt"
+        self.manager._v2_protected_paths_provider = lambda: {blocked_path}
+        tree_order = {
+            "<root>": ["13-2 테스트"],
+            "메인/13-2 테스트": [
+                "폴더 B",
+                "문서 A.txt",
+                "자료.txt",
+                "대기.txt",
+            ],
+        }
+
+        changes = self._apply(
+            tree_order,
+            [self._live_remote(live_path), self._live_remote(blocked_path)],
+            strict=False,
+        )
+
+        root = Path(self.wpm.writing_root_path, "메인", "13-2 테스트")
+        self.assertTrue(Path(root, "문서 A.txt").is_file())
+        self.assertFalse(Path(root, "대기.txt").exists())
+        self.assertFalse(Path(root, "자료.txt").exists())
+        self.assertFalse(Path(root, "폴더 B").exists())
+        self.assertFalse(any(
+            change.get("kind") == "tree_order" for change in changes
+        ))
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_folder_projection_defers_unresolved_extensionless_document(self):
+        main_id = str(uuid.uuid4())
+        memo_id = str(uuid.uuid4())
+        unresolved_path = "메인/메모장/팯-문서"
+        legacy_content = json.dumps({
+            "version": 1,
+            "tree_order": {
+                "<root>": ["메모장"],
+                "메인/메모장": ["팯-문서"],
+            },
+        }, ensure_ascii=False)
+        remote = {
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": legacy_content,
+            "revision": 1,
+            "is_deleted": False,
+        }
+        folder_rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": memo_id,
+                "parent_folder_id": main_id,
+                "name": "메모장",
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            [remote], strict=False, folder_rows=folder_rows
+        )
+
+        self.assertEqual(changes, [])
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, unresolved_path
+        ).exists())
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_ipad_extensionless_document_alias_allows_same_snapshot_empty_folder(self):
+        baseline = {
+            "<root>": ["메모장"],
+            "메인/메모장": [],
+        }
+        self._apply(baseline, revision=9)
+
+        main_id = str(uuid.uuid4())
+        empty_folder_id = str(uuid.uuid4())
+        nonempty_folder_id = str(uuid.uuid4())
+        empty_folder = "메인/팯-빈폴더"
+        nonempty_folder = "메인/팯-든폴더"
+        document_path = f"{nonempty_folder}/팯-문서.txt"
+        remote_order = {
+            "<root>": ["메모장", "팯-빈폴더", "팯-든폴더"],
+            "메인/메모장": [],
+            empty_folder: [],
+            nonempty_folder: ["팯-문서"],
+        }
+        remote_tree = {
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": remote_order,
+            }, ensure_ascii=False),
+            "revision": 12,
+            "is_deleted": False,
+        }
+        folder_rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": empty_folder_id,
+                "parent_folder_id": main_id,
+                "name": "팯-빈폴더",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": nonempty_folder_id,
+                "parent_folder_id": main_id,
+                "name": "팯-든폴더",
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            [remote_tree, self._live_remote(document_path)],
+            strict=True,
+            folder_rows=folder_rows,
+        )
+
+        root = Path(self.wpm.writing_root_path)
+        self.assertTrue(Path(root, empty_folder).is_dir())
+        self.assertTrue(Path(root, document_path).is_file())
+        self.assertFalse(Path(root, nonempty_folder, "팯-문서").exists())
+        stored_tree = self.store.get_document_by_id(self.tree_document_id)
+        self.assertEqual(stored_tree["revision"], 12)
+        self.assertEqual(
+            json.loads(stored_tree["base_content"])["tree_order"],
+            remote_order,
+        )
+        self.assertEqual(changes[-1]["kind"], "tree_order")
+
+    def test_ipad_partial_folder_projection_keeps_tree_parent_folders(self):
+        main_id = str(uuid.uuid4())
+        manuscript_id = str(uuid.uuid4())
+        third_volume_id = str(uuid.uuid4())
+        fourth_volume_id = str(uuid.uuid4())
+        empty_folder_id = str(uuid.uuid4())
+        nonempty_folder_id = str(uuid.uuid4())
+        document_path = "메인/팯-든폴더/팯-문서.txt"
+        remote_order = {
+            "<root>": ["원고", "팯-빈폴더", "팯-든폴더"],
+            "메인/원고": ["1권", "2권", "3권", "4권"],
+            "메인/원고/1권": [],
+            "메인/원고/2권": [],
+            "메인/원고/3권": [],
+            "메인/원고/4권": [],
+            "메인/팯-빈폴더": [],
+            "메인/팯-든폴더": ["팯-문서"],
+        }
+        remote_tree = {
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": remote_order,
+            }, ensure_ascii=False),
+            "revision": 13,
+            "is_deleted": False,
+        }
+        # Older Windows-created volumes have no stable folder rows. Newer iPad
+        # folders do. The tree parent keys are still authoritative evidence that
+        # all four volume paths are directories.
+        folder_rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": manuscript_id,
+                "parent_folder_id": main_id,
+                "name": "원고",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": third_volume_id,
+                "parent_folder_id": manuscript_id,
+                "name": "3권",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": fourth_volume_id,
+                "parent_folder_id": manuscript_id,
+                "name": "4권",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": empty_folder_id,
+                "parent_folder_id": main_id,
+                "name": "팯-빈폴더",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": nonempty_folder_id,
+                "parent_folder_id": main_id,
+                "name": "팯-든폴더",
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            [remote_tree, self._live_remote(document_path)],
+            strict=True,
+            folder_rows=folder_rows,
+        )
+
+        root = Path(self.wpm.writing_root_path)
+        for volume in ("1권", "2권", "3권", "4권"):
+            self.assertTrue(Path(root, "메인", "원고", volume).is_dir())
+        self.assertTrue(Path(root, "메인", "팯-빈폴더").is_dir())
+        self.assertTrue(Path(root, document_path).is_file())
+        self.assertFalse(Path(root, "메인", "팯-든폴더", "팯-문서").exists())
+        stored_tree = self.store.get_document_by_id(self.tree_document_id)
+        self.assertEqual(stored_tree["revision"], 13)
+        self.assertEqual(changes[-1]["kind"], "tree_order")
+
+    def test_ipad_document_alias_conflicting_with_stable_folder_is_rejected(self):
+        main_id = str(uuid.uuid4())
+        parent_id = str(uuid.uuid4())
+        conflicting_folder_id = str(uuid.uuid4())
+        parent_path = "메인/팯-든폴더"
+        document_path = f"{parent_path}/팯-문서.txt"
+        remote_tree = {
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {
+                    "<root>": ["팯-든폴더"],
+                    parent_path: ["팯-문서"],
+                    f"{parent_path}/팯-문서": [],
+                },
+            }, ensure_ascii=False),
+            "revision": 12,
+            "is_deleted": False,
+        }
+        folder_rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": parent_id,
+                "parent_folder_id": main_id,
+                "name": "팯-든폴더",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": conflicting_folder_id,
+                "parent_folder_id": parent_id,
+                "name": "팯-문서",
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+
+        with self.assertRaises(FileExistsError):
+            self.manager._apply_v2_remote_documents(
+                [remote_tree, self._live_remote(document_path)],
+                strict=True,
+                folder_rows=folder_rows,
+            )
+
+        root = Path(self.wpm.writing_root_path)
+        self.assertTrue(Path(root, document_path).is_file())
+        self.assertFalse(Path(root, parent_path, "팯-문서").exists())
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_modern_tree_payload_marks_empty_folders_explicitly(self):
+        empty_folder = "메인/메모장/윈_빈폴더"
+        tree_order = {
+            "<root>": ["메모장"],
+            "메인/메모장": ["윈_빈폴더"],
+            empty_folder: [],
+        }
+        payload = json.loads(self.manager._tree_order_content(tree_order))
+
+        self.assertIn("folder_paths", payload)
+        self.assertIn(empty_folder, payload["folder_paths"])
+
+        change = self.manager._apply_remote_tree_order_document(
+            self.tree_document_id,
+            json.dumps(payload, ensure_ascii=False),
+            1,
+            remote_folder_paths=set(),
+            has_remote_folder_projection=True,
+        )
+
+        self.assertEqual(change["kind"], "tree_order")
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, empty_folder
+        ).is_dir())
+
+    def test_stable_folder_identity_can_materialize_folder_named_txt(self):
+        main_id = str(uuid.uuid4())
+        parent_id = str(uuid.uuid4())
+        txt_folder_id = str(uuid.uuid4())
+        rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": parent_id,
+                "parent_folder_id": main_id,
+                "name": "13-2 테스트",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": txt_folder_id,
+                "parent_folder_id": parent_id,
+                "name": "자료.txt",
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+        tree_order = {
+            "<root>": ["13-2 테스트"],
+            "메인/13-2 테스트": ["자료.txt"],
+        }
+
+        changes = self.manager._apply_v2_remote_documents(
+            [self._tree_remote(tree_order)],
+            strict=True,
+            folder_rows=rows,
+        )
+
+        target = Path(
+            self.wpm.writing_root_path, "메인", "13-2 테스트", "자료.txt"
+        )
+        self.assertTrue(target.is_dir())
+        self.assertEqual(changes[-1]["kind"], "tree_order")
+
+    def test_remote_live_document_path_conflicting_with_directory_blocks_tree_baseline(self):
+        document_path = "메인/메모장/문서 충돌.txt"
+        Path(self.wpm.writing_root_path, document_path).mkdir()
+        tree_order = {"메인/메모장": ["문서 충돌.txt"]}
+
+        with self.assertRaises(FileExistsError):
+            self._apply_direct(tree_order, live_paths={document_path})
+
+        self.assertTrue(Path(self.wpm.writing_root_path, document_path).is_dir())
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_is_idempotent_for_existing_directories(self):
+        existing = Path(
+            self.wpm.writing_root_path, "메인", "13-2 테스트", "기존 빈 폴더"
+        )
+        existing.mkdir(parents=True)
+        marker = Path(existing, "보존.txt")
+        marker.write_text("보존", encoding="utf-8")
+        tree_order = {
+            "<root>": ["13-2 테스트"],
+            "메인/13-2 테스트": ["기존 빈 폴더", "새 빈 폴더"],
+        }
+
+        first = self._apply(tree_order)
+        second = self._apply(tree_order)
+
+        self.assertEqual([item["kind"] for item in first], ["tree_order"])
+        self.assertEqual(second, [])
+        self.assertEqual(marker.read_text(encoding="utf-8"), "보존")
+        self.assertEqual(
+            [path.name for path in existing.parent.iterdir()].count("새 빈 폴더"), 1
+        )
+
+    def test_remote_empty_folder_rename_replaces_old_name_once(self):
+        old_order = {
+            "메인/메모장": ["가나다"],
+            "메인/메모장/가나다": [],
+        }
+        new_order = {
+            "메인/메모장": ["가나다바"],
+            "메인/메모장/가나다바": [],
+        }
+        self._apply(old_order, revision=1)
+
+        changes = self._apply(new_order, revision=2)
+
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        self.assertFalse(Path(parent, "가나다").exists())
+        self.assertTrue(Path(parent, "가나다바").is_dir())
+        self.assertEqual([item["kind"] for item in changes], ["tree_order"])
+
+    def test_remote_root_empty_folder_rename_accepts_omitted_leaf_key(self):
+        old_path = "메인/새 폴더2"
+        new_path = "메인/새 폴더3"
+        old_order = {
+            "<root>": ["원고", "새 폴더2"],
+            old_path: [],
+        }
+        # iPad publishes an empty root folder in the parent list without the
+        # otherwise redundant ``메인/새 폴더3: []`` leaf entry.
+        new_order = {
+            "<root>": ["원고", "새 폴더3"],
+        }
+        self._apply(old_order, revision=1)
+
+        changes = self._apply(new_order, revision=2)
+
+        root = Path(self.wpm.writing_root_path, "메인")
+        self.assertFalse(Path(root, "새 폴더2").exists())
+        self.assertTrue(Path(root, "새 폴더3").is_dir())
+        self.assertEqual(
+            [path.name for path in root.iterdir()].count("새 폴더3"), 1
+        )
+        self.assertEqual([item["kind"] for item in changes], ["tree_order"])
+        self.assertEqual(self.wpm.project_settings["tree_order"], new_order)
+
+    def test_remote_root_rename_ignores_fixed_label_and_trash_omission(self):
+        old_path = "메인/새 폴더4"
+        new_path = "메인/새 폴더ㅅ"
+        chapters = [f"{number:03d}화.txt" for number in range(1, 26)]
+        old_order = {
+            "<root>": [
+                "원고", "캐릭터", "설정집", "메모장", "흐름정리",
+                "복선", "장소", "새 폴더4", "플롯", "휴지통",
+            ],
+            "메인/메모장": [],
+            old_path: [],
+            "메인/원고": ["1권"],
+            "메인/원고/1권": chapters,
+        }
+        # This mirrors the iPad representation: a fixed-root alias, no trash,
+        # omitted empty fixed-folder keys, and no redundant custom leaf key.
+        new_order = {
+            "<root>": [
+                "원고", "캐릭터", "설정집", "메모장", "흐름정리",
+                "복선", "장소", "새 폴더ㅅ", "스토리 플롯",
+            ],
+            "메인/원고": ["1권"],
+            "메인/원고/1권": chapters,
+        }
+        chapter_documents = [
+            self._live_remote(
+                f"메인/원고/1권/{name}", content=f"본문 {name}"
+            )
+            for name in chapters
+        ]
+        self._apply(old_order, chapter_documents, revision=9)
+
+        changes = self._apply(new_order, chapter_documents, revision=10)
+
+        root = Path(self.wpm.writing_root_path, "메인")
+        self.assertFalse(Path(root, "새 폴더4").exists())
+        self.assertTrue(Path(root, "새 폴더ㅅ").is_dir())
+        self.assertEqual(
+            [path.name for path in root.iterdir()].count("새 폴더ㅅ"), 1
+        )
+        self.assertEqual([item["kind"] for item in changes], ["tree_order"])
+
+    def test_remote_root_does_not_pair_multiple_custom_name_changes(self):
+        old_order = {
+            "<root>": ["원고", "옛 A", "옛 B", "플롯", "휴지통"],
+        }
+        new_order = {
+            "<root>": ["원고", "새 A", "새 B", "스토리 플롯"],
+        }
+        self._apply(old_order, revision=1)
+
+        with patch("sync_manager.os.rename", wraps=os.rename) as rename:
+            self._apply(new_order, revision=2)
+
+        root = Path(self.wpm.writing_root_path, "메인")
+        for name in ("옛 A", "옛 B", "새 A", "새 B"):
+            self.assertTrue(Path(root, name).is_dir())
+        rename.assert_not_called()
+
+    def test_remote_empty_folder_rename_snapshot_reapply_is_idempotent(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        self._apply(old_order, revision=1)
+        self._apply(new_order, revision=2)
+
+        changes = self._apply(new_order, revision=2)
+
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        self.assertEqual(changes, [])
+        self.assertFalse(Path(parent, "옛 이름").exists())
+        self.assertTrue(Path(parent, "새 이름").is_dir())
+        self.assertEqual([path.name for path in parent.iterdir()].count("새 이름"), 1)
+
+    def test_remote_empty_folder_rename_never_moves_nonempty_folder(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        self._apply(old_order, revision=1)
+        manuscript = Path(
+            self.wpm.writing_root_path, "메인", "메모장", "옛 이름", "원고.bin"
+        )
+        original = b"\x00\x01\xff\xed\x95\x9c\xea\xb8\x80"
+        manuscript.write_bytes(original)
+        before_hash = hashlib.sha256(manuscript.read_bytes()).hexdigest()
+
+        with patch("sync_manager.os.rename", wraps=os.rename) as rename:
+            self._apply(new_order, revision=2)
+
+        parent = manuscript.parent.parent
+        self.assertTrue(manuscript.is_file())
+        self.assertTrue(Path(parent, "새 이름").is_dir())
+        self.assertEqual(
+            hashlib.sha256(manuscript.read_bytes()).hexdigest(), before_hash
+        )
+        rename.assert_not_called()
+
+    def test_remote_empty_folder_rename_never_overwrites_existing_target(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        self._apply(old_order, revision=1)
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        new_marker = Path(parent, "새 이름", "new.bin")
+        new_marker.parent.mkdir()
+        new_marker.write_bytes(b"new manuscript")
+        new_hash = hashlib.sha256(new_marker.read_bytes()).hexdigest()
+        old_folder = Path(parent, "옛 이름")
+        old_entries = list(old_folder.iterdir())
+
+        with patch("sync_manager.os.rename", wraps=os.rename) as rename:
+            self._apply(new_order, revision=2)
+
+        self.assertEqual(list(old_folder.iterdir()), old_entries)
+        self.assertEqual(hashlib.sha256(new_marker.read_bytes()).hexdigest(), new_hash)
+        rename.assert_not_called()
+
+    def test_remote_empty_folder_rename_skips_local_unsent_tree_order(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        local_order = {"메인/메모장": ["옛 이름", "로컬 폴더"]}
+        self._apply(old_order, revision=1)
+        self.wpm.project_settings["tree_order"] = local_order
+        self.assertTrue(self.wpm.save_settings())
+        operation = self.manager.record_tree_order(local_order, retry=False)
+        self.assertIsNotNone(operation)
+
+        with patch("sync_manager.os.rename", wraps=os.rename) as rename:
+            changes = self._apply(new_order, revision=2, strict=False)
+
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        self.assertEqual(changes, [])
+        self.assertTrue(Path(parent, "옛 이름").is_dir())
+        self.assertFalse(Path(parent, "새 이름").exists())
+        self.assertEqual(self.wpm.project_settings["tree_order"], local_order)
+        rename.assert_not_called()
+
+    def test_remote_empty_folder_rename_never_moves_reparse_point(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        self._apply(old_order, revision=1)
+        old_folder = Path(self.wpm.writing_root_path, "메인", "메모장", "옛 이름")
+        real_is_reparse = self.manager._is_reparse_path
+
+        with patch.object(
+            SyncManager,
+            "_is_reparse_path",
+            side_effect=lambda path: (
+                os.path.abspath(path) == os.path.abspath(old_folder)
+                or real_is_reparse(path)
+            ),
+        ), patch("sync_manager.os.rename", wraps=os.rename) as rename:
+            self._apply(new_order, revision=2)
+
+        self.assertTrue(old_folder.is_dir())
+        self.assertTrue(Path(old_folder.parent, "새 이름").is_dir())
+        rename.assert_not_called()
+
+    def test_remote_empty_folder_rename_rolls_back_when_settings_save_fails(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        self._apply(old_order, revision=1)
+
+        with patch.object(self.wpm, "save_settings", return_value=False):
+            with self.assertRaises(OSError):
+                self._apply_direct(new_order, revision=2)
+
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        self.assertTrue(Path(parent, "옛 이름").is_dir())
+        self.assertFalse(Path(parent, "새 이름").exists())
+        self.assertEqual(self.wpm.project_settings["tree_order"], old_order)
+        reloaded = WritingProjectManager.create_detached(
+            self.wpm.workspace_dir,
+            self.wpm.current_project,
+            self.wpm.writing_root_path,
+        )
+        self.assertEqual(reloaded.project_settings["tree_order"], old_order)
+        self.assertEqual(
+            self.store.get_document_by_id(self.tree_document_id)["revision"], 1
+        )
+
+    def test_remote_tree_order_does_not_pair_multiple_additions_and_removals(self):
+        old_order = {"메인/메모장": ["옛 A", "옛 B"]}
+        new_order = {"메인/메모장": ["새 A", "새 B"]}
+        self._apply(old_order, revision=1)
+
+        with patch("sync_manager.os.rename", wraps=os.rename) as rename:
+            self._apply(new_order, revision=2)
+
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        self.assertTrue(Path(parent, "옛 A").is_dir())
+        self.assertTrue(Path(parent, "옛 B").is_dir())
+        self.assertTrue(Path(parent, "새 A").is_dir())
+        self.assertTrue(Path(parent, "새 B").is_dir())
+        rename.assert_not_called()
+
+    def test_remote_document_sync_still_works_with_tree_order_materialization(self):
+        document_path = "메인/메모장/문서 폴더/원고.txt"
+        document = self._live_remote(document_path, "첫 내용", revision=1)
+        tree_order = {
+            "메인/메모장": ["문서 폴더"],
+            "메인/메모장/문서 폴더": ["원고.txt"],
+        }
+        self._apply(tree_order, [document], revision=1)
+        document["content"] = "원격 최신 내용"
+        document["revision"] = 2
+
+        self._apply(tree_order, [document], revision=2)
+
+        manuscript = Path(self.wpm.writing_root_path, document_path)
+        self.assertEqual(manuscript.read_text(encoding="utf-8"), "원격 최신 내용")
+        self.assertTrue(manuscript.parent.is_dir())
+
+    def test_local_empty_folder_rename_still_queues_tree_order_for_ipad(self):
+        old_order = {"메인/메모장": ["옛 이름"]}
+        new_order = {"메인/메모장": ["새 이름"]}
+        self._apply(old_order, revision=1)
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        os.rename(Path(parent, "옛 이름"), Path(parent, "새 이름"))
+        self.wpm.project_settings["tree_order"] = new_order
+        self.assertTrue(self.wpm.save_settings())
+
+        operation = self.manager.record_tree_order(new_order, retry=False)
+        payload = json.loads(operation["content"])
+
+        self.assertEqual(payload["tree_order"], new_order)
+        self.assertNotIn("옛 이름", payload["tree_order"]["메인/메모장"])
+        self.assertEqual(operation["relative_path"], TREE_ORDER_DOCUMENT_PATH)
+
+    def test_reloaded_custom_root_empty_folder_rename_is_durably_queued(self):
+        old_path = "메인/새 폴더1"
+        new_path = "메인/새 폴더2"
+        self._apply({
+            "<root>": ["새 폴더1"],
+            old_path: [],
+        }, revision=1)
+        panel = WritingTreeMixin()
+        panel.wpm = self.wpm
+        panel.sync_manager = self.manager
+        panel.binder_tree = BinderTreeWidget()
+        self.addCleanup(panel.binder_tree.close)
+        panel.controller = SimpleNamespace(rename_path=MagicMock())
+        panel.loaded_versions = {}
+        panel.current_loaded_file_left = None
+        panel.current_loaded_file_right = None
+        panel.lbl_current_doc = MagicMock()
+        panel.lbl_r_doc = MagicMock()
+        panel.load_tree_data()
+        item = next(
+            panel.binder_tree.topLevelItem(index)
+            for index in range(panel.binder_tree.topLevelItemCount())
+            if panel.binder_tree.topLevelItem(index).data(
+                0, Qt.ItemDataRole.UserRole
+            ) == old_path
+        )
+
+        self.assertIs(
+            item.data(0, Qt.ItemDataRole.UserRole + 1), True
+        )
+        item.setText(0, "새 폴더2")
+        with patch.object(
+            self.manager, "retry_pending_syncs", return_value=False
+        ), patch("writing_tree.QTimer.singleShot"), patch(
+            "writing_tree.QMessageBox.warning"
+        ) as warning:
+            panel.on_tree_item_changed(item, 0)
+
+        warning.assert_not_called()
+        self.assertFalse(Path(self.wpm.writing_root_path, old_path).exists())
+        self.assertTrue(Path(self.wpm.writing_root_path, new_path).is_dir())
+        self.assertIn(
+            "새 폴더2", self.wpm.project_settings["tree_order"]["<root>"]
+        )
+        self.assertNotIn(
+            "새 폴더1", self.wpm.project_settings["tree_order"]["<root>"]
+        )
+        operation = self.store.next_ready_operation(self.context["local_key"])
+        self.assertIsNotNone(operation)
+        queued_order = json.loads(operation["content"])["tree_order"]
+        self.assertIn("새 폴더2", queued_order["<root>"])
+        self.assertNotIn("새 폴더1", queued_order["<root>"])
+
+    def test_inline_nonempty_folder_rename_closes_editor_before_durable_move(self):
+        old_path = "메인/메모장/원고 폴더"
+        new_path = "메인/메모장/바꾸는 폴더"
+        old_document_path = f"{old_path}/보존 원고.txt"
+        new_document_path = f"{new_path}/보존 원고.txt"
+        content = "이 바이트는 폴더 이름을 바꿔도 그대로여야 합니다."
+        old_order = {
+            "<root>": ["메모장"],
+            "메인/메모장": ["원고 폴더"],
+            old_path: ["보존 원고.txt"],
+        }
+        self._apply(
+            old_order,
+            [self._live_remote(old_document_path, content)],
+            revision=1,
+        )
+        before_hash = hashlib.sha256(
+            Path(self.wpm.writing_root_path, old_document_path).read_bytes()
+        ).hexdigest()
+
+        panel = WritingTreeMixin()
+        panel.wpm = self.wpm
+        panel.sync_manager = self.manager
+        panel.binder_tree = BinderTreeWidget()
+        self.addCleanup(panel.binder_tree.close)
+        panel.controller = SimpleNamespace(rename_path=MagicMock())
+        panel.loaded_versions = {}
+        panel.current_loaded_file_left = None
+        panel.current_loaded_file_right = None
+        panel.lbl_current_doc = MagicMock()
+        panel.lbl_r_doc = MagicMock()
+        panel.load_tree_data()
+        memo_root = next(
+            panel.binder_tree.topLevelItem(index)
+            for index in range(panel.binder_tree.topLevelItemCount())
+            if panel.binder_tree.topLevelItem(index).data(
+                0, Qt.ItemDataRole.UserRole
+            ) == "메인/메모장"
+        )
+        folder_item = next(
+            memo_root.child(index)
+            for index in range(memo_root.childCount())
+            if memo_root.child(index).data(
+                0, Qt.ItemDataRole.UserRole
+            ) == old_path
+        )
+        with patch.object(
+            self.manager, "retry_pending_syncs", return_value=False
+        ):
+            # Exercise the durable handler directly. Real focused QLineEdit
+            # simulation is platform-plugin dependent and can terminate the
+            # Windows Actions interpreter before unittest prints a traceback.
+            folder_item.setText(0, "바꾸는 폴더")
+            panel._apply_tree_item_changed(folder_item, 0)
+
+        self.assertFalse(Path(self.wpm.writing_root_path, old_path).exists())
+        self.assertTrue(Path(self.wpm.writing_root_path, new_path).is_dir())
+        renamed_file = Path(self.wpm.writing_root_path, new_document_path)
+        self.assertEqual(
+            hashlib.sha256(renamed_file.read_bytes()).hexdigest(), before_hash
+        )
+        self.assertEqual(renamed_file.read_text(encoding="utf-8"), content)
+        moved_document = self.store.get_document(
+            self.context["local_key"], new_document_path
+        )
+        self.assertIsNotNone(moved_document)
+        self.assertIsNone(self.store.get_document(
+            self.context["local_key"], old_document_path
+        ))
+        queued = self.store.next_ready_operation(self.context["local_key"])
+        self.assertEqual(queued["relative_path"], new_document_path)
+        barrier = self.store.tree_order_barrier(self.context["local_key"])
+        self.assertIsNotNone(barrier)
+        barrier_order = json.loads(barrier["tree_order_content"])["tree_order"]
+        self.assertEqual(
+            barrier_order["메인/메모장"], ["바꾸는 폴더"]
+        )
+        self.assertIn(new_path, barrier_order)
+        self.assertNotIn(old_path, barrier_order)
+
+    def _persist_local_empty_folder_rename(
+        self,
+        old_name,
+        new_name,
+        new_order,
+        renamed_event=None,
+        allow_enqueue_event=None,
+    ):
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        with self.manager.local_structure_mutation():
+            os.rename(Path(parent, old_name), Path(parent, new_name))
+            self.manager.record_folder_rename_intent(
+                f"메인/메모장/{old_name}",
+                f"메인/메모장/{new_name}",
+            )
+            self.wpm.project_settings["tree_order"] = new_order
+            self.assertTrue(self.wpm.save_settings())
+            if renamed_event is not None:
+                renamed_event.set()
+            if (
+                allow_enqueue_event is not None
+                and not allow_enqueue_event.wait(5)
+            ):
+                raise TimeoutError("tree-order enqueue test gate timed out")
+            return self.manager.record_tree_order(new_order, retry=False)
+
+    def _assert_local_tree_order_is(self, folder_name, expected_order):
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        self.assertTrue(Path(parent, folder_name).is_dir())
+        self.assertEqual(self.wpm.project_settings["tree_order"], expected_order)
+        operation = self.store.next_ready_operation(self.context["local_key"])
+        self.assertIsNotNone(operation)
+        self.assertEqual(
+            json.loads(operation["content"])["tree_order"], expected_order
+        )
+        return operation
+
+    def test_local_rename_holds_gate_until_tree_order_enqueue_is_durable(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        manuscript = Path(self.wpm.writing_root_path, "메인", "원고", "보존.txt")
+        manuscript.write_bytes(b"preserve manuscript bytes\x00\xff")
+        manuscript_hash = hashlib.sha256(manuscript.read_bytes()).hexdigest()
+        renamed = threading.Event()
+        allow_enqueue = threading.Event()
+        remote_started = threading.Event()
+        remote_done = threading.Event()
+        errors = []
+
+        def run_local():
+            try:
+                self._persist_local_empty_folder_rename(
+                    "새 폴더F",
+                    "새 폴더H",
+                    local_order,
+                    renamed_event=renamed,
+                    allow_enqueue_event=allow_enqueue,
+                )
+            except Exception as error:
+                errors.append(error)
+
+        def run_remote():
+            remote_started.set()
+            try:
+                self._apply_direct(remote_order, revision=12)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                remote_done.set()
+
+        local_thread = threading.Thread(target=run_local)
+        remote_thread = threading.Thread(target=run_remote)
+        local_thread.start()
+        self.assertTrue(renamed.wait(5))
+        remote_thread.start()
+        self.assertTrue(remote_started.wait(5))
+        self.assertFalse(remote_done.wait(0.2))
+
+        allow_enqueue.set()
+        local_thread.join(5)
+        remote_thread.join(5)
+
+        self.assertFalse(local_thread.is_alive())
+        self.assertFalse(remote_thread.is_alive())
+        self.assertEqual(errors, [])
+        self._assert_local_tree_order_is("새 폴더H", local_order)
+        self.assertFalse(
+            Path(self.wpm.writing_root_path, "메인", "메모장", "새 폴더F").exists()
+        )
+        self.assertEqual(
+            hashlib.sha256(manuscript.read_bytes()).hexdigest(), manuscript_hash
+        )
+
+    def test_remote_plan_fetched_before_local_rename_cannot_revert_new_generation(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        remote_validating = threading.Event()
+        allow_remote_apply = threading.Event()
+        remote_done = threading.Event()
+        errors = []
+        real_validate = self.manager._validated_remote_tree_order
+
+        def pause_after_fetch(tree_order):
+            remote_validating.set()
+            if not allow_remote_apply.wait(5):
+                raise TimeoutError("remote apply test gate timed out")
+            return real_validate(tree_order)
+
+        def run_remote():
+            try:
+                self._apply_direct(remote_order, revision=12)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                remote_done.set()
+
+        with patch.object(
+            self.manager,
+            "_validated_remote_tree_order",
+            side_effect=pause_after_fetch,
+        ):
+            remote_thread = threading.Thread(target=run_remote)
+            remote_thread.start()
+            self.assertTrue(remote_validating.wait(5))
+            self._persist_local_empty_folder_rename(
+                "새 폴더F", "새 폴더H", local_order
+            )
+            allow_remote_apply.set()
+            remote_thread.join(5)
+
+        self.assertFalse(remote_thread.is_alive())
+        self.assertTrue(remote_done.is_set())
+        self.assertEqual(errors, [])
+        self._assert_local_tree_order_is("새 폴더H", local_order)
+
+    def test_remote_apply_first_then_local_rename_queues_latest_order(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+
+        change = self._apply_direct(remote_order, revision=13)
+        operation = self._persist_local_empty_folder_rename(
+            "새 폴더F", "새 폴더H", local_order
+        )
+
+        self.assertEqual(change["revision"], 13)
+        self.assertEqual(operation["base_revision"], 13)
+        self._assert_local_tree_order_is("새 폴더H", local_order)
+
+    def test_local_tree_order_pending_rename_survives_store_and_settings_restart(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        operation = self._persist_local_empty_folder_rename(
+            "새 폴더F", "새 폴더H", local_order
+        )
+
+        reloaded_wpm = WritingProjectManager.create_detached(
+            self.wpm.workspace_dir,
+            self.wpm.current_project,
+            self.wpm.writing_root_path,
+        )
+        reloaded_store = SyncV2Store(self.store.db_path)
+        recovered = reloaded_store.operation(operation["operation_id"])
+
+        self.assertEqual(reloaded_wpm.project_settings["tree_order"], local_order)
+        self.assertTrue(
+            Path(reloaded_wpm.writing_root_path, "메인", "메모장", "새 폴더H").is_dir()
+        )
+        self.assertEqual(recovered["status"], "pending")
+        self.assertEqual(
+            json.loads(recovered["content"])["tree_order"], local_order
+        )
+
+    def test_dispatched_tree_order_next_revision_contains_local_folder_name(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        operation = self._persist_local_empty_folder_rename(
+            "새 폴더F", "새 폴더H", local_order
+        )
+        main_id = str(uuid.uuid4())
+        memo_id = str(uuid.uuid4())
+        folder_id = str(uuid.uuid4())
+        self.manager.supabase = _FolderAwareClient([
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": memo_id,
+                "parent_folder_id": main_id,
+                "name": "메모장",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": folder_id,
+                "parent_folder_id": memo_id,
+                "name": "새 폴더F",
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ])
+
+        result = self.manager._process_v2_operation(operation["operation_id"])
+        folder_commit_name, folder_params = next(
+            call for call in self.manager.supabase.calls
+            if call[0] == "commit_folder"
+        )
+        commit_name, params = self.manager.supabase.calls[-1]
+        self.store.mark_success(operation["operation_id"], result["result"])
+        document = self.store.get_document_by_id(operation["document_id"])
+
+        self.assertEqual(result["kind"], "committed")
+        self.assertEqual(folder_commit_name, "commit_folder")
+        self.assertEqual(folder_params["p_folder_id"], folder_id)
+        self.assertEqual(folder_params["p_base_revision"], 2)
+        self.assertEqual(folder_params["p_parent_folder_id"], memo_id)
+        self.assertEqual(folder_params["p_name"], "새 폴더H")
+        self.assertEqual(commit_name, "commit_document")
+        self.assertEqual(params["p_base_revision"], 12)
+        self.assertEqual(
+            json.loads(params["p_content"])["tree_order"], local_order
+        )
+        self.assertEqual(document["revision"], 13)
+        self.assertEqual(
+            json.loads(document["base_content"])["tree_order"], local_order
+        )
+
+    def test_outbound_folder_rename_replay_does_not_create_second_revision(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        operation = self._persist_local_empty_folder_rename(
+            "새 폴더F", "새 폴더H", local_order
+        )
+        main_id = str(uuid.uuid4())
+        memo_id = str(uuid.uuid4())
+        folder_id = str(uuid.uuid4())
+        client = _FolderAwareClient([
+            {
+                "folder_id": main_id, "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": memo_id, "parent_folder_id": main_id,
+                "name": "메모장", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": folder_id, "parent_folder_id": memo_id,
+                "name": "새 폴더F", "revision": 2, "is_deleted": False,
+            },
+        ])
+        self.manager.supabase = client
+
+        first = self.manager._commit_outbound_folder_rename(operation, client)
+        second = self.manager._commit_outbound_folder_rename(operation, client)
+
+        self.assertEqual(first["operation_kind"], "rename")
+        self.assertIsNone(second)
+        self.assertEqual(
+            [name for name, _params in client.calls], ["commit_folder"]
+        )
+        self.assertEqual(client.folder_rows[-1]["name"], "새 폴더H")
+        self.assertEqual(client.folder_rows[-1]["revision"], 3)
+
+    def test_explicit_rename_commits_when_server_tree_already_has_new_name(self):
+        old_path = "메인/아팯_빈폴더_윈"
+        new_path = "메인/아팯_빈폴더_팯"
+        current_order = {"<root>": ["아팯_빈폴더_팯"]}
+        tree_content = self.manager._tree_order_content(current_order)
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            tree_content,
+            49,
+            local_path=TREE_ORDER_DOCUMENT_PATH,
+        )
+        self.wpm.project_settings["tree_order"] = current_order
+        self.assertTrue(self.wpm.save_settings())
+        old_folder = Path(self.wpm.writing_root_path, old_path)
+        new_folder = Path(self.wpm.writing_root_path, new_path)
+        old_folder.mkdir(parents=True)
+        os.rename(old_folder, new_folder)
+        self.manager.record_folder_rename_intent(old_path, new_path)
+
+        operation = self.manager.record_tree_order(current_order, retry=False)
+        main_id = str(uuid.uuid4())
+        folder_id = str(uuid.uuid4())
+        client = _FolderAwareClient([
+            {
+                "folder_id": main_id, "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": folder_id, "parent_folder_id": main_id,
+                "name": "아팯_빈폴더_윈", "revision": 4,
+                "is_deleted": False,
+            },
+        ])
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(operation["operation_id"])
+
+        self.assertEqual(result["kind"], "committed")
+        folder_call = next(
+            params for name, params in client.calls if name == "commit_folder"
+        )
+        self.assertEqual(folder_call["p_folder_id"], folder_id)
+        self.assertEqual(folder_call["p_base_revision"], 4)
+        self.assertEqual(folder_call["p_name"], "아팯_빈폴더_팯")
+        self.assertIsNone(self.store.pending_folder_rename_intent(
+            self.context["local_key"], old_path, new_path
+        ))
+
+    def test_outbound_folder_rename_does_not_guess_missing_folder_identity(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        operation = self._persist_local_empty_folder_rename(
+            "새 폴더F", "새 폴더H", local_order
+        )
+        client = _FolderAwareClient([])
+
+        result = self.manager._commit_outbound_folder_rename(operation, client)
+
+        self.assertIsNone(result)
+        self.assertEqual(client.calls, [])
+
+    def test_tree_order_without_explicit_local_intent_never_commits_folder(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        parent = Path(self.wpm.writing_root_path, "메인", "메모장")
+        os.rename(Path(parent, "새 폴더F"), Path(parent, "새 폴더H"))
+        operation = self.manager.record_tree_order(local_order, retry=False)
+        main_id = str(uuid.uuid4())
+        memo_id = str(uuid.uuid4())
+        client = _FolderAwareClient([
+            {
+                "folder_id": main_id, "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": memo_id, "parent_folder_id": main_id,
+                "name": "메모장", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": str(uuid.uuid4()),
+                "parent_folder_id": memo_id,
+                "name": "새 폴더F", "revision": 2, "is_deleted": False,
+            },
+        ])
+
+        result = self.manager._commit_outbound_folder_rename(operation, client)
+
+        self.assertIsNone(result)
+        self.assertEqual(client.calls, [])
+
+    def test_inconsistent_folder_identity_and_tree_order_never_mkdirs_duplicate(self):
+        main_id = str(uuid.uuid4())
+        folder_id = str(uuid.uuid4())
+        old_path = "메인/아팯_빈폴더_윈"
+        new_path = "메인/아팯_빈폴더_팯"
+        folder_rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": folder_id,
+                "parent_folder_id": main_id,
+                "name": "아팯_빈폴더_윈",
+                "revision": 4,
+                "is_deleted": False,
+            },
+        ]
+        resolved = self.manager._folder_rows_with_tree_paths(folder_rows)
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], list(resolved.values())
+        )
+        old_folder = Path(self.wpm.writing_root_path, old_path)
+        new_folder = Path(self.wpm.writing_root_path, new_path)
+        old_folder.mkdir(parents=True)
+
+        changes = self.manager._apply_v2_remote_documents(
+            [self._tree_remote({"<root>": ["아팯_빈폴더_팯"]}, revision=49)],
+            strict=True,
+            folder_rows=folder_rows,
+        )
+
+        self.assertEqual(changes, [])
+        self.assertFalse(self.manager._v2_last_pull_apply_blocked)
+        self.assertTrue(old_folder.is_dir())
+        self.assertFalse(new_folder.exists())
+        stored = self.store.get_folder_by_id(folder_id)
+        self.assertEqual(stored["local_path"], old_path)
+
+    def test_ipad_add_volume_applies_when_tree_omits_fixed_trash_root(self):
+        first_document = self._live_remote(
+            "메인/원고/1권/001화.txt", "1권 원고", revision=1
+        )
+        baseline = {
+            "<root>": ["원고", "플롯", "휴지통"],
+            "메인/원고": ["1권"],
+            "메인/원고/1권": ["001화.txt"],
+        }
+        self._apply(baseline, [first_document], revision=2)
+        second_document = self._live_remote(
+            "메인/원고/2권/002화.txt", "2권 원고", revision=1
+        )
+        ipad_order = {
+            "<root>": ["원고", "스토리 플롯"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": ["001화.txt"],
+            "메인/원고/2권": ["002화.txt"],
+        }
+        main_id = str(uuid.uuid4())
+        manuscript_id = str(uuid.uuid4())
+        folder_rows = [
+            {
+                "folder_id": main_id, "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": manuscript_id, "parent_folder_id": main_id,
+                "name": "원고", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": str(uuid.uuid4()),
+                "parent_folder_id": main_id,
+                "name": "스토리 플롯", "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": str(uuid.uuid4()),
+                "parent_folder_id": main_id,
+                "name": "휴지통", "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": str(uuid.uuid4()),
+                "parent_folder_id": manuscript_id,
+                "name": "2권", "revision": 1, "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(ipad_order, revision=3),
+                first_document,
+                second_document,
+            ],
+            strict=True,
+            folder_rows=folder_rows,
+        )
+
+        self.assertFalse(self.manager._v2_last_pull_apply_blocked)
+        self.assertTrue(changes)
+        second_path = Path(
+            self.wpm.writing_root_path, "메인", "원고", "2권", "002화.txt"
+        )
+        self.assertEqual(second_path.read_text(encoding="utf-8"), "2권 원고")
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, "메인", "스토리 플롯"
+        ).exists())
+        self.assertEqual(
+            self.wpm.project_settings["tree_order"]["메인/원고"],
+            ["1권", "2권"],
+        )
+        self.assertEqual(
+            self.wpm.project_settings["tree_order"]["<root>"],
+            ["원고", "플롯"],
+        )
+
+    def test_tree_ahead_folder_defers_only_tree_and_applies_confirmed_sibling(self):
+        main_id = str(uuid.uuid4())
+        empty_id = str(uuid.uuid4())
+        filled_id = str(uuid.uuid4())
+        old_empty = "메인/팯_빈폴더_윈"
+        new_empty = "메인/팯_빈폴더_팯"
+        old_filled = "메인/팯_든폴더_윈"
+        new_filled = "메인/팯_든폴더_팯"
+        old_document_path = f"{old_filled}/팯_문서_윈.txt"
+        new_document_path = f"{new_filled}/팯_문서_팯.txt"
+        document = self._live_remote(
+            old_document_path, "보존할 원고", revision=1
+        )
+        old_order = {
+            "<root>": ["팯_빈폴더_윈", "팯_든폴더_윈"],
+            old_filled: ["팯_문서_윈.txt"],
+        }
+        old_rows = [
+            {
+                "folder_id": main_id, "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+            {
+                "folder_id": empty_id, "parent_folder_id": main_id,
+                "name": "팯_빈폴더_윈", "revision": 2,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": filled_id, "parent_folder_id": main_id,
+                "name": "팯_든폴더_윈", "revision": 2,
+                "is_deleted": False,
+            },
+        ]
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote(old_order, revision=24), document],
+            strict=True,
+            folder_rows=old_rows,
+        )
+        before_hash = hashlib.sha256(Path(
+            self.wpm.writing_root_path, old_document_path
+        ).read_bytes()).hexdigest()
+
+        new_order = {
+            "<root>": ["팯_빈폴더_팯", "팯_든폴더_팯"],
+            new_filled: ["팯_문서_팯.txt"],
+        }
+        partial_rows = [
+            old_rows[0],
+            old_rows[1],
+            {
+                **old_rows[2],
+                "name": "팯_든폴더_팯",
+                "revision": 3,
+            },
+        ]
+        renamed_document = {
+            **document,
+            "relative_path": new_document_path,
+            "revision": 2,
+        }
+
+        partial_changes = self.manager._apply_v2_remote_documents(
+            [self._tree_remote(new_order, revision=27), renamed_document],
+            strict=True,
+            folder_rows=partial_rows,
+        )
+
+        self.assertFalse(self.manager._v2_last_pull_apply_blocked)
+        self.assertTrue(partial_changes)
+        self.assertTrue(Path(self.wpm.writing_root_path, old_empty).is_dir())
+        self.assertFalse(Path(self.wpm.writing_root_path, new_empty).exists())
+        self.assertFalse(Path(self.wpm.writing_root_path, old_filled).exists())
+        renamed_document_file = Path(
+            self.wpm.writing_root_path, new_document_path
+        )
+        self.assertTrue(renamed_document_file.is_file())
+        self.assertEqual(
+            hashlib.sha256(renamed_document_file.read_bytes()).hexdigest(),
+            before_hash,
+        )
+        tree_document = self.store.get_document_by_id(self.tree_document_id)
+        self.assertEqual(tree_document["revision"], 24)
+
+        complete_rows = [
+            old_rows[0],
+            {
+                **old_rows[1],
+                "name": "팯_빈폴더_팯",
+                "revision": 3,
+            },
+            partial_rows[2],
+        ]
+        completed_changes = self.manager._apply_v2_remote_documents(
+            [self._tree_remote(new_order, revision=27), renamed_document],
+            strict=True,
+            folder_rows=complete_rows,
+        )
+
+        self.assertTrue(completed_changes)
+        self.assertFalse(Path(self.wpm.writing_root_path, old_empty).exists())
+        self.assertTrue(Path(self.wpm.writing_root_path, new_empty).is_dir())
+        self.assertEqual(
+            self.store.get_document_by_id(self.tree_document_id)["revision"],
+            27,
+        )
+        self.assertEqual(
+            self.wpm.project_settings["tree_order"]["<root>"],
+            ["팯_빈폴더_팯", "팯_든폴더_팯"],
+        )
+
+    def test_outbound_folder_identity_never_touches_nonempty_renamed_folder(self):
+        remote_order = {"메인/메모장": ["새 폴더F"]}
+        local_order = {"메인/메모장": ["새 폴더H"]}
+        self._apply(remote_order, revision=12)
+        operation = self._persist_local_empty_folder_rename(
+            "새 폴더F", "새 폴더H", local_order
+        )
+        manuscript = Path(
+            self.wpm.writing_root_path,
+            "메인", "메모장", "새 폴더H", "보존.txt",
+        )
+        manuscript.write_bytes(b"never alter manuscript bytes\x00\xff")
+        before_hash = hashlib.sha256(manuscript.read_bytes()).hexdigest()
+        client = _FolderAwareClient([{
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": None,
+            "name": "새 폴더F",
+            "revision": 2,
+            "is_deleted": False,
+        }])
+
+        result = self.manager._commit_outbound_folder_rename(operation, client)
+
+        self.assertIsNone(result)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(
+            hashlib.sha256(manuscript.read_bytes()).hexdigest(), before_hash
+        )
+
+    def test_remote_folder_rename_moves_directory_once_without_old_empty_copy(self):
+        old_folder = "메인/새 폴더"
+        new_folder = "메인/새 폴 더"
+        documents = []
+        for relative_leaf, content in (
+            ("첫 문서.txt", "첫 내용"),
+            ("하위 폴더/둘째 문서.txt", "둘째 내용"),
+        ):
+            document_id = str(uuid.uuid4())
+            old_path = f"{old_folder}/{relative_leaf}"
+            new_path = f"{new_folder}/{relative_leaf}"
+            self.assertTrue(self.wpm.write_text_file(old_path, content))
+            applied = self.store.apply_remote_snapshot(
+                self.context, document_id, old_path, content, 1
+            )
+            self.assertTrue(applied["applied"])
+            documents.append({
+                "document_id": document_id,
+                "relative_path": new_path,
+                "content": content,
+                "revision": 2,
+                "is_deleted": False,
+            })
+        old_order = {
+            "<root>": ["새 폴더"],
+            old_folder: ["첫 문서.txt", "하위 폴더"],
+            f"{old_folder}/하위 폴더": ["둘째 문서.txt"],
+        }
+        self.wpm.project_settings["tree_order"] = old_order
+        self.assertTrue(self.wpm.save_settings())
+        new_order = {
+            "<root>": ["새 폴 더"],
+            new_folder: ["첫 문서.txt", "하위 폴더"],
+            f"{new_folder}/하위 폴더": ["둘째 문서.txt"],
+        }
+
+        real_rename = os.rename
+        with patch("sync_manager.os.rename", wraps=real_rename) as rename:
+            changes = self._apply(new_order, documents, revision=2)
+
+        root = Path(self.wpm.writing_root_path)
+        self.assertFalse(Path(root, old_folder).exists())
+        self.assertTrue(Path(root, new_folder).is_dir())
+        self.assertEqual(
+            Path(root, new_folder, "첫 문서.txt").read_text(encoding="utf-8"),
+            "첫 내용",
+        )
+        self.assertEqual(
+            Path(root, new_folder, "하위 폴더", "둘째 문서.txt").read_text(
+                encoding="utf-8"
+            ),
+            "둘째 내용",
+        )
+        self.assertEqual(rename.call_count, 1)
+        renamed_from, renamed_to = rename.call_args.args
+        self.assertEqual(
+            os.path.normpath(renamed_from), os.path.normpath(root / old_folder)
+        )
+        self.assertEqual(
+            os.path.normpath(renamed_to), os.path.normpath(root / new_folder)
+        )
+        self.assertEqual(self.wpm.project_settings["tree_order"], new_order)
+        self.assertEqual(
+            {
+                self.store.get_document_by_id(item["document_id"])["local_path"]
+                for item in documents
+            },
+            {
+                f"{new_folder}/첫 문서.txt",
+                f"{new_folder}/하위 폴더/둘째 문서.txt",
+            },
+        )
+        self.assertEqual(len(changes), 3)
+
+    @staticmethod
+    def _folder_identity_fixture(old_name, new_name, revision=2):
+        main_id = str(uuid.uuid4())
+        folder_id = str(uuid.uuid4())
+        rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": folder_id,
+                "parent_folder_id": main_id,
+                "name": new_name,
+                "revision": revision,
+                "is_deleted": False,
+            },
+        ]
+        versions = [
+            {
+                "folder_id": folder_id,
+                "parent_folder_id": main_id,
+                "name": old_name,
+                "revision": revision - 1,
+                "is_deleted": False,
+                "operation_kind": "rename",
+            },
+            {
+                "folder_id": folder_id,
+                "parent_folder_id": main_id,
+                "name": new_name,
+                "revision": revision,
+                "is_deleted": False,
+                "operation_kind": "rename",
+            },
+        ]
+        return folder_id, rows, versions
+
+    def _seed_nonempty_folder_identity_document(self, old_folder):
+        old_document = f"{old_folder}/보존.txt"
+        content = "절대 변경되면 안 되는 원고 \x00 바이트"
+        document_id = str(uuid.uuid4())
+        self.assertTrue(self.wpm.write_text_file(old_document, content))
+        applied = self.store.apply_remote_snapshot(
+            self.context, document_id, old_document, content, 1
+        )
+        self.assertTrue(applied["applied"])
+        old_order = {
+            "<root>": [old_folder.removeprefix("메인/")],
+            old_folder: ["보존.txt"],
+        }
+        self._apply_direct(old_order, revision=1, live_paths={old_document})
+        return document_id, old_document, content, old_order
+
+    def test_folder_id_renames_nonempty_directory_before_child_document_apply(self):
+        old_folder = "메인/든폴더_윈"
+        new_folder = "메인/든폴더_팏"
+        document_id, old_document, content, _old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        new_document = f"{new_folder}/보존.txt"
+        new_order = {
+            "<root>": ["든폴더_팏"],
+            new_folder: ["보존.txt"],
+        }
+        folder_id, rows, versions = self._folder_identity_fixture(
+            "든폴더_윈", "든폴더_팏"
+        )
+        source = Path(self.wpm.writing_root_path, old_document)
+        before_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        remote = [
+            self._tree_remote(new_order, revision=2),
+            {
+                "document_id": document_id,
+                "relative_path": new_document,
+                "content": content,
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            remote,
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        self.assertFalse(Path(self.wpm.writing_root_path, old_folder).exists())
+        target = Path(self.wpm.writing_root_path, new_document)
+        self.assertTrue(target.is_file())
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), before_hash)
+        self.assertEqual(
+            self.store.get_document_by_id(document_id)["local_path"], new_document
+        )
+        stored_folder = self.store.get_folder_by_id(folder_id)
+        self.assertEqual(stored_folder["local_path"], new_folder)
+        self.assertEqual(stored_folder["revision"], 2)
+        self.assertTrue(any(
+            change.get("kind") == "folder_identity_rename"
+            for change in changes
+        ))
+
+    def test_folder_id_rename_projects_stale_child_parent_without_data_loss(self):
+        old_folder = "메인/빠른변경_윈"
+        new_folder = "메인/빠른변경_팯"
+        document_id, old_document, content, _old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        new_document = f"{new_folder}/보존.txt"
+        folder_id, rows, versions = self._folder_identity_fixture(
+            "빠른변경_윈", "빠른변경_팯"
+        )
+        new_order = {
+            "<root>": ["빠른변경_팯"],
+            new_folder: ["보존.txt"],
+        }
+        source = Path(self.wpm.writing_root_path, old_document)
+        before_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        remote = [
+            self._tree_remote(new_order, revision=2),
+            {
+                "document_id": document_id,
+                # commit_folder is newer, but this child projection still has
+                # the old parent prefix.
+                "relative_path": old_document,
+                "content": content,
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+        self.manager._v2_active_paths_provider = lambda: {old_document}
+
+        first = self.manager._apply_v2_remote_documents(
+            remote,
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+        repeated = self.manager._apply_v2_remote_documents(
+            remote,
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        target = Path(self.wpm.writing_root_path, new_document)
+        self.assertFalse(Path(self.wpm.writing_root_path, old_folder).exists())
+        self.assertTrue(target.is_file())
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), before_hash)
+        stored = self.store.get_document_by_id(document_id)
+        self.assertEqual(stored["local_path"], new_document)
+        self.assertEqual(stored["server_path"], old_document)
+        self.assertEqual(self.store.get_folder_by_id(folder_id)["local_path"], new_folder)
+        self.assertTrue(any(
+            change.get("kind") == "folder_identity_rename" for change in first
+        ))
+        self.assertEqual(repeated, [])
+
+    def test_fast_folder_and_missing_document_rename_never_creates_txt_directory(self):
+        old_folder = "메인/동시변경_윈"
+        new_folder = "메인/동시변경_팯"
+        document_id, old_document, content, old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        new_document = f"{new_folder}/새 문서_팯.txt"
+        old_leaf_after_folder = f"{new_folder}/보존.txt"
+        _folder_id, rows, versions = self._folder_identity_fixture(
+            "동시변경_윈", "동시변경_팯"
+        )
+        remote_order = {
+            "<root>": ["동시변경_팯"],
+            new_folder: ["새 문서_팯.txt"],
+        }
+        before_hash = hashlib.sha256(
+            Path(self.wpm.writing_root_path, old_document).read_bytes()
+        ).hexdigest()
+        remote = [
+            self._tree_remote(remote_order, revision=2),
+            {
+                "document_id": document_id,
+                # The iPad tree changed the leaf, but commit_document has not
+                # reached the server projection yet.
+                "relative_path": old_document,
+                "content": content,
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            remote,
+            strict=False,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        preserved = Path(self.wpm.writing_root_path, old_leaf_after_folder)
+        self.assertTrue(preserved.is_file())
+        self.assertFalse(Path(self.wpm.writing_root_path, new_document).exists())
+        self.assertEqual(
+            hashlib.sha256(preserved.read_bytes()).hexdigest(), before_hash
+        )
+        self.assertEqual(
+            self.store.get_document_by_id(document_id)["local_path"],
+            old_leaf_after_folder,
+        )
+        self.assertEqual(
+            self.wpm.project_settings["tree_order"], old_order
+        )
+        self.assertTrue(any(
+            change.get("kind") == "folder_identity_rename" for change in changes
+        ))
+
+    def test_partial_document_snapshot_waits_for_matching_tree_order(self):
+        old_folder = "메인/순서_이전"
+        new_folder = "메인/순서_이후"
+        document_id, old_document, content, old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        new_document = f"{new_folder}/보존.txt"
+        _folder_id, rows, versions = self._folder_identity_fixture(
+            "순서_이전", "순서_이후"
+        )
+        partial = [
+            self._tree_remote(old_order, revision=1),
+            {
+                "document_id": document_id,
+                "relative_path": new_document,
+                "content": content,
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ]
+
+        changes = self.manager._apply_v2_remote_documents(
+            partial,
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        self.assertEqual(changes, [])
+        self.assertTrue(self.manager._v2_last_pull_apply_blocked)
+        self.assertTrue(Path(self.wpm.writing_root_path, old_document).is_file())
+        self.assertFalse(Path(self.wpm.writing_root_path, new_folder).exists())
+        self.assertEqual(
+            self.store.get_document_by_id(document_id)["local_path"], old_document
+        )
+
+    def test_folder_id_repairs_only_exact_empty_source_residue(self):
+        old_folder = "메인/남은_예전폴더"
+        new_folder = "메인/서버_새폴더"
+        document_id, old_document, content, _old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        new_document = f"{new_folder}/보존.txt"
+        os.makedirs(Path(self.wpm.writing_root_path, new_folder), exist_ok=True)
+        os.rename(
+            Path(self.wpm.writing_root_path, old_document),
+            Path(self.wpm.writing_root_path, new_document),
+        )
+        applied = self.store.apply_remote_snapshot(
+            self.context, document_id, new_document, content, 2
+        )
+        self.assertTrue(applied["applied"])
+        new_order = {
+            "<root>": ["서버_새폴더"],
+            new_folder: ["보존.txt"],
+        }
+        folder_id, rows, versions = self._folder_identity_fixture(
+            "남은_예전폴더", "서버_새폴더"
+        )
+        before_hash = hashlib.sha256(
+            Path(self.wpm.writing_root_path, new_document).read_bytes()
+        ).hexdigest()
+        self.manager._v2_active_paths_provider = lambda: {new_document}
+
+        self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(new_order, revision=2),
+                {
+                    "document_id": document_id,
+                    "relative_path": new_document,
+                    "content": content,
+                    "revision": 2,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        self.assertFalse(Path(self.wpm.writing_root_path, old_folder).exists())
+        target = Path(self.wpm.writing_root_path, new_document)
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), before_hash)
+        self.assertEqual(
+            self.store.get_folder_by_id(folder_id)["local_path"], new_folder
+        )
+
+    def test_folder_id_collision_preserves_both_nonempty_directories(self):
+        old_folder = "메인/충돌_이전"
+        new_folder = "메인/충돌_이후"
+        document_id, old_document, content, _old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        target_collision = Path(
+            self.wpm.writing_root_path, new_folder, "다른 원고.txt"
+        )
+        target_collision.parent.mkdir(parents=True)
+        target_collision.write_bytes(b"unrelated target bytes\x00\xff")
+        old_hash = hashlib.sha256(
+            Path(self.wpm.writing_root_path, old_document).read_bytes()
+        ).hexdigest()
+        target_hash = hashlib.sha256(target_collision.read_bytes()).hexdigest()
+        new_order = {
+            "<root>": ["충돌_이후"],
+            new_folder: ["보존.txt", "다른 원고.txt"],
+        }
+        _folder_id, rows, versions = self._folder_identity_fixture(
+            "충돌_이전", "충돌_이후"
+        )
+
+        changes = self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(new_order, revision=2),
+                {
+                    "document_id": document_id,
+                    "relative_path": f"{new_folder}/보존.txt",
+                    "content": content,
+                    "revision": 2,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        self.assertEqual(changes, [])
+        self.assertTrue(Path(self.wpm.writing_root_path, old_document).is_file())
+        self.assertEqual(
+            hashlib.sha256(
+                Path(self.wpm.writing_root_path, old_document).read_bytes()
+            ).hexdigest(),
+            old_hash,
+        )
+        self.assertEqual(
+            hashlib.sha256(target_collision.read_bytes()).hexdigest(), target_hash
+        )
+
+    def test_folder_id_rename_waits_for_local_document_operation(self):
+        old_folder = "메인/로컬작업_이전"
+        new_folder = "메인/로컬작업_이후"
+        document_id, old_document, content, _old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        operation = self.store.enqueue(
+            self.context,
+            old_document,
+            content + " 로컬 수정",
+            relative_path=old_document,
+        )
+        new_order = {
+            "<root>": ["로컬작업_이후"],
+            new_folder: ["보존.txt"],
+        }
+        _folder_id, rows, versions = self._folder_identity_fixture(
+            "로컬작업_이전", "로컬작업_이후"
+        )
+        before_hash = hashlib.sha256(
+            Path(self.wpm.writing_root_path, old_document).read_bytes()
+        ).hexdigest()
+
+        changes = self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(new_order, revision=2),
+                {
+                    "document_id": document_id,
+                    "relative_path": f"{new_folder}/보존.txt",
+                    "content": content,
+                    "revision": 2,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=rows,
+            folder_versions=versions,
+        )
+
+        self.assertEqual(changes, [])
+        self.assertTrue(Path(self.wpm.writing_root_path, old_document).is_file())
+        self.assertFalse(Path(self.wpm.writing_root_path, new_folder).exists())
+        self.assertEqual(
+            hashlib.sha256(
+                Path(self.wpm.writing_root_path, old_document).read_bytes()
+            ).hexdigest(),
+            before_hash,
+        )
+        self.assertEqual(
+            self.store.operation(operation["operation_id"])["status"], "pending"
+        )
+
+    def test_folder_id_mapping_survives_restart_without_history_fetch(self):
+        old_folder = "메인/재시작_이전"
+        new_folder = "메인/재시작_이후"
+        document_id, old_document, content, old_order = (
+            self._seed_nonempty_folder_identity_document(old_folder)
+        )
+        folder_id, initial_rows, _versions = self._folder_identity_fixture(
+            "재시작_이전", "재시작_이전", revision=1
+        )
+        self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(old_order, revision=1),
+                {
+                    "document_id": document_id,
+                    "relative_path": old_document,
+                    "content": content,
+                    "revision": 1,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=initial_rows,
+            folder_versions=[],
+        )
+        reopened = SyncV2Store(self.store.db_path)
+        self.manager._v2_store = reopened
+        new_document = f"{new_folder}/보존.txt"
+        new_order = {
+            "<root>": ["재시작_이후"],
+            new_folder: ["보존.txt"],
+        }
+        main_id = initial_rows[0]["folder_id"]
+        renamed_rows = [
+            initial_rows[0],
+            {
+                "folder_id": folder_id,
+                "parent_folder_id": main_id,
+                "name": "재시작_이후",
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ]
+
+        self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(new_order, revision=2),
+                {
+                    "document_id": document_id,
+                    "relative_path": new_document,
+                    "content": content,
+                    "revision": 2,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=renamed_rows,
+            folder_versions=[],
+        )
+
+        self.assertFalse(Path(self.wpm.writing_root_path, old_folder).exists())
+        self.assertTrue(Path(self.wpm.writing_root_path, new_document).is_file())
+        self.assertEqual(
+            reopened.get_folder_by_id(folder_id)["local_path"], new_folder
+        )
+
+    def test_already_applied_active_folder_does_not_block_other_empty_rename(self):
+        main_id = str(uuid.uuid4())
+        active_folder_id = str(uuid.uuid4())
+        empty_folder_id = str(uuid.uuid4())
+        active_old = "메인/든폴더_이전"
+        active_new = "메인/든폴더_이후"
+        active_document = f"{active_new}/열린 원고.txt"
+        empty_old = "메인/빈폴더_이전"
+        empty_new = "메인/빈폴더_이후"
+        content = "열려 있지만 이미 옮겨진 문서"
+        self.assertTrue(self.wpm.write_text_file(active_document, content))
+        document_id = str(uuid.uuid4())
+        applied = self.store.apply_remote_snapshot(
+            self.context, document_id, active_document, content, 2
+        )
+        self.assertTrue(applied["applied"])
+        Path(self.wpm.writing_root_path, empty_old).mkdir(parents=True)
+        self.store.replace_folder_snapshots(self.context["local_key"], [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "local_path": "메인",
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": active_folder_id,
+                "parent_folder_id": main_id,
+                "local_path": active_old,
+                "name": "든폴더_이전",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": empty_folder_id,
+                "parent_folder_id": main_id,
+                "local_path": empty_old,
+                "name": "빈폴더_이전",
+                "revision": 1,
+                "is_deleted": False,
+            },
+        ])
+        folder_rows = [
+            {
+                "folder_id": main_id,
+                "parent_folder_id": None,
+                "name": "메인",
+                "revision": 1,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": active_folder_id,
+                "parent_folder_id": main_id,
+                "name": "든폴더_이후",
+                "revision": 2,
+                "is_deleted": False,
+            },
+            {
+                "folder_id": empty_folder_id,
+                "parent_folder_id": main_id,
+                "name": "빈폴더_이후",
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ]
+        tree_order = {
+            "<root>": ["든폴더_이후", "빈폴더_이후"],
+            active_new: ["열린 원고.txt"],
+            empty_new: [],
+        }
+        self.manager._v2_active_paths_provider = lambda: {active_document}
+
+        changes = self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(tree_order, revision=2),
+                {
+                    "document_id": document_id,
+                    "relative_path": active_document,
+                    "content": content,
+                    "revision": 2,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=folder_rows,
+            folder_versions=[],
+        )
+
+        self.assertFalse(self.manager._v2_last_pull_apply_blocked)
+        self.assertFalse(Path(self.wpm.writing_root_path, empty_old).exists())
+        self.assertTrue(Path(self.wpm.writing_root_path, empty_new).is_dir())
+        self.assertTrue(Path(self.wpm.writing_root_path, active_document).is_file())
+        self.assertEqual(
+            self.store.get_folder_by_id(empty_folder_id)["local_path"], empty_new
+        )
+        self.assertTrue(any(
+            change.get("folder_id") == empty_folder_id for change in changes
+        ))
+
+    def test_existing_tree_order_baseline_repairs_folders_missing_from_old_receiver(self):
+        tree_order = {"<root>": ["기존 baseline 빈 폴더"]}
+        content = self.manager._tree_order_content(tree_order)
+        self.wpm.project_settings["tree_order"] = tree_order
+        self.assertTrue(self.wpm.save_settings())
+        applied = self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            content,
+            1,
+            local_path=TREE_ORDER_DOCUMENT_PATH,
+        )
+        self.assertTrue(applied["applied"])
+
+        change = self._apply_direct(tree_order)
+
+        self.assertEqual(change["kind"], "tree_order")
+        self.assertTrue(
+            Path(
+                self.wpm.writing_root_path, "메인", "기존 baseline 빈 폴더"
+            ).is_dir()
+        )
+
+    def test_remote_tree_order_rejects_file_case_and_unicode_collisions(self):
+        parent = Path(self.wpm.writing_root_path, "메인", "13-2 테스트")
+        parent.mkdir(parents=True)
+        Path(parent, "파일 충돌").write_text("보존", encoding="utf-8")
+        Path(parent, "CaseFolder").mkdir()
+        nfd_name = unicodedata.normalize("NFD", "한글폴더")
+        Path(parent, nfd_name).mkdir()
+
+        for name in ("파일 충돌", "casefolder", "한글폴더"):
+            with self.subTest(name=name):
+                with self.assertRaises(FileExistsError):
+                    self._apply_direct({
+                        "<root>": ["13-2 테스트"],
+                        "메인/13-2 테스트": [name],
+                    })
+        self.assertEqual(Path(parent, "파일 충돌").read_text(encoding="utf-8"), "보존")
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_rejects_unsafe_paths_reserved_names_and_duplicates(self):
+        invalid_orders = (
+            {"C:/탈출": ["폴더"]},
+            {"메인/../탈출": ["폴더"]},
+            {"<root>": ["CON"]},
+            {"<root>": ["중복", "중복"]},
+            {"<root>": ["Case", "case"]},
+            {"<root>": ["끝점."]},
+            {"<root>": ["__antigravity__"]},
+            {"<root>": ["C:\\절대경로"]},
+            {"<root>": ["가" * 256]},
+            {"메인/Case": [], "메인/case": []},
+        )
+
+        for tree_order in invalid_orders:
+            with self.subTest(tree_order=tree_order):
+                with self.assertRaises((ValueError, FileExistsError)):
+                    self._apply_direct(tree_order)
+        invalid_type_content = json.dumps({
+            "version": 1,
+            "tree_order": {"<root>": [123]},
+        })
+        with self.assertRaises(ValueError):
+            self.manager._apply_remote_tree_order_document(
+                self.tree_document_id, invalid_type_content, 1
+            )
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_never_follows_symbolic_link(self):
+        outside = Path(self.temp.name, "outside")
+        outside.mkdir()
+        link = Path(self.wpm.writing_root_path, "메인", "연결 폴더")
+        try:
+            os.symlink(outside, link, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symbolic link 생성 권한 없음: {error}")
+
+        with self.assertRaises(FileExistsError):
+            self._apply_direct({"<root>": ["연결 폴더"]})
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_rejects_existing_reparse_point(self):
+        candidate = Path(self.wpm.writing_root_path, "메인", "연결 폴더")
+        candidate.mkdir()
+        real_is_reparse = self.manager._is_reparse_path
+
+        with patch.object(
+            SyncManager,
+            "_is_reparse_path",
+            side_effect=lambda path: (
+                os.path.abspath(path) == os.path.abspath(candidate)
+                or real_is_reparse(path)
+            ),
+        ):
+            with self.assertRaises(FileExistsError):
+                self._apply_direct({"<root>": ["연결 폴더"]})
+        self.assertTrue(candidate.is_dir())
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_preserves_trash_and_never_creates_remote_trash_folders(self):
+        self.wpm.project_settings["tree_order"] = {
+            "메인/휴지통": ["로컬 보관본.txt"],
+            "메인/휴지통/로컬 폴더": ["로컬 하위.txt"],
+        }
+        tree_order = {
+            "<root>": ["새 빈 폴더"],
+            "메인/휴지통": ["원격 폴더"],
+            "메인/휴지통/원격 폴더": ["하위 원격 폴더"],
+        }
+
+        self._apply(tree_order)
+
+        trash_order = self.wpm.project_settings["tree_order"]
+        self.assertEqual(trash_order["메인/휴지통"], ["로컬 보관본.txt"])
+        self.assertEqual(
+            trash_order["메인/휴지통/로컬 폴더"], ["로컬 하위.txt"]
+        )
+        self.assertFalse(
+            Path(self.wpm.writing_root_path, "메인", "휴지통", "원격 폴더").exists()
+        )
+
+    def test_remote_tree_order_rolls_back_new_folders_when_creation_fails(self):
+        tree_order = {
+            "<root>": ["13-2 테스트"],
+            "메인/13-2 테스트": ["첫 폴더"],
+            "메인/13-2 테스트/첫 폴더": ["둘째 폴더"],
+        }
+        real_mkdir = os.mkdir
+
+        def fail_second_folder(path, *args, **kwargs):
+            if str(path).endswith("둘째 폴더"):
+                raise OSError("의도한 생성 실패")
+            return real_mkdir(path, *args, **kwargs)
+
+        with patch("sync_manager.os.mkdir", side_effect=fail_second_folder):
+            with self.assertRaises(OSError):
+                self._apply_direct(tree_order)
+
+        self.assertFalse(
+            Path(self.wpm.writing_root_path, "메인", "13-2 테스트").exists()
+        )
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_settings_failure_does_not_advance_baseline(self):
+        tree_order = {"<root>": ["저장 실패 폴더"]}
+
+        with patch.object(self.wpm, "save_settings", return_value=False):
+            with self.assertRaises(OSError):
+                self._apply_direct(tree_order)
+
+        self.assertFalse(Path(self.wpm.writing_root_path, "메인", "저장 실패 폴더").exists())
+        self.assertNotIn("tree_order", self.wpm.project_settings)
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_cas_failure_rolls_back_only_new_empty_directories(self):
+        existing = Path(self.wpm.writing_root_path, "메인", "기존 폴더")
+        existing.mkdir()
+        marker = Path(existing, "보존.txt")
+        marker.write_text("보존", encoding="utf-8")
+        tree_order = {
+            "<root>": ["기존 폴더", "새 폴더"],
+            "메인/새 폴더": ["새 하위 폴더"],
+        }
+
+        with patch.object(
+            self.store,
+            "apply_remote_snapshot",
+            return_value={"applied": False, "reason": "not_newer"},
+        ):
+            with self.assertRaises(RuntimeError):
+                self._apply_direct(tree_order)
+
+        self.assertTrue(existing.is_dir())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "보존")
+        self.assertFalse(Path(self.wpm.writing_root_path, "메인", "새 폴더").exists())
+        self.assertNotIn("tree_order", self.wpm.project_settings)
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+        change = self._apply_direct(tree_order)
+        self.assertEqual(change["kind"], "tree_order")
+        self.assertTrue(
+            Path(self.wpm.writing_root_path, "메인", "새 폴더", "새 하위 폴더").is_dir()
+        )
+
+    def test_remote_tree_order_rollback_keeps_folder_that_became_nonempty(self):
+        tree_order = {
+            "<root>": ["새 폴더"],
+            "메인/새 폴더": ["새 하위 폴더"],
+        }
+        deepest = Path(
+            self.wpm.writing_root_path, "메인", "새 폴더", "새 하위 폴더"
+        )
+
+        def fail_after_external_write(*_args, **_kwargs):
+            Path(deepest, "동시 생성.txt").write_text("보존", encoding="utf-8")
+            return {"applied": False, "reason": "active_operations"}
+
+        with patch.object(
+            self.store, "apply_remote_snapshot", side_effect=fail_after_external_write
+        ):
+            with self.assertRaises(RuntimeError):
+                self._apply_direct(tree_order)
+
+        self.assertEqual(
+            Path(deepest, "동시 생성.txt").read_text(encoding="utf-8"), "보존"
+        )
+        self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
+
+    def test_remote_tree_order_notification_refreshes_once_without_outbound_echo(self):
+        panel = SimpleNamespace(
+            _schedule_remote_tree_refresh=MagicMock(),
+            _refresh_storage_status_for_editor_state=MagicMock(),
+            save_tree_order=MagicMock(),
+        )
+
+        WritingModeWidget.on_remote_documents_applied(
+            panel, [{"kind": "tree_order"}]
+        )
+
+        panel._schedule_remote_tree_refresh.assert_called_once_with()
+        panel.save_tree_order.assert_not_called()
 
 
 class WritingManualSaveTestCase(unittest.TestCase):

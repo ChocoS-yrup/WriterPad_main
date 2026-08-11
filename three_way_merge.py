@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, unified_diff
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,39 @@ def _ensure_newline(lines):
 def _line_tokens(value):
     """Normalize editor text into independent line tokens for line-based merging."""
     return [line + "\n" for line in value.splitlines()]
+
+
+def _unified_diff_section(base, changed, changed_label):
+    lines = unified_diff(
+        base.splitlines(keepends=True),
+        changed.splitlines(keepends=True),
+        fromfile="마지막 공통본",
+        tofile=changed_label,
+        n=3,
+        lineterm="\n",
+    )
+    normalized = [
+        line if line.endswith(("\n", "\r")) else line + "\n"
+        for line in lines
+    ]
+    return "".join(normalized) or "(변경 없음)\n"
+
+
+def build_conflict_report(base, local, remote):
+    """Build a human-readable comparison without changing canonical merge markers."""
+    return (
+        "3방향 병합 충돌 차이점 비교\n"
+        "\n"
+        "이 파일은 충돌 해결을 돕는 참고용입니다.\n"
+        "원문과 서버 최신본은 자동으로 덮어쓰지 않았습니다.\n"
+        "'-' 줄은 마지막 공통본에서 빠진 내용이고, '+' 줄은 추가된 내용입니다.\n"
+        "\n"
+        "========== 마지막 공통본 → 내 로컬 편집본 ==========\n"
+        f"{_unified_diff_section(base, local, '내 로컬 편집본')}"
+        "\n"
+        "========== 마지막 공통본 → 서버 최신본 ==========\n"
+        f"{_unified_diff_section(base, remote, '서버 최신본')}"
+    )
 
 
 def three_way_merge(base, local, remote):

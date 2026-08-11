@@ -1,20 +1,134 @@
+import copy
 import os
 import re
+import unicodedata
+from contextlib import nullcontext
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QTextEdit, QLabel,
     QComboBox, QToolButton, QFrame, QMenu, QMessageBox,
-    QLineEdit, QDialog, QListWidget, QListWidgetItem,
+    QLineEdit, QDialog, QListWidget, QListWidgetItem, QAbstractItemView,
     QToolBar, QSizePolicy, QTextBrowser, QTabWidget, QFileDialog
 )
 from PyQt6.QtGui import QAction, QShortcut, QKeySequence, QPixmap, QPainter, QIcon, QFont
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
 
 from writing_backup import HistoryViewerDialog
+from binder_order import (
+    canonical_manuscript_children,
+    canonical_root_children,
+    canonical_root_storage_name,
+)
+from project_paths import LocalProjectPathError, normalize_local_entry_name
 
 
 class WritingTreeMixin:
+    FIXED_ROOT_NODES = (
+        ("📚 원고", "메인/원고"),
+        ("👤 캐릭터", "메인/캐릭터"),
+        ("📖 설정집", "메인/설정집"),
+        ("📝 메모장", "메인/메모장"),
+        ("🗺️ 스토리 플롯", "메인/플롯"),
+        ("🌊 흐름 정리", "메인/흐름정리"),
+        ("🔍 복선", "메인/복선"),
+        ("📌 장소", "메인/장소"),
+        ("🗑️ 휴지통", "메인/휴지통"),
+    )
+    def _show_temporary_invalid_name_message(self):
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle("이름 변경")
+        message_box.setIcon(QMessageBox.Icon.Warning)
+        message_box.setText("지원하지 않는 파일명 입니다.")
+        message_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        message_box.setModal(False)
+        message_box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        message_box.show()
+
+        active_boxes = getattr(self, "_temporary_name_message_boxes", None)
+        if active_boxes is None:
+            active_boxes = []
+            self._temporary_name_message_boxes = active_boxes
+        active_boxes.append(message_box)
+
+        def close_message():
+            try:
+                message_box.close()
+            except RuntimeError:
+                pass
+            if message_box in active_boxes:
+                active_boxes.remove(message_box)
+
+        QTimer.singleShot(2000, close_message)
+        return message_box
+
+    def _finish_item_name_edit(self, item, is_folder):
+        item_flags = (
+            Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsEnabled
+        )
+        if is_folder:
+            item_flags |= Qt.ItemFlag.ItemIsDropEnabled
+        try:
+            previous_signal_state = self.binder_tree.blockSignals(True)
+        except (AttributeError, RuntimeError):
+            previous_signal_state = None
+        try:
+            item.setFlags(item_flags)
+        finally:
+            if previous_signal_state is not None:
+                try:
+                    self.binder_tree.blockSignals(previous_signal_state)
+                except RuntimeError:
+                    pass
+
+    @classmethod
+    def _normalize_fixed_root_order(cls, root_order):
+        normalized = []
+        seen = set()
+        for name in canonical_root_children(root_order):
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(name)
+        return normalized
+
+    def _apply_saved_root_order(self, root_order):
+        """Apply logical 메인 child order while keeping fixed root invariants."""
+        preferred = {
+            canonical_root_storage_name(name).casefold(): index
+            for index, name in enumerate(root_order or [])
+        }
+        items = [
+            self.binder_tree.takeTopLevelItem(0)
+            for _ in range(self.binder_tree.topLevelItemCount())
+        ]
+
+        def sort_key(index_and_item):
+            original_index, item = index_and_item
+            rel_path = str(
+                item.data(0, Qt.ItemDataRole.UserRole) or ""
+            ).replace("\\", "/")
+            if rel_path == "메인/원고":
+                return (-1, 0, original_index)
+            if rel_path == "메인/휴지통":
+                return (2, 0, original_index)
+            names = {
+                canonical_root_storage_name(item.text(0)).casefold(),
+                canonical_root_storage_name(
+                    os.path.basename(rel_path)
+                ).casefold(),
+            }
+            positions = [preferred[name] for name in names if name in preferred]
+            if positions:
+                return (0, min(positions), original_index)
+            return (1, original_index, original_index)
+
+        for _index, item in sorted(enumerate(items), key=sort_key):
+            self.binder_tree.addTopLevelItem(item)
+
     def _schedule_remote_tree_refresh(self):
         """Reload the binder only after every inline editor is safely closed."""
         self._remote_tree_refresh_pending = True
@@ -72,11 +186,61 @@ class WritingTreeMixin:
             is_folder = bool(item.data(0, Qt.ItemDataRole.UserRole + 1))
         except RuntimeError:
             return False
-        if rel_path and not is_folder and hasattr(self, "sync_manager"):
-            self.sync_manager.record_path_change(rel_path, rel_path)
-        self._finish_tree_item_creation(item)
-        self.save_tree_order()
-        return True
+        sync_manager = getattr(self, "sync_manager", None)
+        if not hasattr(getattr(self, "wpm", None), "project_settings"):
+            if rel_path and not is_folder and sync_manager is not None:
+                sync_manager.record_path_change(rel_path, rel_path)
+            self._finish_tree_item_creation(item)
+            self.save_tree_order()
+            return True
+        try:
+            mutation_gate = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None else nullcontext()
+            )
+            with mutation_gate:
+                operations = []
+                if rel_path and sync_manager is not None:
+                    if is_folder:
+                        operations = sync_manager.record_path_change(
+                            rel_path, rel_path, retry=False
+                        )
+                    else:
+                        operation = sync_manager.record_created_document(
+                            rel_path, retry=False
+                        )
+                        if operation:
+                            operations = [operation]
+                self._finish_tree_item_creation(item)
+                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                if operations and any(
+                    operation.get("contract_structure_intents")
+                    for operation in operations
+                    if isinstance(operation, dict)
+                ):
+                    sync_manager.queue_contract_path_change_with_order(
+                        operations, tree_order, retry=False
+                    )
+                elif operations:
+                    self.defer_tree_order_until_operations(
+                        operations, tree_order=tree_order
+                    )
+                else:
+                    WritingTreeMixin._persist_tree_order(
+                        self, tree_order, retry=False
+                    )
+            if sync_manager is not None:
+                sync_manager.retry_pending_syncs()
+            return True
+        except Exception:
+            if sync_manager is not None and rel_path:
+                sync_manager.record_structure_recovery(
+                    rel_path, rel_path, "CREATE_DURABILITY_FAILED"
+                )
+            self._finish_tree_item_creation(item)
+            if hasattr(self, "load_tree_data"):
+                self.load_tree_data()
+            return False
 
     def _finalize_current_tree_creation(self):
         item = getattr(self, "_tree_creation_item", None)
@@ -85,6 +249,7 @@ class WritingTreeMixin:
 
     def on_tree_editor_closed(self, *_args):
         """Finish a new-item transaction even when inline editing is cancelled."""
+        editor = _args[0] if _args else None
         item = getattr(self, "_tree_creation_item", None)
         if item is None:
             item = self.binder_tree.currentItem()
@@ -92,7 +257,27 @@ class WritingTreeMixin:
         def finish_if_needed():
             self._commit_tree_item_creation(item)
 
+        def finish_flags_after_editor_destruction(*_destroyed_args):
+            try:
+                is_folder = bool(
+                    item.data(0, Qt.ItemDataRole.UserRole + 1)
+                )
+                self._finish_item_name_edit(item, is_folder)
+            except (AttributeError, RuntimeError):
+                pass
+
         QTimer.singleShot(0, finish_if_needed)
+        try:
+            if editor is not None:
+                editor.destroyed.connect(
+                    lambda *_destroyed_args: QTimer.singleShot(
+                        0, finish_flags_after_editor_destruction
+                    )
+                )
+            else:
+                QTimer.singleShot(50, finish_flags_after_editor_destruction)
+        except RuntimeError:
+            QTimer.singleShot(50, finish_flags_after_editor_destruction)
 
     def load_tree_data(self):
         """로컬 폴더를 스캔하여 트리에 동적으로 노드를 생성합니다."""
@@ -101,24 +286,28 @@ class WritingTreeMixin:
 
 
         # 고정 노드 맵핑
-        self.root_nodes = {
-            "📚 원고": "메인/원고",
-            "👤 캐릭터": "메인/캐릭터",
-            "📖 설정집": "메인/설정집",
-            "📝 메모장": "메인/메모장",
-            "🗺️ 메인 스토리 틀": "메인/플롯",
-            "🌊 흐름 정리": "메인/흐름정리",
-            "🔍 복선": "메인/복선",
-            "📌 장소": "메인/장소",
-            "🗑️ 휴지통": "메인/휴지통"
-        }
+        self.root_nodes = dict(self.FIXED_ROOT_NODES)
 
         tree_order = self.wpm.project_settings.get("tree_order", {})
-        root_order = tree_order.get("<root>", [])
+        root_order = self._normalize_fixed_root_order(
+            tree_order.get("<root>", [])
+        )
 
         sorted_root_keys = list(self.root_nodes.keys())
-        # '📚 원고'는 무조건 최상단(-1)으로 고정, 나머지는 root_order 인덱스를 따름
-        sorted_root_keys.sort(key=lambda x: -1 if x == "📚 원고" else (root_order.index(x) if x in root_order else 999))
+        root_positions = {
+            canonical_root_storage_name(name): index
+            for index, name in enumerate(root_order)
+        }
+        # '📚 원고'는 무조건 최상단(-1)으로 고정, 나머지는 공통 저장 이름의 순서를 따름
+        sorted_root_keys.sort(
+            key=lambda name: (
+                -1
+                if name == "📚 원고"
+                else root_positions.get(
+                    canonical_root_storage_name(name), 999
+                )
+            )
+        )
 
         for name in sorted_root_keys:
             relative_path = self.root_nodes[name]
@@ -142,18 +331,35 @@ class WritingTreeMixin:
                         if os.path.isdir(full_path):
                             item = QTreeWidgetItem(self.binder_tree, [d])
                             item.setData(0, Qt.ItemDataRole.UserRole, rel_path)
+                            # Custom root items must carry the same type marker
+                            # as lazily populated children.  Without it the
+                            # inline rename handler treats a reloaded empty
+                            # folder as an unknown item and silently ignores
+                            # the edit; the next refresh then shows the old disk
+                            # name again before tree-order can be enqueued.
+                            item.setData(
+                                0, Qt.ItemDataRole.UserRole + 1, True
+                            )
                             item.setIcon(0, self._get_emoji_icon("📁"))
                             self._populate_tree_level(item, full_path, rel_path)
                         elif full_path.endswith(".txt"):
                             display_text = d[:-4]
                             item = QTreeWidgetItem(self.binder_tree, [display_text])
                             item.setData(0, Qt.ItemDataRole.UserRole, rel_path)
+                            item.setData(
+                                0, Qt.ItemDataRole.UserRole + 1, False
+                            )
                             if os.path.getsize(full_path) == 0:
                                 item.setIcon(0, self._get_empty_page_icon())
                             else:
                                 item.setIcon(0, self._get_emoji_icon("📝"))
             except Exception:
                 pass
+
+        # Saved orders from older builds and newly discovered custom roots may
+        # otherwise leave items below trash. Repair the invariant on every load.
+        self._apply_saved_root_order(root_order)
+        self.binder_tree.ensure_trash_at_bottom()
 
         if "expanded_folders" not in self.wpm.project_settings:
             for i in range(self.binder_tree.topLevelItemCount()):
@@ -163,6 +369,9 @@ class WritingTreeMixin:
         else:
             self.restore_tree_state()
 
+        # This creates a scrollable blank area after the last root item, making
+        # it easy to right-click there without targeting an existing item.
+        self.binder_tree.add_bottom_spacer()
         self.binder_tree.blockSignals(False)
 
     def _get_emoji_icon(self, emoji_text):
@@ -249,6 +458,12 @@ class WritingTreeMixin:
 
     def _sorted_tree_entries(self, dir_path, relative_base):
         entries = os.listdir(dir_path)
+
+        fixed_manuscript_order = canonical_manuscript_children(
+            relative_base, entries
+        )
+        if fixed_manuscript_order is not None:
+            return fixed_manuscript_order
 
         if relative_base == "메인/휴지통":
             # 휴지통은 장치별 로컬 드래그 순서를 무시하고 최신 삭제본부터
@@ -413,6 +628,8 @@ class WritingTreeMixin:
                     self._processing = False
 
         item = self.binder_tree.itemAt(pos)
+        if self.binder_tree.is_bottom_spacer(item):
+            item = None
         menu = QMenu(self.window())
 
         if not item:
@@ -420,11 +637,6 @@ class WritingTreeMixin:
             add_folder_action.triggered.connect(lambda: self.start_create_root_item(is_folder=True))
             menu.addAction(add_folder_action)
             callbacks['F'] = lambda: self.start_create_root_item(is_folder=True)
-
-            add_file_action = QAction("새 문서", self)
-            add_file_action.triggered.connect(lambda: self.start_create_root_item(is_folder=False))
-            menu.addAction(add_file_action)
-            callbacks['N'] = lambda: self.start_create_root_item(is_folder=False)
         elif item.text(0) == "📚 원고":
             add_volume_action = QAction("권 추가", self)
             add_volume_action.triggered.connect(self.add_volume)
@@ -552,12 +764,26 @@ class WritingTreeMixin:
         reply = QMessageBox.question(self, "삭제 확인", f"'{item.text(0)}'을(를) 휴지통으로 이동하시겠습니까?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                trash_rel_path = self.wpm.move_to_trash(rel_path)
-                if hasattr(self, "sync_manager"):
-                    self.sync_manager.record_tombstone(rel_path, trash_rel_path)
-                if hasattr(self, "controller"):
-                    self.controller.forget_path(rel_path)
-                self._cleanup_after_delete(rel_path, item)
+                sync_manager = getattr(self, "sync_manager", None)
+                mutation_gate = (
+                    sync_manager.local_structure_mutation()
+                    if sync_manager is not None else nullcontext()
+                )
+                with mutation_gate:
+                    trash_rel_path = self.wpm.move_to_trash(rel_path)
+                    if sync_manager is not None:
+                        operations = sync_manager.record_tombstone(
+                            rel_path, trash_rel_path, retry=False
+                        )
+                    else:
+                        operations = []
+                    if hasattr(self, "controller"):
+                        self.controller.forget_path(rel_path)
+                    self._cleanup_after_delete(
+                        rel_path, item, operations=operations
+                    )
+                if sync_manager is not None:
+                    sync_manager.retry_pending_syncs()
 
                 # 휴지통 노드 시각적 갱신
                 for i in range(self.binder_tree.topLevelItemCount()):
@@ -572,6 +798,23 @@ class WritingTreeMixin:
                                 QTreeWidgetItem(trash_item, ["<dummy>"])
                         break
             except Exception as e:
+                if 'trash_rel_path' in locals():
+                    sync_manager = getattr(self, "sync_manager", None)
+                    rollback_gate = (
+                        sync_manager.local_structure_mutation()
+                        if sync_manager is not None else nullcontext()
+                    )
+                    with rollback_gate:
+                        try:
+                            self.wpm.restore_from_trash(trash_rel_path)
+                        except Exception:
+                            if sync_manager is not None:
+                                sync_manager.record_structure_recovery(
+                                    rel_path,
+                                    trash_rel_path,
+                                    "DELETE_ROLLBACK_FAILED",
+                                )
+                    self.load_tree_data()
                 QMessageBox.warning(self, "오류", f"삭제 실패: {e}")
 
     def restore_trash_item(self, item, choose_location=False):
@@ -595,17 +838,74 @@ class WritingTreeMixin:
             destination_parent = os.path.relpath(selected, self.wpm.writing_root_path).replace("\\", "/")
 
         try:
-            restored_path = self.wpm.restore_from_trash(rel_path, destination_parent)
-            if hasattr(self, "sync_manager"):
-                self.sync_manager.record_restore(rel_path, restored_path)
-            if hasattr(self, "controller"):
-                self.controller.rename_path(rel_path, restored_path)
-            self.load_tree_data()
+            sync_manager = getattr(self, "sync_manager", None)
+            mutation_gate = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None else nullcontext()
+            )
+            trash_entry = next(
+                (
+                    entry for entry in self.wpm.list_trash_items()
+                    if entry.get("trash_path") == rel_path
+                ),
+                {},
+            )
+            original_rel_path = trash_entry.get("original_path")
+            with mutation_gate:
+                restored_path = self.wpm.restore_from_trash(
+                    rel_path, destination_parent
+                )
+                if sync_manager is not None:
+                    operations = sync_manager.record_restore(
+                        rel_path,
+                        restored_path,
+                        original_rel_path=original_rel_path,
+                        retry=False,
+                    )
+                else:
+                    operations = []
+                if hasattr(self, "controller"):
+                    self.controller.rename_path(rel_path, restored_path)
+                self.load_tree_data()
+                if operations and sync_manager is not None:
+                    tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                    if any(
+                        operation.get("contract_structure_intents")
+                        or operation.get("contract_document_changes")
+                        for operation in operations
+                        if isinstance(operation, dict)
+                    ):
+                        sync_manager.queue_contract_path_change_with_order(
+                            operations, tree_order, retry=False
+                        )
+                    else:
+                        self.defer_tree_order_until_operations(
+                            operations, tree_order=tree_order
+                        )
+            if operations and sync_manager is not None:
+                sync_manager.retry_pending_syncs()
             QMessageBox.information(self, "복원 완료", f"다음 위치로 복원했습니다.\n{restored_path}")
         except Exception as e:
+            if 'restored_path' in locals():
+                sync_manager = getattr(self, "sync_manager", None)
+                rollback_gate = (
+                    sync_manager.local_structure_mutation()
+                    if sync_manager is not None else nullcontext()
+                )
+                with rollback_gate:
+                    try:
+                        self.wpm.move_to_trash(restored_path)
+                    except Exception:
+                        if sync_manager is not None:
+                            sync_manager.record_structure_recovery(
+                                rel_path,
+                                restored_path,
+                                "RESTORE_ROLLBACK_FAILED",
+                            )
+                self.load_tree_data()
             QMessageBox.warning(self, "복원 실패", str(e))
 
-    def _cleanup_after_delete(self, rel_path, item):
+    def _cleanup_after_delete(self, rel_path, item, operations=None):
         parent = item.parent()
         if parent:
             parent.removeChild(item)
@@ -635,7 +935,23 @@ class WritingTreeMixin:
             self.is_dirty_right = False
             self.right_editor.document().setModified(False)
 
-        self.save_tree_order()
+        if not hasattr(getattr(self, "wpm", None), "project_settings"):
+            self.save_tree_order()
+            return
+        tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+        if operations and any(
+            operation.get("contract_structure_intents")
+            or operation.get("contract_document_changes")
+            for operation in operations
+            if isinstance(operation, dict)
+        ):
+            self.sync_manager.queue_contract_path_change_with_order(
+                operations, tree_order, retry=False
+            )
+        else:
+            WritingTreeMixin._persist_tree_order(
+                self, tree_order, retry=False
+            )
 
     def empty_trash(self):
         reply = QMessageBox.question(self, "휴지통 비우기", "휴지통의 모든 항목을 영구적으로 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -657,69 +973,298 @@ class WritingTreeMixin:
                 QMessageBox.warning(self, "오류", f"휴지통 비우기 실패: {e}")
 
     def handle_item_moved(self, item, old_rel_path, new_parent_rel_path):
+        new_rel_path = None
+        filesystem_changed = False
         try:
-            new_rel_path = self.wpm.move_item(old_rel_path, new_parent_rel_path)
-            if hasattr(self, "sync_manager"):
-                self.sync_manager.record_path_change(old_rel_path, new_rel_path)
-            if hasattr(self, "controller"):
-                self.controller.rename_path(old_rel_path, new_rel_path)
+            sync_manager = getattr(self, "sync_manager", None)
+            mutation_gate = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None else nullcontext()
+            )
+            with mutation_gate:
+                new_rel_path = self.wpm.move_item(
+                    old_rel_path, new_parent_rel_path
+                )
+                filesystem_changed = True
+                path_operations = []
+                if sync_manager is not None:
+                    path_operations = sync_manager.record_path_change(
+                        old_rel_path, new_rel_path, retry=False
+                    )
+                if hasattr(self, "controller"):
+                    self.controller.rename_path(old_rel_path, new_rel_path)
 
-            # 하위 항목들의 rel_path도 전부 업데이트
-            def update_paths(node, current_rel_path):
-                node.setData(0, Qt.ItemDataRole.UserRole, current_rel_path)
-                for i in range(node.childCount()):
-                    child = node.child(i)
-                    if child.text(0) == "<dummy>": continue
-                    child_basename = os.path.basename(child.data(0, Qt.ItemDataRole.UserRole))
-                    update_paths(child, os.path.join(current_rel_path, child_basename).replace("\\", "/"))
+                # 하위 항목들의 rel_path도 전부 업데이트
+                def update_paths(node, current_rel_path):
+                    node.setData(0, Qt.ItemDataRole.UserRole, current_rel_path)
+                    for i in range(node.childCount()):
+                        child = node.child(i)
+                        if child.text(0) == "<dummy>":
+                            continue
+                        child_basename = os.path.basename(
+                            child.data(0, Qt.ItemDataRole.UserRole)
+                        )
+                        update_paths(
+                            child,
+                            os.path.join(
+                                current_rel_path, child_basename
+                            ).replace("\\", "/"),
+                        )
 
-            update_paths(item, new_rel_path)
+                update_paths(item, new_rel_path)
 
-            def update_loaded_file(attr_name):
-                current_path = getattr(self, attr_name, None)
-                if current_path:
-                    if current_path == old_rel_path:
-                        setattr(self, attr_name, new_rel_path)
-                    elif current_path.startswith(old_rel_path + "/"):
-                        setattr(self, attr_name, current_path.replace(old_rel_path, new_rel_path, 1))
+                def update_loaded_file(attr_name):
+                    current_path = getattr(self, attr_name, None)
+                    if current_path:
+                        if current_path == old_rel_path:
+                            setattr(self, attr_name, new_rel_path)
+                        elif current_path.startswith(old_rel_path + "/"):
+                            setattr(
+                                self,
+                                attr_name,
+                                current_path.replace(
+                                    old_rel_path, new_rel_path, 1
+                                ),
+                            )
 
-            update_loaded_file('current_loaded_file_left')
-            update_loaded_file('current_loaded_file_right')
+                update_loaded_file('current_loaded_file_left')
+                update_loaded_file('current_loaded_file_right')
 
-            self.save_tree_order()
+                self.save_tree_order_for_rename(
+                    old_rel_path,
+                    new_rel_path,
+                    retry=False,
+                    operations=path_operations,
+                )
+            if sync_manager is not None:
+                sync_manager.retry_pending_syncs()
 
         except Exception as e:
+            if filesystem_changed and new_rel_path:
+                self._rollback_structure_path(new_rel_path, old_rel_path)
             QMessageBox.warning(self, "이동 실패", f"항목을 이동할 수 없습니다:\n{e}")
             self.load_tree_data() # UI 원복
 
-    def save_tree_order(self):
-        tree_order = {}
+    def _rollback_structure_path(self, current_rel_path, original_rel_path):
+        """Restore filesystem and UI projection after durable queue failure."""
+        try:
+            self.wpm.rename_item(current_rel_path, original_rel_path)
+            if hasattr(self, "controller"):
+                self.controller.rename_path(
+                    current_rel_path, original_rel_path
+                )
+            for attr_name in (
+                "current_loaded_file_left", "current_loaded_file_right"
+            ):
+                current_path = getattr(self, attr_name, None)
+                if current_path == current_rel_path:
+                    setattr(self, attr_name, original_rel_path)
+                elif current_path and current_path.startswith(
+                    current_rel_path + "/"
+                ):
+                    setattr(
+                        self,
+                        attr_name,
+                        current_path.replace(
+                            current_rel_path, original_rel_path, 1
+                        ),
+                    )
+            versions = getattr(self, "loaded_versions", {})
+            restored = {}
+            for path in list(versions):
+                if path == current_rel_path or path.startswith(
+                    current_rel_path + "/"
+                ):
+                    restored[path.replace(
+                        current_rel_path, original_rel_path, 1
+                    )] = versions.pop(path)
+            versions.update(restored)
+            return True
+        except Exception:
+            sync_manager = getattr(self, "sync_manager", None)
+            if sync_manager is not None:
+                sync_manager.record_structure_recovery(
+                    original_rel_path,
+                    current_rel_path,
+                    "FILESYSTEM_ROLLBACK_FAILED",
+                )
+            return False
+
+    def _current_tree_order_snapshot(self):
+        saved_order = self.wpm.project_settings.get("tree_order", {})
+        tree_order = (
+            copy.deepcopy(saved_order) if isinstance(saved_order, dict) else {}
+        )
+        self.binder_tree.ensure_trash_at_bottom()
+
+        writing_root = getattr(self.wpm, "writing_root_path", None)
+        if writing_root:
+            # Remove only baselines for directories that no longer exist.  This
+            # prevents a deleted folder from surviving merely because its item
+            # was outside the currently materialized UI subtree.
+            for parent_path in list(tree_order):
+                if parent_path == "<root>":
+                    continue
+                full_parent = os.path.join(writing_root, parent_path)
+                if not os.path.isdir(full_parent):
+                    tree_order.pop(parent_path, None)
+
         def traverse(item):
             rel_path = item.data(0, Qt.ItemDataRole.UserRole)
             if rel_path:
                 child_names = []
+                has_dummy = False
                 for i in range(item.childCount()):
                     child = item.child(i)
-                    if child.text(0) == "<dummy>": continue
+                    if child.text(0) == "<dummy>":
+                        has_dummy = True
+                        continue
                     child_rel_path = child.data(0, Qt.ItemDataRole.UserRole)
                     if child_rel_path:
                         child_names.append(os.path.basename(child_rel_path))
-                if child_names:
+
+                folder_state = item.data(0, Qt.ItemDataRole.UserRole + 1)
+                full_path = (
+                    os.path.join(writing_root, rel_path) if writing_root else None
+                )
+                is_directory = bool(
+                    folder_state is True
+                    or (full_path and os.path.isdir(full_path))
+                    or item.childCount() > 0
+                )
+                is_unloaded = bool(
+                    is_directory
+                    and has_dummy
+                    and item.data(0, Qt.ItemDataRole.UserRole + 2) is False
+                )
+                if is_unloaded and full_path:
+                    # A collapsed volume is absent from the Qt subtree, not from
+                    # the project.  Reuse its saved order and deterministically
+                    # append any newly created disk entries (notably 25 chapters
+                    # from add_volume) instead of dropping the whole parent list.
+                    tree_order[rel_path] = self._sorted_tree_entries(
+                        full_path, rel_path
+                    )
+                elif is_directory:
                     tree_order[rel_path] = child_names
             for i in range(item.childCount()):
-                traverse(item.child(i))
+                child = item.child(i)
+                if child.text(0) != "<dummy>":
+                    traverse(child)
 
         root_names = []
         for i in range(self.binder_tree.topLevelItemCount()):
             item = self.binder_tree.topLevelItem(i)
-            root_names.append(item.text(0))
+            if self.binder_tree.is_bottom_spacer(item):
+                continue
+            rel_path = item.data(0, Qt.ItemDataRole.UserRole)
+            root_names.append(
+                os.path.basename(rel_path) if rel_path else item.text(0)
+            )
             traverse(item)
 
         tree_order["<root>"] = root_names
+        for parent_path, child_names in list(tree_order.items()):
+            fixed_order = canonical_manuscript_children(
+                parent_path, child_names
+            )
+            if fixed_order is not None:
+                tree_order[parent_path] = fixed_order
+        return tree_order
+
+    @staticmethod
+    def _rename_saved_tree_order(tree_order, old_rel_path, new_rel_path):
+        """Rename one same-parent folder in a saved, possibly lazily loaded tree."""
+        if not isinstance(tree_order, dict):
+            return {}
+        old_rel_path = str(old_rel_path or "").replace("\\", "/").strip("/")
+        new_rel_path = str(new_rel_path or "").replace("\\", "/").strip("/")
+        old_parent, _, old_name = old_rel_path.rpartition("/")
+        new_parent, _, new_name = new_rel_path.rpartition("/")
+        if not old_name or not new_name or old_parent != new_parent:
+            return copy.deepcopy(tree_order)
+
+        renamed = {}
+        for parent_path, child_names in tree_order.items():
+            normalized_parent = str(parent_path).replace("\\", "/")
+            if normalized_parent == old_rel_path:
+                renamed_parent = new_rel_path
+            elif normalized_parent.startswith(old_rel_path + "/"):
+                renamed_parent = new_rel_path + normalized_parent[len(old_rel_path):]
+            else:
+                renamed_parent = normalized_parent
+            if renamed_parent in renamed and renamed_parent != normalized_parent:
+                raise ValueError("TREE_ORDER_PATH_CONFLICT")
+            renamed[renamed_parent] = copy.deepcopy(child_names)
+
+        # Children directly below the physical ``메인`` directory are
+        # represented by the logical ``<root>`` tree-order key.
+        sibling_key = "<root>" if old_parent == "메인" else old_parent
+        siblings = renamed.get(sibling_key)
+        if isinstance(siblings, list):
+            old_indexes = [
+                index for index, name in enumerate(siblings) if name == old_name
+            ]
+            if len(old_indexes) == 1 and new_name not in siblings:
+                siblings[old_indexes[0]] = new_name
+        return renamed
+
+    def _persist_tree_order(self, tree_order, retry=True):
         self.wpm.project_settings["tree_order"] = tree_order
         self.wpm.save_settings()
         if hasattr(self, "sync_manager"):
-            self.sync_manager.record_tree_order(tree_order)
+            return self.sync_manager.record_tree_order(tree_order, retry=retry)
+        return None
+
+    def save_tree_order(self, retry=True):
+        return WritingTreeMixin._persist_tree_order(
+            self,
+            WritingTreeMixin._current_tree_order_snapshot(self),
+            retry=retry,
+        )
+
+    def save_tree_order_for_rename(
+        self, old_rel_path, new_rel_path, retry=True, operations=None
+    ):
+        """Preserve unloaded descendants while persisting a local path rename."""
+        saved_order = WritingTreeMixin._rename_saved_tree_order(
+            self.wpm.project_settings.get("tree_order", {}),
+            old_rel_path,
+            new_rel_path,
+        )
+        current_order = WritingTreeMixin._current_tree_order_snapshot(self)
+        # The visible parent contains the renamed item and therefore has the
+        # freshest sibling order. Unloaded descendants are absent from the UI
+        # snapshot and remain preserved from the saved snapshot above.
+        saved_order.update(current_order)
+        if operations:
+            if any(
+                operation.get("contract_structure_intents")
+                for operation in operations
+                if isinstance(operation, dict)
+            ):
+                return self.sync_manager.queue_contract_path_change_with_order(
+                    operations, saved_order, retry=retry
+                )
+            return self.defer_tree_order_until_operations(
+                operations, tree_order=saved_order
+            )
+        return WritingTreeMixin._persist_tree_order(
+            self, saved_order, retry=retry
+        )
+
+    def defer_tree_order_until_operations(self, operations, tree_order=None):
+        tree_order = (
+            copy.deepcopy(tree_order)
+            if isinstance(tree_order, dict)
+            else WritingTreeMixin._current_tree_order_snapshot(self)
+        )
+        self.wpm.project_settings["tree_order"] = tree_order
+        if self.wpm.save_settings() is False:
+            raise OSError("TREE_ORDER_SETTINGS_SAVE_FAILED")
+        return self.sync_manager.defer_tree_order_until_operations(
+            tree_order, operations
+        )
 
     def start_create_root_item(self, is_folder):
         # Rapid clicks can arrive before the first 150ms inline-editor timer.
@@ -729,7 +1274,8 @@ class WritingTreeMixin:
         if not new_name: return
 
         self.binder_tree.blockSignals(True)
-        new_item = QTreeWidgetItem(self.binder_tree)
+        new_item = QTreeWidgetItem()
+        self.binder_tree.insert_root_item(new_item)
         display_name = new_name[:-4] if not is_folder else new_name
         new_item.setText(0, display_name)
         editable_flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled | Qt.ItemFlag.ItemIsEnabled
@@ -901,6 +1447,45 @@ class WritingTreeMixin:
         self.binder_tree.editItem(item, 0)
 
     def on_tree_item_changed(self, item, column):
+        # QStyledItemDelegate commits model data synchronously while its editor
+        # is still being closed.  A folder rename can update many child rows and
+        # SQLite operations, so doing that work inside setModelData/closeEditor
+        # risks corrupting Qt's editor lifecycle.  Reserve the structure gate
+        # now, then perform the durable rename on the next UI event.
+        try:
+            editor_is_closing = (
+                self.binder_tree.state()
+                == QAbstractItemView.State.EditingState
+            )
+        except (AttributeError, RuntimeError):
+            editor_is_closing = False
+        if editor_is_closing:
+            sync_manager = getattr(self, "sync_manager", None)
+            reservation = (
+                sync_manager.local_structure_mutation()
+                if sync_manager is not None
+                else nullcontext()
+            )
+            reservation.__enter__()
+
+            def apply_after_editor_close():
+                try:
+                    self._apply_tree_item_changed(
+                        item, column, finalize_flags=False
+                    )
+                finally:
+                    reservation.__exit__(None, None, None)
+
+            try:
+                QTimer.singleShot(0, apply_after_editor_close)
+            except Exception:
+                reservation.__exit__(None, None, None)
+                raise
+            return
+
+        return self._apply_tree_item_changed(item, column)
+
+    def _apply_tree_item_changed(self, item, column, finalize_flags=True):
         is_folder = item.data(0, Qt.ItemDataRole.UserRole + 1)
         was_creating = bool(item.data(0, Qt.ItemDataRole.UserRole + 4))
         print(f"[DEBUG TOP] on_tree_item_changed called! is_folder = {is_folder!r}, text = {item.text(0)!r}")
@@ -911,7 +1496,11 @@ class WritingTreeMixin:
                 if not old_rel_path: return
 
                 parent_rel_path = os.path.dirname(old_rel_path)
-                new_display_name = item.text(0)
+                new_display_name = unicodedata.normalize(
+                    "NFC", item.text(0).rstrip()
+                )
+                if new_display_name != item.text(0):
+                    item.setText(0, new_display_name)
 
                 # '📚 원고' 하위 항목 이름 변경 규칙 강제
                 if old_rel_path.startswith("메인/원고/"):
@@ -935,6 +1524,25 @@ class WritingTreeMixin:
                 else:
                     new_name = new_display_name
 
+                try:
+                    new_name = normalize_local_entry_name(new_name)
+                except LocalProjectPathError:
+                    old_display_name = os.path.basename(old_rel_path)
+                    if not is_folder and old_display_name.endswith(".txt"):
+                        old_display_name = old_display_name[:-4]
+                    item.setText(0, old_display_name)
+                    if was_creating:
+                        if hasattr(self, "sync_manager"):
+                            self.sync_manager.record_path_change(
+                                old_rel_path, old_rel_path
+                            )
+                        self._finish_tree_item_creation(item)
+                        self.save_tree_order()
+                    if finalize_flags:
+                        self._finish_item_name_edit(item, is_folder)
+                    self._show_temporary_invalid_name_message()
+                    return
+
                 new_rel_path = os.path.join(parent_rel_path, new_name).replace("\\", "/") if parent_rel_path else new_name
 
                 if old_rel_path == new_rel_path:
@@ -943,14 +1551,8 @@ class WritingTreeMixin:
                     if was_creating:
                         self._finish_tree_item_creation(item)
                         self.save_tree_order()
-                    item_flags = (
-                        Qt.ItemFlag.ItemIsSelectable
-                        | Qt.ItemFlag.ItemIsDragEnabled
-                        | Qt.ItemFlag.ItemIsEnabled
-                    )
-                    if is_folder:
-                        item_flags |= Qt.ItemFlag.ItemIsDropEnabled
-                    item.setFlags(item_flags)
+                    if finalize_flags:
+                        self._finish_item_name_edit(item, is_folder)
                     def _set_active():
                         try:
                             self.binder_tree.setCurrentItem(item)
@@ -969,65 +1571,92 @@ class WritingTreeMixin:
                 print(f"[DEBUG] wpm object id = {id(self.wpm)}")
 
                 if self.wpm.writing_root_path:
+                    filesystem_changed = False
                     try:
-                        self.wpm.rename_item(old_rel_path, new_rel_path)
-                        if hasattr(self, "sync_manager"):
-                            self.sync_manager.record_path_change(old_rel_path, new_rel_path)
-                        if hasattr(self, "controller"):
-                            self.controller.rename_path(old_rel_path, new_rel_path)
-                        item.setData(0, Qt.ItemDataRole.UserRole, new_rel_path)
-                        if was_creating:
-                            self._finish_tree_item_creation(item)
-                        print(f"[DEBUG] setData 직후 재확인: {item.data(0, Qt.ItemDataRole.UserRole)!r}")
+                        sync_manager = getattr(self, "sync_manager", None)
+                        mutation_gate = (
+                            sync_manager.local_structure_mutation()
+                            if sync_manager is not None
+                            else nullcontext()
+                        )
+                        with mutation_gate:
+                            self.wpm.rename_item(old_rel_path, new_rel_path)
+                            filesystem_changed = True
+                            path_operations = []
+                            if sync_manager is not None:
+                                path_operations = sync_manager.record_path_change(
+                                    old_rel_path, new_rel_path, retry=False
+                                )
+                            if hasattr(self, "controller"):
+                                self.controller.rename_path(old_rel_path, new_rel_path)
+                            item.setData(0, Qt.ItemDataRole.UserRole, new_rel_path)
+                            if was_creating:
+                                self._finish_tree_item_creation(item)
+                            print(f"[DEBUG] setData 직후 재확인: {item.data(0, Qt.ItemDataRole.UserRole)!r}")
 
-                        # 1. 탭 제목 실시간 갱신 및 현재 열린 파일 경로 갱신
-                        def update_loaded_file(attr_name, label_widget):
-                            current_path = getattr(self, attr_name, None)
-                            if current_path:
-                                if current_path == old_rel_path:
-                                    setattr(self, attr_name, new_rel_path)
-                                    base_name = os.path.basename(new_rel_path).replace(".txt", "")
-                                    label_widget.setText(f"{base_name}")
-                                    if attr_name == 'current_loaded_file_left':
-                                        self._original_text_l = f"{base_name}"
-                                    else:
-                                        self._original_text_r = f"{base_name}"
-                                elif current_path.startswith(old_rel_path + "/"):
-                                    new_cur_path = current_path.replace(old_rel_path, new_rel_path, 1)
-                                    setattr(self, attr_name, new_cur_path)
-                                    base_name = os.path.basename(new_cur_path).replace(".txt", "")
-                                    label_widget.setText(f"{base_name}")
-                                    if attr_name == 'current_loaded_file_left':
-                                        self._original_text_l = f"{base_name}"
-                                    else:
-                                        self._original_text_r = f"{base_name}"
+                            # 1. 탭 제목 실시간 갱신 및 현재 열린 파일 경로 갱신
+                            def update_loaded_file(attr_name, label_widget):
+                                current_path = getattr(self, attr_name, None)
+                                if current_path:
+                                    if current_path == old_rel_path:
+                                        setattr(self, attr_name, new_rel_path)
+                                        base_name = os.path.basename(new_rel_path).replace(".txt", "")
+                                        label_widget.setText(f"{base_name}")
+                                        if attr_name == 'current_loaded_file_left':
+                                            self._original_text_l = f"{base_name}"
+                                        else:
+                                            self._original_text_r = f"{base_name}"
+                                    elif current_path.startswith(old_rel_path + "/"):
+                                        new_cur_path = current_path.replace(old_rel_path, new_rel_path, 1)
+                                        setattr(self, attr_name, new_cur_path)
+                                        base_name = os.path.basename(new_cur_path).replace(".txt", "")
+                                        label_widget.setText(f"{base_name}")
+                                        if attr_name == 'current_loaded_file_left':
+                                            self._original_text_l = f"{base_name}"
+                                        else:
+                                            self._original_text_r = f"{base_name}"
 
-                        update_loaded_file('current_loaded_file_left', self.lbl_current_doc)
-                        update_loaded_file('current_loaded_file_right', self.lbl_r_doc)
+                            update_loaded_file('current_loaded_file_left', self.lbl_current_doc)
+                            update_loaded_file('current_loaded_file_right', self.lbl_r_doc)
 
-                        # 2. 서버 동기화 버전 캐시(self.loaded_versions) 동기화
-                        new_versions = {}
-                        for path, version in list(self.loaded_versions.items()):
-                            if path == old_rel_path:
-                                new_versions[new_rel_path] = self.loaded_versions.pop(path)
-                            elif path.startswith(old_rel_path + "/"):
-                                new_path = path.replace(old_rel_path, new_rel_path, 1)
-                                new_versions[new_path] = self.loaded_versions.pop(path)
-                        self.loaded_versions.update(new_versions)
+                            # 2. 서버 동기화 버전 캐시(self.loaded_versions) 동기화
+                            new_versions = {}
+                            for path, version in list(self.loaded_versions.items()):
+                                if path == old_rel_path:
+                                    new_versions[new_rel_path] = self.loaded_versions.pop(path)
+                                elif path.startswith(old_rel_path + "/"):
+                                    new_path = path.replace(old_rel_path, new_rel_path, 1)
+                                    new_versions[new_path] = self.loaded_versions.pop(path)
+                            self.loaded_versions.update(new_versions)
 
-                        # 3. 만약 폴더라면, 트리에 이미 존재하는 자식 노드들의 UserRole 경로도 동기적으로 즉시 갱신 (레이스 컨디션 방지)
-                        if is_folder:
-                            def update_children_user_role(parent_item, old_base, new_base):
-                                for i in range(parent_item.childCount()):
-                                    child = parent_item.child(i)
-                                    child_path = child.data(0, Qt.ItemDataRole.UserRole)
-                                    if child_path and child_path.startswith(old_base + "/"):
-                                        new_child_path = child_path.replace(old_base, new_base, 1)
-                                        child.setData(0, Qt.ItemDataRole.UserRole, new_child_path)
-                                        update_children_user_role(child, old_base, new_base)
-                            update_children_user_role(item, old_rel_path, new_rel_path)
+                            # 3. 폴더라면 트리에 표시된 모든 자식 경로도 같은 임계구역에서 갱신
+                            if is_folder:
+                                def update_children_user_role(parent_item, old_base, new_base):
+                                    for i in range(parent_item.childCount()):
+                                        child = parent_item.child(i)
+                                        child_path = child.data(0, Qt.ItemDataRole.UserRole)
+                                        if child_path and child_path.startswith(old_base + "/"):
+                                            new_child_path = child_path.replace(old_base, new_base, 1)
+                                            child.setData(0, Qt.ItemDataRole.UserRole, new_child_path)
+                                            update_children_user_role(child, old_base, new_base)
+                                update_children_user_role(item, old_rel_path, new_rel_path)
+                                if sync_manager is not None:
+                                    sync_manager.record_folder_rename_intent(
+                                        old_rel_path, new_rel_path
+                                    )
 
-                        self.save_tree_order()
+                            self.save_tree_order_for_rename(
+                                old_rel_path,
+                                new_rel_path,
+                                retry=False,
+                                operations=path_operations,
+                            )
+
+                        if sync_manager is not None:
+                            # SQLite enqueue is durable before any network worker starts.
+                            sync_manager.retry_pending_syncs()
+                        if finalize_flags:
+                            self._finish_item_name_edit(item, is_folder)
 
                         def _set_active():
                             try:
@@ -1041,11 +1670,17 @@ class WritingTreeMixin:
                         from PyQt6.QtCore import QTimer
                         QTimer.singleShot(10, _set_active)
                     except Exception as e:
+                        if filesystem_changed:
+                            self._rollback_structure_path(
+                                new_rel_path, old_rel_path
+                            )
                         if was_creating:
                             self._finish_tree_item_creation(item)
                         print(f"[DEBUG] rename_item 실패! old={old_rel_path!r}, new={new_rel_path!r}, error={e!r}")
                         QMessageBox.warning(self, "오류", f"이름 변경 실패: {e}")
                         item.setText(0, os.path.basename(old_rel_path).replace(".txt", "") if not is_folder else os.path.basename(old_rel_path))
+                        if finalize_flags:
+                            self._finish_item_name_edit(item, is_folder)
 
                         def _set_active():
                             try:
@@ -1062,11 +1697,89 @@ class WritingTreeMixin:
                 self.binder_tree.blockSignals(False)
 
     def add_volume(self):
-        new_vol_name = self.wpm.add_volume()
-        if not new_vol_name: return
+        sync_manager = getattr(self, "sync_manager", None)
+        mutation_gate = (
+            sync_manager.local_structure_mutation()
+            if sync_manager is not None
+            else nullcontext()
+        )
+        with mutation_gate:
+            new_vol_name = self.wpm.add_volume()
+            if not new_vol_name:
+                return
+
+            # Rebuild first so the new volume and all 25 chapters are present in
+            # the binder. Queue document UUIDs before publishing tree-order so
+            # another device never materializes the same paths with temporary
+            # local UUIDs first.
+            self.load_tree_data()
+            document_operations = []
+            if sync_manager is not None:
+                match = re.fullmatch(r"(\d+)권", new_vol_name)
+                if not match:
+                    raise ValueError("INVALID_VOLUME_NAME")
+                start_chapter = (int(match.group(1)) - 1) * 25 + 1
+                chapter_names = [
+                    f"{chapter_number:03d}화.txt"
+                    for chapter_number in range(
+                        start_chapter, start_chapter + 25
+                    )
+                ]
+                volume_path = f"메인/원고/{new_vol_name}"
+                folder_operations = sync_manager.record_path_change(
+                    volume_path, volume_path, retry=False
+                )
+                for folder_operation in folder_operations:
+                    intents = folder_operation.get("contract_structure_intents")
+                    if intents:
+                        sync_manager.queue_contract_structure_intents(
+                            intents, retry=False
+                        )
+                for chapter_number in range(start_chapter, start_chapter + 25):
+                    chapter_path = (
+                        f"메인/원고/{new_vol_name}/{chapter_number:03d}화.txt"
+                    )
+                    operation = sync_manager.record_created_document(
+                        chapter_path, retry=False
+                    )
+                    if operation is None:
+                        raise RuntimeError("DOCUMENT_QUEUE_FAILED")
+                    document_operations.append(operation)
+                # Do not depend on lazy Qt child materialization for the durable
+                # barrier.  The new volume identity and its exact 25 chapters
+                # are known from the filesystem transaction above.
+                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                manuscript_path = os.path.join(
+                    self.wpm.writing_root_path, "메인", "원고"
+                )
+                disk_volumes = [
+                    name for name in os.listdir(manuscript_path)
+                    if os.path.isdir(os.path.join(manuscript_path, name))
+                ]
+                saved_volumes = tree_order.get("메인/원고", [])
+                volume_order = [
+                    name for name in saved_volumes if name in disk_volumes
+                ]
+                volume_order.extend(sorted(
+                    (name for name in disk_volumes if name not in volume_order),
+                    key=lambda name: WritingTreeMixin._natural_sort_key(
+                        self, name
+                    ),
+                ))
+                tree_order["메인/원고"] = volume_order
+                tree_order[f"메인/원고/{new_vol_name}"] = chapter_names
+                self.defer_tree_order_until_operations(
+                    document_operations, tree_order
+                )
+            else:
+                self.save_tree_order()
+
+        if sync_manager is not None:
+            # Never start a network worker while the structure gate is held.
+            sync_manager.retry_pending_syncs()
 
         QMessageBox.information(self, "권 추가", f"{new_vol_name}이 생성되고 25화 분량 파일이 만들어졌습니다.")
-        self.load_tree_data()
+        self._open_new_volume_chapters(new_vol_name)
 
         # 새 권수 아이템 포커스 강제
         def _set_active():
@@ -1083,6 +1796,28 @@ class WritingTreeMixin:
                     break
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(10, _set_active)
+
+    def _open_new_volume_chapters(self, volume_name):
+        """Open the first new chapter, and its successor when split view is on."""
+        match = re.fullmatch(r"(\d+)권", volume_name)
+        if not match:
+            return
+
+        first_chapter_number = (int(match.group(1)) - 1) * 25 + 1
+        first_chapter = f"메인/원고/{volume_name}/{first_chapter_number:03d}화.txt"
+
+        self.set_active_editor(self.left_editor)
+        self._open_file_by_path(first_chapter)
+
+        if self.btn_toggle_split.isChecked() and self.right_editor_container.isVisible():
+            next_chapter = (
+                f"메인/원고/{volume_name}/{first_chapter_number + 1:03d}화.txt"
+            )
+            self.set_active_editor(self.right_editor)
+            self._open_file_by_path(next_chapter)
+
+        # The newly-created volume always leaves the main (left) editor active.
+        self.set_active_editor(self.left_editor)
 
     def on_tree_current_item_changed(self, current, previous):
         if not current:

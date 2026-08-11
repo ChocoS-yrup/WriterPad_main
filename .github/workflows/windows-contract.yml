@@ -1,0 +1,88 @@
+name: Windows Sync Contract
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    paths:
+      - "sync_contract.py"
+      - "sync_v2_store.py"
+      - "sync_manager.py"
+      - "tests/**"
+      - "requirements-stage8.txt"
+      - "Antigravity_AI_Writer.spec"
+      - ".github/workflows/windows-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Contract vectors, Windows tests, and executable
+    runs-on: windows-latest
+    env:
+      EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
+    steps:
+      - name: Check out exact Windows client head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.EXPECTED_CHECKOUT_SHA }}
+          persist-credentials: false
+
+      - name: Check out pinned released contract content
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ChocoS-yrup/Writerpad
+          ref: 7bcb5d25c5376b02469666df7318b90b456ffee6
+          path: contract-source
+          persist-credentials: false
+
+      - name: Confirm exact Windows client checkout
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          Write-Host "Expected HEAD: $env:EXPECTED_CHECKOUT_SHA"
+          Write-Host "Actual HEAD:   $actual"
+          if ($actual -ne $env:EXPECTED_CHECKOUT_SHA) { exit 1 }
+
+      - name: Set up contract validator Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: contract-source/sync-contract/requirements-validation.txt
+
+      - name: Validate pinned released contract
+        run: |
+          python -m pip install -r contract-source/sync-contract/requirements-validation.txt
+          python contract-source/sync-contract/scripts/verify_contract.py
+
+      - name: Set up Windows client Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-stage8.txt
+
+      - name: Install pinned Windows dependencies
+        run: python -m pip install -r requirements-stage8.txt
+
+      - name: Run Windows client tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build distributable executable
+        run: python -m PyInstaller --noconfirm --clean Antigravity_AI_Writer.spec
+
+      - name: Record executable digest
+        shell: pwsh
+        run: |
+          $artifact = Get-Item -LiteralPath dist/Antigravity_AI_Writer.exe
+          $digest = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "executable=$($artifact.FullName)"
+          Write-Host "bytes=$($artifact.Length)"
+          Write-Host "sha256=$digest"
