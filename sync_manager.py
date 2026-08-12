@@ -1572,6 +1572,16 @@ class SyncManager(QObject):
                 )
                 return True
             operation = self._v2_store.next_ready_operation(self._v2_context["local_key"])
+            if operation is None:
+                # 앞선 작업이 사라져 고아가 된 연쇄 편집이 있으면 되살린다.
+                # 그대로 두면 대기 건수만 표시된 채 큐가 영원히 멈춘다.
+                recover = getattr(
+                    self._v2_store, "recover_stranded_operations", None
+                )
+                if callable(recover) and recover(self._v2_context["local_key"]):
+                    operation = self._v2_store.next_ready_operation(
+                        self._v2_context["local_key"]
+                    )
             if operation:
                 self._launch_v2_operation(operation)
                 return True

@@ -2092,6 +2092,79 @@ class SyncV2Store:
             )
             return operation
 
+    def recover_stranded_operations(self, local_key=None):
+        """Re-issue chained edits whose predecessor will never complete.
+
+        `base_revision IS NULL` marks an edit that waits for an earlier
+        operation on the same document; `mark_success` normally re-issues it
+        with the committed revision. When that predecessor never reaches
+        `mark_success` - superseded, cancelled, or lost to a crash - nothing
+        ever resolves the dependent. `next_ready_operation` skips a NULL
+        base_revision forever, so the whole queue stops draining while the UI
+        still reports work as pending.
+
+        Returns the number of operations re-issued.
+        """
+        params = []
+        where = "base_revision IS NULL"
+        if local_key:
+            where += " AND local_key = ?"
+            params.append(local_key)
+        recovered = 0
+        with self._transaction() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM sync_operations WHERE {where} ORDER BY queue_id",
+                params,
+            ).fetchall()
+            for row in rows:
+                if self._derived_state(connection, row["operation_id"]) not in {
+                    "pending", "retry_wait"
+                }:
+                    continue
+                predecessors = connection.execute(
+                    """
+                    SELECT operation_id FROM sync_operations
+                    WHERE document_id = ? AND queue_id < ?
+                    ORDER BY queue_id
+                    """,
+                    (row["document_id"], row["queue_id"]),
+                ).fetchall()
+                if any(
+                    self._derived_state(connection, item["operation_id"])
+                    in {"pending", "inflight", "retry_wait"}
+                    for item in predecessors
+                ):
+                    # 앞선 작업이 아직 살아 있다면 정상적으로 기다리는 중이다.
+                    continue
+                document = connection.execute(
+                    "SELECT * FROM sync_documents WHERE document_id = ?",
+                    (row["document_id"],),
+                ).fetchone()
+                if document is None:
+                    continue
+                successor = self._insert_document_operation(
+                    connection,
+                    context={
+                        "local_key": row["local_key"],
+                        "project_id": row["project_id"],
+                    },
+                    document=document,
+                    local_path=row["local_path"],
+                    relative_path=row["relative_path"],
+                    base_revision=int(document["revision"] or 0),
+                    base_content=document["base_content"],
+                    content=row["content"],
+                    is_deleted=bool(row["is_deleted"]),
+                    supersedes_operation_id=row["operation_id"],
+                )
+                self._append_event(
+                    connection, row["operation_id"], "superseded",
+                    related_operation_id=successor["operation_id"],
+                    detail={"successor_operation_id": successor["operation_id"]},
+                )
+                recovered += 1
+        return recovered
+
     def next_ready_operation(self, local_key=None):
         params = []
         where = "base_revision IS NOT NULL"

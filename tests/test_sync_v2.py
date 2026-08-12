@@ -980,6 +980,82 @@ class SyncV2RpcTestCase(unittest.TestCase):
             callback.assert_called_once_with(True, "", relative_path, 1)
             retry.assert_not_called()
 
+    def test_chained_edit_is_reissued_when_its_predecessor_never_completes(self):
+        """base_revision IS NULL 작업이 고아가 되면 큐 전체가 멈춘다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "연쇄 편집 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, wpm.current_project, "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            previous = (
+                manager._v2_store, manager._v2_context, manager._v2_wpm
+            )
+            try:
+                manager.configure_v2(
+                    wpm, wpm.current_project, str(uuid.uuid4()), store=store
+                )
+                local_key = manager._v2_context["local_key"]
+                path = "메인/원고/1권/001화.txt"
+
+                first = store.enqueue(manager._v2_context, path, "첫 저장")
+                second = store.enqueue(manager._v2_context, path, "이어서 저장")
+                self.assertIsNone(second["base_revision"])
+
+                # 앞선 작업이 mark_success 를 거치지 않고 사라진다.
+                store.cancel_operation(first["operation_id"], str(uuid.uuid4()))
+
+                self.assertIsNone(store.next_ready_operation(local_key))
+                self.assertGreater(store.counts(local_key)["pending"], 0)
+
+                self.assertEqual(store.recover_stranded_operations(local_key), 1)
+
+                ready = store.next_ready_operation(local_key)
+                self.assertIsNotNone(ready)
+                self.assertIsNotNone(ready["base_revision"])
+                self.assertEqual(ready["content"], "이어서 저장")
+
+                # 이미 복구했으면 다시 만들지 않는다.
+                self.assertEqual(store.recover_stranded_operations(local_key), 0)
+            finally:
+                (
+                    manager._v2_store, manager._v2_context, manager._v2_wpm
+                ) = previous
+
+    def test_live_predecessor_keeps_its_chained_edit_waiting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "대기 유지 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, wpm.current_project, "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            previous = (
+                manager._v2_store, manager._v2_context, manager._v2_wpm
+            )
+            try:
+                manager.configure_v2(
+                    wpm, wpm.current_project, str(uuid.uuid4()), store=store
+                )
+                local_key = manager._v2_context["local_key"]
+                path = "메인/원고/1권/002화.txt"
+                store.enqueue(manager._v2_context, path, "첫 저장")
+                store.enqueue(manager._v2_context, path, "이어서 저장")
+
+                # 앞 작업이 아직 살아 있으므로 건드리지 않는다.
+                self.assertEqual(store.recover_stranded_operations(local_key), 0)
+            finally:
+                (
+                    manager._v2_store, manager._v2_context, manager._v2_wpm
+                ) = previous
+
     def test_completed_operation_error_stops_describing_the_queue(self):
         """A stale AUTH_REQUIRED must not outlive the operation that hit it."""
         with tempfile.TemporaryDirectory() as temp_dir:
