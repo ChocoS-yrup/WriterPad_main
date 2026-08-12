@@ -534,6 +534,7 @@ class SmartTextEdit(QTextEdit):
         # 죽는다. 표시된 뒤 resizeEvent 가 정렬을 이어받는다.
         if not self.isVisible():
             return
+        self._ensure_typewriter_margin()
 
         cursor_rect = self.cursorRect()
         viewport_height = self.viewport().height()
@@ -557,12 +558,31 @@ class SmartTextEdit(QTextEdit):
         self.typewriter_enabled = bool(enabled)
         self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
 
-    def _refresh_typewriter_layout(self, align_cursor=False):
-        # 아직 표시되지 않은 뷰의 문서 레이아웃은 건드리지 않는다. AI 모드의
-        # 좌·우 에디터는 하나의 QTextDocument 를 공유한 채 생성되는데, 이 시점에
-        # rootFrame 의 frameFormat 을 바꾸면 Qt 가 죽는다. 표시되는 순간
-        # showEvent/resizeEvent 가 같은 갱신을 이어받는다.
+    def _expected_bottom_margin(self):
+        if self.typewriter_enabled:
+            return self.viewport().height() / 2
+        return self._typewriter_base_bottom_margin
+
+    def _ensure_typewriter_margin(self):
+        """문서가 새로 채워지면 rootFrame 서식이 기본값으로 돌아간다.
+
+        setPlainText 는 탭 전환과 화수 로드마다 호출되므로 타자기 하단 여백이
+        조용히 사라진다. 여백이 없으면 스크롤 여유가 0이라 중앙 정렬이 아예
+        걸리지 않고, 커서가 뷰포트 맨 아래에 닿아야 Qt 기본 스크롤만 동작한다.
+        """
         if not self.isVisible():
+            return
+        current = self.document().rootFrame().frameFormat().bottomMargin()
+        if abs(current - self._expected_bottom_margin()) > 0.5:
+            self._refresh_typewriter_layout(from_view_event=True)
+
+    def _refresh_typewriter_layout(self, align_cursor=False, from_view_event=False):
+        # 생성 도중에는 문서 레이아웃을 건드리지 않는다. AI 모드의 좌·우
+        # 에디터는 하나의 QTextDocument 를 공유한 채 만들어지는데, 뷰가 생기기
+        # 전에 rootFrame 의 frameFormat 을 바꾸면 Qt 가 죽는다.
+        # show/resize 이벤트는 뷰가 실제로 존재한다는 뜻이므로 그대로 적용한다.
+        # (showEvent 시점의 isVisible() 은 아직 False 라 이 구분이 필요하다.)
+        if not from_view_event and not self.isVisible():
             return
         doc = self.document()
         was_modified = doc.isModified()
@@ -570,12 +590,7 @@ class SmartTextEdit(QTextEdit):
         try:
             root_frame = doc.rootFrame()
             fmt = root_frame.frameFormat()
-            bottom_margin = (
-                self.viewport().height() / 2
-                if self.typewriter_enabled
-                else self._typewriter_base_bottom_margin
-            )
-            fmt.setBottomMargin(bottom_margin)
+            fmt.setBottomMargin(self._expected_bottom_margin())
             root_frame.setFrameFormat(fmt)
             doc.setModified(was_modified)
         finally:
@@ -590,11 +605,15 @@ class SmartTextEdit(QTextEdit):
     def showEvent(self, event):
         super().showEvent(event)
         # 생성 중 미뤄둔 타자기 여백을 뷰가 실제로 생긴 시점에 적용한다.
-        self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
+        self._refresh_typewriter_layout(
+            align_cursor=self.typewriter_enabled, from_view_event=True
+        )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
+        self._refresh_typewriter_layout(
+            align_cursor=self.typewriter_enabled, from_view_event=True
+        )
 
     @staticmethod
     def _is_direct_period_event(event):

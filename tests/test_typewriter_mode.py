@@ -348,6 +348,69 @@ class RealAssistantConstructionTestCase(unittest.TestCase):
         self.assertEqual(len(restored), 8)
         self.assertTrue(all(restored))
 
+    def test_reloading_a_document_restores_the_typewriter_margin(self):
+        """setPlainText 는 rootFrame 서식을 기본값으로 되돌린다.
+
+        탭 전환과 화수 로드마다 일어나므로, 여백이 살아나지 않으면 스크롤
+        여유가 0이 되어 커서가 뷰포트 맨 아래에 닿아야만 스크롤된다.
+        """
+        editor = SmartTextEdit()
+        editor.resize(400, 300)
+        editor.show()
+        self.addCleanup(editor.close)
+        self.addCleanup(editor.deleteLater)
+        self.assertTrue(process_until(lambda: editor.viewport().height() > 0))
+        editor.set_typewriter_mode(True)
+        expected = editor.viewport().height() / 2
+        self.assertAlmostEqual(
+            editor.document().rootFrame().frameFormat().bottomMargin(),
+            expected,
+            delta=1,
+        )
+
+        # 문서를 새로 채우면 여백이 기본값으로 초기화된다.
+        editor.setPlainText("새로 불러온 원고")
+        cursor = editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+
+        self.assertTrue(
+            process_until(
+                lambda: abs(
+                    editor.document().rootFrame().frameFormat().bottomMargin()
+                    - editor.viewport().height() / 2
+                )
+                <= 1
+            )
+        )
+
+    def test_typewriter_scroll_starts_at_the_viewport_centre(self):
+        editor = SmartTextEdit()
+        editor.resize(480, 300)
+        editor.show()
+        self.addCleanup(editor.close)
+        self.addCleanup(editor.deleteLater)
+        self.assertTrue(process_until(lambda: editor.viewport().height() > 0))
+        editor.set_typewriter_mode(True)
+        editor.setPlainText("")
+        self.assertTrue(process_until(lambda: editor.verticalScrollBar().value() == 0))
+
+        centre = editor.viewport().height() / 2
+        cursor_y_at_first_scroll = None
+        for index in range(60):
+            cursor = editor.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            editor.setTextCursor(cursor)
+            editor.insertPlainText(f"line {index}\n")
+            process_until(lambda: True, timeout_ms=10)
+            if editor.verticalScrollBar().value() > 0:
+                cursor_y_at_first_scroll = editor.cursorRect().center().y()
+                break
+
+        self.assertIsNotNone(cursor_y_at_first_scroll)
+        # 뷰포트 맨 아래가 아니라 중앙에서 스크롤이 시작돼야 한다.
+        self.assertLess(abs(cursor_y_at_first_scroll - centre), centre * 0.35)
+
     def test_hidden_editor_defers_document_layout_until_shown(self):
         editor = SmartTextEdit()
         self.addCleanup(editor.deleteLater)
