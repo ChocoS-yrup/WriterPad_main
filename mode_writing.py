@@ -1165,7 +1165,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "title": "문서 충돌 확인 필요",
                 "summary": "로컬 원고는 보존됐지만 다른 기기의 변경과 자동 병합하지 못했습니다.",
                 "cause": detail or "같은 문서를 여러 기기에서 서로 다르게 수정했습니다.",
-                "action": "충돌 폴더에서 두 내용을 비교하고 사용할 원고를 선택해주세요.",
+                "action": "충돌 문서를 열어 세 버전을 비교하고 사용할 원고를 선택해주세요.",
                 "action_code": "open_conflicts",
                 "warning": True,
             },
@@ -1231,7 +1231,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             )
         elif action_code == "open_conflicts":
             action_button = box.addButton(
-                "충돌 폴더 열기", QMessageBox.ButtonRole.ActionRole
+                "충돌 문서 확인", QMessageBox.ButtonRole.ActionRole
             )
         elif action_code == "manual_save":
             action_button = box.addButton(
@@ -1243,7 +1243,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             if action_code == "retry":
                 self._retry_storage_sync()
             elif action_code == "open_conflicts":
-                self.open_conflict_folder()
+                self.open_conflict_resolver()
             elif action_code == "manual_save":
                 self.manual_save()
 
@@ -1925,6 +1925,84 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         if os.name == 'nt':
             os.startfile(backup_path)
             
+    def conflict_views(self):
+        """Collect the three versions for every document waiting on a choice."""
+        from conflict_dialog import build_conflict_view
+
+        store = getattr(self.sync_manager, "_v2_store", None)
+        context = getattr(self.sync_manager, "_v2_context", None) or {}
+        lister = getattr(store, "conflict_documents", None)
+        if not callable(lister):
+            return []
+        documents = lister(context.get("local_key"))
+        return [
+            build_conflict_view(self.wpm, document, build_conflict_report)
+            for document in documents
+        ]
+
+    def open_conflict_resolver(self):
+        """Let the writer pick a version in-app instead of hunting through files."""
+        from conflict_dialog import ConflictResolutionDialog
+
+        views = self.conflict_views()
+        if not views:
+            QMessageBox.information(
+                self,
+                "충돌 문서 없음",
+                "지금 선택을 기다리는 충돌 문서가 없습니다.",
+            )
+            return
+        dialog = ConflictResolutionDialog(views, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.apply_conflict_choice(
+            dialog.selected_document_path(),
+            dialog.selected_content(),
+            dialog.selected_label(),
+        )
+
+    def apply_conflict_choice(self, relative_path, content, label=""):
+        """Write the chosen version and let the normal save path clear the conflict."""
+        if not relative_path:
+            return False
+        if not self.wpm.write_text_file(relative_path, content):
+            QMessageBox.warning(
+                self, "적용 실패", "선택한 내용을 원고에 쓰지 못했습니다."
+            )
+            return False
+
+        for dirty_name, editor_name, loaded_name in (
+            ("is_dirty_left", "left_editor", "current_loaded_file_left"),
+            ("is_dirty_right", "right_editor", "current_loaded_file_right"),
+        ):
+            if getattr(self, loaded_name, None) != relative_path:
+                continue
+            editor = getattr(self, editor_name, None)
+            if editor is None:
+                continue
+            editor.setPlainText(content)
+            editor.document().setModified(False)
+            setattr(self, dirty_name, False)
+        WritingModeWidget._accept_persisted_snapshot(self, relative_path, content)
+
+        # 저장 경로가 충돌·차단 작업을 정리하고 서버 최신 revision 을 기준으로
+        # 새 작업을 넣는다.
+        self.sync_manager.upload_content_async(
+            self.wpm,
+            self.pm.current_project,
+            relative_path,
+            content,
+            callback=self.on_sync_finished,
+        )
+        target_label = self.lbl_current_doc
+        if getattr(self, "current_loaded_file_right", None) == relative_path:
+            target_label = self.lbl_r_doc
+        target_label.setText(
+            f"{os.path.basename(relative_path)} · {label or '선택한 내용'} 적용됨"
+        )
+        target_label.setStyleSheet("font-weight: bold; color: #00ff00;")
+        return True
+
     def open_conflict_folder(self):
         if not self.pm or not self.pm.current_project: return
         import os

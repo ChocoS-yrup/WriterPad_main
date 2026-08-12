@@ -2709,6 +2709,24 @@ class SyncV2Store:
         result["documents"] = len(outstanding_documents)
         return result
 
+    def conflict_documents(self, local_key=None):
+        """Return every document waiting for the writer to pick a version."""
+        params = ["conflict"]
+        where = "sync_state = ?"
+        if local_key:
+            where += " AND local_key = ?"
+            params.append(local_key)
+        with self._reader() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT document_id, local_path, revision, conflict_base,
+                       conflict_local, conflict_remote, conflict_merged
+                FROM sync_documents WHERE {where} ORDER BY local_path
+                """,
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def latest_error(self, local_key=None):
         """Return the newest error still describing unfinished work.
 
