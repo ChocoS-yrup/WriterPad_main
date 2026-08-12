@@ -14,6 +14,7 @@ isolated_module_runs: 27 modules, 0 failures
 packaged_build: produced, unsigned
 packaged_sha256: 9cfa8f8bd70081c4c28e5ff57a93598bf57654e175c7be358e6bdbe1a61fbdc8
 end_to_end_app_run: passed offscreen with an isolated profile
+packaged_binary_run: passed, shutdown 0.08 s
 production_changes: none
 staging_changes: none
 ```
@@ -132,15 +133,31 @@ credential_field_leaks: []
 jwt_in_release_config: false
 ```
 
+### Packaged binary run
+
+The frozen executable was launched in the same isolated profile and closed with
+a real `WM_CLOSE`. PyInstaller onefile runs the UI in a child process, so the
+close request has to go to the process that owns the window, not to the
+launcher.
+
+```yaml
+startup_seconds: 2.7
+onefile_child: true          # launcher pid != window owner pid
+close_request_accepted: true
+shutdown_seconds: 0.08       # release config ships cloud disabled
+ui_process_exited: true
+launcher_exited: true
+pid_file_removed: true       # aboutToQuit ran to completion
+leftover_processes: 0
+```
+
 ## Known gaps
 
 - The executable is unsigned, and no Windows staging E2E was run against a live
   Supabase project. Both remain outstanding before release.
-- The packaged binary was launched once and started correctly, but its graceful
-  close was not timed: PyInstaller onefile runs the UI in a child process, so a
-  close request sent to the parent never reaches the window. The shutdown
-  numbers above come from the offscreen end-to-end run and the component
-  measurement, not from the frozen binary.
+- The packaged shutdown above was measured with cloud sync disabled, which is
+  what the release config ships. The degraded-network worst case (`3.5 s`) comes
+  from the component measurement, not from the frozen binary.
 - `release_cloud_config.json` ships empty, so a release build starts with cloud
   sync disabled until the two public values are filled in.
 - `mode_writing_old.py` is tracked, contains null bytes, is imported by nothing
