@@ -8,10 +8,12 @@ branch: codex/windows-post-stage8-stabilization
 base_head: 221db4fa69e06210c0afad16870ccb25ef015094
 contract_version: 0.2.0
 canonical_contract_sha256: 416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670
-unit_tests: 442 passed, 1 skipped
-consecutive_full_runs: 5
+unit_tests: 444 passed, 1 skipped
+consecutive_full_runs: 7
 isolated_module_runs: 27 modules, 0 failures
-packaged_build: not produced in this stage
+packaged_build: produced, unsigned
+packaged_sha256: 9cfa8f8bd70081c4c28e5ff57a93598bf57654e175c7be358e6bdbe1a61fbdc8
+end_to_end_app_run: passed offscreen with an isolated profile
 production_changes: none
 staging_changes: none
 ```
@@ -25,7 +27,7 @@ Network paths were exercised through mocks and forced-offline mode only.
 |---|---|---|---|
 | 1 | Packaged cloud client config bundled `.env.example` placeholders, so login resolved `your-project.supabase.co` and surfaced a raw DNS errno | `958b9bc` | `tests/test_cloud_config.py` (14) |
 | 2 | `MainWindow.init_ui()` never read `startup_mode`, so assistant always won | `c571c66` | `tests/test_startup_mode.py` (10) |
-| 3 | AI editors kept `typewriter_enabled = False` because the settings checkbox was `setChecked()` before its `toggled` connection | `8fb4920` | `tests/test_typewriter_mode.py` (8) |
+| 3 | AI editors kept `typewriter_enabled = False` because the settings checkbox was `setChecked()` before its `toggled` connection | `8fb4920`, `4c4bef9` | `tests/test_typewriter_mode.py` (10) |
 | 4 | Shutdown had no upper bound: a fixed 8 s remote flush ran while periodic timers could still start workers, then `worker.wait()` blocked without a timeout | `1c297b1` | `tests/test_shutdown_budget.py` (29) |
 
 ## Shutdown budget
@@ -68,18 +70,77 @@ queue_still_pending: 3
 
 The pending operations stay in the durable queue, so the next run resumes them.
 
+## Construction regression found and fixed during preflight
+
+Stage 3 restored the saved typewriter setting by rewriting the document root
+frame's bottom margin while the AI panels were still being constructed. The
+paired AI editors share one `QTextDocument`, and mutating that layout before
+either view exists kills Qt with no Python traceback — the app never finished
+starting. The original code only did this from `resizeEvent`, so it was always
+running against a realized view.
+
+No test caught it: every typewriter test replaced the mode widgets with stubs,
+so the real construction path had no coverage at all. `4c4bef9` defers the
+layout work to `showEvent`/`resizeEvent`, keeps the state flag at construction
+time, and adds `RealAssistantConstructionTestCase`, which builds the real
+`AssistantModeWidget` instead of stubs.
+
+This is also why the first packaged smoke run looked inconclusive: on an empty
+profile the app stops at the first-run project dialog inside
+`AssistantModeWidget.__init__`, and cancelling it calls `sys.exit(0)` before
+the Qt event loop ever starts — so `aboutToQuit` correctly never ran.
+
+## End-to-end application run
+
+Real `MainWindow`, real assistant and writing modes, isolated profile
+(`ANTIGRAVITY_ROOT_DIR`, `ANTIGRAVITY_APP_DATA_DIR`, `ANTIGRAVITY_AUTO_PROJECT`),
+forced offline, offscreen platform. `config.json` requested the writing startup
+screen with the AI draft and writing typewriter settings on.
+
+```yaml
+startup_ms: 422
+startup_widget: WritingModeWidget   # finding 2
+ai_draft_typewriter: [true, true]   # finding 3
+writing_typewriter: [true, true]
+shutdown_ms: 16                     # finding 4, cloud disabled
+about_to_quit_ran: true
+pid_file_removed: true
+dialogs_shown: []
+```
+
 ## Test execution
 
-- `python -m unittest discover -s tests -t .` — 442 tests, 5 consecutive runs,
+- `python -m unittest discover -s tests -t .` — 444 tests, 7 consecutive runs,
   all `OK (skipped=1)`.
 - Every test module also runs standalone with no failures. This matters because
   `SyncManager` is a singleton; `reset_shutdown_state()` keeps a closed shutdown
   window from leaking into later tests.
 
+## Packaged build
+
+`python -m PyInstaller --noconfirm --clean Antigravity_AI_Writer.spec` succeeds.
+The archive was inspected directly:
+
+```yaml
+size_bytes: 81238469
+sha256: 9cfa8f8bd70081c4c28e5ff57a93598bf57654e175c7be358e6bdbe1a61fbdc8
+archive_entries: 315
+env_entries: []                     # no .env of any kind ships
+release_config_fields: [supabase_publishable_key, supabase_url]
+release_config_values: [empty, empty]
+credential_field_leaks: []
+jwt_in_release_config: false
+```
+
 ## Known gaps
 
-- No packaged `dist/Antigravity_AI_Writer.exe` was produced or signed in this
-  stage. Packaging and a Windows staging E2E remain outstanding before release.
+- The executable is unsigned, and no Windows staging E2E was run against a live
+  Supabase project. Both remain outstanding before release.
+- The packaged binary was launched once and started correctly, but its graceful
+  close was not timed: PyInstaller onefile runs the UI in a child process, so a
+  close request sent to the parent never reaches the window. The shutdown
+  numbers above come from the offscreen end-to-end run and the component
+  measurement, not from the frozen binary.
 - `release_cloud_config.json` ships empty, so a release build starts with cloud
   sync disabled until the two public values are filled in.
 - `mode_writing_old.py` is tracked, contains null bytes, is imported by nothing
