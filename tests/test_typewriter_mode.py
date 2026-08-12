@@ -1,7 +1,10 @@
+import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -284,6 +287,88 @@ class TypewriterModeTestCase(unittest.TestCase):
             process_until(
                 lambda: left.verticalScrollBar().value() > 0
                 and right.verticalScrollBar().value() > 0
+            )
+        )
+
+
+class RealAssistantConstructionTestCase(unittest.TestCase):
+    """The real widget tree, not stubs.
+
+    Every other typewriter test replaces the mode widgets with stubs, so a
+    construction-time crash in the real AI panels went unnoticed: the paired
+    editors share one QTextDocument, and touching its root frame layout before
+    the views exist kills Qt outright.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        project = "타자기 회귀 작품"
+        (root / "작품목록" / project).mkdir(parents=True)
+        (root / "config.json").write_text(
+            json.dumps(
+                {
+                    "last_project": project,
+                    "tw_summary": True,
+                    "tw_draft": True,
+                    "tw_eval": True,
+                    "tw_completed": True,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        env = patch.dict(
+            os.environ,
+            {
+                "ANTIGRAVITY_ROOT_DIR": str(root),
+                "ANTIGRAVITY_APP_DATA_DIR": str(root / "appdata"),
+                "ANTIGRAVITY_AUTO_PROJECT": project,
+            },
+            clear=False,
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_assistant_mode_builds_with_saved_typewriter_settings(self):
+        widget = AssistantModeWidget()
+        self.addCleanup(widget.deleteLater)
+        self.addCleanup(widget.close)
+
+        restored = [
+            panel.text_edit.typewriter_enabled
+            for panel in widget.left_panels[:4] + widget.right_panels[:4]
+        ]
+
+        self.assertEqual(len(restored), 8)
+        self.assertTrue(all(restored))
+
+    def test_hidden_editor_defers_document_layout_until_shown(self):
+        editor = SmartTextEdit()
+        self.addCleanup(editor.deleteLater)
+        base_margin = editor.document().rootFrame().frameFormat().bottomMargin()
+
+        editor.set_typewriter_mode(True)
+
+        # 숨어 있는 동안에는 문서를 건드리지 않는다.
+        self.assertTrue(editor.typewriter_enabled)
+        self.assertEqual(
+            editor.document().rootFrame().frameFormat().bottomMargin(),
+            base_margin,
+        )
+
+        editor.resize(400, 300)
+        editor.show()
+        self.addCleanup(editor.close)
+        self.assertTrue(
+            process_until(
+                lambda: editor.document().rootFrame().frameFormat().bottomMargin()
+                > base_margin
             )
         )
 

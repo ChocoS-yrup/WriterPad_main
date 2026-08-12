@@ -529,6 +529,11 @@ class SmartTextEdit(QTextEdit):
         # 겹치지 않게 한다. 선택이 끝난 뒤 일반 입력 시에는 다시 동작한다.
         if not self.typewriter_enabled or self.textCursor().hasSelection():
             return
+        # 아직 표시되지 않은 뷰는 문서 레이아웃이 없다. 특히 좌·우 에디터가 하나의
+        # QTextDocument 를 공유한 채 생성 중일 때 cursorRect() 를 만지면 Qt 가
+        # 죽는다. 표시된 뒤 resizeEvent 가 정렬을 이어받는다.
+        if not self.isVisible():
+            return
 
         cursor_rect = self.cursorRect()
         viewport_height = self.viewport().height()
@@ -553,6 +558,12 @@ class SmartTextEdit(QTextEdit):
         self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
 
     def _refresh_typewriter_layout(self, align_cursor=False):
+        # 아직 표시되지 않은 뷰의 문서 레이아웃은 건드리지 않는다. AI 모드의
+        # 좌·우 에디터는 하나의 QTextDocument 를 공유한 채 생성되는데, 이 시점에
+        # rootFrame 의 frameFormat 을 바꾸면 Qt 가 죽는다. 표시되는 순간
+        # showEvent/resizeEvent 가 같은 갱신을 이어받는다.
+        if not self.isVisible():
+            return
         doc = self.document()
         was_modified = doc.isModified()
         signals_were_blocked = self.blockSignals(True)
@@ -575,6 +586,11 @@ class SmartTextEdit(QTextEdit):
             self._typewriter_align_timer.start(0)
         else:
             self._typewriter_align_timer.stop()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 생성 중 미뤄둔 타자기 여백을 뷰가 실제로 생긴 시점에 적용한다.
+        self._refresh_typewriter_layout(align_cursor=self.typewriter_enabled)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
