@@ -246,6 +246,67 @@ class ConflictApplyTestCase(unittest.TestCase):
         self.assertFalse(applied)
         sync_manager.upload_content_async.assert_not_called()
 
+    def test_resolving_a_conflict_never_deletes_the_conflict_folder(self):
+        """충돌 폴더는 해결 뒤에도 그대로 남아야 한다. 유일한 원본 사본이다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "충돌 보존 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, wpm.current_project, "집필모드")
+            )
+            conflict_dir = Path(wpm.writing_root_path, "백업", "충돌")
+            conflict_dir.mkdir(parents=True)
+            artifacts = {
+                "002화 (3방향 병합 충돌 2026-08-12 101010).txt": MERGED_BODY,
+                "002화 (내 로컬 편집본 2026-08-12 101010).txt": "내 문장",
+                "002화 (서버 최신본 2026-08-12 101010).txt": "서버 문장",
+                "002화 (차이점 비교 2026-08-12 101010).txt": "차이점 비교 본문",
+            }
+            for name, body in artifacts.items():
+                (conflict_dir / name).write_text(body, encoding="utf-8")
+
+            path = "메인/원고/1권/002화.txt"
+            self.assertTrue(wpm.write_text_file(path, "충돌 이전 원고"))
+
+            target = SimpleNamespace(
+                wpm=wpm,
+                sync_manager=MagicMock(),
+                pm=SimpleNamespace(current_project=wpm.current_project),
+                current_loaded_file_left=None,
+                current_loaded_file_right=None,
+                is_dirty_left=False,
+                is_dirty_right=False,
+                left_editor=None,
+                right_editor=None,
+                lbl_current_doc=MagicMock(),
+                lbl_r_doc=MagicMock(),
+                on_sync_finished=MagicMock(),
+                last_snapshot_contents={},
+            )
+
+            with patch.object(WritingModeWidget, "_accept_persisted_snapshot"):
+                self.assertTrue(
+                    WritingModeWidget.apply_conflict_choice(
+                        target, path, "서버 문장", REMOTE_LABEL
+                    )
+                )
+
+            # 원고는 선택한 내용으로 바뀐다.
+            self.assertEqual(wpm.read_text_file(path), "서버 문장")
+            # 충돌 사본은 이름과 내용 모두 그대로 남는다.
+            for name, body in artifacts.items():
+                artifact = conflict_dir / name
+                self.assertTrue(artifact.exists(), name)
+                self.assertEqual(artifact.read_text(encoding="utf-8"), body)
+
+    def test_backup_folder_is_never_treated_as_a_cloud_document(self):
+        from sync_manager import is_live_document_path
+
+        self.assertFalse(is_live_document_path("백업/충돌/002화 (서버 최신본).txt"))
+        self.assertFalse(is_live_document_path("백업"))
+        self.assertTrue(is_live_document_path("메인/원고/1권/002화.txt"))
+
     def test_store_lists_documents_waiting_for_a_choice(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wpm = WritingProjectManager()
