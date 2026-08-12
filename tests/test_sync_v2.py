@@ -980,6 +980,53 @@ class SyncV2RpcTestCase(unittest.TestCase):
             callback.assert_called_once_with(True, "", relative_path, 1)
             retry.assert_not_called()
 
+    def test_completed_operation_error_stops_describing_the_queue(self):
+        """A stale AUTH_REQUIRED must not outlive the operation that hit it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "낡은 오류 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, wpm.current_project, "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            previous = (
+                manager._v2_store, manager._v2_context, manager._v2_wpm
+            )
+            try:
+                manager.configure_v2(
+                    wpm, wpm.current_project, str(uuid.uuid4()), store=store
+                )
+                local_key = manager._v2_context["local_key"]
+
+                failed = store.enqueue(
+                    manager._v2_context, "메인/원고/1권/001화.txt", "첫 본문"
+                )
+                store.mark_attempt(failed["operation_id"])
+                store.mark_retry(failed["operation_id"], "AUTH_REQUIRED")
+                self.assertIn("AUTH_REQUIRED", store.latest_error(local_key))
+
+                # 같은 작업이 재로그인 뒤 성공한다.
+                store.mark_success(
+                    failed["operation_id"],
+                    {"revision": 1, "content_hash": "a" * 64},
+                )
+
+                self.assertEqual(store.latest_error(local_key), "")
+
+                # 아직 보내지 않은 작업이 남아도 옛 오류가 되살아나지 않는다.
+                store.enqueue(
+                    manager._v2_context, "메인/원고/1권/002화.txt", "다음 본문"
+                )
+                self.assertEqual(store.latest_error(local_key), "")
+                self.assertEqual(store.counts(local_key)["pending"], 1)
+            finally:
+                (
+                    manager._v2_store, manager._v2_context, manager._v2_wpm
+                ) = previous
+
     def test_v2_upload_rejects_accidental_empty_overwrite_before_disk_write(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wpm = WritingProjectManager()

@@ -132,6 +132,76 @@ class SyncManagerStateTestCase(unittest.TestCase):
         self.assertEqual(self.manager.pending_retry_count, 1)
         self.assertEqual(self.manager._retry_queue[key]["content"], "최신 내용")
 
+    def _publish_with_v2_error(self, error, pending=1):
+        old = (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_device_id,
+        )
+        try:
+            self.manager._v2_store = SimpleNamespace(
+                counts=lambda _key: {
+                    "pending": pending, "inflight": 0, "conflict": 0,
+                    "total": pending,
+                },
+                latest_error=lambda _key: error,
+            )
+            self.manager._v2_context = {"local_key": "A"}
+            self.manager._v2_device_id = "device-a"
+            self.manager._publish_sync_state()
+        finally:
+            (
+                self.manager._v2_store,
+                self.manager._v2_context,
+                self.manager._v2_device_id,
+            ) = old
+        return self.states[-1]
+
+    def test_expired_login_asks_for_relogin_instead_of_a_network_check(self):
+        state, detail, _pending = self._publish_with_v2_error("AUTH_REQUIRED")
+
+        self.assertEqual(state, "auth_required")
+        guidance = WritingModeWidget._storage_status_guidance(
+            state, detail, 1, 0, False
+        )
+        self.assertIn("로그인", guidance["action"])
+        self.assertNotIn("인터넷", guidance["action"])
+
+    def test_queued_work_without_an_error_is_not_reported_as_offline(self):
+        state, _detail, _pending = self._publish_with_v2_error("")
+
+        self.assertEqual(state, "failed")
+        guidance = WritingModeWidget._storage_status_guidance(
+            state, "", 1, 0, False
+        )
+        self.assertEqual(guidance["action_code"], "retry")
+        self.assertNotIn("인터넷", guidance["action"])
+
+    def test_connectivity_error_still_reports_offline(self):
+        state, _detail, _pending = self._publish_with_v2_error("connection timeout")
+
+        self.assertEqual(state, "offline")
+
+    def test_success_clears_a_previous_failure_reason(self):
+        self.manager._last_sync_error = "AUTH_REQUIRED: 세션 갱신 실패"
+        self.manager._last_failure_offline = True
+        self.manager._auth_retry_blocked = True
+
+        self.manager._record_sync_success()
+
+        self.assertEqual(self.manager._last_sync_error, "")
+        self.assertFalse(self.manager._last_failure_offline)
+        self.assertFalse(self.manager._auth_retry_blocked)
+
+    def test_auth_failure_is_not_recorded_as_offline(self):
+        try:
+            self.manager._mark_auth_required()
+            self.assertTrue(self.manager._auth_retry_blocked)
+            self.assertFalse(self.manager._last_failure_offline)
+        finally:
+            self.manager._auth_retry_blocked = False
+            self.manager._last_sync_error = ""
+
     def test_persistent_lease_conflict_has_a_distinct_user_state(self):
         old_store = self.manager._v2_store
         old_context = self.manager._v2_context

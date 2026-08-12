@@ -1328,6 +1328,11 @@ class SyncManager(QObject):
         self.syncStateChanged.emit(state, detail, pending_count)
 
     def _record_sync_success(self):
+        # 전송이 한 번이라도 성공했다면 직전 실패 사유는 더 이상 현재 상태가
+        # 아니다. 남겨두면 큐가 다시 돌고 있는데도 옛 오류가 계속 표시된다.
+        self._last_sync_error = ""
+        self._last_failure_offline = False
+        self._auth_retry_blocked = False
         self._diagnostics.record(
             "sync_success",
             state="saved",
@@ -1402,7 +1407,18 @@ class SyncManager(QObject):
                     "다른 기기에서 이 문서를 편집 중입니다. 그 기기에서 문서를 닫은 뒤 다시 시도하세요.",
                 )
                 return
-            offline = not detail or self._is_connectivity_error(detail) or "AUTH_REQUIRED" in detail
+            if "AUTH_REQUIRED" in detail or "AUTH_EXPIRED" in detail:
+                # 로그인 문제를 오프라인으로 부르면 "인터넷을 확인하세요" 라는
+                # 엉뚱한 안내가 나간다. 필요한 행동은 재로그인이다.
+                publish(
+                    "auth_required",
+                    "클라우드 로그인 세션이 만료됐습니다. 다시 로그인하면 "
+                    "대기 작업이 이어서 전송됩니다.",
+                )
+                return
+            # 오류 근거가 없으면 연결 문제라고 단정하지 않는다. 전송을 기다리는
+            # 상태이므로 재시도 버튼이 있는 failed 로 알린다.
+            offline = bool(detail) and self._is_connectivity_error(detail)
             publish(
                 "offline" if offline else "failed",
                 detail or "서버 전송을 기다리는 로컬 변경 사항이 있습니다.",
@@ -1828,7 +1844,9 @@ class SyncManager(QObject):
 
     def _mark_auth_required(self, error=None):
         self._auth_retry_blocked = True
-        self._last_failure_offline = True
+        # 로그인 만료는 오프라인이 아니다. offline 로 표시하면 네트워크를
+        # 확인하라는 안내가 나가고 정작 필요한 재로그인은 안내되지 않는다.
+        self._last_failure_offline = False
         self._last_sync_error = (
             "AUTH_REQUIRED: 클라우드 로그인 세션을 갱신하지 못했습니다. "
             "설정 탭에서 다시 로그인하면 로컬 대기 작업이 이어서 전송됩니다."

@@ -2632,20 +2632,35 @@ class SyncV2Store:
         return result
 
     def latest_error(self, local_key=None):
+        """Return the newest error still describing unfinished work.
+
+        Errors recorded against an operation that later completed are history:
+        a single stale AUTH_REQUIRED must not keep describing a queue that has
+        since been committing successfully.
+        """
         with self._reader() as connection:
             params = []
             scope = ""
             if local_key:
                 scope = " AND operation_id IN (SELECT operation_id FROM sync_operations WHERE local_key = ? UNION SELECT operation_id FROM sync_structure_operations WHERE local_key = ?)"
                 params.extend((local_key, local_key))
-            row = connection.execute(
+            cursor = connection.execute(
                 """
-                SELECT error_code FROM sync_operation_events
+                SELECT operation_id, error_code FROM sync_operation_events
                 WHERE error_code IS NOT NULL
-                """ + scope + " ORDER BY recorded_at DESC, event_sequence DESC LIMIT 1",
+                """ + scope + " ORDER BY recorded_at DESC, event_sequence DESC",
                 params,
-            ).fetchone()
-            return row["error_code"] if row else ""
+            )
+            # 상태는 append-only 이벤트에서 파생된다. 가장 최근 오류부터 훑되
+            # 이미 끝난 작업의 오류는 건너뛴다.
+            for row in cursor:
+                try:
+                    state = self._derived_state(connection, row["operation_id"])
+                except RuntimeError:
+                    continue
+                if state in CONTRACT_ACTIVE_STATES:
+                    return row["error_code"]
+            return ""
 
     def operation(self, operation_id):
         with self._reader() as connection:
