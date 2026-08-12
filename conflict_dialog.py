@@ -90,14 +90,17 @@ def build_conflict_view(wpm, document, report_builder=None):
                 else:
                     remote = edited
 
+    # 세 버전은 직접 고쳐둘 수 있으니 폴더가 우선이지만, 차이점 비교는 파생
+    # 결과물이다. 충돌 당시 저장된 파일을 그대로 쓰면 예전 형식이 계속 보이고
+    # 손으로 고친 로컬본도 반영되지 않는다. 항상 지금 내용으로 다시 만든다.
     report = ""
-    if wpm is not None:
-        report = _newest_artifact(wpm, path, REPORT_LABEL) or ""
-    if not report and callable(report_builder):
+    if callable(report_builder):
         try:
             report = report_builder(base, local, remote)
         except Exception:
             report = ""
+    if not report and wpm is not None:
+        report = _newest_artifact(wpm, path, REPORT_LABEL) or ""
 
     return {
         "path": path,

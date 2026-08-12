@@ -122,6 +122,55 @@ class ConflictViewSourceTestCase(unittest.TestCase):
             self.assertEqual(view["remote"], "서버 문장")
             self.assertEqual(view["report"], "생성된 비교")
 
+    def test_stale_report_file_never_shadows_the_current_format(self):
+        """차이점 비교는 파생물이라 충돌 당시 파일을 재사용하면 안 된다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "집필모드")
+            (root / "백업" / "충돌").mkdir(parents=True)
+            (root / "백업" / "충돌" / "002화 (차이점 비교 2026-08-01 090000).txt").write_text(
+                "+++ 옛 형식\n@@ -1 +1 @@\n-예전\n", encoding="utf-8"
+            )
+            wpm = SimpleNamespace(writing_root_path=str(root))
+
+            view = build_conflict_view(
+                wpm,
+                {
+                    "local_path": "메인/원고/1권/002화.txt",
+                    "conflict_merged": MERGED_BODY,
+                    "conflict_local": "내 문장",
+                    "conflict_remote": "서버 문장",
+                    "conflict_base": "공통 조상",
+                },
+                report_builder=lambda base, local, remote: f"지금 형식 {local}/{remote}",
+            )
+
+            self.assertEqual(view["report"], "지금 형식 내 문장/서버 문장")
+            for noise in ("+++", "@@"):
+                self.assertNotIn(noise, view["report"])
+
+    def test_report_reflects_hand_edited_versions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "집필모드")
+            (root / "백업" / "충돌").mkdir(parents=True)
+            (root / "백업" / "충돌" / "002화 (내 로컬 편집본 2026-08-12 101010).txt").write_text(
+                "손으로 고친 로컬본", encoding="utf-8"
+            )
+            wpm = SimpleNamespace(writing_root_path=str(root))
+
+            view = build_conflict_view(
+                wpm,
+                {
+                    "local_path": "메인/원고/1권/002화.txt",
+                    "conflict_merged": MERGED_BODY,
+                    "conflict_local": "저장된 로컬본",
+                    "conflict_remote": "서버 문장",
+                    "conflict_base": "공통 조상",
+                },
+                report_builder=lambda base, local, remote: f"비교:{local}",
+            )
+
+            self.assertEqual(view["report"], "비교:손으로 고친 로컬본")
+
     def test_missing_folder_falls_back_to_stored_snapshots(self):
         view = build_conflict_view(
             SimpleNamespace(writing_root_path="/존재하지 않는 경로"),
