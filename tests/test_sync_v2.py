@@ -114,9 +114,14 @@ class ThreeWayMergeTestCase(unittest.TestCase):
         self.assertTrue(result.has_conflicts)
         self.assertIn("<<<<<<< 내 로컬 편집본", result.content)
         self.assertNotIn("차이점 비교", result.content)
-        self.assertIn("-삭제 대상", report)
-        self.assertIn("+로컬 수정", report)
-        self.assertIn("+서버 수정", report)
+        # 보고서는 diff 문법 대신 사람이 읽는 문장으로 쓴다.
+        self.assertIn("바꾸기 전 원본", report)
+        self.assertIn("서버 최신본", report)
+        self.assertIn("차이점 비교", report)
+        self.assertIn("로컬 : 로컬 수정", report)
+        self.assertIn("서버 : 삭제 대상", report)
+        for noise in ("+++", "---", "@@"):
+            self.assertNotIn(noise, report)
 
     def test_conflict_artifacts_keep_original_and_add_separate_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -161,9 +166,12 @@ class ThreeWayMergeTestCase(unittest.TestCase):
                 path for path in artifacts if "차이점 비교" in path.name
             )
             comparison = comparison_path.read_text(encoding="utf-8")
-            self.assertIn("-주인공은 학교에 걸어갔다.", comparison)
-            self.assertIn("+어제 주인공은 학교에 걸어갔다.", comparison)
-            self.assertIn("+주인공은 빠르게 학교에 걸어갔다.", comparison)
+            self.assertIn("바꾸기 전 원본", comparison)
+            self.assertIn("주인공은 학교에 걸어갔다.", comparison)
+            self.assertIn("로컬 : 어제 주인공은 학교에 걸어갔다.", comparison)
+            self.assertIn("서버 : 주인공은 빠르게 학교에 걸어갔다.", comparison)
+            for noise in ("+++", "---", "@@"):
+                self.assertNotIn(noise, comparison)
 
 
 class SyncV2StoreTestCase(unittest.TestCase):

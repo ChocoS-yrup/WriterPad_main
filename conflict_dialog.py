@@ -114,12 +114,15 @@ class ConflictResolutionDialog(QDialog):
     def __init__(self, views, parent=None):
         super().__init__(parent)
         self.setWindowTitle("충돌 문서 확인")
+        self.setObjectName("ConflictDialog")
         self.setModal(True)
         self.resize(980, 680)
         self._views = list(views)
         self._editors = {}
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
 
         self.document_selector = QComboBox()
         for view in self._views:
@@ -142,16 +145,20 @@ class ConflictResolutionDialog(QDialog):
         splitter = QSplitter(Qt.Orientation.Vertical)
         merged_page = QWidget()
         merged_layout = QVBoxLayout(merged_page)
-        merged_layout.setContentsMargins(0, 0, 0, 0)
-        merged_layout.addWidget(
-            QLabel("충돌 마커를 정리한 뒤 선택하세요. 이 탭은 편집할 수 있습니다.")
-        )
+        merged_layout.setContentsMargins(12, 12, 12, 6)
+        merged_layout.setSpacing(6)
+        hint = QLabel("충돌 마커를 정리한 뒤 선택하세요. 이 탭은 편집할 수 있습니다.")
+        hint.setObjectName("ConflictHint")
+        merged_layout.addWidget(hint)
         merged_layout.addWidget(self._merged_editor)
         splitter.addWidget(merged_page)
         report_page = QWidget()
         report_layout = QVBoxLayout(report_page)
-        report_layout.setContentsMargins(0, 0, 0, 0)
-        report_layout.addWidget(QLabel(REPORT_LABEL))
+        report_layout.setContentsMargins(12, 6, 12, 12)
+        report_layout.setSpacing(6)
+        report_title = QLabel(REPORT_LABEL)
+        report_title.setObjectName("ConflictSectionLabel")
+        report_layout.addWidget(report_title)
         report_layout.addWidget(self._report_view)
         splitter.addWidget(report_page)
         splitter.setStretchFactor(0, 3)
@@ -162,12 +169,17 @@ class ConflictResolutionDialog(QDialog):
         for index, (label, key) in enumerate(
             ((LOCAL_LABEL, "local"), (REMOTE_LABEL, "remote")), start=1
         ):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(12, 12, 12, 12)
             editor = QPlainTextEdit()
-            self.tabs.addTab(editor, label)
+            page_layout.addWidget(editor)
+            self.tabs.addTab(page, label)
             self._editors[index] = editor
             setattr(self, f"_{key}_editor", editor)
 
         self.status = QLabel("")
+        self.status.setObjectName("ConflictWarning")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
@@ -175,7 +187,9 @@ class ConflictResolutionDialog(QDialog):
         self.apply_button = buttons.addButton(
             "활성화된 탭 선택", QDialogButtonBox.ButtonRole.AcceptRole
         )
-        buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        close_button.setObjectName("DarkButton")
+        close_button.setText("닫기")
         buttons.accepted.connect(self._confirm)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -209,16 +223,13 @@ class ConflictResolutionDialog(QDialog):
                 f"'{self.selected_label()}' 는 빈 문서입니다. "
                 "그대로 적용하면 원고 내용이 사라집니다."
             )
-            self.status.setStyleSheet("color: #ff6b81;")
         elif has_conflict_markers(content):
             self.status.setText(
                 "선택한 내용에 충돌 마커(<<<<<<<, >>>>>>>)가 남아 있습니다. "
                 "그대로 적용하면 원고에 그대로 들어갑니다."
             )
-            self.status.setStyleSheet("color: #ff6b81;")
         else:
             self.status.setText("")
-            self.status.setStyleSheet("")
 
     def selected_document_path(self):
         view = self._current_view()

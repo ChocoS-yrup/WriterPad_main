@@ -46,6 +46,56 @@ class ConflictMarkerTestCase(unittest.TestCase):
         self.assertFalse(has_conflict_markers(""))
 
 
+class ConflictReportFormatTestCase(unittest.TestCase):
+    """사람이 읽는 비교. diff 문법(+++, ---, @@)은 쓰지 않는다."""
+
+    def test_single_line_change_reads_as_local_versus_server(self):
+        from three_way_merge import build_conflict_report
+
+        report = build_conflict_report("ㅎㅇㅎ", "ㅎㅇㅎ", "ㅎㅇㅎㅇ")
+
+        self.assertIn("바꾸기 전 원본", report)
+        self.assertIn("서버 최신본", report)
+        self.assertIn("차이점 비교", report)
+        self.assertIn("로컬 : ㅎㅇㅎ", report)
+        self.assertIn("서버 : ㅎㅇㅎㅇ", report)
+        # 한 곳만 다르면 줄 번호를 붙이지 않는다.
+        self.assertNotIn("번째 줄", report)
+        for noise in ("+++", "---", "@@"):
+            self.assertNotIn(noise, report)
+
+    def test_multiple_changes_are_located_by_line_number(self):
+        from three_way_merge import build_conflict_report
+
+        report = build_conflict_report(
+            "공통\n둘째\n셋째\n",
+            "공통\n내가 고침\n셋째\n",
+            "공통\n둘째\n서버가 고침\n",
+        )
+
+        self.assertIn("2번째 줄", report)
+        self.assertIn("3번째 줄", report)
+        self.assertIn("로컬 : 내가 고침", report)
+        self.assertIn("서버 : 서버가 고침", report)
+
+    def test_a_line_missing_on_one_side_is_labelled(self):
+        from three_way_merge import build_conflict_report
+
+        report = build_conflict_report(
+            "한 줄\n", "한 줄\n추가한 줄\n", "한 줄\n"
+        )
+
+        self.assertIn("로컬 : 추가한 줄", report)
+        self.assertIn("서버 : (없음)", report)
+
+    def test_identical_sides_say_so(self):
+        from three_way_merge import build_conflict_report
+
+        report = build_conflict_report("원본", "같은 내용", "같은 내용")
+
+        self.assertIn("로컬과 서버 내용이 같습니다", report)
+
+
 class ConflictViewSourceTestCase(unittest.TestCase):
     def test_hand_edited_conflict_file_wins_over_the_stored_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:

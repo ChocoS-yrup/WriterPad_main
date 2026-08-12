@@ -105,6 +105,82 @@ QTextEdit:focus {
     border: 1px solid #2a64f6;
 }
 
+/* 코드/로그성 본문. 원고 에디터와 달리 어두운 배경을 쓴다. */
+QPlainTextEdit {
+    background-color: #14161c;
+    border: 1px solid #3a3f4c;
+    border-radius: 6px;
+    padding: 10px;
+    color: #e0e0e0;
+    selection-background-color: #2a64f6;
+    selection-color: #ffffff;
+}
+QPlainTextEdit:focus {
+    border: 1px solid #2a64f6;
+}
+QPlainTextEdit[readOnly="true"] {
+    background-color: #1b1d24;
+    color: #b9bec9;
+}
+
+/* =========================================================
+   탭 (설정 패널, 충돌 문서 확인 등)
+   ========================================================= */
+QTabWidget::pane {
+    background-color: #1b1d24;
+    border: 1px solid #3a3f4c;
+    border-radius: 6px;
+    top: -1px;
+}
+QTabBar::tab {
+    background-color: #262933;
+    color: #b9bec9;
+    border: 1px solid #3a3f4c;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 8px 18px;
+    margin-right: 2px;
+    font-weight: bold;
+}
+QTabBar::tab:hover {
+    background-color: #323644;
+    color: #e0e0e0;
+}
+QTabBar::tab:selected {
+    background-color: #1b1d24;
+    color: #00e5ff;
+    border: 1px solid #3a3f4c;
+    border-bottom: 2px solid #00e5ff;
+}
+QTabBar::tab:disabled {
+    color: #6b7080;
+}
+
+/* 대화상자 안쪽 여백을 창 배경과 맞춘다. */
+QDialog {
+    background-color: #1b1d24;
+}
+QSplitter::handle {
+    background-color: #3a3f4c;
+}
+QSplitter::handle:vertical {
+    height: 4px;
+}
+
+/* 충돌 문서 확인 대화상자 */
+QLabel#ConflictHint {
+    color: #b9bec9;
+    font-weight: normal;
+}
+QLabel#ConflictSectionLabel {
+    color: #00e5ff;
+}
+QLabel#ConflictWarning {
+    color: #ff6b81;
+    padding: 4px 2px;
+}
+
 /* =========================================================
    Sidebar (QFrame & QPushButton) - 탭 구분 영역 표시
    ========================================================= */

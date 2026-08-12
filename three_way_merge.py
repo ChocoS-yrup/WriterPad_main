@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from difflib import SequenceMatcher, unified_diff
+from difflib import SequenceMatcher
 
 
 @dataclass(frozen=True)
@@ -82,37 +82,64 @@ def _line_tokens(value):
     return [line + "\n" for line in value.splitlines()]
 
 
-def _unified_diff_section(base, changed, changed_label):
-    lines = unified_diff(
-        base.splitlines(keepends=True),
-        changed.splitlines(keepends=True),
-        fromfile="마지막 공통본",
-        tofile=changed_label,
-        n=3,
-        lineterm="\n",
-    )
-    normalized = [
-        line if line.endswith(("\n", "\r")) else line + "\n"
-        for line in lines
-    ]
-    return "".join(normalized) or "(변경 없음)\n"
+
+
+SECTION_RULE = "=" * 9
+EMPTY_LINE_LABEL = "(빈 줄)"
+MISSING_LINE_LABEL = "(없음)"
+
+
+def _section(title, body):
+    text = str(body or "")
+    if not text.strip():
+        text = "(내용 없음)"
+    return f"{SECTION_RULE}\n\n{title}\n\n{text.rstrip()}\n\n"
+
+
+def _shown(line):
+    if line is None:
+        return MISSING_LINE_LABEL
+    return line if line.strip() else EMPTY_LINE_LABEL
+
+
+def _line_differences(local, remote):
+    """List the lines where the local and server versions disagree."""
+    local_lines = str(local or "").splitlines()
+    remote_lines = str(remote or "").splitlines()
+    matcher = SequenceMatcher(None, local_lines, remote_lines, autojunk=False)
+    blocks = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        span = max(i2 - i1, j2 - j1)
+        for offset in range(span):
+            local_line = local_lines[i1 + offset] if i1 + offset < i2 else None
+            remote_line = remote_lines[j1 + offset] if j1 + offset < j2 else None
+            blocks.append((i1 + offset + 1, local_line, remote_line))
+    return blocks
 
 
 def build_conflict_report(base, local, remote):
-    """Build a human-readable comparison without changing canonical merge markers."""
-    return (
-        "3방향 병합 충돌 차이점 비교\n"
-        "\n"
-        "이 파일은 충돌 해결을 돕는 참고용입니다.\n"
-        "원문과 서버 최신본은 자동으로 덮어쓰지 않았습니다.\n"
-        "'-' 줄은 마지막 공통본에서 빠진 내용이고, '+' 줄은 추가된 내용입니다.\n"
-        "\n"
-        "========== 마지막 공통본 → 내 로컬 편집본 ==========\n"
-        f"{_unified_diff_section(base, local, '내 로컬 편집본')}"
-        "\n"
-        "========== 마지막 공통본 → 서버 최신본 ==========\n"
-        f"{_unified_diff_section(base, remote, '서버 최신본')}"
+    """Plain-language comparison. No +/-/@@ diff syntax to decode."""
+    report = (
+        "3방향 병합 충돌 차이점 비교\n\n"
+        "참고용입니다. 원고와 서버 최신본은 자동으로 덮어쓰지 않았습니다.\n\n"
+        + _section("바꾸기 전 원본", base)
+        + _section("서버 최신본", remote)
+        + f"{SECTION_RULE}\n\n차이점 비교\n\n"
     )
+    differences = _line_differences(local, remote)
+    if not differences:
+        return report + "로컬과 서버 내용이 같습니다.\n"
+    lines = []
+    single = len(differences) == 1
+    for line_number, local_line, remote_line in differences:
+        if not single:
+            lines.append(f"{line_number}번째 줄")
+        lines.append(f"로컬 : {_shown(local_line)}")
+        lines.append(f"서버 : {_shown(remote_line)}")
+        lines.append("")
+    return report + "\n".join(lines).rstrip() + "\n"
 
 
 def three_way_merge(base, local, remote):
