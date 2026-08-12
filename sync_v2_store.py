@@ -2682,26 +2682,31 @@ class SyncV2Store:
                 where = " WHERE local_key = ?"
                 params.append(local_key)
             rows = connection.execute(
-                f"SELECT operation_id FROM sync_operations{where}", params
+                f"SELECT operation_id, document_id FROM sync_operations{where}",
+                params,
             ).fetchall()
             structure_rows = connection.execute(
                 f"SELECT operation_id FROM sync_structure_operations{where}", params
             ).fetchall()
-            documents = connection.execute(
-                f"SELECT COUNT(DISTINCT document_id) AS count "
-                f"FROM sync_operations{where}",
-                params,
-            ).fetchone()
             result = {
                 "pending": 0, "inflight": 0, "retry_wait": 0,
                 "blocked": 0, "conflict": 0,
             }
-            for row in [*rows, *structure_rows]:
+            # 사용자에게 보이는 건수다. 이미 끝난 작업의 문서까지 세면 숫자가
+            # 늘기만 하고 절대 줄지 않아, 남은 일이 없어도 계속 경고가 뜬다.
+            outstanding_documents = set()
+            for row in rows:
+                state = self._derived_state(connection, row["operation_id"])
+                if state in result:
+                    result[state] += 1
+                    if row["document_id"]:
+                        outstanding_documents.add(row["document_id"])
+            for row in structure_rows:
                 state = self._derived_state(connection, row["operation_id"])
                 if state in result:
                     result[state] += 1
         result["total"] = sum(result.values())
-        result["documents"] = int(documents["count"] or 0)
+        result["documents"] = len(outstanding_documents)
         return result
 
     def latest_error(self, local_key=None):

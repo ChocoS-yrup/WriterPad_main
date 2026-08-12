@@ -980,6 +980,49 @@ class SyncV2RpcTestCase(unittest.TestCase):
             callback.assert_called_once_with(True, "", relative_path, 1)
             retry.assert_not_called()
 
+    def test_pending_count_only_covers_documents_with_outstanding_work(self):
+        """완료된 작업의 문서까지 세면 건수가 늘기만 하고 줄지 않는다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "건수 표시 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, wpm.current_project, "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            previous = (
+                manager._v2_store, manager._v2_context, manager._v2_wpm
+            )
+            try:
+                manager.configure_v2(
+                    wpm, wpm.current_project, str(uuid.uuid4()), store=store
+                )
+                local_key = manager._v2_context["local_key"]
+
+                done = store.enqueue(
+                    manager._v2_context, "메인/원고/1권/001화.txt", "끝난 원고"
+                )
+                store.enqueue(
+                    manager._v2_context, "메인/원고/1권/002화.txt", "남은 원고"
+                )
+                self.assertEqual(store.counts(local_key)["documents"], 2)
+
+                store.mark_success(
+                    done["operation_id"],
+                    {"revision": 1, "content_hash": "b" * 64},
+                )
+
+                counts = store.counts(local_key)
+                self.assertEqual(counts["documents"], 1)
+                self.assertEqual(counts["pending"], 1)
+                self.assertEqual(manager.pending_retry_count, 1)
+            finally:
+                (
+                    manager._v2_store, manager._v2_context, manager._v2_wpm
+                ) = previous
+
     def test_chained_edit_is_reissued_when_its_predecessor_never_completes(self):
         """base_revision IS NULL 작업이 고아가 되면 큐 전체가 멈춘다."""
         with tempfile.TemporaryDirectory() as temp_dir:
