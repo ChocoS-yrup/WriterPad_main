@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 import uuid
@@ -28,6 +29,16 @@ from sync_contract import (
 )
 from sync_manager import SyncManager
 from sync_v2_store import STAGE8_USER_VERSION, SyncV2Store
+from unicode15_casefold import (
+    MAPPING_COUNT,
+    MAPPING_SHA256,
+    SOURCE_COMMIT,
+    SOURCE_PATH,
+    UNICODE_VERSION,
+    frozen_casefold,
+    mapping_sha256,
+    validate_frozen_table,
+)
 
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000201"
@@ -61,6 +72,46 @@ class ContractPrimitiveTests(unittest.TestCase):
             CANONICAL_CONTRACT_SHA256,
             "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
         )
+
+    def test_frozen_unicode15_casefold_table_integrity(self):
+        self.assertEqual(UNICODE_VERSION, "15.0.0")
+        self.assertEqual(
+            SOURCE_COMMIT,
+            "1fbc31bee3e36d46e86e8723936b5c2c7b71081f",
+        )
+        self.assertEqual(
+            SOURCE_PATH,
+            "supabase/migrations/"
+            "20260811010000_sync_contract_0_1_0_foundation.sql",
+        )
+        self.assertEqual(MAPPING_COUNT, 1530)
+        self.assertEqual(
+            MAPPING_SHA256,
+            "2a17566332a6a1e32afbfd431f9c73a7f30caa22fb4ce881c4e35ebc2b7f2284",
+        )
+        self.assertEqual(mapping_sha256(), MAPPING_SHA256)
+        validate_frozen_table()
+
+    def test_frozen_unicode15_casefold_representative_values(self):
+        cases = (
+            ("ABC", "abc"),
+            ("Straße", "strasse"),
+            ("\u0130", "i\u0307"),
+            ("\u13a0", "\u13a0"),
+            ("\uab70", "\u13a0"),
+            ("\u1c80", "\u0432"),
+            ("\u1c88", "\ua64b"),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(frozen_casefold(source), expected)
+                self.assertEqual(normalize_storage_name(source).normalized, expected)
+
+    def test_frozen_casefold_preserves_previous_runtime_output_for_all_scalars(self):
+        for codepoint in range(sys.maxunicode + 1):
+            character = chr(codepoint)
+            if frozen_casefold(character) != character.casefold():
+                self.fail(f"case-fold mismatch for U+{codepoint:06X}")
 
     def test_all_storage_name_vectors(self):
         vectors = load_json(

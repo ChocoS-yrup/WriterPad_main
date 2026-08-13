@@ -14,6 +14,8 @@ import re
 import uuid
 from dataclasses import dataclass
 
+from unicode15_casefold import frozen_casefold
+
 
 CONTRACT_VERSION = "0.2.0"
 CONTRACT_GIT_COMMIT = "fcd99b7098b9a04bd93c585d89b16588aa482530"
@@ -121,7 +123,7 @@ def normalize_storage_name(value: str) -> StorageName:
             raise SyncContractError("STORAGE_NAME_INVALID")
     unicode_data = _unicode15_module()
     normalized = unicode_data.normalize("NFKC", value)
-    normalized = normalized.casefold()
+    normalized = frozen_casefold(normalized)
     normalized = unicode_data.normalize("NFKC", normalized).rstrip(" .")
     if normalized in {"", ".", ".."}:
         raise SyncContractError("STORAGE_NAME_INVALID")
