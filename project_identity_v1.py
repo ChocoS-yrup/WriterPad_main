@@ -313,23 +313,40 @@ def plan_identity(project, local_nodes, sync_rows=None, uuid_factory=None):
     return plan
 
 
-def apply_identity(project_root, plan):
-    """Write a clean plan to the identity file atomically."""
-    blocking = {name: plan["report"][name] for name in BLOCKING_BUCKETS
-                if plan["report"][name]}
-    if blocking:
-        raise IdentityError(f"plan is blocked, nothing was written: {blocking}")
+def identity_node(raw):
+    """Normalize one node into the shape stored in the identity file."""
+    kind = str(raw.get("kind") or "")
+    if kind not in KINDS:
+        raise IdentityError(f"unsupported kind {kind!r}")
+    legacy_path = str(raw.get("legacy_path") or "")
+    if not legacy_path:
+        raise IdentityError("every node needs a legacy_path")
+    return {
+        "uuid": _require_uuid(raw.get("uuid"), "node.uuid"),
+        "kind": kind,
+        "parent_uuid": (
+            None
+            if raw.get("parent_uuid") in (None, "")
+            else _require_uuid(raw.get("parent_uuid"), "node.parent_uuid")
+        ),
+        "legacy_path": legacy_path,
+        "path": _display_path(legacy_path),
+        "title": (
+            _nfc(raw["title"])
+            if raw.get("title") is not None
+            else _nfc(_default_title(legacy_path, kind))
+        ),
+        "order": int(raw.get("order", 0)),
+    }
+
+
+def write_identity(project_root, identity, overwrite=False):
+    """Validate and write an identity file through a temp file plus atomic replace."""
+    _validate_nodes(identity["project"]["uuid"], identity["nodes"])
 
     target = identity_path(project_root)
-    if os.path.exists(target):
+    if os.path.exists(target) and not overwrite:
         raise IdentityError(f"identity file already exists: {target}")
-
-    identity = {
-        "format_version": FORMAT_VERSION,
-        "project": dict(plan["project"]),
-        "nodes": [dict(node) for node in plan["nodes"]],
-    }
-    _validate_nodes(identity["project"]["uuid"], identity["nodes"])
 
     directory = os.path.dirname(target)
     os.makedirs(directory, exist_ok=True)
@@ -346,6 +363,51 @@ def apply_identity(project_root, plan):
             os.unlink(temp_path)
         raise
     return identity
+
+
+def apply_identity(project_root, plan):
+    """Write a clean plan to the identity file atomically."""
+    blocking = {name: plan["report"][name] for name in BLOCKING_BUCKETS
+                if plan["report"][name]}
+    if blocking:
+        raise IdentityError(f"plan is blocked, nothing was written: {blocking}")
+
+    identity = {
+        "format_version": FORMAT_VERSION,
+        "project": dict(plan["project"]),
+        "nodes": [dict(node) for node in plan["nodes"]],
+    }
+    return write_identity(project_root, identity)
+
+
+def append_nodes(project_root, new_nodes):
+    """Add nodes to an existing identity file in one atomic replacement.
+
+    Re-adding a uuid that is already recorded is a no-op for that node, so a
+    resumed transaction can safely repeat the append with the same ids.
+    """
+    identity = read_identity(project_root)
+    known = {node["uuid"]: node for node in identity["nodes"]}
+
+    merged = list(identity["nodes"])
+    for raw in new_nodes:
+        node = identity_node(raw)
+        existing = known.get(node["uuid"])
+        if existing is not None:
+            if existing != node:
+                raise IdentityError(
+                    f"node {node['uuid']} already exists with different values"
+                )
+            continue
+        known[node["uuid"]] = node
+        merged.append(node)
+
+    updated = {
+        "format_version": FORMAT_VERSION,
+        "project": dict(identity["project"]),
+        "nodes": merged,
+    }
+    return write_identity(project_root, updated, overwrite=True)
 
 
 def ensure_identity(project_root, project, local_nodes, sync_rows=None,
