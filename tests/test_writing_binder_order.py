@@ -265,7 +265,7 @@ class WritingBinderOrderTestCase(unittest.TestCase):
             for relative_path in (
                 "메인/원고",
                 "메인/메모장",
-                "메인/플롯",
+                "메인/스토리 플롯",
                 "메인/휴지통",
                 "메인/윈_빈폴더",
             ):
@@ -295,7 +295,7 @@ class WritingBinderOrderTestCase(unittest.TestCase):
             panel.load_tree_data()
 
             root_paths = self._root_paths()
-            plot_index = root_paths.index("메인/플롯")
+            plot_index = root_paths.index("메인/스토리 플롯")
             custom_index = root_paths.index("메인/윈_빈폴더")
             self.assertEqual(plot_index + 1, custom_index)
             self.assertEqual(root_paths[-1], "메인/휴지통")
@@ -312,12 +312,12 @@ class WritingBinderOrderTestCase(unittest.TestCase):
             with self.subTest(alias=alias):
                 self.assertEqual(
                     WritingTreeMixin._normalize_fixed_root_order([alias]),
-                    ["플롯"],
+                    ["스토리 플롯"],
                 )
 
         self.assertEqual(
             WritingTreeMixin._normalize_fixed_root_order(list(aliases)),
-            ["플롯"],
+            ["스토리 플롯"],
         )
 
 

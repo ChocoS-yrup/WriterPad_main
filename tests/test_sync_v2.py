@@ -2140,21 +2140,22 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
                 })
                 normalized = json.loads(content)["tree_order"]
                 self.assertEqual(
-                    normalized["<root>"], ["원고", "플롯", "휴지통"]
+                    normalized["<root>"], ["원고", "스토리 플롯", "휴지통"]
                 )
-                self.assertIn("메인/플롯", normalized)
-                if alias != "플롯":
+                self.assertIn("메인/스토리 플롯", normalized)
+                if alias != "스토리 플롯":
                     self.assertNotIn(f"메인/{alias}", normalized)
 
+        # The legacy Windows name now normalizes to the shared canonical one.
         validated = self.manager._validated_remote_tree_order({
-            "<root>": ["원고", "스토리 플롯", "휴지통"],
-            "메인/스토리 플롯": [],
+            "<root>": ["원고", "플롯", "휴지통"],
+            "메인/플롯": [],
         })
         self.assertEqual(
-            validated["<root>"], ["원고", "플롯", "휴지통"]
+            validated["<root>"], ["원고", "스토리 플롯", "휴지통"]
         )
-        self.assertIn("메인/플롯", validated)
-        self.assertNotIn("메인/스토리 플롯", validated)
+        self.assertIn("메인/스토리 플롯", validated)
+        self.assertNotIn("메인/플롯", validated)
 
     def test_add_volume_durably_queues_tree_and_all_chapters_immediately(self):
         chapter_names = [f"{number:03d}화.txt" for number in range(1, 26)]
@@ -4047,7 +4048,7 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             "메인/원고/1권/001화.txt", "1권 원고", revision=1
         )
         baseline = {
-            "<root>": ["원고", "플롯", "휴지통"],
+            "<root>": ["원고", "스토리 플롯", "휴지통"],
             "메인/원고": ["1권"],
             "메인/원고/1권": ["001화.txt"],
         }
@@ -4107,8 +4108,9 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             self.wpm.writing_root_path, "메인", "원고", "2권", "002화.txt"
         )
         self.assertEqual(second_path.read_text(encoding="utf-8"), "2권 원고")
+        # The legacy name must not appear alongside the canonical root.
         self.assertFalse(Path(
-            self.wpm.writing_root_path, "메인", "스토리 플롯"
+            self.wpm.writing_root_path, "메인", "플롯"
         ).exists())
         self.assertEqual(
             self.wpm.project_settings["tree_order"]["메인/원고"],
@@ -4116,7 +4118,7 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.assertEqual(
             self.wpm.project_settings["tree_order"]["<root>"],
-            ["원고", "플롯"],
+            ["원고", "스토리 플롯"],
         )
 
     def test_tree_ahead_folder_defers_only_tree_and_applies_confirmed_sibling(self):

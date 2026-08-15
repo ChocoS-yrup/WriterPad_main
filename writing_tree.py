@@ -30,7 +30,7 @@ class WritingTreeMixin:
         ("👤 캐릭터", "메인/캐릭터"),
         ("📖 설정집", "메인/설정집"),
         ("📝 메모장", "메인/메모장"),
-        ("🗺️ 스토리 플롯", "메인/플롯"),
+        ("🗺️ 스토리 플롯", "메인/스토리 플롯"),
         ("🌊 흐름 정리", "메인/흐름정리"),
         ("🔍 복선", "메인/복선"),
         ("📌 장소", "메인/장소"),
@@ -324,8 +324,14 @@ class WritingTreeMixin:
         main_path = os.path.join(self.wpm.writing_root_path, "메인") if self.wpm.writing_root_path else ""
         if main_path and os.path.exists(main_path):
             try:
+                # Derived from FIXED_ROOT_NODES so a renamed root cannot show up
+                # twice. A legacy 메인/플롯 folder is deliberately not listed here:
+                # it then surfaces as a custom root instead of vanishing.
+                fixed_root_names = {
+                    path.split("/", 1)[1] for _, path in self.FIXED_ROOT_NODES
+                }
                 for d in os.listdir(main_path):
-                    if d not in ["원고", "캐릭터", "설정집", "메모장", "플롯", "흐름정리", "복선", "장소", "휴지통"]:
+                    if d not in fixed_root_names:
                         full_path = os.path.join(main_path, d)
                         rel_path = f"메인/{d}"
 

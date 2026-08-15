@@ -38,16 +38,16 @@ class WritingDataTestCase(unittest.TestCase):
     def path(self, relative_path):
         return Path(self.wpm.writing_root_path, relative_path)
 
-    def test_fixed_binder_uses_story_plot_label_without_changing_storage_path(self):
+    def test_fixed_binder_uses_story_plot_for_label_and_storage_path(self):
         roots = dict(WritingTreeMixin.FIXED_ROOT_NODES)
 
-        self.assertEqual(roots["🗺️ 스토리 플롯"], "메인/플롯")
+        self.assertEqual(roots["🗺️ 스토리 플롯"], "메인/스토리 플롯")
         self.assertNotIn("🗺️ 메인 스토리 틀", roots)
         self.assertEqual(
             WritingTreeMixin._normalize_fixed_root_order([
                 "📚 원고", "🗺️ 메인 스토리 틀", "🗑️ 휴지통"
             ]),
-            ["원고", "플롯", "휴지통"],
+            ["원고", "스토리 플롯", "휴지통"],
         )
 
     def test_split_mode_defaults_on_and_reads_global_state(self):

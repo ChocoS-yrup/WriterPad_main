@@ -13,10 +13,12 @@ ROOT_STORAGE_NAMES = {
     "설정집": "설정집",
     "📝 메모장": "메모장",
     "메모장": "메모장",
-    "🗺️ 스토리 플롯": "플롯",
-    "🗺️ 메인 스토리 틀": "플롯",
-    "스토리 플롯": "플롯",
-    "플롯": "플롯",
+    # Canonical is 스토리 플롯, matching iPad. 플롯 is the legacy Windows name and
+    # stays readable so existing folders and imports still resolve.
+    "🗺️ 스토리 플롯": "스토리 플롯",
+    "🗺️ 메인 스토리 틀": "스토리 플롯",
+    "스토리 플롯": "스토리 플롯",
+    "플롯": "스토리 플롯",
     "🌊 흐름 정리": "흐름정리",
     "흐름 정리": "흐름정리",
     "흐름정리": "흐름정리",
