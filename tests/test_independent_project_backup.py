@@ -45,12 +45,12 @@ class IndependentProjectBackupTests(unittest.TestCase):
             "메인/메모장",
         ):
             (self.workspace / relative).mkdir(parents=True, exist_ok=True)
-        (self.workspace / "메인/원고/1권/001화.txt").write_text(
-            self.chapter_text, encoding="utf-8"
+        (self.workspace / "메인/원고/1권/001화.txt").write_bytes(
+            self.chapter_text.encode("utf-8")
         )
         (self.workspace / "메인/원고/1권/002화.txt").write_bytes(b"")
-        (self.workspace / "메인/메모장/등장인물.txt").write_text(
-            self.note_text, encoding="utf-8"
+        (self.workspace / "메인/메모장/등장인물.txt").write_bytes(
+            self.note_text.encode("utf-8")
         )
         self.project = ProjectIdentity(
             self.PROJECT_ID,
