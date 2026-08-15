@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import tempfile
 import unittest
@@ -142,6 +143,44 @@ class ProjectCreationV1TestCase(unittest.TestCase):
         )
         self.assertEqual(audit(root)["missing_in_identity"], [])
 
+    def test_same_name_gets_a_suffix_instead_of_overwriting(self):
+        """이름이 충돌하면 덮어쓰지 않고 고유 이름을 만든다."""
+        root = self._project()
+        manuscript = {
+            node["legacy_path"]: node for node in read_identity(root)["nodes"]
+        }["메인/원고"]
+
+        create_item(root, manuscript["uuid"], "아이디어", False, uuid_factory=self.uuids)
+        first = os.path.join(writing_root(root), "메인", "원고", "아이디어.txt")
+        with open(first, "wb") as handle:
+            handle.write("첫 번째".encode("utf-8"))
+
+        identity = create_item(
+            root, manuscript["uuid"], "아이디어", False, uuid_factory=self.uuids
+        )
+        by_path = {node["legacy_path"]: node for node in identity["nodes"]}
+        self.assertIn("메인/원고/아이디어.txt", by_path)
+        self.assertIn("메인/원고/아이디어 (1).txt", by_path)
+        self.assertNotEqual(
+            by_path["메인/원고/아이디어.txt"]["uuid"],
+            by_path["메인/원고/아이디어 (1).txt"]["uuid"],
+        )
+
+        # The first document keeps its content and the second starts empty.
+        with open(first, "rb") as handle:
+            self.assertEqual(handle.read().decode("utf-8"), "첫 번째")
+        second = os.path.join(writing_root(root), "메인", "원고", "아이디어 (1).txt")
+        self.assertEqual(os.path.getsize(second), 0)
+
+        # Folders collide by the same rule.
+        create_item(root, manuscript["uuid"], "묶음", True, uuid_factory=self.uuids)
+        identity = create_item(
+            root, manuscript["uuid"], "묶음", True, uuid_factory=self.uuids
+        )
+        paths = {node["legacy_path"] for node in identity["nodes"]}
+        self.assertIn("메인/원고/묶음", paths)
+        self.assertIn("메인/원고/묶음 (1)", paths)
+
     def test_volume_creates_twenty_six_numbered_nodes_in_one_transaction(self):
         root = self._project()
         identity = create_volume(root, uuid_factory=self.uuids)
@@ -168,6 +207,9 @@ class ProjectCreationV1TestCase(unittest.TestCase):
         second = {node["legacy_path"] for node in identity["nodes"]}
         self.assertIn("메인/원고/2권/026화.txt", second)
         self.assertIn("메인/원고/2권/050화.txt", second)
+        self.assertEqual(
+            len([p for p in second if p.startswith("메인/원고/2권/")]), 25
+        )
         self.assertEqual(audit(root)["missing_in_identity"], [])
 
     def test_interrupted_volume_resumes_with_the_same_uuids(self):
@@ -189,6 +231,11 @@ class ProjectCreationV1TestCase(unittest.TestCase):
             os.path.join(project_journal_dir(root), journals[0]), encoding="utf-8"
         ) as handle:
             journalled = json.load(handle)
+
+        # All 26 ids were recorded up front, in one journal, before the crash.
+        self.assertEqual(journalled["kind"], "create_volume")
+        self.assertEqual(len(journalled["nodes"]), 26)
+        self.assertEqual(len({node["uuid"] for node in journalled["nodes"]}), 26)
 
         # The identity file has not grown yet, but the files may already exist.
         self.assertEqual(len(read_identity(root)["nodes"]), len(STANDARD_FOLDERS))
@@ -270,6 +317,124 @@ class ProjectCreationV1TestCase(unittest.TestCase):
         # audit only reports: identity is untouched and no uuid was invented.
         self.assertEqual(read_identity(root), before)
         self.assertFalse(os.path.isdir(os.path.join(writing_root(root), "메인", "장소")))
+
+
+class InitializeExistingProjectTestCase(unittest.TestCase):
+    """가져오기 전용 제자리 초기화. 일반 열기 경로에서는 쓰이지 않는다."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name) / "작품목록"
+        self.workspace.mkdir(parents=True)
+        self.uuids = seq_uuids()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def _reserved(self, title="가져온 작품", state="preparing"):
+        """Reserve a destination the way server import does, marker and all."""
+        from project_paths import IMPORT_MARKER_FILENAME
+
+        project_root = self.workspace / title
+        (project_root / "집필모드").mkdir(parents=True)
+        marker = project_root / IMPORT_MARKER_FILENAME
+        marker.write_text(
+            json.dumps({"project_id": "server-uuid", "state": state}),
+            encoding="utf-8",
+        )
+        return str(project_root), marker
+
+    def test_reserved_marker_survives_initialization(self):
+        project_root, marker = self._reserved()
+        before = marker.read_bytes()
+
+        identity = creation.initialize_existing_project(
+            str(self.workspace), "가져온 작품", uuid_factory=self.uuids
+        )
+
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertEqual(len(identity["nodes"]), len(STANDARD_FOLDERS))
+        self.assertTrue(
+            os.path.isdir(os.path.join(writing_root(project_root), "메인", "원고"))
+        )
+        self.assertEqual(creation.audit(project_root)["missing_on_disk"], [])
+
+    def test_interrupted_initialization_recovers_with_the_same_uuids(self):
+        self._reserved()
+
+        with patch(
+            "project_creation_v1.write_identity",
+            side_effect=OSError("simulated crash before identity write"),
+        ):
+            with self.assertRaises(OSError):
+                creation.initialize_existing_project(
+                    str(self.workspace), "가져온 작품", uuid_factory=self.uuids
+                )
+
+        journals = os.listdir(workspace_journal_dir(str(self.workspace)))
+        self.assertEqual(len(journals), 1)
+        with open(
+            os.path.join(workspace_journal_dir(str(self.workspace)), journals[0]),
+            encoding="utf-8",
+        ) as handle:
+            journalled = json.load(handle)
+
+        recover_workspace(str(self.workspace))
+        identity = read_identity(str(self.workspace / "가져온 작품"))
+
+        self.assertEqual(
+            identity["project"]["uuid"], journalled["project"]["uuid"]
+        )
+        self.assertEqual(
+            [node["uuid"] for node in identity["nodes"]],
+            [node["uuid"] for node in journalled["nodes"]],
+        )
+
+    def test_a_half_built_project_is_not_listed_as_a_normal_project(self):
+        from project_manager import ProjectManager
+
+        self._reserved(state="preparing")
+        with patch(
+            "project_creation_v1.write_identity",
+            side_effect=OSError("simulated crash before identity write"),
+        ):
+            with self.assertRaises(OSError):
+                creation.initialize_existing_project(
+                    str(self.workspace), "가져온 작품", uuid_factory=self.uuids
+                )
+
+        manager = ProjectManager()
+        manager.workspace_dir = str(self.workspace)
+        manager.global_config = {}
+        manager.save_global_config = lambda: None
+
+        listed = manager.get_all_projects()
+        self.assertNotIn("가져온 작품", listed)
+        # The workspace journal directory is not a project either.
+        self.assertEqual(listed, [])
+
+    def test_opening_a_normal_project_never_initializes(self):
+        create_project(str(self.workspace), "정상 작품", uuid_factory=self.uuids)
+        project_root = str(self.workspace / "정상 작품")
+
+        with patch.object(
+            creation, "initialize_existing_project"
+        ) as never_called:
+            verdict = creation.prepare_open(project_root)
+
+        self.assertEqual(verdict["status"], creation.OPEN_OK)
+        never_called.assert_not_called()
+
+    def test_only_the_import_path_calls_initialize_existing_project(self):
+        """제품 코드에서 호출 가능한 곳은 명시적 가져오기 경로뿐이다."""
+        repository = Path(__file__).resolve().parent.parent
+        callers = set()
+        for module in repository.glob("*.py"):
+            text = module.read_text(encoding="utf-8", errors="ignore")
+            if "initialize_existing_project" in text:
+                callers.add(module.name)
+
+        self.assertEqual(
+            callers, {"project_creation_v1.py", "server_project_import.py"}
+        )
 
 
 if __name__ == "__main__":

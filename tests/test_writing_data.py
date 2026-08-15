@@ -325,19 +325,6 @@ class WritingDataTestCase(unittest.TestCase):
         message_box.show.assert_called_once_with()
         self.assertEqual(single_shot.call_args.args[0], 2000)
 
-    def test_creating_same_name_adds_a_suffix_without_overwriting(self):
-        parent = "메인/메모"
-        self.path(parent).mkdir(parents=True, exist_ok=True)
-
-        first = self.wpm.create_physical_item(parent, "아이디어", is_folder=False)
-        self.assertEqual(first, "아이디어.txt")
-        self.assertTrue(self.wpm.write_text_file(f"{parent}/{first}", "첫 번째"))
-
-        second = self.wpm.create_physical_item(parent, "아이디어", is_folder=False)
-        self.assertEqual(second, "아이디어 (1).txt")
-        self.assertEqual(self.wpm.read_text_file(f"{parent}/{first}"), "첫 번째")
-        self.assertEqual(self.wpm.read_text_file(f"{parent}/{second}"), "")
-
     def test_trash_keeps_duplicate_files_then_empty_trash_removes_them(self):
         source = "메인/메모/삭제 대상.txt"
         self.assertTrue(self.wpm.write_text_file(source, "첫 번째 원고"))
@@ -439,12 +426,13 @@ class WritingDataTestCase(unittest.TestCase):
     def test_document_cannot_be_used_as_new_item_parent(self):
         panel = WritingTreeMixin()
         panel.wpm = MagicMock()
+        panel._create_binder_item = MagicMock()
         parent = MagicMock()
         parent.data.return_value = False
 
         panel.start_create_item(parent, is_folder=False)
 
-        panel.wpm.create_physical_item.assert_not_called()
+        panel._create_binder_item.assert_not_called()
 
     def test_delete_cleanup_resets_open_editors_without_old_label_attribute(self):
         deleted_folder = "메인/메모장/삭제 대상"
@@ -582,22 +570,6 @@ class WritingDataTestCase(unittest.TestCase):
             trash_path, restored_path, "RESTORE_ROLLBACK_FAILED"
         )
         panel.load_tree_data.assert_called()
-
-    def test_volumes_create_exactly_twenty_five_sequential_chapters(self):
-        first_volume = self.wpm.add_volume()
-        second_volume = self.wpm.add_volume()
-
-        manuscript = self.path("메인/원고")
-        first_chapters = sorted(path.name for path in (manuscript / first_volume).glob("*.txt"))
-        second_chapters = sorted(path.name for path in (manuscript / second_volume).glob("*.txt"))
-
-        self.assertEqual((first_volume, second_volume), ("1권", "2권"))
-        self.assertEqual(len(first_chapters), 25)
-        self.assertEqual(len(second_chapters), 25)
-        self.assertEqual(first_chapters[0], "001화.txt")
-        self.assertEqual(first_chapters[-1], "025화.txt")
-        self.assertEqual(second_chapters[0], "026화.txt")
-        self.assertEqual(second_chapters[-1], "050화.txt")
 
     def test_contract_volume_queues_folder_before_documents_and_defers_order(self):
         manager = MagicMock()

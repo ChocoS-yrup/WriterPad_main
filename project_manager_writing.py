@@ -188,24 +188,6 @@ class WritingProjectManager:
                 pass
             return False
 
-    def create_physical_item(self, parent_rel_path, base_name, is_folder):
-        """새로운 폴더나 파일을 실제 파일 시스템에 생성하고, 최종 생성된 상대 경로를 반환합니다."""
-        if not self.writing_root_path: return None
-        full_parent_path = os.path.join(self.writing_root_path, parent_rel_path) if parent_rel_path else self.writing_root_path
-        ext = "" if is_folder else ".txt"
-        new_name = base_name + ext
-        counter = 1
-        while os.path.exists(os.path.join(full_parent_path, new_name)):
-            new_name = f"{base_name} ({counter}){ext}"
-            counter += 1
-        full_new_path = os.path.join(full_parent_path, new_name)
-        if is_folder:
-            os.makedirs(full_new_path, exist_ok=True)
-        else:
-            with open(full_new_path, "w", encoding="utf-8") as f:
-                f.write("")
-        return new_name
-
     def rename_item(self, old_rel_path, new_rel_path):
         """파일 또는 폴더의 이름을 변경합니다."""
         if not self.writing_root_path: return False
@@ -582,33 +564,3 @@ class WritingProjectManager:
         import shutil
         shutil.move(old_full_path, new_full_path)
         return new_rel_path
-
-    def add_volume(self):
-        """새로운 'N권' 폴더를 생성하고 하위에 25개의 챕터를 생성합니다."""
-        import re
-        if not self.writing_root_path: return None
-        manuscript_path = os.path.join(self.writing_root_path, "메인", "원고")
-        os.makedirs(manuscript_path, exist_ok=True)
-        
-        dirs = [d for d in os.listdir(manuscript_path) if os.path.isdir(os.path.join(manuscript_path, d))]
-        max_vol = 0
-        for d in dirs:
-            match = re.match(r'(\d+)권', d)
-            if match:
-                max_vol = max(max_vol, int(match.group(1)))
-                
-        new_vol_num = max_vol + 1
-        new_vol_name = f"{new_vol_num}권"
-        new_vol_path = os.path.join(manuscript_path, new_vol_name)
-        os.makedirs(new_vol_path, exist_ok=True)
-        
-        start_chapter = (new_vol_num - 1) * 25 + 1
-        end_chapter = new_vol_num * 25
-        
-        for i in range(start_chapter, end_chapter + 1):
-            chapter_name = f"{i:03d}화.txt"
-            chapter_path = os.path.join(new_vol_path, chapter_name)
-            with open(chapter_path, "w", encoding="utf-8") as f:
-                f.write("")
-        
-        return new_vol_name
