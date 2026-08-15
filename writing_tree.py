@@ -36,6 +36,46 @@ class WritingTreeMixin:
         ("📌 장소", "메인/장소"),
         ("🗑️ 휴지통", "메인/휴지통"),
     )
+
+    def _binder_project_root(self):
+        root = getattr(self.wpm, "writing_root_path", None)
+        return os.path.dirname(root) if root else None
+
+    def _create_binder_item(self, parent_rel_path, base_name, is_folder):
+        """Create one binder item through the journalled UUID transaction."""
+        from project_creation_v1 import create_item_at_path
+
+        project_root = self._binder_project_root()
+        if not project_root:
+            return None
+        identity = create_item_at_path(
+            project_root, parent_rel_path, base_name, is_folder
+        )
+        return identity["nodes"][-1]["legacy_path"].rsplit("/", 1)[-1]
+
+    def _create_binder_volume(self):
+        """Create the next 권 and its 25 화 as one journalled transaction."""
+        from binder_order import MANUSCRIPT_ROOT_PATH
+        from project_creation_v1 import create_volume
+
+        project_root = self._binder_project_root()
+        if not project_root:
+            return None
+        identity = create_volume(project_root)
+
+        prefix = f"{MANUSCRIPT_ROOT_PATH}/"
+        highest = None
+        for node in identity["nodes"]:
+            path = node["legacy_path"]
+            if node["kind"] != "folder" or not path.startswith(prefix):
+                continue
+            name = path[len(prefix):]
+            if "/" in name or not name.endswith("권") or not name[:-1].isdigit():
+                continue
+            if highest is None or int(name[:-1]) > int(highest[:-1]):
+                highest = name
+        return highest
+
     def _show_temporary_invalid_name_message(self):
         message_box = QMessageBox(self)
         message_box.setWindowTitle("이름 변경")
@@ -1303,7 +1343,7 @@ class WritingTreeMixin:
         # Rapid clicks can arrive before the first 150ms inline-editor timer.
         # Commit the previous default-named item so only one editor can open.
         self._finalize_current_tree_creation()
-        new_name = self.wpm.create_physical_item("메인", "새 폴더" if is_folder else "새_문서", is_folder)
+        new_name = self._create_binder_item("메인", "새 폴더" if is_folder else "새_문서", is_folder)
         if not new_name: return
 
         self.binder_tree.blockSignals(True)
@@ -1404,7 +1444,7 @@ class WritingTreeMixin:
 
         parent_rel_path = parent_item.data(0, Qt.ItemDataRole.UserRole)
 
-        new_name = self.wpm.create_physical_item(parent_rel_path, "새 폴더" if is_folder else "새_문서", is_folder)
+        new_name = self._create_binder_item(parent_rel_path, "새 폴더" if is_folder else "새_문서", is_folder)
         new_rel_path = os.path.join(parent_rel_path, new_name).replace("\\", "/") if parent_rel_path else new_name
 
         self.binder_tree.blockSignals(True)
@@ -1741,7 +1781,7 @@ class WritingTreeMixin:
             else nullcontext()
         )
         with mutation_gate:
-            new_vol_name = self.wpm.add_volume()
+            new_vol_name = self._create_binder_volume()
             if not new_vol_name:
                 return
 

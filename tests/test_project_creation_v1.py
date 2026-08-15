@@ -18,7 +18,7 @@ from project_creation_v1 import (
     workspace_journal_dir,
     writing_root,
 )
-from project_identity_v1 import read_identity
+from project_identity_v1 import identity_path, read_identity
 
 
 def seq_uuids():
@@ -203,6 +203,56 @@ class ProjectCreationV1TestCase(unittest.TestCase):
         # Recovery is idempotent.
         self.assertEqual(recover_project(root), [])
         self.assertEqual(len(read_identity(root)["nodes"]), len(identity["nodes"]))
+
+    def _tree_snapshot(self, root):
+        """Every path under root with its size and mtime, for change detection."""
+        snapshot = {}
+        for current, directories, files in os.walk(root):
+            for name in list(directories) + files:
+                path = os.path.join(current, name)
+                stat = os.stat(path)
+                snapshot[os.path.relpath(path, root)] = (
+                    os.path.isdir(path),
+                    stat.st_size if os.path.isfile(path) else None,
+                    stat.st_mtime_ns,
+                )
+        return snapshot
+
+    def test_opening_a_project_without_identity_changes_no_file(self):
+        """레거시 프로젝트는 열기만으로 어떤 파일도 바뀌지 않는다."""
+        legacy = self.workspace / "레거시 작품"
+        manuscript = legacy / "집필모드" / "메인" / "원고"
+        manuscript.mkdir(parents=True)
+        (manuscript / "001화.txt").write_bytes("옛 원고".encode("utf-8"))
+        # A legacy 메인/플롯 folder must survive untouched for a later import.
+        (legacy / "집필모드" / "메인" / "플롯").mkdir()
+
+        before = self._tree_snapshot(legacy)
+
+        verdict = creation.prepare_open(str(legacy))
+
+        self.assertEqual(verdict["status"], creation.OPEN_LEGACY)
+        self.assertIn("가져오기", verdict["reason"])
+        self.assertEqual(self._tree_snapshot(legacy), before)
+        self.assertFalse((legacy / ".writerpad").exists())
+        self.assertTrue((legacy / "집필모드" / "메인" / "플롯").is_dir())
+
+    def test_repeated_open_never_changes_uuids_or_the_user_tree(self):
+        root = self._project()
+        identity_file = Path(identity_path(root))
+
+        first_identity = read_identity(root)
+        first_bytes = identity_file.read_bytes()
+        first_tree = self._tree_snapshot(writing_root(root))
+
+        for _ in range(3):
+            verdict = creation.prepare_open(root)
+            self.assertEqual(verdict["status"], creation.OPEN_OK)
+            creation.ensure_machine_folders(root)
+
+        self.assertEqual(read_identity(root), first_identity)
+        self.assertEqual(identity_file.read_bytes(), first_bytes)
+        self.assertEqual(self._tree_snapshot(writing_root(root)), first_tree)
 
     def test_journalless_mismatch_is_reported_and_never_repaired(self):
         root = self._project()

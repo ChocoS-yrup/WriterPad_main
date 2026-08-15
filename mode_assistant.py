@@ -79,6 +79,9 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
 
         if dlg.exec():
             if dlg.selected_project:
+                if dlg.is_new_project:
+                    from project_creation_v1 import create_project
+                    create_project(self.pm.workspace_dir, dlg.selected_project)
                 self.pm.set_current_project(dlg.selected_project)
             else:
                 sys.exit(0)

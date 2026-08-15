@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from PyQt6.QtCore import QMutex, Qt
@@ -24,13 +24,19 @@ class WritingDataTestCase(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.project_name = "테스트 작품"
 
+        # Build the fixture through the real creation transaction so the standard
+        # folders carry the same UUIDs the product would give them.
+        from project_creation_v1 import create_project
+
+        create_project(str(self.root), self.project_name)
+
         self.wpm = WritingProjectManager()
         self.wpm.workspace_dir = str(self.root)
         self.wpm.current_project = self.project_name
         self.wpm.writing_root_path = str(self.root / self.project_name / "집필모드")
         self.wpm.settings_path = str(Path(self.wpm.writing_root_path) / "설정.json")
         self.wpm.project_settings = {}
-        self.wpm._create_folder_structure()
+        self.wpm._ensure_machine_managed_folders()
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -616,6 +622,13 @@ class WritingDataTestCase(unittest.TestCase):
             binder_tree=MagicMock(),
             _open_new_volume_chapters=MagicMock(),
         )
+        # The stand-in panel needs the real journalled creation helpers.
+        for helper in ("_binder_project_root", "_create_binder_volume"):
+            setattr(
+                panel,
+                helper,
+                MethodType(getattr(WritingTreeMixin, helper), panel),
+            )
 
         with patch.object(
             WritingTreeMixin,

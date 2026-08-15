@@ -314,7 +314,16 @@ class ServerProjectImportService:
             destination, recovering_missing = self._prepare_destination(
                 project_id, local_project_name
             )
+            from project_creation_v1 import initialize_existing_project
             from project_manager_writing import WritingProjectManager
+
+            # Importing a server project creates a local one, so the standard
+            # folders must come from the journalled transaction that issues
+            # their UUIDs. The destination is already reserved with an import
+            # marker in it, and resuming keeps the ids the journal recorded.
+            initialize_existing_project(
+                self.workspace_dir, destination.project_name
+            )
 
             wpm = WritingProjectManager.create_detached(
                 self.workspace_dir,

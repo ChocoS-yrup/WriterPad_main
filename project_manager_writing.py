@@ -53,49 +53,52 @@ class WritingProjectManager:
             instance.writing_root_path, "설정.json"
         )
         instance.project_settings = {}
-        instance._create_folder_structure()
+        instance._ensure_machine_managed_folders()
         instance._load_settings()
         return instance
 
     def initialize_project(self, project_name):
         """
         프로젝트 진입 시, 해당 프로젝트의 '집필모드' 전용 샌드박스 영역을 초기화합니다.
-        """
-        self.current_project = project_name
-        
-        # 작품목록/[프로젝트명]/집필모드/ 를 최상위 루트로 설정
-        self.writing_root_path = os.path.join(self.workspace_dir, project_name, "집필모드")
-        self.settings_path = os.path.join(self.writing_root_path, "설정.json")
-        
-        self._create_folder_structure()
-        self._load_settings()
 
-    def _create_folder_structure(self):
+        열기는 사용자 폴더나 UUID를 만들지 않습니다. 미완료 생성 거래를 먼저 끝내고,
+        identity 파일과 파일 트리를 대조한 뒤, 이상이 없을 때만 프로젝트를 준비합니다.
+        판정 결과를 반환하므로 호출자가 레거시·불일치 프로젝트를 거부할 수 있습니다.
         """
-        PRD에 명시된 한글 폴더 구조가 없으면 생성합니다. (기존 어시스턴트 경로는 건드리지 않음)
+        from project_creation_v1 import OPEN_OK, prepare_open
+
+        self.current_project = project_name
+
+        # 작품목록/[프로젝트명]/집필모드/ 를 최상위 루트로 설정
+        project_root = os.path.join(self.workspace_dir, project_name)
+        self.writing_root_path = os.path.join(project_root, "집필모드")
+        self.settings_path = os.path.join(self.writing_root_path, "설정.json")
+
+        verdict = prepare_open(project_root)
+        if verdict["status"] != OPEN_OK:
+            # Leave the root unset so every downstream writer stays inert and the
+            # refused project keeps its files exactly as they are.
+            self.writing_root_path = None
+            self.settings_path = None
+            return verdict
+
+        self._ensure_machine_managed_folders()
+        self._load_settings()
+        return verdict
+
+    def _ensure_machine_managed_folders(self):
+        """기계 관리 디렉터리만 다시 만듭니다. 사용자 표준 폴더는 만들지 않습니다.
+
+        사용자 표준 폴더 9개는 생성 거래 안에서 UUID와 함께 한 번만 만들어집니다.
+        열기 경로에서 다시 만들면 UUID 없는 폴더가 생기므로, 누락은 audit 오류로
+        보고하고 여기서 복구하지 않습니다.
         """
         if not self.writing_root_path:
             return
 
-        directories = [
-            "메인/원고",
-            "메인/캐릭터",
-            "메인/설정집",
-            "메인/메모장",
-            "메인/스토리 플롯",
-            "메인/흐름정리",
-            "메인/복선",
-            "메인/장소",
-            "메인/휴지통",
-            "백업/자동저장",
-            "백업/전환직전",
-            "백업/충돌",
-            "백업/복원전"
-        ]
-        
-        for directory in directories:
-            target_path = os.path.join(self.writing_root_path, directory)
-            os.makedirs(target_path, exist_ok=True)
+        from project_creation_v1 import ensure_machine_folders
+
+        ensure_machine_folders(os.path.dirname(self.writing_root_path))
 
     def _load_settings(self):
         """설정.json을 로드합니다. 없으면 빈 딕셔너리로 초기화합니다."""

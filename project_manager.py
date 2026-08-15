@@ -61,6 +61,9 @@ class ProjectManager:
         from project_paths import IMPORT_MARKER_FILENAME
         existing_projects = []
         for name in os.listdir(self.workspace_dir):
+            # Workspace bookkeeping (creation journals, staging) is not a project.
+            if name.startswith("."):
+                continue
             project_path = os.path.join(self.workspace_dir, name)
             if not os.path.isdir(project_path):
                 continue

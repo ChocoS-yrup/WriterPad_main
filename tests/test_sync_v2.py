@@ -8,7 +8,7 @@ import unittest
 import unicodedata
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from PyQt6.QtCore import Qt
@@ -2090,6 +2090,10 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         workspace = str(Path(self.temp.name, "작품목록"))
         writing_root = str(Path(workspace, "빈 폴더 동기화", "집필모드"))
+        # Standard user folders only exist after the creation transaction now.
+        from project_creation_v1 import create_project
+
+        create_project(workspace, "빈 폴더 동기화")
         self.wpm = WritingProjectManager.create_detached(
             workspace, "빈 폴더 동기화", writing_root
         )
@@ -2180,6 +2184,13 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             _open_new_volume_chapters=MagicMock(),
             binder_tree=MagicMock(),
         )
+        # The stand-in panel needs the real journalled creation helpers.
+        for helper in ("_binder_project_root", "_create_binder_volume"):
+            setattr(
+                panel,
+                helper,
+                MethodType(getattr(WritingTreeMixin, helper), panel),
+            )
         with patch.object(
             self.manager, "retry_pending_syncs", return_value=False
         ) as retry, patch(

@@ -277,9 +277,18 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self._initial_split_mode_enabled = self._saved_split_mode(self.pm)
         self.wpm = WritingProjectManager()
         
-        # 프로젝트 초기화 (폴더 구조 생성)
+        # 프로젝트 열기 판정 (열기는 폴더나 UUID를 만들지 않는다)
+        self.open_verdict = None
         if self.pm.current_project:
-            self.wpm.initialize_project(self.pm.current_project)
+            from project_creation_v1 import OPEN_OK
+
+            self.open_verdict = self.wpm.initialize_project(self.pm.current_project)
+            if self.open_verdict["status"] != OPEN_OK:
+                QMessageBox.warning(
+                    self,
+                    "프로젝트를 열 수 없습니다",
+                    f"{self.open_verdict['reason']}\n\n파일은 변경하지 않았습니다.",
+                )
             print(f"[DEBUG INIT] self.wpm initialized. id = {id(self.wpm)}")
         else:
             print(f"[DEBUG INIT] self.pm.current_project is empty. wpm id = {id(self.wpm)}")

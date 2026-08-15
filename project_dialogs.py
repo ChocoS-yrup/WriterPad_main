@@ -603,6 +603,8 @@ class ProjectSelectionDialog(QDialog):
         super().__init__(parent)
         self.pm = pm
         self.selected_project = None
+        # Creating and opening are separate paths: only creation issues UUIDs.
+        self.is_new_project = False
         self.setWindowTitle("프로젝트 선택")
         self.setFixedSize(720, 430)
         # This is shown before the main window is visible. Keep it above any
@@ -692,6 +694,7 @@ class ProjectSelectionDialog(QDialog):
             QMessageBox.warning(self, "경고", "열어볼 프로젝트를 선택하세요.")
             return
         self.selected_project = item.text()
+        self.is_new_project = False
         self.accept()
 
     def on_create(self):
@@ -711,6 +714,7 @@ class ProjectSelectionDialog(QDialog):
             QMessageBox.warning(self, "경고", error.user_message)
             return
         self.selected_project = destination.project_name
+        self.is_new_project = True
         self.accept()
 
     def on_order_changed(self, parent, start, end, destination, row):

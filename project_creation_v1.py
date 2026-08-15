@@ -177,15 +177,11 @@ def _verify(root, nodes):
             raise CreationError(f"missing document for {node['uuid']}: {target}")
 
 
-def create_project(workspace, title, uuid_factory=None):
-    """Create a project whose standard folders already have UUIDs on return."""
-    project_root = os.path.join(workspace, title)
-    if os.path.exists(project_root):
-        raise CreationError(f"project already exists: {project_root}")
+def _is_empty_dir(path):
+    return os.path.isdir(path) and not os.listdir(path)
 
-    transaction_id = _new_uuid(uuid_factory)
-    project_uuid = _new_uuid(uuid_factory)
 
+def _standard_folder_nodes(uuid_factory):
     nodes = []
     assigned = {}
     for index, legacy_path in enumerate(STANDARD_FOLDERS):
@@ -202,8 +198,13 @@ def create_project(workspace, title, uuid_factory=None):
                 "order": index if parent_path else 0,
             }
         )
+    return nodes
 
-    staging = os.path.join(workspace, PROJECT_STAGING_DIRNAME, transaction_id)
+
+def _start_project_transaction(workspace, title, project_root, staging,
+                               uuid_factory):
+    transaction_id = _new_uuid(uuid_factory)
+    project_uuid = _new_uuid(uuid_factory)
     journal = os.path.join(workspace_journal_dir(workspace), f"{transaction_id}.json")
     _write_json_atomic(
         journal,
@@ -215,42 +216,80 @@ def create_project(workspace, title, uuid_factory=None):
             "target_path": project_root,
             "staging_path": staging,
             "project": {"uuid": project_uuid, "title": title},
-            "nodes": nodes,
+            "nodes": _standard_folder_nodes(uuid_factory),
         },
     )
-
     _finish_create_project(_read_json(journal), journal)
     return read_identity(project_root)
+
+
+def create_project(workspace, title, uuid_factory=None):
+    """Create a project whose standard folders already have UUIDs on return."""
+    project_root = os.path.join(workspace, title)
+    if os.path.exists(project_root):
+        raise CreationError(f"project already exists: {project_root}")
+
+    transaction_id = _new_uuid(uuid_factory)
+    staging = os.path.join(workspace, PROJECT_STAGING_DIRNAME, transaction_id)
+    return _start_project_transaction(
+        workspace, title, project_root, staging, uuid_factory
+    )
+
+
+def initialize_existing_project(workspace, title, uuid_factory=None):
+    """Give an already-reserved project directory its standard folders and identity.
+
+    Import flows must create the destination first so they can write their own
+    marker, so they cannot hand over an empty directory for the staging rename.
+    The journal still records every UUID before a single folder is created, so
+    an interrupted import resumes with the same ids rather than new ones.
+    """
+    project_root = os.path.join(workspace, title)
+    if os.path.exists(identity_path(project_root)):
+        return read_identity(project_root)
+    return _start_project_transaction(
+        workspace, title, project_root, None, uuid_factory
+    )
 
 
 def _finish_create_project(entry, journal_path):
     """Complete or roll back one create_project transaction. Safe to repeat."""
     project_root = entry["target_path"]
-    staging = entry["staging_path"]
+    staging = entry.get("staging_path")
 
-    if os.path.exists(project_root):
-        # The rename already landed. Confirm the journalled ids are what is there.
+    if os.path.exists(identity_path(project_root)):
+        # The transaction already landed. Confirm the journalled ids are there.
         identity = read_identity(project_root)
         if identity["project"]["uuid"] != entry["project"]["uuid"]:
             raise CreationError(
                 f"{project_root} exists with a different project uuid; "
                 "manual recovery required"
             )
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
         os.unlink(journal_path)
         return identity
 
-    staging_writing_root = writing_root(staging)
-    os.makedirs(staging_writing_root, exist_ok=True)
-    _materialize(staging_writing_root, entry["nodes"])
+    if staging and os.path.exists(project_root):
+        raise CreationError(
+            f"{project_root} exists without an identity file; "
+            "manual recovery required"
+        )
+
+    # With staging the tree is built aside and lands with one rename. Without it
+    # the caller already reserved the directory and owns the other files in it.
+    build_root = staging or project_root
+    build_writing_root = writing_root(build_root)
+    os.makedirs(build_writing_root, exist_ok=True)
+    _materialize(build_writing_root, entry["nodes"])
     for legacy_path in UNTRACKED_FOLDERS:
         os.makedirs(
-            os.path.join(staging_writing_root, legacy_path.replace("/", os.sep)),
+            os.path.join(build_writing_root, legacy_path.replace("/", os.sep)),
             exist_ok=True,
         )
 
     write_identity(
-        staging,
+        build_root,
         {
             "format_version": 1,
             "project": entry["project"],
@@ -259,10 +298,11 @@ def _finish_create_project(entry, journal_path):
         overwrite=True,
     )
 
-    _verify(staging_writing_root, read_identity(staging)["nodes"])
+    _verify(build_writing_root, read_identity(build_root)["nodes"])
 
-    os.makedirs(os.path.dirname(project_root), exist_ok=True)
-    os.replace(staging, project_root)
+    if staging:
+        os.makedirs(os.path.dirname(project_root), exist_ok=True)
+        os.replace(staging, project_root)
     os.unlink(journal_path)
     return read_identity(project_root)
 
@@ -361,6 +401,63 @@ def create_volume(project_root, uuid_factory=None):
             }
         )
     return _run_item_transaction(project_root, "create_volume", nodes, uuid_factory)
+
+
+OPEN_OK = "ok"
+OPEN_LEGACY = "legacy"
+OPEN_BLOCKED = "blocked"
+
+
+def ensure_machine_folders(project_root):
+    """Recreate only the machine-managed directories.
+
+    These carry no UUID and never appear in the sync tree or in a backup
+    manifest, so remaking them is safe. User folders are never recreated here:
+    a missing one is an audit error, not something to paper over.
+    """
+    root = writing_root(project_root)
+    for legacy_path in UNTRACKED_FOLDERS:
+        os.makedirs(os.path.join(root, legacy_path.replace("/", os.sep)), exist_ok=True)
+
+
+def prepare_open(project_root):
+    """Decide whether a project may be opened. Creates no user folder or UUID.
+
+    Order: finish any pending journal, validate the identity file, audit it
+    against the file tree, and only then report ``OPEN_OK``. A project with no
+    identity file is reported as legacy and left untouched — importing it is an
+    explicit user action, never a side effect of opening.
+    """
+    if not os.path.exists(identity_path(project_root)):
+        return {
+            "status": OPEN_LEGACY,
+            "reason": "레거시 프로젝트 — 명시적 가져오기/마이그레이션 필요",
+            "audit": None,
+        }
+
+    try:
+        recover_project(project_root)
+        read_identity(project_root)
+        report = audit(project_root)
+    except (IdentityError, CreationError, OSError) as error:
+        return {"status": OPEN_BLOCKED, "reason": str(error), "audit": None}
+
+    if any(report[key] for key in report):
+        return {
+            "status": OPEN_BLOCKED,
+            "reason": "identity와 파일 트리가 일치하지 않는다",
+            "audit": report,
+        }
+    return {"status": OPEN_OK, "reason": "", "audit": report}
+
+
+def create_item_at_path(project_root, parent_legacy_path, base_name, is_folder,
+                        uuid_factory=None):
+    """create_item addressed by the parent's path instead of its uuid."""
+    parent = _node_by_path(read_identity(project_root), parent_legacy_path)
+    return create_item(
+        project_root, parent["uuid"], base_name, is_folder, uuid_factory
+    )
 
 
 def recover_workspace(workspace):
