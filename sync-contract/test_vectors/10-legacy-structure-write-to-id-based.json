@@ -1,0 +1,151 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-010",
+  "title": "Legacy writes rejected after manual ID-based promotion",
+  "contract_version": "0.2.0",
+  "minimum_protocol_version": 1,
+  "tags": [
+    "id-based",
+    "legacy-client",
+    "protocol-gate"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000010",
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 4,
+    "entities": [
+      {
+        "entity_id": "30000000-0000-4000-8000-000000000101",
+        "entity_kind": "folder",
+        "revision": 7,
+        "is_deleted": false,
+        "name": "정식 폴더"
+      },
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000101",
+        "entity_kind": "document",
+        "revision": 3,
+        "is_deleted": false,
+        "name": "본문.txt"
+      }
+    ],
+    "tree_order": {
+      "root": [
+        "30000000-0000-4000-8000-000000000101"
+      ],
+      "30000000-0000-4000-8000-000000000101": [
+        "40000000-0000-4000-8000-000000000101"
+      ]
+    }
+  },
+  "initial_client_states": [
+    {
+      "client_id": "windows-v1",
+      "platform": "windows",
+      "protocol_version": 1,
+      "capabilities": [
+        "legacy_tree_folder_projection"
+      ],
+      "local_entities": [],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000071",
+          "provenance_kind": "LEGACY_EPOCH_0",
+          "entity_id": "30000000-0000-4000-8000-000000000101",
+          "intent_kind": "rename",
+          "base_revision": 7,
+          "payload_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "windows-v1",
+      "kind": "legacy_structure_write",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000071",
+        "tree_order": {
+          "root": [
+            "구형 이름"
+          ]
+        }
+      },
+      "expected_outcome": "server rejects the structural write with PROTOCOL_TOO_OLD"
+    },
+    {
+      "action_id": "A02",
+      "actor": "windows-v1",
+      "kind": "commit_batch",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000072",
+        "provenance_kind": "LEGACY_EPOCH_0",
+        "content_only": true,
+        "document_id": "40000000-0000-4000-8000-000000000101",
+        "relative_path_unchanged": true,
+        "parent_unchanged": true
+      },
+      "expected_outcome": "server rejects the content write with PROTOCOL_TOO_OLD because enforcement began before ID_BASED"
+    }
+  ],
+  "fault_injections": [],
+  "expected_server_state": {
+    "project_sync_mode": "ID_BASED",
+    "migration_epoch": 4,
+    "entity_assertions": [
+      "folder name remains 정식 폴더 at revision 7",
+      "document content and revision remain unchanged"
+    ],
+    "tree_order_assertions": [
+      "ID-based tree references remain unchanged"
+    ],
+    "error_code": "PROTOCOL_TOO_OLD"
+  },
+  "expected_client_states": [
+    {
+      "client_id": "windows-v1",
+      "assertions": [
+        "both intents are visibly blocked with an update-required reason",
+        "no rejected legacy value is projected into authoritative state"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000071",
+      "state": "blocked",
+      "attempt_count": 1,
+      "error_code": "PROTOCOL_TOO_OLD",
+      "assertions": [
+        "the structural operation is not rewritten or assigned a fabricated batch",
+        "server state is unchanged"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000072",
+      "state": "blocked",
+      "attempt_count": 1,
+      "error_code": "PROTOCOL_TOO_OLD",
+      "assertions": [
+        "post-enforcement content cannot use LEGACY_EPOCH_0 provenance"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-005",
+      "assert": "a name-based payload cannot modify an ID-based tree"
+    },
+    {
+      "id": "INV-007",
+      "assert": "the project does not downgrade to LEGACY"
+    },
+    {
+      "id": "INV-009",
+      "assert": "no post-enforcement write is accepted without a released contract batch"
+    }
+  ]
+}

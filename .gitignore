@@ -1,0 +1,40 @@
+# Local credentials (keep the real values on this computer only)
+.env
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Local application state and manuscripts
+config.json
+fonts.json
+saves/
+작품목록/
+메인/
+백업/
+공유/
+
+# Generated packages and local working files
+build/
+dist/
+scratch/
+*.zip
+node_modules/
+
+# Public Supabase URL and publishable key for the packaged build.
+# Kept out of git for the same reason as .env: it is per-machine setup.
+release_cloud_config.json
+
+# Superseded build and test trees moved aside on 2026-08-15. Kept on disk so
+# the promotion of the canonical source stays reversible; delete once the
+# current tree has proven itself.
+_사용안함_과거테스트흔적_20260815/
+
+# Manuscript text and creative assets (keep on PC and Supabase only)
+005화.txt
+15화-45화_추출_20260708.txt
+전체추출_20260708.txt
+디버깅.txt
+프롬프트.txt
+out*.log
+create_performance_test_project.py

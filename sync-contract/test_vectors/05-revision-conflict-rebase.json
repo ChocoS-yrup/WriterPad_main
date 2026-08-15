@@ -1,0 +1,165 @@
+{
+  "$schema": "../transition-vector.schema.json",
+  "vector_id": "TV-005",
+  "title": "Revision conflict creates an immutable successor intent",
+  "contract_version": "0.2.0",
+  "minimum_protocol_version": 3,
+  "tags": [
+    "immutable-intent",
+    "rebase",
+    "revision-conflict",
+    "supersession"
+  ],
+  "initial_server_state": {
+    "project_id": "00000000-0000-4000-8000-000000000005",
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entities": [
+      {
+        "entity_id": "40000000-0000-4000-8000-000000000005",
+        "entity_kind": "document",
+        "revision": 3,
+        "is_deleted": false,
+        "content": "remote-3"
+      }
+    ],
+    "tree_order": {}
+  },
+  "initial_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "platform": "ipad",
+      "protocol_version": 3,
+      "capabilities": [
+        "folders_authoritative",
+        "tree_order_ids",
+        "tombstones",
+        "immutable_batch_contract_metadata",
+        "operation_attempt_history",
+        "operation_state_events",
+        "storage_name_v1",
+        "document_commit_v1"
+      ],
+      "local_entities": [
+        {
+          "entity_id": "40000000-0000-4000-8000-000000000005",
+          "entity_kind": "document",
+          "revision": 2,
+          "is_deleted": false,
+          "content": "local-change"
+        }
+      ],
+      "queue": [
+        {
+          "operation_id": "20000000-0000-4000-8000-000000000021",
+          "batch_id": "10000000-0000-4000-8000-000000000021",
+          "provenance_kind": "CONTRACT_BATCH",
+          "entity_id": "40000000-0000-4000-8000-000000000005",
+          "intent_kind": "update",
+          "base_revision": 2,
+          "payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "state": "pending",
+          "attempt_count": 0
+        }
+      ]
+    }
+  ],
+  "ordered_actions": [
+    {
+      "action_id": "A01",
+      "actor": "ipad-v3",
+      "kind": "commit_batch",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000021"
+      },
+      "expected_outcome": "the original immutable intent records one REVISION_CONFLICT attempt and conflict_detected event"
+    },
+    {
+      "action_id": "A02",
+      "actor": "ipad-v3",
+      "kind": "rebase_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000022",
+        "batch_id": "10000000-0000-4000-8000-000000000022",
+        "supersedes_operation_id": "20000000-0000-4000-8000-000000000021",
+        "base_revision": 3,
+        "payload_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merge_policy": "three-way-no-overlap"
+      },
+      "expected_outcome": "a new immutable intent is durably created before a superseded event cancels the original"
+    },
+    {
+      "action_id": "A03",
+      "actor": "ipad-v3",
+      "kind": "retry_operation",
+      "input": {
+        "operation_id": "20000000-0000-4000-8000-000000000022"
+      },
+      "expected_outcome": "the successor intent commits revision 4"
+    }
+  ],
+  "fault_injections": [
+    {
+      "after_action_id": "A01",
+      "type": "inject_revision_conflict",
+      "parameters": {
+        "current_revision": 3
+      }
+    }
+  ],
+  "expected_server_state": {
+    "project_sync_mode": "LEGACY",
+    "migration_epoch": 0,
+    "entity_assertions": [
+      "document revision is 4",
+      "merged content contains both non-overlapping changes",
+      "the original intent bytes remain unchanged"
+    ],
+    "tree_order_assertions": []
+  },
+  "expected_client_states": [
+    {
+      "client_id": "ipad-v3",
+      "assertions": [
+        "the document baseline advances to revision 4",
+        "the original REVISION_CONFLICT attempt remains in history",
+        "the successor points to the original exactly once"
+      ]
+    }
+  ],
+  "expected_queue_states": [
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000021",
+      "state": "cancelled",
+      "attempt_count": 1,
+      "assertions": [
+        "the original intent is cancelled only by an append-only superseded event",
+        "base revision and payload digest remain unchanged"
+      ]
+    },
+    {
+      "operation_id": "20000000-0000-4000-8000-000000000022",
+      "supersedes_operation_id": "20000000-0000-4000-8000-000000000021",
+      "state": "completed",
+      "attempt_count": 1,
+      "assertions": [
+        "the rebased intent has a new operation_id and batch_id",
+        "result revision is 4"
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "INV-001",
+      "assert": "server revision increases from 3 to 4"
+    },
+    {
+      "id": "INV-002",
+      "assert": "the original operation identity never changes payload"
+    },
+    {
+      "id": "INV-011",
+      "assert": "supersession and completion are derived from append-only events"
+    }
+  ]
+}
