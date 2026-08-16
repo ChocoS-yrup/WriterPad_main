@@ -37,6 +37,20 @@ from sync_v2_store import SyncV2Store
 from three_way_merge import three_way_merge
 
 
+# commit_folder refuses these for a reason that no amount of waiting changes:
+# a name someone else holds, a parent that is not there, a tree that cannot
+# exist. Sending them again on a timer would spin forever, and because folder
+# work rides inside the tree-order commit it would take binder order down with
+# it. They are reported once and stepped over.
+PERMANENT_FOLDER_ERROR_CODES = frozenset({
+    "PARENT_FOLDER_NOT_FOUND",
+    "FOLDER_NAME_CONFLICT",
+    "FOLDER_ALREADY_EXISTS",
+    "FOLDER_NOT_FOUND",
+    "FOLDER_NOT_EMPTY",
+    "FOLDER_CYCLE",
+    "INVALID_ARGUMENT",
+})
 TREE_ORDER_DOCUMENT_PATH = "__antigravity__/tree-order.json"
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
 LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
@@ -2034,6 +2048,11 @@ class SyncManager(QObject):
             "AUTH_REQUIRED", "FORBIDDEN", "INVALID_ARGUMENT",
             "PROJECT_TRASHED", "PROJECT_PURGED", "PROJECT_NOT_FOUND",
             "DOCUMENT_NOT_FOUND", "DOCUMENT_ALREADY_EXISTS",
+            # PARENT_FOLDER_NOT_FOUND must stay ahead of FOLDER_NOT_FOUND:
+            # this matches by substring, and the shorter one is inside it.
+            "PARENT_FOLDER_NOT_FOUND", "FOLDER_NAME_CONFLICT",
+            "FOLDER_ALREADY_EXISTS", "FOLDER_NOT_FOUND",
+            "FOLDER_NOT_EMPTY", "FOLDER_CYCLE",
             "REVISION_CONFLICT", "OPERATION_ID_REUSED", "LEASE_REQUIRED",
             "LEASE_CONFLICT", "LEASE_EXPIRED", "PATH_CONFLICT",
             "CONTRACT_NOT_ALLOWED", "CONTRACT_DIGEST_MISMATCH",
@@ -2586,20 +2605,32 @@ class SyncManager(QObject):
         ]
 
     def _commit_folder_state(self, operation, client, folder_id, params):
-        """Send one commit_folder and return the validated result."""
-        response = client.rpc("commit_folder", {
-            "p_folder_id": folder_id,
-            "p_project_id": operation["project_id"],
-            "p_operation_id": str(uuid.uuid5(
-                uuid.UUID(str(operation["operation_id"])),
-                f"folder-{params['intent']}:{folder_id}",
-            )),
-            "p_device_id": self._v2_device_id,
-            "p_base_revision": params["base_revision"],
-            "p_parent_folder_id": params["parent_folder_id"],
-            "p_name": params["name"],
-            "p_is_deleted": params["is_deleted"],
-        }).execute()
+        """Send one commit_folder, or report and step over a refusal that stands.
+
+        Returns ``None`` when the server refused for a reason a retry cannot
+        change. Anything else — a network failure, an expired session — is
+        raised so the tree-order operation retries the whole thing as before.
+        """
+        try:
+            response = client.rpc("commit_folder", {
+                "p_folder_id": folder_id,
+                "p_project_id": operation["project_id"],
+                "p_operation_id": str(uuid.uuid5(
+                    uuid.UUID(str(operation["operation_id"])),
+                    f"folder-{params['intent']}:{folder_id}",
+                )),
+                "p_device_id": self._v2_device_id,
+                "p_base_revision": params["base_revision"],
+                "p_parent_folder_id": params["parent_folder_id"],
+                "p_name": params["name"],
+                "p_is_deleted": params["is_deleted"],
+            }).execute()
+        except Exception as error:
+            code = self._stable_error_code(error)
+            if code not in PERMANENT_FOLDER_ERROR_CODES:
+                raise
+            self._report_folder_block(operation, folder_id, code)
+            return None
         result = self._response_data(response) or {}
         if str(result.get("folder_id")) != folder_id or "revision" not in result:
             raise RuntimeError("INVALID_FOLDER_COMMIT_RESPONSE")
@@ -2696,6 +2727,12 @@ class SyncManager(QObject):
                 "name": row.get("name"),
                 "is_deleted": True,
             })
+            if committed is None:
+                # Reported and left as it is. Its ancestors stay live, which is
+                # what the server already believes, so the rest of the pass
+                # still describes a tree the server can accept.
+                result["blocked"].append(node["legacy_path"])
+                continue
             live_by_slot.pop(
                 self._folder_slot(row.get("parent_folder_id"), row.get("name")),
                 None,
@@ -2733,6 +2770,11 @@ class SyncManager(QObject):
                 "name": name,
                 "is_deleted": False,
             })
+            if committed is None:
+                # Children of a folder that never landed are skipped by the
+                # PARENT_NOT_PUBLISHED guard on the next turn of this same loop.
+                result["blocked"].append(node["legacy_path"])
+                continue
             live_by_id[folder_id] = {**committed, "is_deleted": False}
             live_by_slot[slot] = folder_id
             deleted_by_id.pop(folder_id, None)
@@ -2855,16 +2897,28 @@ class SyncManager(QObject):
             folder_namespace,
             f"folder-rename:{folder['folder_id']}:{intent['new_name']}",
         ))
-        response = client.rpc("commit_folder", {
-            "p_folder_id": folder["folder_id"],
-            "p_project_id": operation["project_id"],
-            "p_base_revision": int(folder.get("revision") or 0),
-            "p_operation_id": folder_operation_id,
-            "p_device_id": self._v2_device_id,
-            "p_parent_folder_id": folder.get("parent_folder_id"),
-            "p_name": intent["new_name"],
-            "p_is_deleted": False,
-        }).execute()
+        try:
+            response = client.rpc("commit_folder", {
+                "p_folder_id": folder["folder_id"],
+                "p_project_id": operation["project_id"],
+                "p_base_revision": int(folder.get("revision") or 0),
+                "p_operation_id": folder_operation_id,
+                "p_device_id": self._v2_device_id,
+                "p_parent_folder_id": folder.get("parent_folder_id"),
+                "p_name": intent["new_name"],
+                "p_is_deleted": False,
+            }).execute()
+        except Exception as error:
+            code = self._stable_error_code(error)
+            if code not in PERMANENT_FOLDER_ERROR_CODES:
+                raise
+            # The intent stays pending on purpose. It is the writer's rename,
+            # and dropping it here would lose that silently; it simply stops
+            # taking the tree-order commit down with it every time.
+            self._report_folder_block(
+                operation, str(folder["folder_id"]), code
+            )
+            return None
         result = self._response_data(response) or {}
         if "revision" not in result or str(result.get("folder_id")) != str(
             folder["folder_id"]

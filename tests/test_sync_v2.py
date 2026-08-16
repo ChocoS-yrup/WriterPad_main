@@ -1361,6 +1361,81 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         ]
         self.assertEqual(blocked, ["RESTORE_TARGET_TAKEN"])
 
+    def _refusing_client(self, code, target_name):
+        """A client whose commit_folder refuses one folder the way a server does."""
+        client = _FolderAwareClient([])
+        original = client.rpc
+
+        def rpc(name, params):
+            if name == "commit_folder" and params["p_name"] == target_name:
+                raise RuntimeError(f"{code}: 서버가 거절했습니다.")
+            return original(name, params)
+
+        client.rpc = rpc
+        return client
+
+    def test_a_refusal_that_retrying_cannot_change_is_stepped_over(self):
+        for code in (
+            "PARENT_FOLDER_NOT_FOUND",
+            "FOLDER_NAME_CONFLICT",
+            "FOLDER_CYCLE",
+            "FOLDER_ALREADY_EXISTS",
+            "FOLDER_NOT_FOUND",
+            "FOLDER_NOT_EMPTY",
+            "INVALID_ARGUMENT",
+        ):
+            with self.subTest(code=code):
+                store = SyncV2Store(str(Path(self.temp.name, f"{code}.sqlite3")))
+                self.manager._v2_store = store
+                self.manager._v2_context = store.configure_project(
+                    self.wpm.writing_root_path, "폴더 발행", str(uuid.uuid4())
+                )
+                client = self._refusing_client(code, "설정집")
+                operation = {
+                    "operation_id": str(uuid.uuid4()),
+                    "project_id": self.manager._v2_context["project_id"],
+                }
+
+                result = self.manager._commit_outbound_folder_lifecycle(
+                    operation, client
+                )
+
+                self.assertIn("메인/설정집", result["blocked"])
+                # 거절 하나가 나머지 폴더 줄을 세우지 않는다.
+                self.assertIn("메인/원고", result["created"])
+                self.assertIn("메인/휴지통", result["created"])
+
+    def test_a_refusal_is_reported_once_no_matter_how_often_it_repeats(self):
+        client = self._refusing_client("FOLDER_NAME_CONFLICT", "설정집")
+
+        for _ in range(3):
+            self.operation["operation_id"] = str(uuid.uuid4())
+            self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+
+        blocked = [
+            record for record in self.store.diagnostics(self.context["local_key"])
+            if record["metadata"].get("error_code") == "FOLDER_NAME_CONFLICT"
+        ]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(
+            blocked[0]["metadata"]["entity_id"], self._uuid_of("메인/설정집")
+        )
+
+    def test_a_failure_that_retrying_can_change_still_reaches_the_queue(self):
+        """연결 실패는 재시도해야 한다. 영구 거절과 섞이면 안 된다."""
+        client = self._refusing_client("network timeout", "설정집")
+
+        with self.assertRaises(RuntimeError):
+            self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+
+    def test_parent_not_found_is_not_read_as_the_shorter_folder_not_found(self):
+        self.assertEqual(
+            SyncManager._stable_error_code(
+                RuntimeError("PARENT_FOLDER_NOT_FOUND: 부모가 없습니다.")
+            ),
+            "PARENT_FOLDER_NOT_FOUND",
+        )
+
     def test_a_project_without_identity_publishes_nothing(self):
         plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))
         self.manager._v2_wpm = SimpleNamespace(writing_root_path=plain_root)
