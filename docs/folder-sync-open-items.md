@@ -73,7 +73,7 @@ UUID·parent·order·bytes·SHA-256 이 모두 일치했다.
 
 ---
 
-## Windows 가 확인해야 할 것
+## Windows 쪽 — 해결된 것
 
 **폴더 삭제·복원의 양방향 — 해결됨**
 
@@ -117,36 +117,6 @@ UUID 가 다시 발급되지 않는다. 계획이 모호하면 쓰지 않고 거
 이 재작성은 **가져오기 거래 안에서만** 안전하다. 방금 만들어진 프로젝트라 그 id 를
 아직 아무도 참조하지 않았기 때문이다. 사용자가 작업해 온 프로젝트에는 절대 쓰지
 않는다.
-
-**계약 패키지가 0.2.0 과 0.3.0 으로 갈라져 있다 — 미해결**
-
-Windows 활성 트리 안에서 값이 두 개다.
-
-```
-sync_contract.py            0.2.0
-sync-contract/protocol.json 0.2.0
-contract-lock.json          0.2.0
-CHANGELOG 최신 항목          0.2.0   (0.3.0 항목 없음)
-
-storage_name_tables.py      0.3.0   ← 활성 트리
-tests/storage_name_v2_*     0.3.0   ← 활성 트리
-sync-contract/unicode/      없음     ← storage_name_tables 가 가리키는 출처
-```
-
-iPad 는 0.3.0 을 pin 하고 있고, 자기 저장소에서 `verify_contract.py` 로 canonical
-SHA 일치를 확인했다. **iPad 의 pin 이 틀린 것이 아니라 Windows 활성 트리가 한
-세대 뒤다.** 0.3.0 산출물은 정크 정리 때 `_사용안함_과거테스트흔적_20260815/`
-안으로 딸려 들어갔고, 그것을 소비하는 코드만 활성 트리에 남았다.
-
-**지금은 무해하다.** 계약을 검증하는 경로는 `_uses_contract_structure()` 뒤에
-있고 제품에서 한 번도 True 가 되지 않는다. 실제로 쓰는 RPC 는 `ensure_project`,
-`commit_document`, `commit_folder` 뿐이며 계약 배치를 쓰지 않는다.
-`storage_name_tables.py` 의 테이블 자체는 활성 트리에 통째로 있어 동작한다.
-없는 것은 그 출처 문서뿐이다.
-
-정리 방향은 정해졌다. iPad 저장소에 온전한 0.3.0 패키지가 있으므로 Windows 가
-그것을 활성 트리로 가져오면 된다. 서버 마이그레이션보다 먼저 해야 한다. 그
-변경을 어느 계약 문서에 적을지가 지금은 불분명하기 때문이다.
 
 **영구 삭제가 identity 노드를 남긴다 — 해결됨**
 
@@ -238,6 +208,48 @@ Windows 는 서버 프로젝트를 가져올 때 identity 의 project uuid 를 �
 pending 으로 남는다. 실제 `ensure_project` 는 연결 직전에 따로 호출되므로
 프로젝트 생성은 되고, batch 상태만 완료되지 않는다. 원고 손실 위험은 없다.
 다른 작업과 같은 커밋에 섞지 않는다.
+
+---
+
+## 계약 pin — 기록만 해둔다
+
+**계약 pin 이 양쪽에서 다르다 — 지금은 건드리지 않는다**
+
+```
+Windows  contract_version 0.2.0   제품은 storage-name-v1 을 쓴다
+iPad     contract_version 0.3.0   자기 저장소에서 canonical SHA 일치를 확인했다
+```
+
+**동작 차이는 지금 0 이다.** 계약을 검증하는 경로는 Windows 의
+`_uses_contract_structure()` 뒤에 있고 제품에서 한 번도 True 가 되지 않는다.
+양쪽이 실제로 부르는 RPC 는 `ensure_project`, `commit_document`, `commit_folder`
+와 리스·휴지통 계열뿐이며 계약 배치를 쓰지 않는다.
+
+Windows 활성 트리는 내부적으로 일관된다. 확인한 결과는 이렇다.
+
+```
+normalize_storage_name      (v1)   제품 호출처 있음  ← 실제로 쓰는 것
+normalize_storage_name_v2          제품 호출처 0 건  ← 시험에서만
+storage_name_tables.py             v2 경로에만 물려 있어 함께 잠들어 있다
+```
+
+즉 0.3.0 산출물이 미리 들어와 있되 켜지지 않은 상태이고, 0.3.0 CHANGELOG 의
+배포 경계가 요구하는 것과 어긋나지 않는다.
+
+> Clients must retain the 0.2.0 pin until the server stage deploys
+> storage-name-v2 and allowlists this release digest.
+
+**아직 모르는 것.** 계약 트랙(`sync_contract_0_1_0_*`, `0_3_0_storage_name_v2`
+마이그레이션 줄기)이 실제 서버에 적용된 적이 있는지 이 저장소에서는 판정할 수
+없다. 활성 `supabase/migrations/` 는 그와 겹치지 않는 다른 줄기다.
+
+**출처 주의.** 0.3.0 산출물이 `_사용안함_과거테스트흔적_20260815/` 안에도 있지만
+그 폴더는 시험하다 늘어난 작업 폴더를 치워둔 잔재이고, `_forbidden` 이 붙은 것은
+쓰지 말라는 표시다. **거기서 활성 트리로 무엇도 가져오지 마라.**
+
+**결정.** 어느 쪽 pin 도 지금 바꾸지 않는다. 바꿀 이유가 생기는 시점은 계약
+경로를 실제로 배선할 때이고, 그때는 서버 배포 상태를 먼저 확인해야 한다.
+그전까지 이 항목은 기록으로만 둔다.
 
 ---
 
