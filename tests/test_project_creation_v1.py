@@ -548,6 +548,40 @@ class InitializeExistingProjectTestCase(unittest.TestCase):
         )
 
 
+class IdentityLivesOutsideTheSyncRootTestCase(unittest.TestCase):
+    """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.workspace = Path(self.temp_dir.name) / "작품목록"
+        self.workspace.mkdir(parents=True)
+        create_project(str(self.workspace), "합성", uuid_factory=seq_uuids())
+        self.project_root = str(self.workspace / "합성")
+
+    def test_identity_never_sits_under_the_directory_sync_walks(self):
+        """동기화는 집필모드만 훑는다. identity 가 그 밖이라 원고로 오해될 수 없다.
+
+        이 배치가 유일한 보호 장치다. identity 를 집필모드 안으로 옮기면 디스크를
+        훑는 경로가 그것을 문서로 집어올릴 수 있고, 그때는 제외 규칙이 따로
+        필요해진다.
+        """
+        sync_root = Path(writing_root(self.project_root)).resolve()
+        identity = Path(identity_path(self.project_root)).resolve()
+
+        self.assertTrue(identity.is_file())
+        self.assertNotIn(sync_root, identity.parents)
+
+    def test_the_journal_directories_stay_outside_the_sync_root_too(self):
+        sync_root = Path(writing_root(self.project_root)).resolve()
+
+        for directory in (
+            Path(project_journal_dir(self.project_root)),
+            Path(workspace_journal_dir(str(self.workspace))),
+        ):
+            self.assertNotIn(sync_root, directory.resolve().parents)
+
+
 class IdentityUuidForWritingPathTestCase(unittest.TestCase):
     """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
 
