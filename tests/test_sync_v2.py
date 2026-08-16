@@ -691,38 +691,64 @@ class _RpcCall:
             })
         if self.name == "commit_folder":
             rows = self.client.folder_rows
-            for row in rows:
-                if str(row.get("folder_id")) == str(self.params["p_folder_id"]):
-                    row["name"] = self.params["p_name"]
-                    row["parent_folder_id"] = self.params["p_parent_folder_id"]
-                    row["revision"] = self.params["p_base_revision"] + 1
-                    return _Response({
-                        "status": "committed",
-                        "folder_id": row["folder_id"],
-                        "operation_id": self.params["p_operation_id"],
-                        "operation_kind": "rename",
-                        "revision": row["revision"],
-                        "parent_folder_id": row["parent_folder_id"],
-                        "name": row["name"],
-                        "is_deleted": False,
-                    })
-            if self.params["p_base_revision"] != 0:
-                raise AssertionError("folder not found")
-            # base_revision 0 은 서버에서 create 다. 실제 commit_folder 처럼
-            # 같은 부모의 같은 이름은 하나만 살아 있게 막는다.
+            wants_deleted = bool(self.params["p_is_deleted"])
             slot = (
                 str(self.params["p_parent_folder_id"] or ""),
                 str(self.params["p_name"]).casefold(),
             )
+
+            def name_is_taken(exclude_id=None):
+                # 서버의 live sibling 유니크 인덱스를 흉내낸다.
+                for other in rows:
+                    if other.get("is_deleted"):
+                        continue
+                    if exclude_id and str(other["folder_id"]) == str(exclude_id):
+                        continue
+                    taken = (
+                        str(other.get("parent_folder_id") or ""),
+                        str(other.get("name") or "").casefold(),
+                    )
+                    if taken == slot:
+                        return True
+                return False
+
             for row in rows:
-                if row.get("is_deleted"):
+                if str(row.get("folder_id")) != str(self.params["p_folder_id"]):
                     continue
-                taken = (
-                    str(row.get("parent_folder_id") or ""),
-                    str(row.get("name") or "").casefold(),
-                )
-                if taken == slot:
+                if wants_deleted and any(
+                    not other.get("is_deleted")
+                    and str(other.get("parent_folder_id") or "")
+                    == str(row["folder_id"])
+                    for other in rows
+                ):
+                    raise RuntimeError("FOLDER_NOT_EMPTY")
+                if not wants_deleted and name_is_taken(row["folder_id"]):
                     raise RuntimeError("FOLDER_NAME_CONFLICT")
+                was_deleted = bool(row.get("is_deleted"))
+                row["name"] = self.params["p_name"]
+                row["parent_folder_id"] = self.params["p_parent_folder_id"]
+                row["revision"] = self.params["p_base_revision"] + 1
+                row["is_deleted"] = wants_deleted
+                return _Response({
+                    "status": "committed",
+                    "folder_id": row["folder_id"],
+                    "operation_id": self.params["p_operation_id"],
+                    "operation_kind": (
+                        "delete" if wants_deleted
+                        else ("restore" if was_deleted else "rename")
+                    ),
+                    "revision": row["revision"],
+                    "parent_folder_id": row["parent_folder_id"],
+                    "name": row["name"],
+                    "is_deleted": wants_deleted,
+                })
+            if self.params["p_base_revision"] != 0:
+                raise AssertionError("folder not found")
+            if wants_deleted:
+                # 서버는 없는 폴더를 삭제 상태로 만들어 주지 않는다.
+                raise RuntimeError("INVALID_ARGUMENT")
+            if name_is_taken():
+                raise RuntimeError("FOLDER_NAME_CONFLICT")
             row = {
                 "folder_id": str(self.params["p_folder_id"]),
                 "parent_folder_id": self.params["p_parent_folder_id"],
@@ -833,7 +859,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
     def test_a_new_project_publishes_its_standard_folders_with_identity_uuids(self):
         client = _FolderAwareClient([])
 
-        result = self.manager._commit_outbound_folder_creates(
+        result = self.manager._commit_outbound_folder_lifecycle(
             self.operation, client
         )
 
@@ -854,7 +880,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
     def test_parents_are_published_before_their_children(self):
         client = _FolderAwareClient([])
 
-        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
 
         order = [
             params["p_name"]
@@ -867,7 +893,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         create_item_at_path(self.project_root, "메인/휴지통", "버린 폴더", True)
         client = _FolderAwareClient([])
 
-        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
 
         names = {row["name"] for row in client.folder_rows}
         self.assertIn("휴지통", names)
@@ -876,11 +902,11 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
     def test_publishing_twice_does_not_create_a_second_revision(self):
         client = _FolderAwareClient([])
 
-        first = self.manager._commit_outbound_folder_creates(
+        first = self.manager._commit_outbound_folder_lifecycle(
             self.operation, client
         )
         calls_after_first = len(client.calls)
-        second = self.manager._commit_outbound_folder_creates(
+        second = self.manager._commit_outbound_folder_lifecycle(
             self.operation, client
         )
 
@@ -899,7 +925,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
             },
         ])
 
-        result = self.manager._commit_outbound_folder_creates(
+        result = self.manager._commit_outbound_folder_lifecycle(
             self.operation, client
         )
 
@@ -918,9 +944,9 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
             },
         ])
 
-        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
         self.operation["operation_id"] = str(uuid.uuid4())
-        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
 
         blocked = {
             record["metadata"]["entity_id"]: record["metadata"]["error_code"]
@@ -939,12 +965,12 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
 
     def test_a_new_user_folder_is_published_after_the_standard_tree(self):
         client = _FolderAwareClient([])
-        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
         created = create_item_at_path(
             self.project_root, "메인/설정집", "구세계", True
         )["nodes"][-1]
 
-        result = self.manager._commit_outbound_folder_creates(
+        result = self.manager._commit_outbound_folder_lifecycle(
             self.operation, client
         )
 
@@ -955,23 +981,160 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
     def test_the_local_folder_row_records_the_published_identity(self):
         client = _FolderAwareClient([])
 
-        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
 
         stored = self.store.get_folder_by_path(
             self.context["local_key"], "메인/원고"
         )
         self.assertEqual(stored["folder_id"], self._uuid_of("메인/원고"))
 
+    def _rows_by_name(self, client):
+        return {row["name"]: row for row in client.folder_rows}
+
+    def test_trashing_a_folder_tombstones_the_row_it_already_had(self):
+        """어제 관찰된 결함이다. 폴더 삭제가 서버에 전혀 전달되지 않았다."""
+        created = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.wpm.move_to_trash("메인/설정집/구세계")
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["deleted"], ["메인/휴지통/구세계"])
+        row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == created["uuid"]
+        )
+        self.assertTrue(row["is_deleted"])
+        self.assertEqual(row["revision"], 2)
+
+    def test_nested_folders_are_tombstoned_deepest_first(self):
+        create_item_at_path(self.project_root, "메인/설정집", "구세계", True)
+        create_item_at_path(
+            self.project_root, "메인/설정집/구세계", "지도", True
+        )
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.wpm.move_to_trash("메인/설정집/구세계")
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        # 부모부터 보내면 서버가 FOLDER_NOT_EMPTY 로 거절한다.
+        deleted_names = [
+            params["p_name"]
+            for name, params in client.calls
+            if name == "commit_folder" and params["p_is_deleted"]
+        ]
+        self.assertEqual(deleted_names, ["지도", "구세계"])
+        self.assertEqual(len(result["deleted"]), 2)
+        self.assertTrue(all(
+            row["is_deleted"] for row in client.folder_rows
+            if row["name"] in {"지도", "구세계"}
+        ))
+
+    def test_a_folder_never_published_is_left_alone_when_trashed(self):
+        """최초 업로드 전에 이미 휴지통에 있던 폴더다. 서버가 만들어주지 않는다."""
+        create_item_at_path(self.project_root, "메인/설정집", "구세계", True)
+        self.wpm.move_to_trash("메인/설정집/구세계")
+        client = _FolderAwareClient([])
+
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["deleted"], [])
+        self.assertNotIn("구세계", self._rows_by_name(client))
+
+    def test_restoring_a_folder_brings_its_row_back_to_life(self):
+        created = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        trash_rel = self.wpm.move_to_trash("메인/설정집/구세계")
+        self.operation["operation_id"] = str(uuid.uuid4())
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.wpm.restore_from_trash(trash_rel)
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["restored"], ["메인/설정집/구세계"])
+        row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == created["uuid"]
+        )
+        self.assertFalse(row["is_deleted"])
+        self.assertEqual(row["parent_folder_id"], self._uuid_of("메인/설정집"))
+
+    def test_a_live_child_of_another_identity_blocks_the_tombstone(self):
+        create_item_at_path(self.project_root, "메인/설정집", "구세계", True)
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        client.folder_rows.append({
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": self._uuid_of("메인/설정집/구세계"),
+            "name": "남의 폴더", "revision": 1, "is_deleted": False,
+        })
+        self.wpm.move_to_trash("메인/설정집/구세계")
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["deleted"], [])
+        self.assertIn("메인/휴지통/구세계", result["blocked"])
+        row = next(
+            row for row in client.folder_rows if row["name"] == "구세계"
+        )
+        self.assertFalse(row["is_deleted"])
+
+    def test_the_name_frees_up_once_the_old_folder_is_tombstoned(self):
+        create_item_at_path(self.project_root, "메인/설정집", "구세계", True)
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.wpm.move_to_trash("메인/설정집/구세계")
+        replacement = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["blocked"], [])
+        self.assertEqual(result["created"], ["메인/설정집/구세계"])
+        live = [
+            row for row in client.folder_rows
+            if row["name"] == "구세계" and not row["is_deleted"]
+        ]
+        self.assertEqual([row["folder_id"] for row in live], [replacement["uuid"]])
+
     def test_a_project_without_identity_publishes_nothing(self):
         plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))
         self.manager._v2_wpm = SimpleNamespace(writing_root_path=plain_root)
         client = _FolderAwareClient([])
 
-        result = self.manager._commit_outbound_folder_creates(
+        result = self.manager._commit_outbound_folder_lifecycle(
             self.operation, client
         )
 
-        self.assertEqual(result, {"created": [], "blocked": []})
+        self.assertEqual(
+            result,
+            {"created": [], "restored": [], "deleted": [], "blocked": []},
+        )
         self.assertEqual(client.calls, [])
 
 

@@ -2566,58 +2566,146 @@ class SyncManager(QObject):
         return matches
 
     def _publishable_identity_folders(self):
-        """Identity folders this client may create on the server, parent first.
+        """Every identity folder, shallowest first, with its wanted server state.
 
-        Identity is the only authority for a create: a node is there only after
-        a journalled creation transaction issued its UUID. 휴지통 keeps its own
-        identity so backups can restore trashed manuscripts, but its contents
-        stay out of the shared tree — the server contract cannot create a folder
-        that is already deleted, so publishing them would fail the first upload.
+        Identity is the only authority here: a node is there only after a
+        journalled creation transaction issued its UUID. Where the node sits now
+        says what the server should hold — a folder under 휴지통 belongs there as
+        a tombstone, anything else as a live row. 휴지통 itself is a live folder,
+        matching iPad.
         """
         from project_creation_v1 import identity_folder_nodes
 
         root = getattr(self._v2_wpm, "writing_root_path", None)
         return [
-            node for node in identity_folder_nodes(root)
-            if not node["legacy_path"].startswith("메인/휴지통/")
+            {
+                **node,
+                "wants_deleted": node["legacy_path"].startswith("메인/휴지통/"),
+            }
+            for node in identity_folder_nodes(root)
         ]
 
-    def _commit_outbound_folder_creates(self, operation, client):
-        """Give identity-issued folders their server row before tree-order lands.
+    def _commit_folder_state(self, operation, client, folder_id, params):
+        """Send one commit_folder and return the validated result."""
+        response = client.rpc("commit_folder", {
+            "p_folder_id": folder_id,
+            "p_project_id": operation["project_id"],
+            "p_operation_id": str(uuid.uuid5(
+                uuid.UUID(str(operation["operation_id"])),
+                f"folder-{params['intent']}:{folder_id}",
+            )),
+            "p_device_id": self._v2_device_id,
+            "p_base_revision": params["base_revision"],
+            "p_parent_folder_id": params["parent_folder_id"],
+            "p_name": params["name"],
+            "p_is_deleted": params["is_deleted"],
+        }).execute()
+        result = self._response_data(response) or {}
+        if str(result.get("folder_id")) != folder_id or "revision" not in result:
+            raise RuntimeError("INVALID_FOLDER_COMMIT_RESPONSE")
+        return result
 
-        Folder identity used to reach the server only through a rename, so a
-        folder that was merely created never existed there and the structure
-        could not be reconstructed on another device.
+    def _report_folder_block(self, operation, folder_id, reason):
+        """Report a folder this client may not touch. Never repair it here."""
+        # A blocked folder stays blocked until someone reconciles the two
+        # identities, so this is one standing report, not one per dispatch. The
+        # operation id is deliberately left out: it would make every retry look
+        # like a new finding.
+        self._v2_store.record_diagnostic(
+            self._v2_context["local_key"],
+            "folder_create_blocked",
+            dedupe=True,
+            entity_id=folder_id,
+            error_code=reason,
+            project_id=operation["project_id"],
+            rpc_name="commit_folder",
+        )
 
-        A create is published only when the parent is already on the server
-        under the very same UUID. When the name is taken by a different
-        identity — an imported project whose folders were issued elsewhere —
-        the folder is reported and skipped. This client never renames or
-        re-parents another identity's folder to make room for its own.
+    def _commit_outbound_folder_lifecycle(self, operation, client):
+        """Make the server's folder rows agree with identity before tree-order.
+
+        Identity says where a folder is, so it also says what the server should
+        hold: a row under 휴지통 belongs there as a tombstone, anything else as a
+        live row. Two directions, two orders. Deletions run deepest first
+        because the server refuses to tombstone a folder that still has a live
+        child. Creations and restores run shallowest first because a folder
+        needs a live parent.
+
+        Only identity may authorize a change, and only over rows that already
+        carry the very same UUID. A folder whose name is held by a different
+        identity — an imported project whose folders were issued elsewhere — is
+        reported and left exactly as it is. This client never renames,
+        re-parents or deletes another identity's folder to make room.
         """
+        empty = {"created": [], "restored": [], "deleted": [], "blocked": []}
         if not self.is_v2_enabled or self._v2_wpm is None:
-            return {"created": [], "blocked": []}
+            return empty
         candidates = self._publishable_identity_folders()
         if not candidates:
-            return {"created": [], "blocked": []}
+            return empty
 
         live_by_id = {}
+        deleted_by_id = {}
         live_by_slot = {}
         for row in self._fetch_v2_project_folders(client) or []:
-            if not isinstance(row, dict) or row.get("is_deleted"):
+            if not isinstance(row, dict):
                 continue
             folder_id = str(row.get("folder_id") or "")
             if not folder_id:
+                continue
+            if row.get("is_deleted"):
+                deleted_by_id[folder_id] = row
                 continue
             live_by_id[folder_id] = row
             live_by_slot[self._folder_slot(
                 row.get("parent_folder_id"), row.get("name")
             )] = folder_id
 
+        result = {key: list(value) for key, value in empty.items()}
+
+        # 휴지통 으로 간 폴더부터, 깊은 것에서 얕은 것 순으로 내린다.
+        for node in sorted(
+            (node for node in candidates if node["wants_deleted"]),
+            key=lambda node: node["legacy_path"].count("/"),
+            reverse=True,
+        ):
+            folder_id = str(node["uuid"])
+            row = live_by_id.get(folder_id)
+            if row is None:
+                # Never published, so there is nothing to tombstone. This is
+                # also what keeps a first upload from trying to create a folder
+                # that is already deleted, which the server refuses outright.
+                continue
+            still_live_child = any(
+                str(other.get("parent_folder_id") or "") == folder_id
+                for other in live_by_id.values()
+            )
+            if still_live_child:
+                result["blocked"].append(node["legacy_path"])
+                self._report_folder_block(
+                    operation, folder_id, "CHILD_FOLDER_STILL_LIVE"
+                )
+                continue
+            committed = self._commit_folder_state(operation, client, folder_id, {
+                "intent": "delete",
+                "base_revision": int(row.get("revision") or 0),
+                # The server row, not identity, describes where this folder
+                # still hangs. Identity already moved it under 휴지통, which has
+                # no bearing on the parent the server must validate.
+                "parent_folder_id": row.get("parent_folder_id"),
+                "name": row.get("name"),
+                "is_deleted": True,
+            })
+            live_by_slot.pop(
+                self._folder_slot(row.get("parent_folder_id"), row.get("name")),
+                None,
+            )
+            del live_by_id[folder_id]
+            deleted_by_id[folder_id] = {**row, **committed, "is_deleted": True}
+            result["deleted"].append(node["legacy_path"])
+
         local_key = self._v2_context["local_key"]
-        created = []
-        blocked = []
-        for node in candidates:
+        for node in (node for node in candidates if not node["wants_deleted"]):
             folder_id = str(node["uuid"])
             if folder_id in live_by_id:
                 continue
@@ -2631,54 +2719,34 @@ class SyncManager(QObject):
             elif slot in live_by_slot:
                 reason = "FOLDER_NAME_TAKEN"
             if reason:
-                blocked.append(node["legacy_path"])
-                # A blocked folder stays blocked until someone reconciles the
-                # two identities, so this is one standing report, not one per
-                # dispatch. The operation id is deliberately left out: it would
-                # make every retry look like a new finding.
-                self._v2_store.record_diagnostic(
-                    local_key,
-                    "folder_create_blocked",
-                    dedupe=True,
-                    entity_id=folder_id,
-                    error_code=reason,
-                    project_id=operation["project_id"],
-                    rpc_name="commit_folder",
-                )
+                result["blocked"].append(node["legacy_path"])
+                self._report_folder_block(operation, folder_id, reason)
                 continue
 
-            folder_operation_id = str(uuid.uuid5(
-                uuid.UUID(str(operation["operation_id"])),
-                f"folder-create:{folder_id}",
-            ))
-            response = client.rpc("commit_folder", {
-                "p_folder_id": folder_id,
-                "p_project_id": operation["project_id"],
-                "p_base_revision": 0,
-                "p_operation_id": folder_operation_id,
-                "p_device_id": self._v2_device_id,
-                "p_parent_folder_id": parent_uuid,
-                "p_name": name,
-                "p_is_deleted": False,
-            }).execute()
-            result = self._response_data(response) or {}
-            if (
-                str(result.get("folder_id")) != folder_id
-                or "revision" not in result
-            ):
-                raise RuntimeError("INVALID_FOLDER_COMMIT_RESPONSE")
-
-            live_by_id[folder_id] = {**result, "is_deleted": False}
+            restored = deleted_by_id.get(folder_id)
+            committed = self._commit_folder_state(operation, client, folder_id, {
+                "intent": "restore" if restored else "create",
+                "base_revision": (
+                    int(restored.get("revision") or 0) if restored else 0
+                ),
+                "parent_folder_id": parent_uuid,
+                "name": name,
+                "is_deleted": False,
+            })
+            live_by_id[folder_id] = {**committed, "is_deleted": False}
             live_by_slot[slot] = folder_id
+            deleted_by_id.pop(folder_id, None)
             self._v2_store.ensure_local_folder(
                 local_key,
                 node["legacy_path"],
                 folder_id=folder_id,
                 parent_folder_id=parent_uuid,
             )
-            created.append(node["legacy_path"])
+            result["restored" if restored else "created"].append(
+                node["legacy_path"]
+            )
 
-        return {"created": created, "blocked": blocked}
+        return result
 
     @staticmethod
     def _folder_slot(parent_folder_id, name):
@@ -5303,9 +5371,9 @@ class SyncManager(QObject):
                         return contract_result(wire_response)
 
                     if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
-                        # Creates run first: a rename needs its folder, and a
-                        # child needs its parent, to already exist server-side.
-                        self._commit_outbound_folder_creates(operation, client)
+                        # Folder state settles first: a rename needs its folder,
+                        # and a child needs its parent, to already be there.
+                        self._commit_outbound_folder_lifecycle(operation, client)
                         self._commit_outbound_folder_rename(operation, client)
                     lease_token = None
                     if operation["base_revision"] > 0:
