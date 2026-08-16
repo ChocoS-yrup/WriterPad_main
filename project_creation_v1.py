@@ -195,20 +195,30 @@ def _is_empty_dir(path):
 
 
 def _standard_folder_nodes(uuid_factory):
+    """Build the standard tree with order counted per parent.
+
+    Order is only meaningful among siblings, so 메인's children start at 0.
+    Numbering them from a single index over the whole list gave 1~8 here and
+    disagreed with the iPad for the same logical tree.
+    """
     nodes = []
     assigned = {}
-    for index, legacy_path in enumerate(STANDARD_FOLDERS):
+    next_order = {}
+    for legacy_path in STANDARD_FOLDERS:
         parent_path = legacy_path.rsplit("/", 1)[0] if "/" in legacy_path else None
+        parent_uuid = assigned[parent_path] if parent_path else None
         node_uuid = _new_uuid(uuid_factory)
         assigned[legacy_path] = node_uuid
+        order = next_order.get(parent_uuid, 0)
+        next_order[parent_uuid] = order + 1
         nodes.append(
             {
                 "uuid": node_uuid,
                 "kind": "folder",
-                "parent_uuid": assigned[parent_path] if parent_path else None,
+                "parent_uuid": parent_uuid,
                 "legacy_path": legacy_path,
                 "title": legacy_path.rsplit("/", 1)[-1],
-                "order": index if parent_path else 0,
+                "order": order,
             }
         )
     return nodes

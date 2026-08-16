@@ -64,7 +64,23 @@ class ProjectCreationV1TestCase(unittest.TestCase):
 
         # 메인 is the root; the rest hang off it.
         self.assertIsNone(by_path["메인"]["parent_uuid"])
+        self.assertEqual(by_path["메인"]["order"], 0)
         self.assertEqual(by_path["메인/원고"]["parent_uuid"], by_path["메인"]["uuid"])
+
+        # Order is scoped to siblings, so 메인's children run 0~8 and match the
+        # iPad for the same logical tree.
+        self.assertEqual(
+            [
+                (node["order"], path.split("/")[-1])
+                for path, node in sorted(by_path.items(), key=lambda kv: kv[1]["order"])
+                if node["parent_uuid"] == by_path["메인"]["uuid"]
+            ],
+            [
+                (0, "원고"), (1, "캐릭터"), (2, "설정집"), (3, "메모장"),
+                (4, "스토리 플롯"), (5, "흐름정리"), (6, "복선"), (7, "장소"),
+                (8, "휴지통"),
+            ],
+        )
 
         # Machine-managed folders exist but stay out of identity.
         self.assertTrue(os.path.isdir(os.path.join(writing_root(root), "백업", "자동저장")))
