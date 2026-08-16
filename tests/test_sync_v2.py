@@ -20,6 +20,7 @@ from project_creation_v1 import (
     create_item_at_path,
     create_project,
     create_volume,
+    node_for_path,
     writing_root,
 )
 from project_identity_v1 import read_identity
@@ -567,6 +568,90 @@ class SyncAdoptsLocalIdentityTestCase(unittest.TestCase):
         )
 
         self.assertEqual(document["document_id"], remote_id)
+
+    def _manager(self):
+        return WritingProjectManager.create_detached(
+            str(self.workspace), "합성 작품", self.writing_root
+        )
+
+    def test_naming_a_new_item_moves_its_identity_instead_of_stranding_it(self):
+        """새 항목은 임시 이름으로 만들어진 뒤 이름 입력으로 rename 된다."""
+        created = create_item_at_path(
+            self.project_root, "메인/메모장", "새_문서", False
+        )["nodes"][-1]
+
+        self._manager().rename_item(
+            "메인/메모장/새_문서.txt", "메인/메모장/초고 메모.txt"
+        )
+
+        document = self.store.ensure_document(
+            self.context["local_key"], "메인/메모장/초고 메모.txt", ""
+        )
+        self.assertEqual(document["document_id"], created["uuid"])
+
+    def test_renaming_in_place_keeps_the_sibling_position(self):
+        first = create_item_at_path(
+            self.project_root, "메인/메모장", "가 메모", False
+        )["nodes"][-1]
+        create_item_at_path(self.project_root, "메인/메모장", "나 메모", False)
+
+        self._manager().rename_item(
+            "메인/메모장/가 메모.txt", "메인/메모장/고친 메모.txt"
+        )
+
+        moved = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == first["uuid"]
+        )
+        self.assertEqual(moved["order"], first["order"])
+        self.assertEqual(moved["legacy_path"], "메인/메모장/고친 메모.txt")
+
+    def test_renaming_a_folder_carries_its_children_paths(self):
+        folder = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        child = create_item_at_path(
+            self.project_root, "메인/설정집/구세계", "마법", False
+        )["nodes"][-1]
+
+        self._manager().rename_item(
+            "메인/설정집/구세계", "메인/설정집/구세계(폐기)"
+        )
+
+        document = self.store.ensure_document(
+            self.context["local_key"], "메인/설정집/구세계(폐기)/마법.txt", ""
+        )
+        self.assertEqual(document["document_id"], child["uuid"])
+        self.assertEqual(
+            self.store.ensure_local_folder(
+                self.context["local_key"], "메인/설정집/구세계(폐기)"
+            )["folder_id"],
+            folder["uuid"],
+        )
+
+    def test_dragging_an_item_to_another_folder_reparents_its_identity(self):
+        node = create_item_at_path(
+            self.project_root, "메인/메모장", "옮길 메모", False
+        )["nodes"][-1]
+        destination = node_for_path(self.project_root, "메인/설정집")
+
+        moved_path = self._manager().move_item(
+            "메인/메모장/옮길 메모.txt", "메인/설정집"
+        )
+
+        self.assertEqual(moved_path, "메인/설정집/옮길 메모.txt")
+        stored = next(
+            item for item in read_identity(self.project_root)["nodes"]
+            if item["uuid"] == node["uuid"]
+        )
+        self.assertEqual(stored["parent_uuid"], destination["uuid"])
+        self.assertEqual(stored["legacy_path"], moved_path)
+        self.assertEqual(
+            self.store.ensure_document(
+                self.context["local_key"], moved_path, ""
+            )["document_id"],
+            node["uuid"],
+        )
 
     def test_a_project_without_identity_keeps_the_previous_behaviour(self):
         plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))

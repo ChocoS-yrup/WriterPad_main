@@ -189,13 +189,22 @@ class WritingProjectManager:
             return False
 
     def rename_item(self, old_rel_path, new_rel_path):
-        """파일 또는 폴더의 이름을 변경합니다."""
+        """파일 또는 폴더의 이름을 변경합니다.
+
+        새 항목은 '새 폴더' 같은 임시 이름으로 먼저 만들어지고 사용자가 이름을
+        입력할 때 여기로 옵니다. identity를 함께 옮기지 않으면 방금 발급한 UUID가
+        임시 경로에 남아, 동기화가 그 문서를 찾지 못하고 UUID를 또 발급합니다.
+        """
         if not self.writing_root_path: return False
         old_full_path = os.path.join(self.writing_root_path, old_rel_path)
         new_full_path = os.path.join(self.writing_root_path, new_rel_path)
         if os.path.exists(new_full_path):
             raise Exception("이미 같은 이름의 항목이 존재합니다.")
-        os.rename(old_full_path, new_full_path)
+        self._relocate_with_identity(
+            str(old_rel_path).replace("\\", "/"),
+            str(new_rel_path).replace("\\", "/"),
+            lambda: os.rename(old_full_path, new_full_path),
+        )
         return True
 
     def move_to_trash(self, rel_path, deleted_at=None, document_id=None):
@@ -417,15 +426,17 @@ class WritingProjectManager:
 
         parent_rel = target_rel.rsplit("/", 1)[0] if "/" in target_rel else None
         parent = node_for_path(project_root, parent_rel) if parent_rel else None
+        parent_uuid = parent["uuid"] if parent else None
         move = {
             "uuid": node["uuid"],
-            "parent_uuid": parent["uuid"] if parent else None,
+            "parent_uuid": parent_uuid,
             "legacy_path": target_rel,
             "title": target_rel.rsplit("/", 1)[-1],
-            "order": next_order_under(
-                project_root, parent["uuid"] if parent else None
-            ),
         }
+        if parent_uuid != node["parent_uuid"]:
+            # Only an actual reparenting takes a new sibling slot. Renaming in
+            # place must keep the position the writer put the item in.
+            move["order"] = next_order_under(project_root, parent_uuid)
         if node["kind"] == "document" and move["title"].endswith(".txt"):
             move["title"] = move["title"][: -len(".txt")]
         journalled_relocate(project_root, [move], apply_filesystem)
@@ -597,16 +608,24 @@ class WritingProjectManager:
         return None
 
     def move_item(self, old_rel_path, new_parent_rel_path):
-        """항목을 다른 폴더로 이동합니다."""
+        """항목을 다른 폴더로 이동합니다.
+
+        identity 의 parent_uuid 와 order 가 트리의 정본이므로, 끌어놓기 이동도
+        rename 과 같은 거래를 거쳐야 합니다. 파일만 옮기면 identity 가 옛 부모를
+        가리킨 채 남아 백업·복원이 항목을 원래 자리로 되돌리지 못합니다.
+        """
         if not self.writing_root_path: return None
         basename = os.path.basename(old_rel_path)
         new_rel_path = os.path.join(new_parent_rel_path, basename).replace("\\", "/")
         old_full_path = os.path.join(self.writing_root_path, old_rel_path)
         new_full_path = os.path.join(self.writing_root_path, new_rel_path)
-        
+
         if os.path.exists(new_full_path):
             raise Exception("대상 폴더에 이미 같은 이름의 항목이 존재합니다.")
-            
-        import shutil
-        shutil.move(old_full_path, new_full_path)
+
+        self._relocate_with_identity(
+            str(old_rel_path).replace("\\", "/"),
+            new_rel_path,
+            lambda: shutil.move(old_full_path, new_full_path),
+        )
         return new_rel_path
