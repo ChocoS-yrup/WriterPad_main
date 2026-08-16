@@ -410,6 +410,47 @@ def append_nodes(project_root, new_nodes):
     return write_identity(project_root, updated, overwrite=True)
 
 
+def remove_nodes(project_root, uuids):
+    """Drop nodes and everything under them in one atomic replacement.
+
+    Permanent deletion is the one case where a UUID legitimately stops
+    existing. Descendants go with their ancestor because a node whose parent is
+    gone would be unreachable, and leaving it behind would report as identity
+    pointing at files that are no longer on disk.
+
+    Removing a uuid that is not recorded is a no-op, so a resumed transaction
+    can repeat the removal safely.
+    """
+    identity = read_identity(project_root)
+    doomed = {_require_uuid(value, "remove uuid") for value in uuids}
+    if not doomed:
+        return identity
+
+    children = {}
+    for node in identity["nodes"]:
+        children.setdefault(node["parent_uuid"], []).append(node["uuid"])
+
+    pending = list(doomed)
+    while pending:
+        for child in children.get(pending.pop(), ()):
+            if child not in doomed:
+                doomed.add(child)
+                pending.append(child)
+
+    remaining = [
+        dict(node) for node in identity["nodes"] if node["uuid"] not in doomed
+    ]
+    if len(remaining) == len(identity["nodes"]):
+        return identity
+
+    updated = {
+        "format_version": FORMAT_VERSION,
+        "project": dict(identity["project"]),
+        "nodes": remaining,
+    }
+    return write_identity(project_root, updated, overwrite=True)
+
+
 def ensure_identity(project_root, project, local_nodes, sync_rows=None,
                     uuid_factory=None):
     """Return the existing identity, or plan and write one on first migration.

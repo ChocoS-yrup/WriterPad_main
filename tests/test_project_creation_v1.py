@@ -548,6 +548,118 @@ class InitializeExistingProjectTestCase(unittest.TestCase):
         )
 
 
+class PurgingTrashClearsIdentityTestCase(unittest.TestCase):
+    """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.workspace = Path(self.temp_dir.name) / "작품목록"
+        self.workspace.mkdir(parents=True)
+        self.uuids = seq_uuids()
+        create_project(str(self.workspace), "합성", uuid_factory=self.uuids)
+        self.project_root = str(self.workspace / "합성")
+        from project_manager_writing import WritingProjectManager
+
+        self.wpm = WritingProjectManager.create_detached(
+            str(self.workspace), "합성", writing_root(self.project_root)
+        )
+
+    def _make(self, parent, name, is_folder=False):
+        return creation.create_item_at_path(
+            self.project_root, parent, name, is_folder, uuid_factory=self.uuids
+        )["nodes"][-1]
+
+    def _uuids(self):
+        return {node["uuid"] for node in read_identity(self.project_root)["nodes"]}
+
+    def test_emptying_the_trash_leaves_the_project_openable(self):
+        """유령 노드가 남으면 audit 이 어긋나 프로젝트가 열리지 않는다."""
+        self._make("메인/메모장", "버릴 메모")
+        self.wpm.move_to_trash("메인/메모장/버릴 메모.txt")
+
+        self.wpm.empty_trash()
+
+        self.assertEqual(
+            creation.prepare_open(self.project_root)["status"], creation.OPEN_OK
+        )
+
+    def test_deleting_one_item_drops_exactly_that_node(self):
+        doomed = self._make("메인/메모장", "버릴 메모")
+        kept = self._make("메인/메모장", "남길 메모")
+        trash_rel = self.wpm.move_to_trash("메인/메모장/버릴 메모.txt")
+
+        self.wpm.delete_from_trash(trash_rel)
+
+        remaining = self._uuids()
+        self.assertNotIn(doomed["uuid"], remaining)
+        self.assertIn(kept["uuid"], remaining)
+
+    def test_purging_a_folder_takes_its_descendants_with_it(self):
+        folder = self._make("메인/설정집", "버릴 폴더", is_folder=True)
+        inner = self._make("메인/설정집/버릴 폴더", "안의 문서")
+        self.wpm.move_to_trash("메인/설정집/버릴 폴더")
+
+        self.wpm.empty_trash()
+
+        remaining = self._uuids()
+        self.assertNotIn(folder["uuid"], remaining)
+        self.assertNotIn(inner["uuid"], remaining)
+        self.assertEqual(
+            creation.prepare_open(self.project_root)["status"], creation.OPEN_OK
+        )
+
+    def test_the_standard_folders_are_never_touched_by_a_purge(self):
+        before = self._uuids()
+        self._make("메인/메모장", "버릴 메모")
+        self.wpm.move_to_trash("메인/메모장/버릴 메모.txt")
+
+        self.wpm.empty_trash()
+
+        self.assertEqual(self._uuids(), before)
+
+    def test_an_interrupted_purge_finishes_from_its_journal(self):
+        doomed = self._make("메인/메모장", "버릴 메모")
+        trash_rel = self.wpm.move_to_trash("메인/메모장/버릴 메모.txt")
+        target = Path(self.wpm.writing_root_path, trash_rel)
+
+        with patch.object(
+            creation, "remove_nodes", side_effect=OSError("중단")
+        ):
+            with self.assertRaises(OSError):
+                self.wpm.delete_from_trash(trash_rel)
+        self.assertFalse(target.exists())
+        self.assertIn(doomed["uuid"], self._uuids())
+
+        creation.recover_project(self.project_root)
+
+        self.assertNotIn(doomed["uuid"], self._uuids())
+        self.assertEqual(
+            creation.prepare_open(self.project_root)["status"], creation.OPEN_OK
+        )
+
+    def test_a_failed_delete_keeps_both_the_file_and_its_node(self):
+        doomed = self._make("메인/메모장", "버릴 메모")
+        trash_rel = self.wpm.move_to_trash("메인/메모장/버릴 메모.txt")
+
+        def refuse():
+            raise OSError("삭제 실패")
+
+        with self.assertRaises(OSError):
+            creation.journalled_remove(
+                self.project_root,
+                [{"uuid": doomed["uuid"], "legacy_path": trash_rel}],
+                refuse,
+            )
+        creation.recover_project(self.project_root)
+
+        self.assertIn(doomed["uuid"], self._uuids())
+        self.assertTrue(Path(self.wpm.writing_root_path, trash_rel).exists())
+        self.assertEqual(
+            creation.prepare_open(self.project_root)["status"], creation.OPEN_OK
+        )
+
+
 class IdentityLivesOutsideTheSyncRootTestCase(unittest.TestCase):
     """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
 

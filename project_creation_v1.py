@@ -31,6 +31,7 @@ from project_identity_v1 import (
     IdentityError,
     append_nodes,
     relocate_nodes,
+    remove_nodes,
     identity_node,
     identity_path,
     read_identity,
@@ -625,6 +626,58 @@ def journalled_relocate(project_root, moves, apply_filesystem):
     return identity, result
 
 
+def journalled_remove(project_root, removals, apply_filesystem):
+    """Delete files and their identity entries as one recoverable transaction.
+
+    ``removals`` carry ``uuid`` and the ``legacy_path`` being destroyed. The
+    journal records both, the filesystem delete runs, and identity follows. If
+    the process stops in between, recovery looks at whether the files are still
+    there: gone means finish the identity removal, present means the delete
+    never happened and the journal is dropped without touching anything.
+    """
+    transaction_id = _new_uuid(None)
+    journal = os.path.join(
+        project_journal_dir(project_root), f"{transaction_id}.json"
+    )
+    _write_json_atomic(
+        journal,
+        {
+            "format_version": JOURNAL_VERSION,
+            "transaction_id": transaction_id,
+            "kind": "remove",
+            "project_root": project_root,
+            "removals": [dict(removal) for removal in removals],
+        },
+    )
+    try:
+        result = apply_filesystem()
+    except BaseException:
+        os.unlink(journal)
+        raise
+
+    identity = remove_nodes(
+        project_root, [removal["uuid"] for removal in removals]
+    )
+    os.unlink(journal)
+    return identity, result
+
+
+def _finish_remove(entry, journal_path):
+    root = writing_root(entry["project_root"])
+    gone = [
+        removal for removal in entry["removals"]
+        if not os.path.exists(
+            os.path.join(root, removal["legacy_path"].replace("/", os.sep))
+        )
+    ]
+    if gone:
+        remove_nodes(
+            entry["project_root"], [removal["uuid"] for removal in gone]
+        )
+    os.unlink(journal_path)
+    return gone
+
+
 def _finish_relocate(entry, journal_path):
     project_root = entry["project_root"]
     root = writing_root(project_root)
@@ -665,6 +718,8 @@ def recover_project(project_root):
     for journal_path, entry in list_journals(project_journal_dir(project_root)):
         if entry.get("kind") == "relocate":
             _finish_relocate(entry, journal_path)
+        elif entry.get("kind") == "remove":
+            _finish_remove(entry, journal_path)
         else:
             _finish_item_transaction(entry, journal_path)
         results.append((entry["transaction_id"], entry["kind"]))

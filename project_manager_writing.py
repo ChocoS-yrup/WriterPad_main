@@ -441,16 +441,50 @@ class WritingProjectManager:
             move["title"] = move["title"][: -len(".txt")]
         journalled_relocate(project_root, [move], apply_filesystem)
 
+    def _purge_with_identity(self, trash_rel_paths, apply_filesystem):
+        """Destroy files and drop their identity entries in one transaction.
+
+        Permanent deletion is the one place a UUID legitimately stops existing.
+        Leaving the entry behind makes identity point at a file that is gone,
+        and opening the project audits identity against the tree and refuses on
+        any divergence, so emptying the trash used to lock the project shut.
+        """
+        from project_creation_v1 import (
+            identity_path,
+            journalled_remove,
+            node_for_path,
+        )
+
+        project_root = os.path.dirname(self.writing_root_path)
+        removals = []
+        if os.path.exists(identity_path(project_root)):
+            for rel_path in trash_rel_paths:
+                node = node_for_path(project_root, rel_path)
+                if node is not None:
+                    removals.append(
+                        {"uuid": node["uuid"], "legacy_path": rel_path}
+                    )
+        if not removals:
+            apply_filesystem()
+            return
+        journalled_remove(project_root, removals, apply_filesystem)
+
     def delete_from_trash(self, trash_rel_path):
         """휴지통 항목 하나를 영구 삭제하고 위치 기록도 제거합니다."""
         source_path = self._resolve_inside_root(trash_rel_path)
         trash_dir = os.path.abspath(os.path.join(self.writing_root_path, "메인", "휴지통"))
         if os.path.commonpath([source_path, trash_dir]) != trash_dir or source_path == trash_dir:
             raise ValueError("휴지통 안의 항목만 삭제할 수 있습니다.")
-        if os.path.isdir(source_path):
-            shutil.rmtree(source_path)
-        elif os.path.exists(source_path):
-            os.remove(source_path)
+
+        def apply_filesystem():
+            if os.path.isdir(source_path):
+                shutil.rmtree(source_path)
+            elif os.path.exists(source_path):
+                os.remove(source_path)
+
+        self._purge_with_identity(
+            [str(trash_rel_path).replace("\\", "/")], apply_filesystem
+        )
         index = self._load_trash_index()
         index.pop(os.path.basename(source_path), None)
         self._save_trash_index(index)
@@ -461,12 +495,19 @@ class WritingProjectManager:
         if not self.writing_root_path: return False
         trash_dir = os.path.join(self.writing_root_path, "메인", "휴지통")
         if not os.path.exists(trash_dir): return False
-        for filename in os.listdir(trash_dir):
-            file_path = os.path.join(trash_dir, filename)
-            if os.path.isdir(file_path):
-                shutil.rmtree(file_path)
-            else:
-                os.remove(file_path)
+        names = os.listdir(trash_dir)
+
+        def apply_filesystem():
+            for filename in names:
+                file_path = os.path.join(trash_dir, filename)
+                if os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+                else:
+                    os.remove(file_path)
+
+        self._purge_with_identity(
+            [f"메인/휴지통/{name}" for name in names], apply_filesystem
+        )
         self._save_trash_index({})
         return True
 
