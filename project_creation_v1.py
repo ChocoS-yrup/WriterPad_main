@@ -27,6 +27,7 @@ from project_identity_v1 import (
     IdentityError,
     append_nodes,
     relocate_nodes,
+    identity_node,
     identity_path,
     read_identity,
     write_identity,
@@ -305,7 +306,9 @@ def _finish_create_project(entry, journal_path):
         {
             "format_version": 1,
             "project": entry["project"],
-            "nodes": entry["nodes"],
+            # Normalize here so every node in the file has the same shape,
+            # whoever assembled it.
+            "nodes": [identity_node(node) for node in entry["nodes"]],
         },
         overwrite=True,
     )
@@ -539,9 +542,16 @@ def recover_workspace(workspace):
     """Resume or roll back interrupted create_project transactions."""
     results = []
     for journal_path, entry in list_journals(workspace_journal_dir(workspace)):
-        if entry.get("kind") != "create_project":
+        kind = entry.get("kind")
+        if kind == "create_project":
+            _finish_create_project(entry, journal_path)
+        elif kind == "restore_project":
+            # Imported here so the adapter can build on this module.
+            from project_backup_adapter_v1 import finish_restore
+
+            finish_restore(entry, journal_path)
+        else:
             raise CreationError(f"unexpected journal kind in {journal_path}")
-        _finish_create_project(entry, journal_path)
         results.append((entry["transaction_id"], entry["target_path"]))
     return results
 
