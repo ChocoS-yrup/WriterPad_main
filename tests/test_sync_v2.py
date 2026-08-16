@@ -1280,6 +1280,87 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
             Path(self.wpm.writing_root_path, "메인/설정집/구세계").is_dir()
         )
 
+    def test_a_folder_restored_elsewhere_comes_back_out_of_the_trash(self):
+        folder, client = self._publish_then_delete_remotely()
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = False
+                row["revision"] = 3
+
+        # 복원한 기기는 tree_order 에도 그 폴더를 다시 올린다.
+        changes = self._pull(
+            client.folder_rows, [],
+            {"<root>": ["설정집"], "메인/설정집": ["구세계"]},
+        )
+
+        self.assertTrue(
+            Path(self.wpm.writing_root_path, "메인/설정집/구세계").is_dir()
+        )
+        self.assertEqual(
+            [change["kind"] for change in changes
+             if change.get("kind") == "folder_restore"],
+            ["folder_restore"],
+        )
+        moved = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == folder["uuid"]
+        )
+        self.assertEqual(moved["legacy_path"], "메인/설정집/구세계")
+
+    def test_following_a_remote_restore_does_not_start_a_delete_fight(self):
+        """복원을 안 따라가면 바깥으로 내보내는 쪽이 상대의 복원을 되돌린다."""
+        folder, client = self._publish_then_delete_remotely()
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = False
+                row["revision"] = 3
+        self._pull(
+            client.folder_rows, [],
+            {"<root>": ["설정집"], "메인/설정집": ["구세계"]},
+        )
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["deleted"], [])
+        row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == folder["uuid"]
+        )
+        self.assertFalse(row["is_deleted"])
+        self.assertEqual(row["revision"], 3)
+
+    def test_an_occupied_target_leaves_the_restored_folder_in_the_trash(self):
+        folder, client = self._publish_then_delete_remotely()
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+        create_item_at_path(self.project_root, "메인/설정집", "구세계", True)
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = False
+                row["revision"] = 3
+
+        # 복원한 기기는 tree_order 에도 그 폴더를 다시 올린다.
+        changes = self._pull(
+            client.folder_rows, [],
+            {"<root>": ["설정집"], "메인/설정집": ["구세계"]},
+        )
+
+        self.assertEqual(
+            [change for change in changes
+             if change.get("kind") == "folder_restore"],
+            [],
+        )
+        blocked = [
+            record["metadata"]["error_code"]
+            for record in self.store.diagnostics(self.context["local_key"])
+            if record["event"] == "folder_restore_blocked"
+        ]
+        self.assertEqual(blocked, ["RESTORE_TARGET_TAKEN"])
+
     def test_a_project_without_identity_publishes_nothing(self):
         plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))
         self.manager._v2_wpm = SimpleNamespace(writing_root_path=plain_root)

@@ -6,11 +6,15 @@
 기준 시점의 Windows 커밋:
 
 ```
-0363fcc  fix: tell the server when a folder goes to the trash
-c9c7504  feat: publish created folders to the server, not only renamed ones
-fa8e8b8  fix: move identity with a renamed or dragged binder item
-2376057  feat: let the local identity file issue every sync UUID
+fix: follow a folder another device moved to the trash
+fix: tell the server when a folder goes to the trash
+feat: publish created folders to the server, not only renamed ones
+fix: move identity with a renamed or dragged binder item
+feat: let the local identity file issue every sync UUID
 ```
+
+브랜치는 `codex/windows-stage4a-local-uuid-identity` 다. 정확한 SHA 는
+`git log --oneline` 으로 읽어라.
 
 ---
 
@@ -63,15 +67,28 @@ UUID·parent·order·bytes·SHA-256 이 모두 일치했다.
 
 ## Windows 가 확인해야 할 것
 
-**iPad 가 지운 폴더를 Windows 가 어떻게 받는가 — 미검증**
+**폴더 삭제·복원의 양방향 — 해결됨**
 
-Windows 는 pull 에서 `is_deleted` 폴더 행을 걸러내기만 한다. 로컬 디렉터리를
-휴지통으로 옮기는 경로는 문서에만 있고 폴더에는 없다. 어제 관찰된 것과 **거울상**
-증상이 날 수 있다. iPad 에서 문서가 든 폴더를 지우면 Windows 바인더에 빈 폴더가
-남을 수 있다.
+Windows 는 폴더 투영을 live 행으로만 풀었기 때문에, 다른 기기가 지운 폴더가 여기서
+보이지 않았다. 안에 있던 문서는 tombstone 으로 와서 각자 휴지통으로 들어가고
+디렉터리만 빈 채로 남았다. iPad 쪽에 빈 폴더를 남겼던 결함의 거울상이다.
 
-이건 Windows 쪽 구현이다. 삭제된 폴더 행을 가짜 transport 로 흉내 내면 iPad 없이
-검증된다. 실기기 확인은 마지막에만 필요하다.
+이제 양방향 모두 따라간다.
+
+- 원격이 지운 폴더는 로컬에서 **휴지통으로 옮긴다.** 지우지 않으므로 안에 남은
+  추적 밖 파일과 아직 안 올린 문서의 바이트가 보존된다. 얕은 것부터 처리하고,
+  identity 가 따라가므로 UUID 가 유지된다.
+- 원격이 복원한 폴더는 로컬에서도 휴지통에서 꺼낸다. 목적지 부모는 서버 행의
+  `parent_folder_id` 에서 얻는다. 로컬 휴지통 색인은 이 기기가 마지막으로 본 위치만
+  알기 때문이다.
+
+복원을 따라가는 것이 특히 중요하다. 따라가지 않으면 바깥으로 내보내는 쪽이 identity 를
+읽고 "아직 휴지통에 있다" 고 판단해 삭제를 다시 발행하고, 상대 기기의 복원을 조용히
+되돌린다.
+
+열려 있는 문서가 그 폴더 아래 있거나, 그 아래 문서에 아직 보내지 않은 작업이
+남아 있으면 폴더를 건드리지 않는다. 복원 목적지가 이미 차 있으면
+`RESTORE_TARGET_TAKEN` 으로 보고하고 휴지통에 그대로 둔다.
 
 **가져오기 프로젝트의 identity 정렬 — 미해결**
 

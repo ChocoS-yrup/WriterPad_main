@@ -2134,7 +2134,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 continue
             if (
                 change.get("kind") in {
-                    "folder_identity_rename", "folder_tombstone"
+                    "folder_identity_rename",
+                    "folder_tombstone",
+                    "folder_restore",
                 }
                 and old_path
                 and old_path != new_path

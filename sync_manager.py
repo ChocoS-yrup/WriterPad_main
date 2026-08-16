@@ -5203,7 +5203,7 @@ class SyncManager(QObject):
             and row.get("is_deleted")
             and row.get("folder_id")
         ]
-        if not deleted_ids or self._v2_wpm is None:
+        if self._v2_wpm is None or not (deleted_ids or folder_rows):
             return []
 
         root = os.path.abspath(self._v2_wpm.writing_root_path)
@@ -5226,34 +5226,7 @@ class SyncManager(QObject):
             local_path = node["legacy_path"]
             if local_path == "메인/휴지통" or local_path.startswith("메인/휴지통/"):
                 continue
-            if local_path in protected or any(
-                path.startswith(local_path + "/") for path in protected
-            ):
-                continue
-            if any(
-                (
-                    document["local_path"] == local_path
-                    or document["local_path"].startswith(local_path + "/")
-                )
-                and self._v2_store.has_active_operations(document["document_id"])
-                for document in self._v2_store.list_documents(
-                    self._v2_context["local_key"]
-                )
-            ):
-                # Unsent local edits still address the old path. Leave the
-                # folder alone and let the next pull settle it.
-                continue
-            full_path = os.path.abspath(
-                os.path.join(root, local_path.replace("/", os.sep))
-            )
-            try:
-                if (
-                    os.path.commonpath([root, full_path]) != root
-                    or not os.path.isdir(full_path)
-                    or self._is_reparse_path(full_path)
-                ):
-                    continue
-            except (OSError, ValueError):
+            if not self._folder_move_is_safe(local_path, protected, root):
                 continue
             trash_path = self._v2_wpm.move_to_trash(local_path)
             self._v2_store.move_local_path(
@@ -5265,7 +5238,106 @@ class SyncManager(QObject):
                 "new_local_path": trash_path,
                 "entity_id": folder_id,
             })
+
+        changes.extend(
+            self._apply_remote_folder_restores(folder_rows, protected, root)
+        )
         return changes
+
+    def _folder_move_is_safe(self, local_path, protected, root):
+        """Whether this client may move one folder on the writer's behalf."""
+        if local_path in protected or any(
+            path.startswith(local_path + "/") for path in protected
+        ):
+            return False
+        if any(
+            (
+                document["local_path"] == local_path
+                or document["local_path"].startswith(local_path + "/")
+            )
+            and self._v2_store.has_active_operations(document["document_id"])
+            for document in self._v2_store.list_documents(
+                self._v2_context["local_key"]
+            )
+        ):
+            # Unsent local edits still address the old path. Leave the folder
+            # alone and let the next pull settle it.
+            return False
+        full_path = os.path.abspath(
+            os.path.join(root, local_path.replace("/", os.sep))
+        )
+        try:
+            return (
+                os.path.commonpath([root, full_path]) == root
+                and os.path.isdir(full_path)
+                and not self._is_reparse_path(full_path)
+            )
+        except (OSError, ValueError):
+            return False
+
+    def _apply_remote_folder_restores(self, folder_rows, protected, root):
+        """Follow a folder another device pulled back out of the trash.
+
+        Without this the two clients undo each other. The outbound pass reads
+        identity, sees the node still under 휴지통 and publishes a delete, so a
+        restore performed on iPad would quietly disappear again.
+
+        The server row says where the folder belongs, so the parent comes from
+        ``parent_folder_id`` rather than the local trash index, which only
+        records where the folder was when this device last saw it. A target
+        that is already occupied is left alone and reported.
+        """
+        restored = []
+        for row in folder_rows or []:
+            if not isinstance(row, dict) or row.get("is_deleted"):
+                continue
+            folder_id = str(row.get("folder_id") or "")
+            node = self._identity_folder_by_uuid(folder_id) if folder_id else None
+            if node is None:
+                continue
+            trash_path = node["legacy_path"]
+            if not trash_path.startswith("메인/휴지통/"):
+                continue
+
+            parent_id = row.get("parent_folder_id")
+            parent_node = (
+                self._identity_folder_by_uuid(parent_id) if parent_id else None
+            )
+            if parent_node is None:
+                continue
+            parent_path = parent_node["legacy_path"]
+            if parent_path.startswith("메인/휴지통"):
+                continue
+            name = unicodedata.normalize("NFC", str(row.get("name") or ""))
+            if not name:
+                continue
+            target_path = f"{parent_path}/{name}"
+            if not self._folder_move_is_safe(trash_path, protected, root):
+                continue
+            if os.path.exists(os.path.abspath(
+                os.path.join(root, target_path.replace("/", os.sep))
+            )):
+                self._v2_store.record_diagnostic(
+                    self._v2_context["local_key"],
+                    "folder_restore_blocked",
+                    dedupe=True,
+                    entity_id=folder_id,
+                    error_code="RESTORE_TARGET_TAKEN",
+                    project_id=self._v2_context["project_id"],
+                )
+                continue
+
+            landed = self._v2_wpm.restore_from_trash(trash_path, parent_path)
+            self._v2_store.move_local_path(
+                self._v2_context["local_key"], trash_path, landed
+            )
+            restored.append({
+                "kind": "folder_restore",
+                "old_local_path": trash_path,
+                "new_local_path": landed,
+                "entity_id": folder_id,
+            })
+        return restored
 
     @staticmethod
     def _prune_empty_unicode_path_parents(root, old_file_path):
