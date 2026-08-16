@@ -690,7 +690,8 @@ class _RpcCall:
                 "content_hash": "b" * 64,
             })
         if self.name == "commit_folder":
-            for row in getattr(self.client, "folder_rows", []):
+            rows = self.client.folder_rows
+            for row in rows:
                 if str(row.get("folder_id")) == str(self.params["p_folder_id"]):
                     row["name"] = self.params["p_name"]
                     row["parent_folder_id"] = self.params["p_parent_folder_id"]
@@ -705,16 +706,58 @@ class _RpcCall:
                         "name": row["name"],
                         "is_deleted": False,
                     })
-            raise AssertionError("folder not found")
+            if self.params["p_base_revision"] != 0:
+                raise AssertionError("folder not found")
+            # base_revision 0 은 서버에서 create 다. 실제 commit_folder 처럼
+            # 같은 부모의 같은 이름은 하나만 살아 있게 막는다.
+            slot = (
+                str(self.params["p_parent_folder_id"] or ""),
+                str(self.params["p_name"]).casefold(),
+            )
+            for row in rows:
+                if row.get("is_deleted"):
+                    continue
+                taken = (
+                    str(row.get("parent_folder_id") or ""),
+                    str(row.get("name") or "").casefold(),
+                )
+                if taken == slot:
+                    raise RuntimeError("FOLDER_NAME_CONFLICT")
+            row = {
+                "folder_id": str(self.params["p_folder_id"]),
+                "parent_folder_id": self.params["p_parent_folder_id"],
+                "name": self.params["p_name"],
+                "revision": 1,
+                "is_deleted": False,
+            }
+            rows.append(row)
+            return _Response({
+                "status": "committed",
+                "folder_id": row["folder_id"],
+                "operation_id": self.params["p_operation_id"],
+                "operation_kind": "create",
+                "revision": row["revision"],
+                "parent_folder_id": row["parent_folder_id"],
+                "name": row["name"],
+                "is_deleted": False,
+            })
         raise AssertionError(self.name)
 
 
 class _FakeClient:
     def __init__(self):
         self.calls = []
+        # Every real client can read the folder projection, and tree-order
+        # commits now publish folder identity before the document lands.
+        self.folder_rows = []
 
     def rpc(self, name, params):
         return _RpcCall(self, name, params)
+
+    def table(self, name):
+        if name != "folders":
+            raise AssertionError(name)
+        return _FolderQuery(self)
 
 
 class _FolderQuery:
@@ -732,14 +775,204 @@ class _FolderQuery:
 
 
 class _FolderAwareClient(_FakeClient):
+    """A client whose folder projection already holds rows."""
+
     def __init__(self, folder_rows):
         super().__init__()
         self.folder_rows = [dict(row) for row in folder_rows]
 
-    def table(self, name):
-        if name != "folders":
-            raise AssertionError(name)
-        return _FolderQuery(self)
+
+class OutboundFolderCreateTestCase(unittest.TestCase):
+    """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        workspace = str(Path(self.temp.name, "작품목록"))
+        create_project(workspace, "폴더 발행")
+        self.project_root = str(Path(workspace, "폴더 발행"))
+        self.wpm = WritingProjectManager.create_detached(
+            workspace, "폴더 발행", writing_root(self.project_root)
+        )
+        self.store = SyncV2Store(str(Path(self.temp.name, "sync.sqlite3")))
+        self.context = self.store.configure_project(
+            self.wpm.writing_root_path, "폴더 발행", str(uuid.uuid4())
+        )
+        self.manager = SyncManager()
+        previous = (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_wpm,
+            self.manager._v2_device_id,
+        )
+        self.addCleanup(self._restore, previous)
+        self.manager._v2_store = self.store
+        self.manager._v2_context = self.context
+        self.manager._v2_wpm = self.wpm
+        self.manager._v2_device_id = str(uuid.uuid4())
+        self.operation = {
+            "operation_id": str(uuid.uuid4()),
+            "project_id": self.context["project_id"],
+        }
+
+    def _restore(self, previous):
+        (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_wpm,
+            self.manager._v2_device_id,
+        ) = previous
+
+    def _uuid_of(self, legacy_path):
+        return node_for_path(self.project_root, legacy_path)["uuid"]
+
+    def test_a_new_project_publishes_its_standard_folders_with_identity_uuids(self):
+        client = _FolderAwareClient([])
+
+        result = self.manager._commit_outbound_folder_creates(
+            self.operation, client
+        )
+
+        self.assertEqual(result["blocked"], [])
+        published = {
+            row["name"]: row for row in client.folder_rows
+        }
+        self.assertEqual(
+            published["메인"]["folder_id"], self._uuid_of("메인")
+        )
+        self.assertEqual(
+            published["원고"]["parent_folder_id"], self._uuid_of("메인")
+        )
+        self.assertEqual(
+            published["원고"]["folder_id"], self._uuid_of("메인/원고")
+        )
+
+    def test_parents_are_published_before_their_children(self):
+        client = _FolderAwareClient([])
+
+        self.manager._commit_outbound_folder_creates(self.operation, client)
+
+        order = [
+            params["p_name"]
+            for name, params in client.calls if name == "commit_folder"
+        ]
+        self.assertEqual(order[0], "메인")
+        self.assertLess(order.index("원고"), len(order))
+
+    def test_trash_keeps_its_row_while_its_contents_stay_local(self):
+        create_item_at_path(self.project_root, "메인/휴지통", "버린 폴더", True)
+        client = _FolderAwareClient([])
+
+        self.manager._commit_outbound_folder_creates(self.operation, client)
+
+        names = {row["name"] for row in client.folder_rows}
+        self.assertIn("휴지통", names)
+        self.assertNotIn("버린 폴더", names)
+
+    def test_publishing_twice_does_not_create_a_second_revision(self):
+        client = _FolderAwareClient([])
+
+        first = self.manager._commit_outbound_folder_creates(
+            self.operation, client
+        )
+        calls_after_first = len(client.calls)
+        second = self.manager._commit_outbound_folder_creates(
+            self.operation, client
+        )
+
+        self.assertTrue(first["created"])
+        self.assertEqual(second["created"], [])
+        self.assertEqual(len(client.calls), calls_after_first)
+        self.assertTrue(all(row["revision"] == 1 for row in client.folder_rows))
+
+    def test_a_foreign_identity_holding_the_name_blocks_the_create(self):
+        """가져오기 프로젝트처럼 서버 폴더 UUID가 다른 경우다."""
+        foreign_main = str(uuid.uuid4())
+        client = _FolderAwareClient([
+            {
+                "folder_id": foreign_main, "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+        ])
+
+        result = self.manager._commit_outbound_folder_creates(
+            self.operation, client
+        )
+
+        self.assertIn("메인", result["blocked"])
+        self.assertEqual(result["created"], [])
+        self.assertEqual(
+            [name for name, _params in client.calls], []
+        )
+        self.assertEqual(len(client.folder_rows), 1)
+
+    def test_a_blocked_folder_is_reported_and_never_repaired(self):
+        client = _FolderAwareClient([
+            {
+                "folder_id": str(uuid.uuid4()), "parent_folder_id": None,
+                "name": "메인", "revision": 1, "is_deleted": False,
+            },
+        ])
+
+        self.manager._commit_outbound_folder_creates(self.operation, client)
+        self.operation["operation_id"] = str(uuid.uuid4())
+        self.manager._commit_outbound_folder_creates(self.operation, client)
+
+        blocked = {
+            record["metadata"]["entity_id"]: record["metadata"]["error_code"]
+            for record in self.store.diagnostics(self.context["local_key"])
+            if record["event"] == "folder_create_blocked"
+        }
+        # 메인 이 남의 이름에 막히면 자식 아홉은 부모가 없어 함께 멈춘다.
+        self.assertEqual(blocked[self._uuid_of("메인")], "FOLDER_NAME_TAKEN")
+        self.assertEqual(
+            blocked[self._uuid_of("메인/원고")], "PARENT_NOT_PUBLISHED"
+        )
+        # 두 번 시도해도 서 있는 상태 하나당 보고는 한 줄이다.
+        self.assertEqual(
+            len(self.store.diagnostics(self.context["local_key"])), len(blocked)
+        )
+
+    def test_a_new_user_folder_is_published_after_the_standard_tree(self):
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_creates(self.operation, client)
+        created = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+
+        result = self.manager._commit_outbound_folder_creates(
+            self.operation, client
+        )
+
+        self.assertEqual(result["created"], ["메인/설정집/구세계"])
+        published = {row["folder_id"] for row in client.folder_rows}
+        self.assertIn(created["uuid"], published)
+
+    def test_the_local_folder_row_records_the_published_identity(self):
+        client = _FolderAwareClient([])
+
+        self.manager._commit_outbound_folder_creates(self.operation, client)
+
+        stored = self.store.get_folder_by_path(
+            self.context["local_key"], "메인/원고"
+        )
+        self.assertEqual(stored["folder_id"], self._uuid_of("메인/원고"))
+
+    def test_a_project_without_identity_publishes_nothing(self):
+        plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))
+        self.manager._v2_wpm = SimpleNamespace(writing_root_path=plain_root)
+        client = _FolderAwareClient([])
+
+        result = self.manager._commit_outbound_folder_creates(
+            self.operation, client
+        )
+
+        self.assertEqual(result, {"created": [], "blocked": []})
+        self.assertEqual(client.calls, [])
 
 
 class SyncV2RpcTestCase(unittest.TestCase):

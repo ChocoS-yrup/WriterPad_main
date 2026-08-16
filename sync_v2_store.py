@@ -3225,9 +3225,26 @@ class SyncV2Store:
             )
             return validated
 
-    def record_diagnostic(self, local_key, event, **metadata):
+    def record_diagnostic(self, local_key, event, dedupe=False, **metadata):
+        """Record one diagnostic. ``dedupe`` keeps a standing state to one row.
+
+        A condition that is re-checked on every dispatch — a folder this client
+        may not publish, say — would otherwise append a row per attempt and bury
+        everything else.
+        """
         trace = safe_trace(event, **metadata)
         with self._transaction() as connection:
+            if dedupe:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM sync_contract_diagnostics
+                    WHERE local_key IS ? AND event = ? AND metadata_json = ?
+                    LIMIT 1
+                    """,
+                    (local_key, trace["event"], canonical_json(trace)),
+                ).fetchone()
+                if existing is not None:
+                    return {"trace_id": existing["trace_id"], **trace}
             trace_id = str(uuid.uuid4())
             connection.execute(
                 """
@@ -3241,6 +3258,27 @@ class SyncV2Store:
                 ),
             )
             return {"trace_id": trace_id, **trace}
+
+    def diagnostics(self, local_key=None, limit=50):
+        """Read recorded diagnostics, newest first, so they can be reported."""
+        query = (
+            "SELECT * FROM sync_contract_diagnostics "
+            "{where}ORDER BY recorded_at DESC, trace_id DESC LIMIT ?"
+        )
+        with self._reader() as connection:
+            if local_key is None:
+                rows = connection.execute(
+                    query.format(where=""), (int(limit),)
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    query.format(where="WHERE local_key = ? "),
+                    (local_key, int(limit)),
+                ).fetchall()
+            return [
+                {**dict(row), "metadata": json.loads(row["metadata_json"])}
+                for row in rows
+            ]
 
     def defer_tree_order(self, context, tree_order_content, operation_ids):
         operation_ids = [str(uuid.UUID(str(value))) for value in operation_ids]

@@ -2565,6 +2565,129 @@ class SyncManager(QObject):
                 matches.append(row)
         return matches
 
+    def _publishable_identity_folders(self):
+        """Identity folders this client may create on the server, parent first.
+
+        Identity is the only authority for a create: a node is there only after
+        a journalled creation transaction issued its UUID. 휴지통 keeps its own
+        identity so backups can restore trashed manuscripts, but its contents
+        stay out of the shared tree — the server contract cannot create a folder
+        that is already deleted, so publishing them would fail the first upload.
+        """
+        from project_creation_v1 import identity_folder_nodes
+
+        root = getattr(self._v2_wpm, "writing_root_path", None)
+        return [
+            node for node in identity_folder_nodes(root)
+            if not node["legacy_path"].startswith("메인/휴지통/")
+        ]
+
+    def _commit_outbound_folder_creates(self, operation, client):
+        """Give identity-issued folders their server row before tree-order lands.
+
+        Folder identity used to reach the server only through a rename, so a
+        folder that was merely created never existed there and the structure
+        could not be reconstructed on another device.
+
+        A create is published only when the parent is already on the server
+        under the very same UUID. When the name is taken by a different
+        identity — an imported project whose folders were issued elsewhere —
+        the folder is reported and skipped. This client never renames or
+        re-parents another identity's folder to make room for its own.
+        """
+        if not self.is_v2_enabled or self._v2_wpm is None:
+            return {"created": [], "blocked": []}
+        candidates = self._publishable_identity_folders()
+        if not candidates:
+            return {"created": [], "blocked": []}
+
+        live_by_id = {}
+        live_by_slot = {}
+        for row in self._fetch_v2_project_folders(client) or []:
+            if not isinstance(row, dict) or row.get("is_deleted"):
+                continue
+            folder_id = str(row.get("folder_id") or "")
+            if not folder_id:
+                continue
+            live_by_id[folder_id] = row
+            live_by_slot[self._folder_slot(
+                row.get("parent_folder_id"), row.get("name")
+            )] = folder_id
+
+        local_key = self._v2_context["local_key"]
+        created = []
+        blocked = []
+        for node in candidates:
+            folder_id = str(node["uuid"])
+            if folder_id in live_by_id:
+                continue
+            parent_uuid = node["parent_uuid"]
+            parent_uuid = str(parent_uuid) if parent_uuid else None
+            name = node["legacy_path"].rsplit("/", 1)[-1]
+            slot = self._folder_slot(parent_uuid, name)
+            reason = None
+            if parent_uuid is not None and parent_uuid not in live_by_id:
+                reason = "PARENT_NOT_PUBLISHED"
+            elif slot in live_by_slot:
+                reason = "FOLDER_NAME_TAKEN"
+            if reason:
+                blocked.append(node["legacy_path"])
+                # A blocked folder stays blocked until someone reconciles the
+                # two identities, so this is one standing report, not one per
+                # dispatch. The operation id is deliberately left out: it would
+                # make every retry look like a new finding.
+                self._v2_store.record_diagnostic(
+                    local_key,
+                    "folder_create_blocked",
+                    dedupe=True,
+                    entity_id=folder_id,
+                    error_code=reason,
+                    project_id=operation["project_id"],
+                    rpc_name="commit_folder",
+                )
+                continue
+
+            folder_operation_id = str(uuid.uuid5(
+                uuid.UUID(str(operation["operation_id"])),
+                f"folder-create:{folder_id}",
+            ))
+            response = client.rpc("commit_folder", {
+                "p_folder_id": folder_id,
+                "p_project_id": operation["project_id"],
+                "p_base_revision": 0,
+                "p_operation_id": folder_operation_id,
+                "p_device_id": self._v2_device_id,
+                "p_parent_folder_id": parent_uuid,
+                "p_name": name,
+                "p_is_deleted": False,
+            }).execute()
+            result = self._response_data(response) or {}
+            if (
+                str(result.get("folder_id")) != folder_id
+                or "revision" not in result
+            ):
+                raise RuntimeError("INVALID_FOLDER_COMMIT_RESPONSE")
+
+            live_by_id[folder_id] = {**result, "is_deleted": False}
+            live_by_slot[slot] = folder_id
+            self._v2_store.ensure_local_folder(
+                local_key,
+                node["legacy_path"],
+                folder_id=folder_id,
+                parent_folder_id=parent_uuid,
+            )
+            created.append(node["legacy_path"])
+
+        return {"created": created, "blocked": blocked}
+
+    @staticmethod
+    def _folder_slot(parent_folder_id, name):
+        """Key one live sibling slot the way the server's unique index does."""
+        return (
+            str(parent_folder_id or ""),
+            unicodedata.normalize("NFC", str(name or "")).casefold(),
+        )
+
     def _commit_outbound_folder_rename(self, operation, client):
         """Mirror a conservative Windows empty-folder rename to stable folder_id."""
         intent = self._infer_outbound_empty_folder_rename(
@@ -5180,6 +5303,9 @@ class SyncManager(QObject):
                         return contract_result(wire_response)
 
                     if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
+                        # Creates run first: a rename needs its folder, and a
+                        # child needs its parent, to already exist server-side.
+                        self._commit_outbound_folder_creates(operation, client)
                         self._commit_outbound_folder_rename(operation, client)
                     lease_token = None
                     if operation["base_revision"] > 0:

@@ -26,6 +26,7 @@ import unicodedata
 import uuid as uuid_module
 
 from project_identity_v1 import (
+    KIND_FOLDER,
     KINDS,
     IdentityError,
     append_nodes,
@@ -562,6 +563,27 @@ def identity_uuid_for_writing_path(writing_root_path, relative_path, kind):
     if node["kind"] != kind:
         return None
     return node["uuid"]
+
+
+def identity_folder_nodes(writing_root_path):
+    """Return identity folder nodes shallowest first, or ``[]`` when absent.
+
+    Depth ordering lets a caller publish a parent before any of its children.
+    Copies are returned so a caller can never mutate the cached index.
+    """
+    if not writing_root_path:
+        return []
+    index = _identity_index(os.path.dirname(os.path.abspath(writing_root_path)))
+    if index is None:
+        return []
+    folders = [
+        dict(node) for node in index["exact"].values()
+        if node["kind"] == KIND_FOLDER
+    ]
+    folders.sort(
+        key=lambda node: (node["legacy_path"].count("/"), node["legacy_path"])
+    )
+    return folders
 
 
 def next_order_under(project_root, parent_uuid):
