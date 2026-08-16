@@ -6,6 +6,10 @@
 기준 시점의 Windows 커밋:
 
 ```
+fix: stop retrying folder refusals that no wait can change
+fix: give an imported project the ids the server already holds
+fix: drop identity entries when the trash is emptied
+fix: follow a folder another device pulled back out of the trash
 fix: follow a folder another device moved to the trash
 fix: tell the server when a folder goes to the trash
 feat: publish created folders to the server, not only renamed ones
@@ -19,9 +23,10 @@ feat: let the local identity file issue every sync UUID
 기준 시점의 iPad 커밋:
 
 ```
-afb96bee0773d4961f9bad1fea76321eeb71a2bf
-  fix: order folder tombstones and skip initial trash
+6ab898abe63ec11f18cc8223756b2a609ea80451  폴더 에러 코드 분류
+afb96bee0773d4961f9bad1fea76321eeb71a2bf  폴더 tombstone 순서, 최초 휴지통 제외
   브랜치 codex/ipad-folder-sync-followup, 부모 cf69d173…
+  PR #12 draft — merge 하지 않는다
 ```
 
 ---
@@ -118,6 +123,24 @@ UUID 가 다시 발급되지 않는다. 계획이 모호하면 쓰지 않고 거
 아직 아무도 참조하지 않았기 때문이다. 사용자가 작업해 온 프로젝트에는 절대 쓰지
 않는다.
 
+**폴더 에러 코드 분류 — 해결됨**
+
+`_stable_error_code` 가 서버의 폴더 코드 **여섯 개를 모두** 몰랐다. 전부 빈
+문자열로 떨어지고 마지막 폴백이 `{"kind": "retry"}` 라, 기다려도 바뀌지 않는
+거절을 60 초마다 영원히 다시 보냈다. iPad 가 셋을 놓쳤다면 여기는 여섯을 다
+놓쳤다.
+
+여기가 더 나빴던 이유는 폴더 발행이 tree-order 커밋 안에 실려 있기 때문이다.
+거절된 폴더 하나가 형제 순서 동기화 전체를 끌고 내려가 그것까지 다시 보냈다.
+
+이제 기다림으로 바뀌지 않는 거절은 한 줄 보고하고 건너뛰며, 그 pass 는 처리할 수
+있는 나머지 폴더를 계속 처리한다. 연결 끊김이나 세션 만료는 예전대로 올려 보내
+재시도한다. 이름 변경 의도는 일부러 pending 으로 남긴다. 사용자의 rename 이라
+여기서 버리면 조용히 사라진다.
+
+`PARENT_FOLDER_NOT_FOUND` 는 `FOLDER_NOT_FOUND` 보다 **앞에** 두어야 한다. 코드
+대조가 부분 문자열이고 짧은 쪽이 긴 쪽 안에 들어 있다.
+
 **영구 삭제가 identity 노드를 남긴다 — 해결됨**
 
 `delete_from_trash` 와 `empty_trash` 가 파일만 지우고 identity 노드를 남겨서,
@@ -164,6 +187,17 @@ journal 거래로 처리한다. 자손도 함께 지운다. 중단되면 파일�
 빈 폴더도 부모의 자식 이름 배열에 들어간다. 예: `"메인/설정집": ["빈 폴더"]`.
 Windows 의 pull 보류 조건에 걸리지 않는다.
 
+**폴더 에러 코드 분류 — 해결됨**
+
+`PARENT_FOLDER_NOT_FOUND`, `FOLDER_NAME_CONFLICT`, `FOLDER_CYCLE` 이 client
+enum 에 없어 `.serverRejected` 로 떨어지고 무조건 재시도였다. 재시도 상한 5 분에
+횟수 제한이 없어, 이름이 겹친 폴더 생성처럼 사람이 개입해야 풀리는 상태를 영원히
+다시 보냈다. 세 코드를 넣고 conflict 로 분류했다.
+
+`FOLDER_NOT_EMPTY`, `FOLDER_ALREADY_EXISTS`, `FOLDER_NOT_FOUND` 는 원래 있었다.
+이제 여섯 개가 모두 자동 재시도에서 빠진다. 진단에서 operation id 는 뺐다. 넣으면
+같은 조작을 다시 시도할 때마다 하나의 상태가 여러 사건으로 보인다.
+
 ---
 
 ## 합의된 차이 — 맞추지 않기로 한 것
@@ -184,8 +218,12 @@ Windows 의 pull 보류 조건에 걸리지 않는다.
 iPad 는 폴더를 제자리에 두고 Windows 는 휴지통에 둔다. 트리 모양은 달라지지만
 원고는 양쪽 다 온전하다.
 
-남은 확인: iPad 가 삭제를 거부할 때 그 operation 이 무한 재시도로 큐를 막지
-않는지. 막히면 그 프로젝트의 다른 동기화까지 선다.
+**막지 않는 것을 확인했다.** 거부는 대기열이 아니라 pull 적용부에 있고 아무것도
+enqueue 하지 않는다. 매 pull 마다 서버 폴더 목록에서 새로 계산되므로 남은 파일이
+정리되면 그다음 pull 에서 자연히 지워진다. 폴더 operation 을 만드는 곳은 사용자
+조작과 최초 스냅샷뿐이라 거부된 폴더가 서버로 되살아나는 되돌이도 없다.
+
+대신 **그 상태가 사용자에게 보이지 않는다.** 아래 "iPad 에 남은 것" 의 (c) 다.
 
 **identity 의 프로젝트 UUID**
 
@@ -202,12 +240,57 @@ Windows 는 서버 프로젝트를 가져올 때 identity 의 project uuid 를 �
 
 ## iPad 에 남은 것
 
+**(c) 폴더 거부와 굳음이 사용자에게 보이지 않는다 — 미해결, 다음 차례**
+
+두 가지가 섞여 있고 급한 정도가 다르다.
+
+- **잘못된 안내문.** 어떤 문서가 `invalidLocalHierarchy` 를 낸 pull 에서는
+  `rejectedStructureNames.first` 가 앞에 붙은 폴더 거부라서, "아직 내용이 남아
+  있어 지우지 않음" 이 *이름을 고치라* 는 안내문 틀에 끼워져 표시된다. 사용자가
+  틀린 지시를 받는다. 이쪽이 먼저다.
+- **미표시.** 폴더 거부만 있었던 pull 은 `.synced` 로 끝난다. 화면 문구는
+  `mergeOutcomes` 로만 갈리는데 그것은 문서 스냅샷 결과에서만 나오고, 폴더 거부는
+  `rejectedStructureNames` 에만 쌓여 outcome 을 만들지 않는다.
+
+실서버 종단간 검증을 앞두고 있어 순서가 여기로 왔다. 화면이 거짓을 말하면 검증
+자체가 성립하지 않는다. 성공과 실패를 구분할 수 없다.
+
+알림 체계를 새로 짓지 않는다. 지금 문구가 거짓이 되지 않게 하는 선까지다.
+
+**(b) 굳은 폴더 작업이 자손과 조상 삭제를 잠근다 — 범위를 다시 재야 한다**
+
+굳은 행은 claim 조건 때문에 그 폴더의 이후 모든 작업을 잠그고, 삭제 대기 조건
+때문에 조상 폴더의 삭제까지 잠근다. 프로젝트 전체가 서는 것은 아니고 그 폴더와
+조상 사슬로 한정된다.
+
+**다만 이 관찰은 에러 코드 분류 이전의 것이다.** 그때는 세 코드가 무한 재시도로
+돌아 굳는 입구가 넓었다. 지금은 여섯 코드가 conflict 로 떨어져 자동 재시도에서
+빠졌다. 그래서 (b) 는 구현이 아니라 **재측정부터** 시작한다.
+
+  에러 코드 분류 이후에도 폴더 operation 이 실제로 굳는 경로가 남아 있는가.
+  남아 있다면 어떤 코드로, 어떤 조작에서인가.
+
+남은 경로가 없으면 claim 질의를 건드리지 않는다.
+
 **최초 batch 의 `ensure_project` bookkeeping — 미해결**
 
 초기 batch 에 `ensure_project` 행을 기록하지만 dispatcher 가 claim 하지 않아
 pending 으로 남는다. 실제 `ensure_project` 는 연결 직전에 따로 호출되므로
 프로젝트 생성은 되고, batch 상태만 완료되지 않는다. 원고 손실 위험은 없다.
 다른 작업과 같은 커밋에 섞지 않는다.
+
+---
+
+## Windows 에 남은 것
+
+**문서 커밋 경로도 알 수 없는 코드를 무한 재시도한다 — 미해결, 급하지 않음**
+
+폴더 경로는 고쳤지만 `_process_v2_operation` 의 마지막 폴백이 여전히
+`{"kind": "retry"}` 다. `_stable_error_code` 가 아는 코드여도 그렇다. 문서
+커밋에서 영구 거절이 나오면 같은 성질의 무한 재시도가 된다.
+
+폴더만큼 급하지 않아 이번 범위에 넣지 않았다. 실제 도달 경로를 먼저 확인해야
+한다.
 
 ---
 
