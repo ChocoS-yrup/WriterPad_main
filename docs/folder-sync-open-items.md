@@ -23,12 +23,13 @@ feat: let the local identity file issue every sync UUID
 기준 시점의 iPad 커밋:
 
 ```
+aaee856123edc1aa5e295503db63f679f029d9cf  폴더 기준선 재설정
 5d39b3b1834ee6590ac645d9df9bef71d6f00c7f  굳은 폴더 재측정 (시험만, 제품 변경 0)
 50e4fc213f7ccfc2230e195cc29cddb8034f438b  폴더 거부 표시
 6ab898abe63ec11f18cc8223756b2a609ea80451  폴더 에러 코드 분류
 afb96bee0773d4961f9bad1fea76321eeb71a2bf  폴더 tombstone 순서, 최초 휴지통 제외
-  브랜치 codex/ipad-folder-rejection-visibility ← codex/ipad-folder-sync-followup
-  PR #14 ← #13 ← #12, 전부 draft — merge 하지 않는다
+  브랜치 codex/ipad-folder-baseline-rebase 가 끝, 아래로 쌓여 있다
+  PR #15 ← #14 ← #13 ← #12, 전부 draft — merge 하지 않는다
   merge 는 실서버 종단간 검증 뒤에 양쪽을 함께 정리한다
 ```
 
@@ -293,32 +294,49 @@ Windows 는 서버 프로젝트를 가져올 때 identity 의 project uuid 를 �
 
 ## iPad 에 남은 것
 
-**(b) 굳은 폴더 작업이 자손과 조상 삭제를 잠근다 — 재측정 끝, 수정 진행 중**
+**(b) 굳은 폴더 작업 — 동시 이름 변경 경로는 닫혔고, 영구 거절 경로는 열려 있다**
 
-에러 코드 분류가 입구를 좁혔을 것이라는 예상은 **틀렸다.** 재보니 그대로 굳는다.
-claim 이 끝난 것으로 보는 상태는 `completed` 와 `cancelled` 둘뿐이라 `conflict`
-는 여전히 잠근다. 재시도에서 conflict 로 옮긴 것은 서버로 나가는 트래픽을 멈춘
-것이지 잠금을 푼 것이 아니었다.
+굳는 성질부터 적는다. claim 이 끝난 것으로 보는 상태는 `completed` 와 `cancelled`
+둘뿐이라 `conflict` 는 잠근다. 재시도에서 conflict 로 옮긴 것은 서버로 나가는
+트래픽을 멈춘 것이지 잠금을 푼 것이 아니었다.
 
 **잠금은 두 겹이다.** claim 조건 말고도, 앞 작업이 살아 있으면 뒤 작업의
 `base_revision` 이 NULL 로 들어가고 claim 은 그것이 NULL 이 아닐 것을 요구한다.
-NULL 은 앞 작업이 **성공할 때만** 채워진다. **claim 조건만 고쳐서는 안 풀린다.**
+NULL 은 앞 작업이 **성공할 때만** 채워진다. claim 조건만 고쳐서는 안 풀린다.
 
-닿는 경로는 특별하지 않다. **두 기기가 같은 폴더 이름을 앞뒤로 바꾸면 늦은 쪽이
-`REVISION_CONFLICT` 로 굳는다.** 문서는 이 코드에서 자동 rebase 를 타지만 폴더
-전송 경로는 그 분기를 지나지 않는다.
+굳으면 그 폴더의 이후 모든 작업, 조상 폴더의 삭제, 그리고 그 폴더로 **들어오는**
+원격 변경까지 멎는다. 셋 다 재현됐다. 원고 바이트는 안전하고 그 가지의 구조
+동기화만 선다. 사용자가 스스로 풀 수 없다 — 이름을 다시 바꾸거나, 폴더를 지우거나,
+앱을 껐다 켜거나, 재시도 버튼을 눌러도 풀리지 않는다. `cancelled` 를 쓰는 네 곳이
+전부 `document_id` 기준이라 폴더 행(그 값이 NULL)에는 닿지 않는다.
 
-잠기는 것은 셋이고 전부 재현됐다. 그 폴더의 이후 모든 작업, 조상 폴더의 삭제,
-그리고 그 폴더로 **들어오는** 원격 변경(굳은 행이 pending 목록에 남아 pull 에서
-접힌다). 원고 바이트는 안전하고 그 가지의 구조 동기화만 멎는다.
+**닫힌 것 — 동시 이름 변경**
 
-사용자가 스스로 풀 수 없다. 이름을 다시 바꾸거나, 폴더를 지우거나, 앱을 껐다
-켜거나, 화면 재시도 버튼을 눌러도 풀리지 않는다. `cancelled` 를 쓰는 네 곳이 전부
-`document_id` 기준이라 폴더 행(그 값이 NULL)에는 닿지 않는다.
+두 기기가 같은 폴더 이름을 앞뒤로 바꾸면 늦은 쪽이 `REVISION_CONFLICT` 로 굳었다.
+문서는 이 코드에서 자동 rebase 를 타지만 폴더 전송 경로는 그 분기를 지나지 않았다.
+재측정에서 **제품 조작으로 닿는 것이 확인된 유일한 경로**였고, 이제 닫혔다.
 
-수정 방향은 claim 질의가 아니라 그 위다. 폴더도 `REVISION_CONFLICT` 에서 서버
-revision 을 다시 읽어 기준선만 잡는다. 폴더는 합칠 본문이 없어 3-way merge 가
-필요 없고, 결국 **iPad 를 Windows 와 같은 성질로 만드는 일**이다.
+서버가 이미 답을 주고 있었다. `commit_folder` 는 `REVISION_CONFLICT` 를 낼 때
+detail 에 `current_revision` 을 싣는데 아무도 읽지 않았다. 그 값으로 기준선만
+옮기므로 **서버에 다시 묻지 않는다.** claim 질의는 그대로다. 두 번째 겹도 앞
+작업이 실제로 성공하므로 자연히 풀린다. 되풀이 방지로 서버 revision 이 현재
+기준선보다 클 때만 옮긴다.
+
+이로써 iPad 도 last-write-wins 로 수렴한다.
+
+**열려 있는 것 — 영구 거절**
+
+`FOLDER_NAME_CONFLICT`, `PARENT_FOLDER_NOT_FOUND`, `FOLDER_CYCLE` 등은 여전히
+굳고, 굳으면 위의 잠금이 그대로다. `FOLDER_ALREADY_EXISTS` 도 같은 성질의 기준선
+문제로 보이나 not-verified 다. 이 코드들에 제품 조작으로 닿는 빈도도 재지 않았다.
+
+**여기서 양쪽이 갈린다.** Windows 는 같은 거절을 만나면 한 줄 보고하고 그 폴더만
+건너뛰며 나머지를 계속 처리한다. iPad 는 그 줄이 선다. 고친다면 Windows 와 같은
+모양 — 보고하고 건너뛰기 — 이 되겠지만, iPad 에서는 그것이 claim 영역이라 순서
+보장의 뿌리를 건드린다. 그래서 승인 없이 진행하지 않는다.
+
+**실서버 검증에서 폴더 줄이 서면 그것은 검증 실패가 아니라 이 항목의 재현이다.**
+그 폴더 가지만 멎고 나머지는 흐른다.
 
 **최초 batch 의 `ensure_project` bookkeeping — 미해결**
 
