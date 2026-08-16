@@ -16,6 +16,13 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit
 
 from mode_writing import BinderTreeWidget, RenameDelegate, WritingModeWidget
+from project_creation_v1 import (
+    create_item_at_path,
+    create_project,
+    create_volume,
+    writing_root,
+)
+from project_identity_v1 import read_identity
 from project_manager_writing import WritingProjectManager
 from sync_manager import (
     LockWorker,
@@ -474,6 +481,102 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(resolved["base_revision"], 2)
         self.assertEqual(resolved["base_content"], "서버 수정")
         self.assertEqual(self.store.operation(conflicted["operation_id"])["status"], "cancelled")
+
+
+class SyncAdoptsLocalIdentityTestCase(unittest.TestCase):
+    """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = Path(self.temp.name, "작품목록")
+        self.workspace.mkdir(parents=True)
+        create_project(str(self.workspace), "합성 작품")
+        self.project_root = str(self.workspace / "합성 작품")
+        self.writing_root = writing_root(self.project_root)
+        self.store = SyncV2Store(str(Path(self.temp.name, "sync.sqlite3")))
+        self.context = self.store.configure_project(
+            self.writing_root, "합성 작품"
+        )
+
+    def _identity_uuid(self, legacy_path):
+        for node in read_identity(self.project_root)["nodes"]:
+            if node["legacy_path"] == legacy_path:
+                return node["uuid"]
+        raise AssertionError(f"identity has no node for {legacy_path}")
+
+    def test_document_reuses_the_identity_uuid_instead_of_minting_one(self):
+        node = create_item_at_path(
+            self.project_root, "메인/메모장", "설정 메모", False
+        )["nodes"][-1]
+
+        document = self.store.ensure_document(
+            self.context["local_key"], node["legacy_path"], ""
+        )
+
+        self.assertEqual(document["document_id"], node["uuid"])
+
+    def test_folder_reuses_the_identity_uuid_instead_of_minting_one(self):
+        folder = self.store.ensure_local_folder(
+            self.context["local_key"], "메인/원고"
+        )
+
+        self.assertEqual(folder["folder_id"], self._identity_uuid("메인/원고"))
+
+    def test_every_chapter_of_a_new_volume_keeps_its_created_uuid(self):
+        create_volume(self.project_root)
+
+        for chapter in range(1, 26):
+            legacy_path = f"메인/원고/1권/{chapter:03d}화.txt"
+            document = self.store.ensure_document(
+                self.context["local_key"], legacy_path, ""
+            )
+            self.assertEqual(
+                document["document_id"], self._identity_uuid(legacy_path)
+            )
+
+    def test_enqueue_binds_the_identity_uuid_before_the_first_upload(self):
+        node = create_item_at_path(
+            self.project_root, "메인/설정집", "세계관", False
+        )["nodes"][-1]
+
+        operation = self.store.enqueue(
+            self.context, node["legacy_path"], "본문", node["legacy_path"]
+        )
+
+        self.assertEqual(operation["document_id"], node["uuid"])
+
+    def test_internal_sync_documents_still_receive_a_generated_uuid(self):
+        internal = self.store.ensure_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH, ""
+        )
+
+        known = {
+            node["uuid"] for node in read_identity(self.project_root)["nodes"]
+        }
+        self.assertNotIn(internal["document_id"], known)
+
+    def test_an_explicit_server_uuid_still_wins_over_local_identity(self):
+        node = create_item_at_path(
+            self.project_root, "메인/복선", "떡밥", False
+        )["nodes"][-1]
+        remote_id = str(uuid.uuid4())
+
+        document = self.store.ensure_document(
+            self.context["local_key"], node["legacy_path"], "", remote_id
+        )
+
+        self.assertEqual(document["document_id"], remote_id)
+
+    def test_a_project_without_identity_keeps_the_previous_behaviour(self):
+        plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))
+        context = self.store.configure_project(plain_root, "정체성없음")
+
+        document = self.store.ensure_document(
+            context["local_key"], "메인/원고/001화.txt", ""
+        )
+
+        self.assertTrue(uuid.UUID(document["document_id"]))
 
 
 class _Response:

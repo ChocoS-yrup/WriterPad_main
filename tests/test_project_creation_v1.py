@@ -2,6 +2,7 @@ import itertools
 import json
 import os
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -544,6 +545,89 @@ class InitializeExistingProjectTestCase(unittest.TestCase):
 
         self.assertEqual(
             callers, {"project_creation_v1.py", "server_project_import.py"}
+        )
+
+
+class IdentityUuidForWritingPathTestCase(unittest.TestCase):
+    """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.workspace = Path(self.temp_dir.name) / "작품목록"
+        self.workspace.mkdir(parents=True)
+        self.uuids = seq_uuids()
+        create_project(str(self.workspace), "합성", uuid_factory=self.uuids)
+        self.project_root = str(self.workspace / "합성")
+        self.writing_root = writing_root(self.project_root)
+
+    def _node(self, legacy_path):
+        return creation.node_for_path(self.project_root, legacy_path)
+
+    def resolve(self, relative_path, kind):
+        return creation.identity_uuid_for_writing_path(
+            self.writing_root, relative_path, kind
+        )
+
+    def test_resolves_a_standard_folder_by_exact_path(self):
+        self.assertEqual(
+            self.resolve("메인/설정집", "folder"),
+            self._node("메인/설정집")["uuid"],
+        )
+
+    def test_resolves_a_document_created_after_the_project(self):
+        node = creation.create_item_at_path(
+            self.project_root, "메인/장소", "성", False, uuid_factory=self.uuids
+        )["nodes"][-1]
+
+        self.assertEqual(
+            self.resolve(node["legacy_path"], "document"), node["uuid"]
+        )
+
+    def test_matches_a_decomposed_path_after_nfc_normalization(self):
+        decomposed = unicodedata.normalize("NFD", "메인/설정집")
+
+        self.assertEqual(
+            self.resolve(decomposed, "folder"),
+            self._node("메인/설정집")["uuid"],
+        )
+
+    def test_refuses_to_bind_a_node_of_the_wrong_kind(self):
+        self.assertIsNone(self.resolve("메인/설정집", "document"))
+
+    def test_returns_none_for_a_path_identity_does_not_know(self):
+        self.assertIsNone(self.resolve("메인/설정집/없는문서.txt", "document"))
+
+    def test_returns_none_when_the_project_has_no_identity_file(self):
+        plain = Path(self.temp_dir.name) / "정체성없음" / "집필모드"
+        plain.mkdir(parents=True)
+
+        self.assertIsNone(
+            creation.identity_uuid_for_writing_path(
+                str(plain), "메인/원고", "folder"
+            )
+        )
+
+    def test_a_normcased_writing_root_resolves_the_same_uuid(self):
+        normcased = os.path.normcase(os.path.abspath(self.writing_root))
+
+        self.assertEqual(
+            creation.identity_uuid_for_writing_path(
+                normcased, "메인/원고", "folder"
+            ),
+            self._node("메인/원고")["uuid"],
+        )
+
+    def test_the_cache_sees_nodes_appended_after_the_first_lookup(self):
+        self.assertIsNone(self.resolve("메인/메모장/새 메모.txt", "document"))
+
+        node = creation.create_item_at_path(
+            self.project_root, "메인/메모장", "새 메모", False,
+            uuid_factory=self.uuids,
+        )["nodes"][-1]
+
+        self.assertEqual(
+            self.resolve(node["legacy_path"], "document"), node["uuid"]
         )
 
 

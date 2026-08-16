@@ -21,9 +21,12 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import unicodedata
 import uuid as uuid_module
 
 from project_identity_v1 import (
+    KINDS,
     IdentityError,
     append_nodes,
     relocate_nodes,
@@ -491,6 +494,74 @@ def node_for_path(project_root, legacy_path):
         if node["legacy_path"] == legacy_path:
             return node
     return None
+
+
+_IDENTITY_INDEX_CACHE = {}
+_IDENTITY_INDEX_LOCK = threading.Lock()
+
+
+def _nfc(value):
+    return unicodedata.normalize("NFC", str(value or ""))
+
+
+def _identity_index(project_root):
+    """Index identity by path, re-reading only when the file itself changes.
+
+    Sync asks for a UUID once per created item, and a full disk sweep asks once
+    per file, so re-reading and re-validating the whole identity every time
+    would be quadratic. Returning ``None`` means "no identity of record here",
+    which is a normal answer: internal sync documents and synthetic test roots
+    legitimately have none.
+    """
+    path = identity_path(project_root)
+    try:
+        stamp = os.stat(path)
+        stamp = (stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        return None
+
+    with _IDENTITY_INDEX_LOCK:
+        cached = _IDENTITY_INDEX_CACHE.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
+
+    try:
+        nodes = read_identity(project_root)["nodes"]
+    except (IdentityError, OSError, ValueError):
+        return None
+
+    index = {"exact": {}, "nfc": {}}
+    for node in nodes:
+        index["exact"][node["legacy_path"]] = node
+        index["nfc"].setdefault(_nfc(node["legacy_path"]), []).append(node)
+    with _IDENTITY_INDEX_LOCK:
+        _IDENTITY_INDEX_CACHE[path] = (stamp, index)
+    return index
+
+
+def identity_uuid_for_writing_path(writing_root_path, relative_path, kind):
+    """Return the UUID of record for one path under the writing root, or None.
+
+    ``writing_root_path`` is the sync root, so the identity file sits one level
+    above it. Matching is exact first and NFC second, the same order the
+    migration planner uses. An ambiguous or wrong-kind match returns ``None``
+    so the caller falls back rather than binding a guessed identity.
+    """
+    relative_path = str(relative_path or "").replace("\\", "/").strip("/")
+    if not writing_root_path or not relative_path or kind not in KINDS:
+        return None
+    index = _identity_index(os.path.dirname(os.path.abspath(writing_root_path)))
+    if index is None:
+        return None
+    node = index["exact"].get(relative_path)
+    if node is None:
+        matches = index["nfc"].get(_nfc(relative_path)) or []
+        if len(matches) != 1:
+            return None
+        node = matches[0]
+    if node["kind"] != kind:
+        return None
+    return node["uuid"]
 
 
 def next_order_under(project_root, parent_uuid):

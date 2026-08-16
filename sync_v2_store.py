@@ -8,6 +8,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from project_creation_v1 import identity_uuid_for_writing_path
+from project_identity_v1 import KIND_DOCUMENT, KIND_FOLDER
 from sync_contract import (
     CANONICAL_CONTRACT_SHA256,
     CLIENT_CAPABILITIES,
@@ -891,6 +893,17 @@ class SyncV2Store:
     def local_key_for(writing_root_path):
         return os.path.normcase(os.path.abspath(writing_root_path or ""))
 
+    @staticmethod
+    def _identity_uuid(local_key, local_path, kind):
+        """Return the project's own UUID for a path, or None when it has none.
+
+        ``local_key`` is the normcased writing root, so the identity file sits
+        one level above it. Internal sync documents (``__antigravity__/*``) and
+        test roots without an identity file legitimately return None and keep
+        the previous generated-UUID behaviour.
+        """
+        return identity_uuid_for_writing_path(local_key, local_path, kind)
+
     def configure_project(self, writing_root_path, project_name, project_id=None):
         local_key = self.local_key_for(writing_root_path)
         now = _utc_now()
@@ -1199,7 +1212,14 @@ class SyncV2Store:
                 (local_key, local_path),
             ).fetchone()
             if row is None:
-                document_id = document_id or str(uuid.uuid4())
+                # The local identity file is the UUID of record. Minting a
+                # second id here is what let one manuscript carry two UUIDs,
+                # one in identity-v1.json and one on the server.
+                document_id = (
+                    document_id
+                    or self._identity_uuid(local_key, local_path, KIND_DOCUMENT)
+                    or str(uuid.uuid4())
+                )
                 base_hash = hashlib.sha256(content.encode("utf-8")).hexdigest() if content else ""
                 connection.execute(
                     """
@@ -1269,7 +1289,11 @@ class SyncV2Store:
             raise SyncContractError("INVALID_FOLDER_SNAPSHOT")
         name = local_path.rsplit("/", 1)[-1]
         storage_name_key = normalize_storage_name(name).normalized
-        folder_id = str(uuid.UUID(str(folder_id or uuid.uuid4())))
+        folder_id = str(uuid.UUID(str(
+            folder_id
+            or self._identity_uuid(local_key, local_path, KIND_FOLDER)
+            or uuid.uuid4()
+        )))
         if parent_folder_id is not None:
             parent_folder_id = str(uuid.UUID(str(parent_folder_id)))
         now = _utc_now()
