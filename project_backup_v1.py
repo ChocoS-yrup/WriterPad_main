@@ -233,8 +233,11 @@ def restore_project_backup(package, destination):
     """
     manifest = read_manifest(package)
 
-    if os.path.exists(destination) and os.listdir(destination):
-        raise BackupFormatError(f"destination is not empty: {destination}")
+    # The destination must not exist at all, matching the iPad client. An empty
+    # directory is refused too: restoring into a path something else already
+    # reserved is how a restore quietly lands on top of live work.
+    if os.path.exists(destination):
+        raise BackupFormatError(f"destination already exists: {destination}")
 
     workspace = os.path.join(package, WORKSPACE_DIR)
     documents = [n for n in manifest["nodes"] if n["kind"] == KIND_DOCUMENT]

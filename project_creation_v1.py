@@ -26,6 +26,7 @@ import uuid as uuid_module
 from project_identity_v1 import (
     IdentityError,
     append_nodes,
+    relocate_nodes,
     identity_path,
     read_identity,
     write_identity,
@@ -41,9 +42,8 @@ ITEM_JOURNAL_DIRNAME = "journal"
 MANUSCRIPT_PATH = "메인/원고"
 CHAPTERS_PER_VOLUME = 25
 
-# Standard folders that carry identity. 백업/* and 메인/휴지통 are deliberately
-# excluded: they are machine-managed and must not consume user-facing UUIDs.
-STANDARD_FOLDERS = (
+# The canonical user tree: 메인 plus the eight folders a writer works in.
+CANONICAL_USER_FOLDERS = (
     "메인",
     "메인/원고",
     "메인/캐릭터",
@@ -55,13 +55,25 @@ STANDARD_FOLDERS = (
     "메인/장소",
 )
 
+# 휴지통 is not a folder the writer authored, but trashed items keep their UUIDs
+# and still need a valid parent_uuid, so it is the one machine-managed directory
+# that carries identity. Backups therefore preserve trashed manuscript bytes.
+TRASH_PATH = "메인/휴지통"
+
+STANDARD_FOLDERS = CANONICAL_USER_FOLDERS + (TRASH_PATH,)
+
 # Created on disk but never given a UUID.
 UNTRACKED_FOLDERS = (
-    "메인/휴지통",
     "백업/자동저장",
     "백업/전환직전",
     "백업/충돌",
     "백업/복원전",
+)
+
+# App state that lives beside the user tree and is not a binder node.
+UNTRACKED_FILES = (
+    "설정.json",
+    ".server-project-import.json",
 )
 
 
@@ -460,6 +472,69 @@ def create_item_at_path(project_root, parent_legacy_path, base_name, is_folder,
     )
 
 
+def node_for_path(project_root, legacy_path):
+    """Return the identity node at ``legacy_path``, or None."""
+    for node in read_identity(project_root)["nodes"]:
+        if node["legacy_path"] == legacy_path:
+            return node
+    return None
+
+
+def next_order_under(project_root, parent_uuid):
+    return _next_order(read_identity(project_root)["nodes"], parent_uuid)
+
+
+def journalled_relocate(project_root, moves, apply_filesystem):
+    """Move files and their identity entries as one recoverable transaction.
+
+    No UUID is issued here, so recovery is simpler than for a creation: the
+    journal records the intended final paths, ``apply_filesystem`` performs the
+    move, and identity follows. If the process stops in between, recovery looks
+    at where the files actually are — present at the target means finish the
+    identity update, absent means the move never happened and the journal is
+    dropped without touching anything.
+    """
+    transaction_id = _new_uuid(None)
+    journal = os.path.join(
+        project_journal_dir(project_root), f"{transaction_id}.json"
+    )
+    _write_json_atomic(
+        journal,
+        {
+            "format_version": JOURNAL_VERSION,
+            "transaction_id": transaction_id,
+            "kind": "relocate",
+            "project_root": project_root,
+            "moves": [dict(move) for move in moves],
+        },
+    )
+    try:
+        result = apply_filesystem()
+    except BaseException:
+        os.unlink(journal)
+        raise
+
+    identity = relocate_nodes(project_root, moves)
+    os.unlink(journal)
+    return identity, result
+
+
+def _finish_relocate(entry, journal_path):
+    project_root = entry["project_root"]
+    root = writing_root(project_root)
+    landed = [
+        move
+        for move in entry["moves"]
+        if os.path.exists(
+            os.path.join(root, move["legacy_path"].replace("/", os.sep))
+        )
+    ]
+    if landed:
+        relocate_nodes(project_root, landed)
+    os.unlink(journal_path)
+    return landed
+
+
 def recover_workspace(workspace):
     """Resume or roll back interrupted create_project transactions."""
     results = []
@@ -472,10 +547,13 @@ def recover_workspace(workspace):
 
 
 def recover_project(project_root):
-    """Resume interrupted folder/document/volume transactions for one project."""
+    """Resume interrupted folder/document/volume/relocate transactions."""
     results = []
     for journal_path, entry in list_journals(project_journal_dir(project_root)):
-        _finish_item_transaction(entry, journal_path)
+        if entry.get("kind") == "relocate":
+            _finish_relocate(entry, journal_path)
+        else:
+            _finish_item_transaction(entry, journal_path)
         results.append((entry["transaction_id"], entry["kind"]))
     return results
 
@@ -510,6 +588,8 @@ def audit(project_root):
             directories[:] = []
             continue
         for name in list(directories) + files:
+            if name in UNTRACKED_FILES or name.startswith("."):
+                continue
             candidate = f"{relative}/{name}" if relative else name
             if candidate in skip or candidate.split("/")[0] in ("백업",):
                 continue

@@ -423,6 +423,58 @@ def ensure_identity(project_root, project, local_nodes, sync_rows=None,
     return apply_identity(project_root, plan)
 
 
+def relocate_nodes(project_root, moves):
+    """Move nodes to a new parent and path without changing a single uuid.
+
+    ``moves`` carry ``uuid`` plus the new ``parent_uuid`` and ``legacy_path``,
+    and optionally ``title`` and ``order``. Descendants follow their ancestor's
+    new path automatically: a path is a lookup value derived from the tree, so
+    moving a folder must never renumber anything inside it.
+
+    Applying the same relocation twice is a no-op, which lets an interrupted
+    move be finished from its journal.
+    """
+    identity = read_identity(project_root)
+    nodes = [dict(node) for node in identity["nodes"]]
+    index = {node["uuid"]: node for node in nodes}
+
+    for move in moves:
+        node_uuid = _require_uuid(move.get("uuid"), "move.uuid")
+        node = index.get(node_uuid)
+        if node is None:
+            raise IdentityError(f"cannot relocate unknown node {node_uuid}")
+
+        old_path = node["legacy_path"]
+        new_path = str(move.get("legacy_path") or old_path)
+        parent = move.get("parent_uuid", node["parent_uuid"])
+        node["parent_uuid"] = (
+            None if parent in (None, "") else _require_uuid(parent, "move.parent_uuid")
+        )
+        node["legacy_path"] = new_path
+        node["path"] = _display_path(new_path)
+        if move.get("title") is not None:
+            node["title"] = _nfc(move["title"])
+        if move.get("order") is not None:
+            node["order"] = int(move["order"])
+
+        if new_path != old_path:
+            prefix = old_path + "/"
+            for other in nodes:
+                if other["uuid"] == node_uuid:
+                    continue
+                if other["legacy_path"].startswith(prefix):
+                    tail = other["legacy_path"][len(prefix):]
+                    other["legacy_path"] = f"{new_path}/{tail}"
+                    other["path"] = _display_path(other["legacy_path"])
+
+    updated = {
+        "format_version": FORMAT_VERSION,
+        "project": dict(identity["project"]),
+        "nodes": nodes,
+    }
+    return write_identity(project_root, updated, overwrite=True)
+
+
 def logical_tree(identity):
     """Return {parent_uuid or None: [(order, uuid, kind), ...]} sorted by order."""
     tree = {}

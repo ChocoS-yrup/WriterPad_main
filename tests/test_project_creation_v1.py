@@ -69,7 +69,7 @@ class ProjectCreationV1TestCase(unittest.TestCase):
         # Machine-managed folders exist but stay out of identity.
         self.assertTrue(os.path.isdir(os.path.join(writing_root(root), "백업", "자동저장")))
         self.assertNotIn("백업/자동저장", by_path)
-        self.assertNotIn("메인/휴지통", by_path)
+        self.assertIn("메인/휴지통", by_path)
 
         # Nothing is left pending.
         self.assertEqual(self._pending(workspace_journal_dir(str(self.workspace))), [])
@@ -317,6 +317,100 @@ class ProjectCreationV1TestCase(unittest.TestCase):
         # audit only reports: identity is untouched and no uuid was invented.
         self.assertEqual(read_identity(root), before)
         self.assertFalse(os.path.isdir(os.path.join(writing_root(root), "메인", "장소")))
+
+
+class TrashIdentityTestCase(unittest.TestCase):
+    """휴지통 이동·복원이 UUID를 유지하고 identity와 어긋나지 않는다."""
+
+    def setUp(self):
+        from project_manager_writing import WritingProjectManager
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp_dir.name) / "작품목록"
+        self.workspace.mkdir(parents=True)
+        self.uuids = seq_uuids()
+        self.addCleanup(self.temp_dir.cleanup)
+
+        self.title = "휴지통 시험"
+        create_project(str(self.workspace), self.title, uuid_factory=self.uuids)
+        self.root = str(self.workspace / self.title)
+        self.wpm = WritingProjectManager.create_detached(
+            str(self.workspace), self.title, writing_root(self.root)
+        )
+
+        memo = creation.node_for_path(self.root, "메인/메모장")
+        create_item(
+            self.root, memo["uuid"], "버릴 메모", False, uuid_factory=self.uuids
+        )
+        self.source_rel = "메인/메모장/버릴 메모.txt"
+        with open(
+            os.path.join(writing_root(self.root), *self.source_rel.split("/")), "wb"
+        ) as handle:
+            handle.write("지워도 남아야 하는 원고".encode("utf-8"))
+        self.document_uuid = creation.node_for_path(self.root, self.source_rel)["uuid"]
+
+    def _node(self, node_uuid):
+        for node in read_identity(self.root)["nodes"]:
+            if node["uuid"] == node_uuid:
+                return node
+        return None
+
+    def test_trashing_keeps_the_uuid_and_reparents_under_trash(self):
+        trash_uuid = creation.node_for_path(self.root, creation.TRASH_PATH)["uuid"]
+
+        trashed_rel = self.wpm.move_to_trash(self.source_rel)
+
+        node = self._node(self.document_uuid)
+        self.assertIsNotNone(node)
+        self.assertEqual(node["parent_uuid"], trash_uuid)
+        self.assertEqual(node["legacy_path"], trashed_rel)
+
+        # The project still opens: identity and the tree agree.
+        report = creation.audit(self.root)
+        self.assertEqual(report["missing_on_disk"], [])
+        self.assertEqual(report["missing_in_identity"], [])
+        self.assertEqual(report["pending_journals"], [])
+        self.assertEqual(
+            creation.prepare_open(self.root)["status"], creation.OPEN_OK
+        )
+
+        # The bytes are still there, so a backup can still carry them.
+        with open(
+            os.path.join(writing_root(self.root), *trashed_rel.split("/")), "rb"
+        ) as handle:
+            self.assertEqual(
+                handle.read().decode("utf-8"), "지워도 남아야 하는 원고"
+            )
+
+    def test_restoring_from_trash_reuses_the_same_uuid(self):
+        trashed_rel = self.wpm.move_to_trash(self.source_rel)
+        memo_uuid = creation.node_for_path(self.root, "메인/메모장")["uuid"]
+
+        restored_rel = self.wpm.restore_from_trash(trashed_rel)
+
+        self.assertEqual(restored_rel, self.source_rel)
+        node = self._node(self.document_uuid)
+        self.assertEqual(node["legacy_path"], self.source_rel)
+        self.assertEqual(node["parent_uuid"], memo_uuid)
+        self.assertEqual(creation.audit(self.root)["missing_in_identity"], [])
+
+    def test_trashing_a_folder_moves_its_children_without_renumbering(self):
+        memo = creation.node_for_path(self.root, "메인/메모장")
+        create_item(self.root, memo["uuid"], "묶음", True, uuid_factory=self.uuids)
+        folder = creation.node_for_path(self.root, "메인/메모장/묶음")
+        create_item(self.root, folder["uuid"], "안쪽", False, uuid_factory=self.uuids)
+        child_uuid = creation.node_for_path(
+            self.root, "메인/메모장/묶음/안쪽.txt"
+        )["uuid"]
+
+        trashed_rel = self.wpm.move_to_trash("메인/메모장/묶음")
+
+        self.assertEqual(self._node(folder["uuid"])["legacy_path"], trashed_rel)
+        child = self._node(child_uuid)
+        self.assertEqual(child["uuid"], child_uuid)
+        self.assertEqual(child["legacy_path"], f"{trashed_rel}/안쪽.txt")
+        self.assertEqual(child["parent_uuid"], folder["uuid"])
+        self.assertEqual(creation.audit(self.root)["missing_in_identity"], [])
 
 
 class InitializeExistingProjectTestCase(unittest.TestCase):

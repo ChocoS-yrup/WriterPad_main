@@ -227,12 +227,17 @@ class WritingProjectManager:
             "document_id": str(document_id) if document_id else None,
         }
         self._save_trash_index(updated_index)
+        target_rel = os.path.relpath(
+            trash_path, self.writing_root_path
+        ).replace("\\", "/")
         try:
-            shutil.move(full_path, trash_path)
+            self._relocate_with_identity(
+                rel_path, target_rel, lambda: shutil.move(full_path, trash_path)
+            )
         except Exception:
             self._save_trash_index(index)
             raise
-        return os.path.relpath(trash_path, self.writing_root_path).replace("\\", "/")
+        return target_rel
 
     def list_trash_items(self):
         """휴지통 항목과 기록된 원래 위치를 반환합니다."""
@@ -379,10 +384,51 @@ class WritingProjectManager:
             raise FileExistsError("복원할 위치에 같은 이름의 항목이 이미 있습니다.")
 
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        shutil.move(source_path, target_path)
+        self._relocate_with_identity(
+            trash_rel_path.replace("\\", "/"),
+            target_rel_path.replace("\\", "/"),
+            lambda: shutil.move(source_path, target_path),
+        )
         index.pop(name, None)
         self._save_trash_index(index)
         return os.path.relpath(target_path, self.writing_root_path).replace("\\", "/")
+
+    def _relocate_with_identity(self, source_rel, target_rel, apply_filesystem):
+        """Move a node on disk and follow it in identity, keeping its UUID.
+
+        A project with no identity file (a legacy tree, or a bare manager in a
+        test) just gets the filesystem move: there is nothing to keep in sync,
+        and inventing an entry here would issue a UUID outside a creation.
+        """
+        from project_creation_v1 import (
+            identity_path,
+            journalled_relocate,
+            next_order_under,
+            node_for_path,
+        )
+
+        project_root = os.path.dirname(self.writing_root_path)
+        node = None
+        if os.path.exists(identity_path(project_root)):
+            node = node_for_path(project_root, source_rel)
+        if node is None:
+            apply_filesystem()
+            return
+
+        parent_rel = target_rel.rsplit("/", 1)[0] if "/" in target_rel else None
+        parent = node_for_path(project_root, parent_rel) if parent_rel else None
+        move = {
+            "uuid": node["uuid"],
+            "parent_uuid": parent["uuid"] if parent else None,
+            "legacy_path": target_rel,
+            "title": target_rel.rsplit("/", 1)[-1],
+            "order": next_order_under(
+                project_root, parent["uuid"] if parent else None
+            ),
+        }
+        if node["kind"] == "document" and move["title"].endswith(".txt"):
+            move["title"] = move["title"][: -len(".txt")]
+        journalled_relocate(project_root, [move], apply_filesystem)
 
     def delete_from_trash(self, trash_rel_path):
         """휴지통 항목 하나를 영구 삭제하고 위치 기록도 제거합니다."""
