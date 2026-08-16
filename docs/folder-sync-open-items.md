@@ -90,27 +90,38 @@ Windows 는 폴더 투영을 live 행으로만 풀었기 때문에, 다른 기�
 남아 있으면 폴더를 건드리지 않는다. 복원 목적지가 이미 차 있으면
 `RESTORE_TARGET_TAKEN` 으로 보고하고 휴지통에 그대로 둔다.
 
-**가져오기 프로젝트의 identity 정렬 — 미해결**
+**가져오기 프로젝트의 identity 정렬 — 해결됨**
 
-`initialize_existing_project` 는 identity 파일이 없으면 표준 폴더 UUID 를 새로
-발급한다. 그 뒤 서버에서 문서를 pull 하면 서버가 발급한 id 가 들어온다. 그래서
-iPad 가 만든 프로젝트를 Windows 가 가져오면 **설계상 반드시 어긋난다.**
+가져오기는 표준 폴더에 새 UUID 를 발급하고 pull 이 받아온 문서는 identity 에 아예
+기록하지 않았다. 프로젝트를 여는 경로가 identity 와 파일 트리를 대조하므로 그
+프로젝트는 **열리지 않았다.** 폴더도 어긋나 있었다. 같은 폴더를 서버는 상대 기기가
+발급한 id 로 이미 들고 있어서, 폴더 발행이 영원히 이름 충돌로 보고만 했다.
 
-- identity: Windows 가 방금 발급한 폴더 UUID, 문서 노드는 아예 없음
-- 서버: iPad 가 발급한 `folder_id` / `document_id`
+이제 pull 이 끝난 뒤 identity 를 서버 id 로 다시 세운다. 프로젝트 uuid 는 서버
+`project_id`, 폴더는 서버 `folder_id`, 문서는 서버 `document_id` 를 그대로 쓴다.
+서버가 모르는 경로만 이 기기가 발급한 id 를 유지하므로, 중단된 가져오기를 재개해도
+UUID 가 다시 발급되지 않는다. 계획이 모호하면 쓰지 않고 거부한다.
 
-지금은 Windows 가 이 상태를 감지하고 **멈춘 뒤 보고만 한다.** 남의 이름을 쓰는
-폴더는 `FOLDER_NAME_TAKEN`, 그 자식들은 `PARENT_NOT_PUBLISHED` 로 기록되고 서버에
-RPC 를 한 번도 보내지 않는다. 진단은 `SyncV2Store.diagnostics()` 로 읽는다.
+형제 순서는 서버 `tree_order` 를 따르고, 표준 폴더 아홉은 힌트가 없거나 부분적이어도
+양쪽이 공유하는 배열(원고·캐릭터·설정집·메모장·스토리 플롯·흐름정리·복선·장소·휴지통)
+을 유지한다.
 
-iPad 회신의 "identity 보존 Windows 가져오기는 native 경로로 취급하고, 기존 서버
-프로젝트 가져오기에만 legacy migration 을 허용해야 한다" 가 이 항목이다.
+이 재작성은 **가져오기 거래 안에서만** 안전하다. 방금 만들어진 프로젝트라 그 id 를
+아직 아무도 참조하지 않았기 때문이다. 사용자가 작업해 온 프로젝트에는 절대 쓰지
+않는다.
 
-**영구 삭제가 identity 노드를 남긴다 — 미해결**
+**영구 삭제가 identity 노드를 남긴다 — 해결됨**
 
-`delete_from_trash` 와 `empty_trash` 는 파일을 지우지만 identity 노드는 지우지
-않는다. 디스크에 없는 노드가 남고 `audit()` 이 `missing_on_disk` 로 보고한다.
-폴더 tombstone 발행에는 오히려 유리하게 작용하지만 정합성 문제로 남아 있다.
+`delete_from_trash` 와 `empty_trash` 가 파일만 지우고 identity 노드를 남겨서,
+**휴지통을 비우면 그 프로젝트가 다음에 열리지 않았다.** 원고는 디스크에 그대로
+있는데 열 수가 없는 상태였다.
+
+영구 삭제는 UUID 가 정당하게 사라지는 유일한 경우이므로 다른 identity 변경과 같은
+journal 거래로 처리한다. 자손도 함께 지운다. 중단되면 파일이 실제로 사라졌는지 보고
+판단하고, 삭제가 실패했으면 파일과 노드를 둘 다 남긴다.
+
+서버 쪽 영구 삭제는 `__antigravity__/trash-purge.json` 이 담당하는 별도 경로이고
+여기서 건드리지 않는다.
 
 ---
 

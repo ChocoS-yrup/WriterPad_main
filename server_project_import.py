@@ -373,6 +373,9 @@ class ServerProjectImportService:
                 remote_documents, strict=True
             )
 
+            phase = "identity"
+            self._adopt_server_identity(destination, project_id, wpm)
+
             phase = "complete"
             self.store.set_project_import_state(project_id, "complete")
             try:
@@ -413,6 +416,56 @@ class ServerProjectImportService:
             if previous_sync_context is not None:
                 self._restore_sync_context(previous_sync_context)
             project_lock.release()
+
+    def _adopt_server_identity(self, destination, project_id, wpm):
+        """Give the imported project the ids the server already holds.
+
+        Without this the project cannot open: the pull writes documents that
+        identity has never heard of, and opening audits identity against the
+        file tree. The folders are just as wrong — they were minted here while
+        the server already had the same folders under the other device's ids —
+        so the folder publisher would report a name clash forever.
+        """
+        from project_creation_v1 import adopt_server_identity
+
+        local_key = self.store.local_key_for(destination.writing_root_path)
+        folder_rows = []
+        try:
+            client = self.sync_manager.supabase
+            if client is not None:
+                folder_rows = (
+                    self.sync_manager._fetch_v2_project_folders(client) or []
+                )
+        except Exception:
+            # A server without a folder projection still imports; those folders
+            # simply keep the ids this client issued.
+            folder_rows = []
+
+        resolved = self.sync_manager._folder_rows_with_tree_paths(folder_rows)
+        sync_rows = {
+            "local_key": local_key,
+            "projects": [{"project_id": project_id, "local_key": local_key}],
+            "folders": [
+                {"folder_id": row["folder_id"], "local_path": row["local_path"]}
+                for row in resolved.values()
+            ],
+            "documents": [
+                {
+                    "document_id": document["document_id"],
+                    "local_path": document["local_path"],
+                }
+                for document in self.store.list_documents(local_key)
+                if not document["is_deleted"]
+            ],
+        }
+        adopt_server_identity(
+            os.path.dirname(destination.writing_root_path),
+            sync_rows,
+            destination.project_name,
+            order_hint=(getattr(wpm, "project_settings", None) or {}).get(
+                "tree_order"
+            ),
+        )
 
     def _prepare_destination(self, project_id, local_project_name):
         destination = resolve_local_project_destination(

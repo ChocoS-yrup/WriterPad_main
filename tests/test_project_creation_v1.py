@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unicodedata
+import uuid as uuid_module
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -546,6 +547,180 @@ class InitializeExistingProjectTestCase(unittest.TestCase):
         self.assertEqual(
             callers, {"project_creation_v1.py", "server_project_import.py"}
         )
+
+
+class AdoptServerIdentityTestCase(unittest.TestCase):
+    """합성 임시 위치에서만 수행한다. 실제 원고와 운영 경로는 건드리지 않는다."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.workspace = Path(self.temp_dir.name) / "작품목록"
+        self.workspace.mkdir(parents=True)
+        (self.workspace / "가져온 작품").mkdir()
+        creation.initialize_existing_project(str(self.workspace), "가져온 작품")
+        self.project_root = str(self.workspace / "가져온 작품")
+        self.writing_root = writing_root(self.project_root)
+        self.minted = {
+            node["legacy_path"]: node["uuid"]
+            for node in read_identity(self.project_root)["nodes"]
+        }
+        self.server = {
+            path: str(uuid_module.uuid4())
+            for path in ("메인", "메인/원고", "메인/원고/1권")
+        }
+        self.document_id = str(uuid_module.uuid4())
+        self.project_id = str(uuid_module.uuid4())
+
+    def _pull_document(self, rel_path="메인/원고/1권/001화.txt", text="서버 본문"):
+        target = Path(self.writing_root, rel_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def _rows(self):
+        return {
+            "local_key": "로컬키",
+            "projects": [
+                {"project_id": self.project_id, "local_key": "로컬키"}
+            ],
+            "folders": [
+                {"folder_id": folder_id, "local_path": path}
+                for path, folder_id in self.server.items()
+            ],
+            "documents": [{
+                "document_id": self.document_id,
+                "local_path": "메인/원고/1권/001화.txt",
+            }],
+        }
+
+    def _adopt(self, order_hint=None):
+        return creation.adopt_server_identity(
+            self.project_root, self._rows(), "가져온 작품",
+            order_hint=order_hint,
+        )
+
+    def _nodes(self):
+        return {
+            node["legacy_path"]: node
+            for node in read_identity(self.project_root)["nodes"]
+        }
+
+    def test_a_pulled_project_cannot_be_opened_before_it_is_adopted(self):
+        self._pull_document()
+
+        verdict = creation.prepare_open(self.project_root)
+
+        self.assertEqual(verdict["status"], creation.OPEN_BLOCKED)
+        self.assertIn(
+            "메인/원고/1권/001화.txt", verdict["audit"]["missing_in_identity"]
+        )
+
+    def test_adopting_makes_the_pulled_project_openable(self):
+        self._pull_document()
+
+        self._adopt()
+
+        self.assertEqual(
+            creation.prepare_open(self.project_root)["status"], creation.OPEN_OK
+        )
+
+    def test_folders_take_the_ids_the_server_already_issued(self):
+        self._pull_document()
+
+        self._adopt()
+
+        nodes = self._nodes()
+        for path, folder_id in self.server.items():
+            self.assertEqual(nodes[path]["uuid"], folder_id, path)
+        self.assertNotEqual(nodes["메인"]["uuid"], self.minted["메인"])
+
+    def test_documents_and_the_project_take_their_server_ids(self):
+        self._pull_document()
+
+        identity = self._adopt()
+
+        self.assertEqual(identity["project"]["uuid"], self.project_id)
+        self.assertEqual(
+            self._nodes()["메인/원고/1권/001화.txt"]["uuid"], self.document_id
+        )
+
+    def test_a_folder_the_server_never_had_keeps_the_id_issued_here(self):
+        self._pull_document()
+
+        self._adopt()
+
+        self.assertEqual(
+            self._nodes()["메인/캐릭터"]["uuid"], self.minted["메인/캐릭터"]
+        )
+
+    def test_adopting_twice_reissues_nothing(self):
+        """가져오기는 재개될 수 있다. UUID 는 한 번만 발급한다."""
+        self._pull_document()
+        first = self._adopt()
+
+        second = self._adopt()
+
+        self.assertEqual(first["nodes"], second["nodes"])
+        self.assertEqual(first["project"], second["project"])
+
+    def test_the_standard_folders_keep_their_shared_arrangement(self):
+        self._pull_document()
+
+        self._adopt(order_hint={"<root>": ["원고"]})
+
+        nodes = self._nodes()
+        main_uuid = nodes["메인"]["uuid"]
+        ordered = [
+            path.rsplit("/", 1)[-1]
+            for _order, path in sorted(
+                (node["order"], path) for path, node in nodes.items()
+                if node["parent_uuid"] == main_uuid
+            )
+        ]
+        self.assertEqual(ordered, [
+            "원고", "캐릭터", "설정집", "메모장", "스토리 플롯",
+            "흐름정리", "복선", "장소", "휴지통",
+        ])
+
+    def test_the_server_tree_order_decides_a_user_folder_arrangement(self):
+        for name in ("나중", "먼저"):
+            Path(self.writing_root, "메인/설정집", name).mkdir(parents=True)
+
+        self._adopt(order_hint={"메인/설정집": ["먼저", "나중"]})
+
+        nodes = self._nodes()
+        parent = nodes["메인/설정집"]["uuid"]
+        ordered = [
+            path.rsplit("/", 1)[-1]
+            for _order, path in sorted(
+                (node["order"], path) for path, node in nodes.items()
+                if node["parent_uuid"] == parent
+            )
+        ]
+        self.assertEqual(ordered, ["먼저", "나중"])
+
+    def test_backup_folders_are_not_pulled_into_identity(self):
+        self._pull_document()
+
+        self._adopt()
+
+        self.assertNotIn("백업", self._nodes())
+        self.assertNotIn("백업/자동저장", self._nodes())
+
+    def test_an_ambiguous_plan_is_refused_and_nothing_is_written(self):
+        self._pull_document()
+        rows = self._rows()
+        rows["folders"].append(
+            {"folder_id": str(uuid_module.uuid4()), "local_path": "메인"}
+        )
+        before = read_identity(self.project_root)
+
+        with self.assertRaises(creation.CreationError):
+            creation.adopt_server_identity(
+                self.project_root, rows, "가져온 작품"
+            )
+
+        self.assertEqual(read_identity(self.project_root), before)
 
 
 class PurgingTrashClearsIdentityTestCase(unittest.TestCase):

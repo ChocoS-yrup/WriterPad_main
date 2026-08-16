@@ -25,10 +25,17 @@ import threading
 import unicodedata
 import uuid as uuid_module
 
+from binder_order import (
+    canonical_manuscript_children,
+    canonical_root_storage_name,
+)
 from project_identity_v1 import (
+    BLOCKING_BUCKETS,
+    KIND_DOCUMENT,
     KIND_FOLDER,
     KINDS,
     IdentityError,
+    plan_identity,
     append_nodes,
     relocate_nodes,
     remove_nodes,
@@ -726,6 +733,157 @@ def recover_project(project_root):
     return results
 
 
+def _sibling_order(parent_path, names, order_hint):
+    """Order one parent's children the way the shared tree already orders them."""
+    fixed = canonical_manuscript_children(parent_path, list(names))
+    if fixed is not None:
+        return fixed
+
+    hint_key = "<root>" if parent_path == "메인" else parent_path
+    hinted = [str(name) for name in (order_hint or {}).get(hint_key, [])]
+    if parent_path == "메인":
+        hinted = [canonical_root_storage_name(name) for name in hinted]
+        # A partial hint must not push the standard folders into alphabetical
+        # order; they have one shared arrangement on both platforms.
+        hinted.extend(
+            path.rsplit("/", 1)[-1] for path in STANDARD_FOLDERS
+            if path != "메인"
+        )
+    ordered = []
+    for name in hinted:
+        if name in names and name not in ordered:
+            ordered.append(name)
+    ordered.extend(sorted(set(names) - set(ordered)))
+    return ordered
+
+
+def _sync_rows_with_local_fallback(project_root, sync_rows):
+    """Let ids already recorded here stand in wherever the server has none.
+
+    A resumed import must not hand a folder the server never heard of a second
+    brand new id. Only paths the server does not cover are added, because two
+    candidates for one path is exactly the ambiguity the planner refuses.
+    """
+    rows = {key: list(value) for key, value in (sync_rows or {}).items()
+            if key in ("projects", "folders", "documents")}
+    rows.setdefault("projects", [])
+    rows.setdefault("folders", [])
+    rows.setdefault("documents", [])
+    if not os.path.exists(identity_path(project_root)):
+        return rows
+
+    covered = {
+        row["local_path"] for row in rows["folders"] + rows["documents"]
+    }
+    try:
+        nodes = read_identity(project_root)["nodes"]
+    except (IdentityError, OSError):
+        return rows
+    for node in nodes:
+        if node["legacy_path"] in covered:
+            continue
+        if node["kind"] == KIND_FOLDER:
+            rows["folders"].append({
+                "folder_id": node["uuid"], "local_path": node["legacy_path"],
+            })
+        else:
+            rows["documents"].append({
+                "document_id": node["uuid"], "local_path": node["legacy_path"],
+            })
+    return rows
+
+
+def adopt_server_identity(project_root, sync_rows, title, order_hint=None,
+                          uuid_factory=None):
+    """Rebuild a freshly imported project's identity from the server's ids.
+
+    Importing used to mint brand new UUIDs for the standard folders and record
+    nothing at all for the documents it pulled. The project then failed its own
+    open check, because identity did not know about files that were sitting
+    right there, and its folders could never be published because the server
+    already held the same folders under the ids the other device had issued.
+
+    Every id here is inherited, never invented, wherever the server has one for
+    that path — the project uuid included, so it matches the server project.
+    Only a path the server has never heard of gets a fresh id. The plan is
+    refused outright if it is ambiguous, so an unclear tree is reported rather
+    than guessed at.
+
+    This replaces the identity file, which is safe only because the import just
+    created this project moments ago and nothing has referenced those ids yet.
+    Never call it on a project the writer has been working in.
+    """
+    root = writing_root(project_root)
+    entries = sorted(tracked_tree_entries(root))
+    folders = {path for path, is_folder in entries if is_folder}
+
+    children = {}
+    for path, _is_folder in entries:
+        parent = path.rsplit("/", 1)[0] if "/" in path else None
+        children.setdefault(parent, []).append(path)
+
+    local_nodes = []
+    for parent, paths in children.items():
+        names = [path.rsplit("/", 1)[-1] for path in paths]
+        ordered = _sibling_order(parent, names, order_hint)
+        positions = {name: index for index, name in enumerate(ordered)}
+        for path in paths:
+            name = path.rsplit("/", 1)[-1]
+            local_nodes.append({
+                "kind": KIND_FOLDER if path in folders else KIND_DOCUMENT,
+                "legacy_path": path,
+                "parent_legacy_path": parent,
+                "order": positions.get(name, len(positions)),
+            })
+
+    # Parents must be planned before their children can reference them.
+    local_nodes.sort(key=lambda node: node["legacy_path"].count("/"))
+    plan = plan_identity(
+        {"title": title, "local_key": (sync_rows or {}).get("local_key")},
+        local_nodes,
+        _sync_rows_with_local_fallback(project_root, sync_rows),
+        uuid_factory,
+    )
+    if plan["blocked"]:
+        raise CreationError(
+            "가져온 프로젝트의 정체성을 확정할 수 없습니다: "
+            f"{ {name: plan['report'][name] for name in BLOCKING_BUCKETS if plan['report'][name]} }"
+        )
+    return write_identity(
+        project_root,
+        {
+            "format_version": plan["format_version"],
+            "project": dict(plan["project"]),
+            "nodes": [dict(node) for node in plan["nodes"]],
+        },
+        overwrite=True,
+    )
+
+
+def tracked_tree_entries(root):
+    """Yield ``(legacy_path, is_folder)`` for everything identity must know.
+
+    Opening a project compares identity against this exact set, so anything
+    that rebuilds identity has to walk it the same way or the project will
+    refuse to open over a difference nobody can see. Both read it from here.
+    """
+    skip = set(UNTRACKED_FOLDERS)
+    for current, directories, files in os.walk(root):
+        relative = os.path.relpath(current, root).replace(os.sep, "/")
+        if relative == ".":
+            relative = ""
+        if any(part in skip for part in (relative, relative.split("/")[0])):
+            directories[:] = []
+            continue
+        for name in list(directories) + files:
+            if name in UNTRACKED_FILES or name.startswith("."):
+                continue
+            candidate = f"{relative}/{name}" if relative else name
+            if candidate in skip or candidate.split("/")[0] in ("백업",):
+                continue
+            yield candidate, os.path.isdir(os.path.join(current, name))
+
+
 def audit(project_root):
     """Report identity/filesystem divergence. Never repairs anything.
 
@@ -746,23 +904,10 @@ def audit(project_root):
             missing_on_disk.append(node["legacy_path"])
 
     known = {node["legacy_path"] for node in identity["nodes"]}
-    skip = set(UNTRACKED_FOLDERS)
-    missing_in_identity = []
-    for current, directories, files in os.walk(root):
-        relative = os.path.relpath(current, root).replace(os.sep, "/")
-        if relative == ".":
-            relative = ""
-        if any(part in skip for part in (relative, relative.split("/")[0])):
-            directories[:] = []
-            continue
-        for name in list(directories) + files:
-            if name in UNTRACKED_FILES or name.startswith("."):
-                continue
-            candidate = f"{relative}/{name}" if relative else name
-            if candidate in skip or candidate.split("/")[0] in ("백업",):
-                continue
-            if candidate not in known:
-                missing_in_identity.append(candidate)
+    missing_in_identity = [
+        path for path, _is_folder in tracked_tree_entries(root)
+        if path not in known
+    ]
 
     return {
         "missing_on_disk": sorted(missing_on_disk),
