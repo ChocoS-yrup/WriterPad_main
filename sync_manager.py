@@ -5166,6 +5166,105 @@ class SyncManager(QObject):
                     state=f"contract;reason={code}",
                     pending_count=self.pending_retry_count,
                 )
+        # Last, because the documents inside a folder deleted elsewhere have
+        # just been tombstoned into 휴지통 on their own.
+        changes.extend(
+            self._apply_remote_folder_tombstones(folder_rows, protected)
+        )
+        return changes
+
+    def _identity_folder_by_uuid(self, folder_uuid):
+        from project_creation_v1 import identity_folder_nodes
+
+        root = getattr(self._v2_wpm, "writing_root_path", None)
+        for node in identity_folder_nodes(root):
+            if str(node["uuid"]) == str(folder_uuid):
+                return node
+        return None
+
+    def _apply_remote_folder_tombstones(self, folder_rows, protected):
+        """Follow a folder another device deleted, without removing one byte.
+
+        Windows read the folder projection only for live rows, so a folder
+        deleted on iPad was simply invisible here: its documents arrived as
+        tombstones and moved themselves into 휴지통, and the directory they
+        came out of stayed in the binder, empty. That is the mirror of the
+        Windows-side gap that left an empty folder on iPad.
+
+        The folder is moved to 휴지통, never deleted, so anything still inside
+        it — an untracked file, a document that has not synced yet — survives
+        and stays reachable. Identity follows the move, so the UUID is intact
+        and this client will not then re-publish the folder as live.
+        """
+        deleted_ids = [
+            str(row.get("folder_id"))
+            for row in (folder_rows or [])
+            if isinstance(row, dict)
+            and row.get("is_deleted")
+            and row.get("folder_id")
+        ]
+        if not deleted_ids or self._v2_wpm is None:
+            return []
+
+        root = os.path.abspath(self._v2_wpm.writing_root_path)
+        protected = set(protected or ())
+        changes = []
+        # Shallowest first: moving a parent takes its children with it, and
+        # identity rewrites their paths, so the children resolve as done.
+        ordered = sorted(
+            deleted_ids,
+            key=lambda folder_id: len(
+                (self._identity_folder_by_uuid(folder_id) or {})
+                .get("legacy_path", "")
+                .split("/")
+            ),
+        )
+        for folder_id in ordered:
+            node = self._identity_folder_by_uuid(folder_id)
+            if node is None:
+                continue
+            local_path = node["legacy_path"]
+            if local_path == "메인/휴지통" or local_path.startswith("메인/휴지통/"):
+                continue
+            if local_path in protected or any(
+                path.startswith(local_path + "/") for path in protected
+            ):
+                continue
+            if any(
+                (
+                    document["local_path"] == local_path
+                    or document["local_path"].startswith(local_path + "/")
+                )
+                and self._v2_store.has_active_operations(document["document_id"])
+                for document in self._v2_store.list_documents(
+                    self._v2_context["local_key"]
+                )
+            ):
+                # Unsent local edits still address the old path. Leave the
+                # folder alone and let the next pull settle it.
+                continue
+            full_path = os.path.abspath(
+                os.path.join(root, local_path.replace("/", os.sep))
+            )
+            try:
+                if (
+                    os.path.commonpath([root, full_path]) != root
+                    or not os.path.isdir(full_path)
+                    or self._is_reparse_path(full_path)
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+            trash_path = self._v2_wpm.move_to_trash(local_path)
+            self._v2_store.move_local_path(
+                self._v2_context["local_key"], local_path, trash_path
+            )
+            changes.append({
+                "kind": "folder_tombstone",
+                "old_local_path": local_path,
+                "new_local_path": trash_path,
+                "entity_id": folder_id,
+            })
         return changes
 
     @staticmethod

@@ -1122,6 +1122,164 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         ]
         self.assertEqual([row["folder_id"] for row in live], [replacement["uuid"]])
 
+    def _pull(self, folder_rows, remote_documents, tree_order):
+        """Apply one pull the way _process_v2_pull hands it to the manager."""
+        documents = [{
+            "document_id": str(uuid.uuid5(
+                uuid.UUID(self.context["project_id"]), TREE_ORDER_DOCUMENT_PATH
+            )),
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": self.manager._tree_order_content(tree_order),
+            "revision": 1,
+            "is_deleted": False,
+        }]
+        documents.extend(remote_documents)
+        return self.manager._apply_v2_remote_documents(
+            documents, folder_rows=folder_rows, strict=False
+        )
+
+    def test_a_folder_deleted_elsewhere_does_not_stay_in_the_binder(self):
+        """어제 관찰된 결함의 거울상이다. iPad 가 지운 폴더가 Windows 에 남는가."""
+        folder = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        document = create_item_at_path(
+            self.project_root, "메인/설정집/구세계", "마법", False
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.assertTrue(
+            Path(self.wpm.writing_root_path, "메인/설정집/구세계").is_dir()
+        )
+
+        # iPad 가 폴더를 휴지통으로 보냈다. 문서 tombstone 과 폴더 tombstone 이
+        # 함께 온다.
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = True
+                row["revision"] = 2
+        self._pull(
+            client.folder_rows,
+            [{
+                "document_id": document["uuid"],
+                "relative_path": "메인/설정집/구세계/마법.txt",
+                "content": "",
+                "revision": 2,
+                "is_deleted": True,
+            }],
+            {"<root>": ["설정집"], "메인/설정집": []},
+        )
+
+        remaining = Path(self.wpm.writing_root_path, "메인/설정집/구세계")
+        self.assertFalse(
+            remaining.exists(),
+            "원격에서 지운 폴더가 바인더에 빈 폴더로 남았다",
+        )
+
+    def _publish_then_delete_remotely(self, extra_files=()):
+        folder = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        for name, text in extra_files:
+            Path(
+                self.wpm.writing_root_path, "메인/설정집/구세계", name
+            ).write_text(text, encoding="utf-8")
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = True
+                row["revision"] = 2
+        return folder, client
+
+    def test_following_a_remote_delete_keeps_every_byte_left_inside(self):
+        folder, client = self._publish_then_delete_remotely(
+            extra_files=[("아직 안 올린 초고.txt", "잃으면 안 되는 본문")]
+        )
+
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+
+        survivors = list(
+            Path(self.wpm.writing_root_path, "메인/휴지통").rglob(
+                "아직 안 올린 초고.txt"
+            )
+        )
+        self.assertEqual(len(survivors), 1)
+        self.assertEqual(
+            survivors[0].read_text(encoding="utf-8"), "잃으면 안 되는 본문"
+        )
+
+    def test_following_a_remote_delete_keeps_the_folder_uuid(self):
+        folder, client = self._publish_then_delete_remotely()
+
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+
+        moved = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == folder["uuid"]
+        )
+        self.assertTrue(moved["legacy_path"].startswith("메인/휴지통/"))
+
+    def test_following_a_remote_delete_does_not_start_a_publish_fight(self):
+        """따라간 뒤 다시 live 로 올리면 두 기기가 서로를 되돌린다."""
+        folder, client = self._publish_then_delete_remotely()
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+
+        self.operation["operation_id"] = str(uuid.uuid4())
+        result = self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+
+        self.assertEqual(result["created"], [])
+        self.assertEqual(result["restored"], [])
+        self.assertEqual(result["deleted"], [])
+        row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == folder["uuid"]
+        )
+        self.assertTrue(row["is_deleted"])
+        self.assertEqual(row["revision"], 2)
+
+    def test_a_second_pull_does_not_move_the_folder_again(self):
+        folder, client = self._publish_then_delete_remotely()
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+        first = sorted(
+            path.name
+            for path in Path(self.wpm.writing_root_path, "메인/휴지통").iterdir()
+        )
+
+        changes = self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+
+        self.assertEqual(
+            [change for change in changes
+             if change.get("kind") == "folder_tombstone"],
+            [],
+        )
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in Path(
+                    self.wpm.writing_root_path, "메인/휴지통"
+                ).iterdir()
+            ),
+            first,
+        )
+
+    def test_an_open_document_protects_its_folder_from_the_remote_delete(self):
+        folder, client = self._publish_then_delete_remotely()
+        self.manager.set_remote_protected_paths_provider(
+            lambda: {"메인/설정집/구세계/열린 문서.txt"}
+        )
+        self.addCleanup(
+            self.manager.set_remote_protected_paths_provider, None
+        )
+
+        self._pull(client.folder_rows, [], {"<root>": ["설정집"]})
+
+        self.assertTrue(
+            Path(self.wpm.writing_root_path, "메인/설정집/구세계").is_dir()
+        )
+
     def test_a_project_without_identity_publishes_nothing(self):
         plain_root = str(Path(self.temp.name, "정체성없음", "집필모드"))
         self.manager._v2_wpm = SimpleNamespace(writing_root_path=plain_root)
