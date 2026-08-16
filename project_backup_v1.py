@@ -71,6 +71,42 @@ def _digest_file(path):
     return total, digest.hexdigest()
 
 
+_WINDOWS_RESERVED = {
+    "con", "prn", "aux", "nul",
+    *(f"com{n}" for n in range(1, 10)),
+    *(f"lpt{n}" for n in range(1, 10)),
+}
+
+
+def _require_safe_path(value, field):
+    """A manifest path must stay inside the destination and be creatable here.
+
+    A package can arrive from another machine, so its paths are untrusted input:
+    an absolute path or a `..` segment would let a restore write outside the
+    directory the user picked.
+    """
+    text = str(value or "")
+    if not text:
+        raise BackupFormatError(f"{field} must not be empty")
+    if text != unicodedata.normalize("NFC", text):
+        raise BackupFormatError(f"{field} must be NFC-normalized: {text!r}")
+    if "\\" in text or text.startswith("/") or ":" in text:
+        raise BackupFormatError(f"{field} must be a relative '/' path: {text!r}")
+
+    for part in text.split("/"):
+        if part in ("", ".", ".."):
+            raise BackupFormatError(f"{field} has an unusable segment: {text!r}")
+        if part != part.rstrip(". "):
+            raise BackupFormatError(
+                f"{field} segment ends with a dot or space: {text!r}"
+            )
+        if part.split(".")[0].lower() in _WINDOWS_RESERVED:
+            raise BackupFormatError(
+                f"{field} uses a reserved Windows name: {text!r}"
+            )
+    return text
+
+
 def _validate_tree(project_uuid, nodes):
     """Reject duplicate ids, unknown parents, non-folder parents and cycles."""
     by_uuid = {}
@@ -174,7 +210,9 @@ def create_project_backup(project, nodes, destination):
 
     manifest = {
         "format_version": FORMAT_VERSION,
-        "project": {"uuid": project_uuid, "title": project_title},
+        # A package holds exactly one project, so its order is always 0. The
+        # field is written because the iPad client expects to read it.
+        "project": {"uuid": project_uuid, "title": project_title, "order": 0},
         "nodes": prepared,
     }
     manifest_path = os.path.join(destination, MANIFEST_NAME)
@@ -198,17 +236,43 @@ def read_manifest(package):
 
     project = manifest.get("project") or {}
     project_uuid = _require_uuid(project.get("uuid"), "project.uuid")
+    # A package holds one project. Older packages omit the field entirely.
+    if int(project.get("order", 0)) != 0:
+        raise BackupFormatError(
+            f"project.order must be 0, got {project.get('order')!r}"
+        )
+    if project.get("title") is not None:
+        title = str(project["title"])
+        if title != unicodedata.normalize("NFC", title):
+            raise BackupFormatError("project.title must be NFC-normalized")
 
     nodes = manifest.get("nodes")
     if not isinstance(nodes, list):
         raise BackupFormatError("manifest.nodes must be a list")
 
+    siblings = set()
     for node in nodes:
         _require_uuid(node.get("uuid"), "node.uuid")
         if node.get("kind") not in KINDS:
             raise BackupFormatError(f"unsupported kind {node.get('kind')!r}")
         if "parent_uuid" not in node:
             raise BackupFormatError(f"node {node['uuid']} omits parent_uuid")
+
+        _require_safe_path(node.get("path"), f"node {node['uuid']} path")
+        title = str(node.get("title") or "")
+        if title != unicodedata.normalize("NFC", title):
+            raise BackupFormatError(f"node {node['uuid']} title must be NFC")
+
+        order = int(node.get("order", 0))
+        if order < 0:
+            raise BackupFormatError(f"node {node['uuid']} has a negative order")
+        key = (node["parent_uuid"], order)
+        if key in siblings:
+            raise BackupFormatError(
+                f"two nodes share order {order} under the same parent"
+            )
+        siblings.add(key)
+
         if node["kind"] == KIND_DOCUMENT:
             if "bytes" not in node or "sha256" not in node:
                 raise BackupFormatError(

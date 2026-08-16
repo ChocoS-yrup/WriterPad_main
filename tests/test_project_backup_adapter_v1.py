@@ -40,6 +40,8 @@ class BackupAdapterTestCase(unittest.TestCase):
         self.base = Path(self.temp_dir.name)
         self.workspace = self.base / "작품목록"
         self.workspace.mkdir(parents=True)
+        self.restore_workspace = self.base / "복원 작업공간"
+        self.restore_workspace.mkdir(parents=True)
         self.uuids = seq_uuids()
         self.addCleanup(self.temp_dir.cleanup)
 
@@ -89,8 +91,10 @@ class BackupAdapterTestCase(unittest.TestCase):
         )
         self.assertEqual(manifest["project"]["uuid"], source["project"]["uuid"])
 
-        restored_root = str(self.workspace / "되살린 작품")
-        adapter.restore_project(package, str(self.workspace), "되살린 작품")
+        restored_root = str(self.restore_workspace / "되살린 작품")
+        adapter.restore_project(
+            package, str(self.restore_workspace), "되살린 작품"
+        )
 
         # Same ids, same parents, same order, same bytes.
         adapter.verify_restored(restored_root, manifest)
@@ -122,8 +126,10 @@ class BackupAdapterTestCase(unittest.TestCase):
         self.assertEqual(len(trashed), 1)
         self.assertTrue(trashed[0]["path"].startswith(creation.TRASH_PATH + "/"))
 
-        adapter.restore_project(package, str(self.workspace), "되살린 작품")
-        restored_root = str(self.workspace / "되살린 작품")
+        adapter.restore_project(
+            package, str(self.restore_workspace), "되살린 작품"
+        )
+        restored_root = str(self.restore_workspace / "되살린 작품")
 
         node = {
             n["uuid"]: n for n in read_identity(restored_root)["nodes"]
@@ -156,6 +162,15 @@ class BackupAdapterTestCase(unittest.TestCase):
             creation.prepare_open(self.root)["status"], creation.OPEN_OK
         )
 
+    def test_restore_refuses_a_second_copy_of_the_same_project_uuid(self):
+        package = str(self.base / "패키지")
+        adapter.backup_project(self.root, package)
+
+        with self.assertRaises(CreationError):
+            adapter.restore_project(package, str(self.workspace), "다른 이름")
+
+        self.assertFalse((self.workspace / "다른 이름").exists())
+
     def test_interrupted_restore_recovers_with_the_same_uuids(self):
         package = str(self.base / "패키지")
         manifest = adapter.backup_project(self.root, package)
@@ -168,19 +183,21 @@ class BackupAdapterTestCase(unittest.TestCase):
 
         with patch("os.replace", side_effect=fail_on_staging):
             with self.assertRaises(OSError):
-                adapter.restore_project(package, str(self.workspace), "되살린 작품")
+                adapter.restore_project(
+                    package, str(self.restore_workspace), "되살린 작품"
+                )
 
-        self.assertFalse((self.workspace / "되살린 작품").exists())
+        self.assertFalse((self.restore_workspace / "되살린 작품").exists())
         self.assertEqual(
-            len(os.listdir(workspace_journal_dir(str(self.workspace)))), 1
+            len(os.listdir(workspace_journal_dir(str(self.restore_workspace)))), 1
         )
 
-        recover_workspace(str(self.workspace))
+        recover_workspace(str(self.restore_workspace))
 
-        restored_root = str(self.workspace / "되살린 작품")
+        restored_root = str(self.restore_workspace / "되살린 작품")
         adapter.verify_restored(restored_root, manifest)
         self.assertEqual(
-            os.listdir(workspace_journal_dir(str(self.workspace))), []
+            os.listdir(workspace_journal_dir(str(self.restore_workspace))), []
         )
 
 

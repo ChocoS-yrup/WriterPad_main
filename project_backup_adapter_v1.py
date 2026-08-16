@@ -54,6 +54,27 @@ def package_looks_valid(package):
     )
 
 
+def project_uuid_owner(workspace, project_uuid):
+    """Return the project title already holding ``project_uuid``, or None."""
+    from project_creation_v1 import identity_path
+
+    if not os.path.isdir(workspace):
+        return None
+    for name in sorted(os.listdir(workspace)):
+        if name.startswith("."):
+            continue
+        candidate = os.path.join(workspace, name)
+        if not os.path.isfile(identity_path(candidate)):
+            continue
+        try:
+            identity = read_identity(candidate)
+        except Exception:
+            continue
+        if identity["project"]["uuid"] == project_uuid:
+            return name
+    return None
+
+
 def backup_project(project_root, destination):
     """Write a v1 package for a real project into a non-existent destination."""
     identity = read_identity(project_root)
@@ -130,6 +151,13 @@ def restore_project(package, workspace, title):
     project_root = os.path.join(workspace, title)
     if os.path.exists(project_root):
         raise CreationError(f"project already exists: {project_root}")
+
+    existing = project_uuid_owner(workspace, manifest["project"]["uuid"])
+    if existing is not None:
+        raise CreationError(
+            f"project uuid {manifest['project']['uuid']} is already used by "
+            f"{existing}; restoring would create a second copy of one project"
+        )
 
     nodes = []
     for node in manifest["nodes"]:
