@@ -16,6 +16,14 @@ feat: let the local identity file issue every sync UUID
 브랜치는 `codex/windows-stage4a-local-uuid-identity` 다. 정확한 SHA 는
 `git log --oneline` 으로 읽어라.
 
+기준 시점의 iPad 커밋:
+
+```
+afb96bee0773d4961f9bad1fea76321eeb71a2bf
+  fix: order folder tombstones and skip initial trash
+  브랜치 codex/ipad-folder-sync-followup, 부모 cf69d173…
+```
+
 ---
 
 ## 지금 서 있는 자리
@@ -110,6 +118,36 @@ UUID 가 다시 발급되지 않는다. 계획이 모호하면 쓰지 않고 거
 아직 아무도 참조하지 않았기 때문이다. 사용자가 작업해 온 프로젝트에는 절대 쓰지
 않는다.
 
+**계약 패키지가 0.2.0 과 0.3.0 으로 갈라져 있다 — 미해결**
+
+Windows 활성 트리 안에서 값이 두 개다.
+
+```
+sync_contract.py            0.2.0
+sync-contract/protocol.json 0.2.0
+contract-lock.json          0.2.0
+CHANGELOG 최신 항목          0.2.0   (0.3.0 항목 없음)
+
+storage_name_tables.py      0.3.0   ← 활성 트리
+tests/storage_name_v2_*     0.3.0   ← 활성 트리
+sync-contract/unicode/      없음     ← storage_name_tables 가 가리키는 출처
+```
+
+iPad 는 0.3.0 을 pin 하고 있고, 자기 저장소에서 `verify_contract.py` 로 canonical
+SHA 일치를 확인했다. **iPad 의 pin 이 틀린 것이 아니라 Windows 활성 트리가 한
+세대 뒤다.** 0.3.0 산출물은 정크 정리 때 `_사용안함_과거테스트흔적_20260815/`
+안으로 딸려 들어갔고, 그것을 소비하는 코드만 활성 트리에 남았다.
+
+**지금은 무해하다.** 계약을 검증하는 경로는 `_uses_contract_structure()` 뒤에
+있고 제품에서 한 번도 True 가 되지 않는다. 실제로 쓰는 RPC 는 `ensure_project`,
+`commit_document`, `commit_folder` 뿐이며 계약 배치를 쓰지 않는다.
+`storage_name_tables.py` 의 테이블 자체는 활성 트리에 통째로 있어 동작한다.
+없는 것은 그 출처 문서뿐이다.
+
+정리 방향은 정해졌다. iPad 저장소에 온전한 0.3.0 패키지가 있으므로 Windows 가
+그것을 활성 트리로 가져오면 된다. 서버 마이그레이션보다 먼저 해야 한다. 그
+변경을 어느 계약 문서에 적을지가 지금은 불분명하기 때문이다.
+
 **영구 삭제가 identity 노드를 남긴다 — 해결됨**
 
 `delete_from_trash` 와 `empty_trash` 가 파일만 지우고 identity 노드를 남겨서,
@@ -125,38 +163,81 @@ journal 거래로 처리한다. 자손도 함께 지운다. 중단되면 파일�
 
 ---
 
-## iPad 가 답해야 할 것
+## iPad 쪽 — 해결된 것
 
-**깊이 순서 — 미해결**
+`afb96be` 와 그 부모 `cf69d17` 에서 확인했다. Windows 가 커밋 원문을 직접 읽고
+대조한 결과다.
 
-폴더 operation 이 부모 우선이라고 보고했다. 생성에는 맞지만 삭제에는 정반대다.
-중첩 폴더를 통째로 버리면 `FOLDER_NOT_EMPTY` 로 실패한다. 삭제 operation 은 깊이
-내림차순이어야 하고, 같은 배수 안에서 병렬 전송하면 안 된다.
+**폴더 operation 순서 — 해결됨**
 
-**폴더 복원 발행 — 미확인**
+정렬은 원래 맞았고 dispatcher 가 같은 batch 의 폴더를 병렬 전송해 도착 순서를
+뒤집고 있었다. 이제 폴더 줄만 claim 순서대로 직렬로 비우고 문서 줄은 계속
+병렬로 흐른다. 삭제뿐 아니라 **생성·복원까지 함께 보호된다** — 병렬 전송은
+자식이 부모보다 먼저 닿아 `PARENT_FOLDER_NOT_FOUND` 를 내는 경로이기도 했다.
 
-휴지통에서 꺼낸 폴더를 `commit_folder(is_deleted = false)` 로 되돌리는가.
-삭제만 보내고 복원을 안 보내면 반대쪽에서 폴더가 죽은 채로 남는다.
+3 단 중첩을 부모 우선으로 enqueue 해도 완료 순서가 `C → B → A` 만 허용되는
+시험이 있다.
 
-**빈 폴더가 `tree_order` 에 들어가는가 — 미확인**
+**폴더 복원 발행 — 원래 되어 있었다**
 
-Windows 는 서버 `folders` 투영과 `tree_order` 에서 유도한 폴더 집합이 어긋나면
-pull 전체를 보류한다. 유도 집합은 `tree_order` 의 부모 키와, live 문서가 아닌
-자식 이름으로 만들어진다.
+같은 UUID 와 부모 id 를 유지하며 `is_deleted = false` 를 발행한다. 얕은 것부터
+보낸다.
 
-```
-tree_order 에 {"메인/설정집": ["빈폴더"]} 로 형제 이름이 들어감  → 정상
-tree_order 에는 없고 folderSnapshot 에만 있음                    → 영구 블록
-```
+**최초 스냅샷의 휴지통 하위 폴더 — 해결됨**
 
-후자면 새 프로젝트가 처음부터 동기화되지 않고 원인이 사용자에게 보이지 않는다.
-휴지통과 달리 서버가 막아주지 않는다.
+최초 스냅샷을 live 노드에서만 만든다. `메인/휴지통` 고정 폴더 자체는 live 로
+올리고 그 아래 폴더 operation 은 0 건이다. 폴더 노드가 컬렉션에 직접 들어 있어
+빈 폴더는 그대로 살아남는다.
+
+**빈 폴더와 `tree_order` — 정상**
+
+빈 폴더도 부모의 자식 이름 배열에 들어간다. 예: `"메인/설정집": ["빈 폴더"]`.
+Windows 의 pull 보류 조건에 걸리지 않는다.
+
+---
+
+## 합의된 차이 — 맞추지 않기로 한 것
+
+같은 결과를 다른 방식으로 얻는다. 양쪽 다 바이트를 잃지 않으므로 통일 비용이
+이득보다 크다고 판단했다.
+
+**원격 폴더 tombstone 을 로컬에서 처리하는 방식**
+
+| | Windows | iPad |
+|---|---|---|
+| 빈 폴더 | 휴지통으로 이동 | 디스크·메타데이터에서 제거 |
+| 내용이 남은 폴더 | 휴지통으로 이동 (바이트 보존) | 삭제 거부 |
+| 다시 live | 휴지통에서 꺼냄 | 서버 UUID 로 재생성 |
+
+문서가 먼저 tombstone 되어 각자 휴지통으로 빠지므로 대개 같은 상태로 수렴한다.
+갈리는 경우는 하나다. **한 번도 동기화된 적 없는 파일이 그 폴더에 남아 있을 때**
+iPad 는 폴더를 제자리에 두고 Windows 는 휴지통에 둔다. 트리 모양은 달라지지만
+원고는 양쪽 다 온전하다.
+
+남은 확인: iPad 가 삭제를 거부할 때 그 operation 이 무한 재시도로 큐를 막지
+않는지. 막히면 그 프로젝트의 다른 동기화까지 선다.
+
+**identity 의 프로젝트 UUID**
+
+Windows 는 서버 프로젝트를 가져올 때 identity 의 project uuid 를 서버
+`project_id` 로 채택한다. iPad 는 로컬 `ProjectID` 를 유지한다. iPad 의
+`.windowsImport` 는 서버에서 내려받는 경로가 아니라 로컬 스냅샷을 빈 서버
+프로젝트에 올리는 경로라 성격 자체가 다르다.
+
+동기화는 `sync_projects.project_id`(서버 값)를 쓰고 identity 의 project uuid 를
+읽지 않는다. 백업이 플랫폼을 건너갈 때는 manifest 값이 정본이라 스스로 맞는다.
+그래서 맞추지 않는다.
+
+---
+
+## iPad 에 남은 것
 
 **최초 batch 의 `ensure_project` bookkeeping — 미해결**
 
 초기 batch 에 `ensure_project` 행을 기록하지만 dispatcher 가 claim 하지 않아
-pending 으로 남는다고 보고했다. 원고 손실 위험은 없어 보인다. 폴더 차단 해소와
-같은 커밋에 섞지 않는다.
+pending 으로 남는다. 실제 `ensure_project` 는 연결 직전에 따로 호출되므로
+프로젝트 생성은 되고, batch 상태만 완료되지 않는다. 원고 손실 위험은 없다.
+다른 작업과 같은 커밋에 섞지 않는다.
 
 ---
 
