@@ -1291,6 +1291,24 @@ class SyncManager(QObject):
             persistent = counts.get("documents", counts["total"])
         return len(self._retry_queue) + persistent
 
+    def _absent_project_state(self):
+        """Decide what a missing server row means for this project.
+
+        Absent is not purged. Before the first commit lands there is no row
+        to find, and ensure_project — the thing that creates it — only runs
+        inside dispatch. Reading that absence as a purge stops dispatch, so
+        the row never appears and the project stays stuck for good. Only a
+        project this device has already committed can have gone missing.
+        """
+        store = getattr(self, "_v2_store", None)
+        context = getattr(self, "_v2_context", None)
+        if not store or not context:
+            return "active"
+        checker = getattr(store, "has_server_acknowledged_commit", None)
+        if not callable(checker):
+            return "active"
+        return "purged" if checker(context["local_key"]) else "active"
+
     def _current_project_server_state(self):
         if not self.is_v2_enabled:
             return "active"
@@ -2094,41 +2112,49 @@ class SyncManager(QObject):
             )
             data = self._response_data(response) or {}
         except Exception as status_error:
-            if self._stable_error_code(status_error) in {
-                "AUTH_EXPIRED", "AUTH_REQUIRED"
-            }:
+            status_code = self._stable_error_code(status_error)
+            if status_code in {"AUTH_EXPIRED", "AUTH_REQUIRED"}:
                 raise
-            # Compatibility path for a server that has the project-trash
-            # migration but has not deployed get_project_status yet.
-            trashed_response = self._call_with_session(
-                lambda: self.supabase.rpc(
-                    "list_trashed_projects", {}
-                ).execute(),
-                self.supabase,
-            )
-            trashed_rows = getattr(trashed_response, "data", None)
-            if not isinstance(trashed_rows, list):
-                raise RuntimeError("INVALID_RESPONSE") from None
-            if any(
-                str(row.get("project_id") or "") == project_id
-                for row in trashed_rows if isinstance(row, dict)
-            ):
-                data = {"state": "trashed"}
+            if status_code == "PROJECT_NOT_FOUND":
+                # The RPC answered. It is deployed, so the compatibility
+                # path below has nothing left to discover: the server
+                # simply holds no row for this project.
+                data = {"state": self._absent_project_state()}
             else:
-                active_response = self._call_with_session(
-                    lambda: self.supabase.table("projects")
-                    .select("project_id")
-                    .eq("project_id", project_id)
-                    .limit(1)
-                    .execute(),
+                # Compatibility path for a server that has the project-trash
+                # migration but has not deployed get_project_status yet.
+                trashed_response = self._call_with_session(
+                    lambda: self.supabase.rpc(
+                        "list_trashed_projects", {}
+                    ).execute(),
                     self.supabase,
                 )
-                active_rows = getattr(active_response, "data", None)
-                if not isinstance(active_rows, list):
+                trashed_rows = getattr(trashed_response, "data", None)
+                if not isinstance(trashed_rows, list):
                     raise RuntimeError("INVALID_RESPONSE") from None
-                data = {
-                    "state": "active" if active_rows else "purged"
-                }
+                if any(
+                    str(row.get("project_id") or "") == project_id
+                    for row in trashed_rows if isinstance(row, dict)
+                ):
+                    data = {"state": "trashed"}
+                else:
+                    active_response = self._call_with_session(
+                        lambda: self.supabase.table("projects")
+                        .select("project_id")
+                        .eq("project_id", project_id)
+                        .limit(1)
+                        .execute(),
+                        self.supabase,
+                    )
+                    active_rows = getattr(active_response, "data", None)
+                    if not isinstance(active_rows, list):
+                        raise RuntimeError("INVALID_RESPONSE") from None
+                    data = {
+                        "state": (
+                            "active" if active_rows
+                            else self._absent_project_state()
+                        )
+                    }
         state = str(data.get("state") or "")
         if state not in {"active", "trashed", "purged"}:
             raise RuntimeError("INVALID_RESPONSE")
@@ -5455,9 +5481,17 @@ class SyncManager(QObject):
                     self.mark_project_server_state(
                         self._v2_context["project_id"], "trashed"
                     )
-                elif code in {"PROJECT_PURGED", "PROJECT_NOT_FOUND"}:
+                elif code == "PROJECT_PURGED":
                     self.mark_project_server_state(
                         self._v2_context["project_id"], "purged"
+                    )
+                elif code == "PROJECT_NOT_FOUND":
+                    # A project still waiting for its first commit is
+                    # absent for an ordinary reason. Only one this device
+                    # already committed has actually gone missing.
+                    self.mark_project_server_state(
+                        self._v2_context["project_id"],
+                        self._absent_project_state(),
                     )
                 print(f"Failed to pull v2 documents: {payload}")
 

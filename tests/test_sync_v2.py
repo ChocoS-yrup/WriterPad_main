@@ -205,6 +205,30 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(queued["operation_id"], operation["operation_id"])
         self.assertEqual(queued["content"], "영구 보관할 내용")
 
+    def test_server_acknowledgement_counts_folders_not_only_documents(self):
+        """A project can prove itself uploaded through folders alone.
+
+        A brand-new binder publishes its folders before any chapter is
+        written, so folders are the first thing the server ever accepts.
+        """
+        local_key = self.context["local_key"]
+        self.assertFalse(self.store.has_server_acknowledged_commit(local_key))
+
+        self.store.ensure_local_folder(local_key, "메인/원고/새 폴더")
+        self.assertFalse(
+            self.store.has_server_acknowledged_commit(local_key),
+            "revision 0 은 아직 서버가 받아준 적 없다는 뜻이다",
+        )
+
+        self.store.replace_folder_snapshots(local_key, [{
+            "folder_id": "3f8a6d21-94c7-4f0b-8a52-7c1d6e5b9034",
+            "parent_folder_id": None,
+            "local_path": "메인/원고/새 폴더",
+            "name": "새 폴더",
+            "revision": 1,
+        }])
+        self.assertTrue(self.store.has_server_acknowledged_commit(local_key))
+
     def test_folder_rename_intent_survives_restart_and_coalesces_chain(self):
         local_key = self.context["local_key"]
         first = self.store.record_folder_rename_intent(

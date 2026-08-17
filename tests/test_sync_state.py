@@ -390,6 +390,156 @@ class SyncManagerStateTestCase(unittest.TestCase):
                 self.manager._v2_context["server_state"], "trashed"
             )
 
+    def test_project_the_server_never_saw_is_not_read_as_purged(self):
+        """A project waiting for its first commit simply has no server row.
+
+        ensure_project is what creates that row, and it only runs inside
+        dispatch. Calling the absence a purge stops dispatch, so the row
+        never appears and the project can never recover on its own.
+        """
+        project_id = "1f2a4c86-3c0f-4b21-9a5e-0f6b7d2c9481"
+
+        class _Rpc:
+            def __init__(self, name):
+                self.name = name
+
+            def execute(self):
+                if self.name == "get_project_status":
+                    raise RuntimeError("P0001: PROJECT_NOT_FOUND")
+                return SimpleNamespace(data=[])
+
+        # No table(): the RPC has answered, so reaching the compatibility
+        # path would be a mistake and this client makes that mistake loud.
+        class _Client:
+            def rpc(self, name, params):
+                return _Rpc(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            context = store.configure_project(
+                str(Path(temp_dir, "작품", "집필모드")),
+                "작품",
+                project_id,
+            )
+            store.enqueue(context, "메인/원고/001화.txt", "첫 회차")
+            self.manager._v2_store = store
+            self.manager._v2_context = context
+            self.manager._v2_wpm = SimpleNamespace()
+            self.manager._v2_device_id = "device"
+            self.manager.supabase = _Client()
+
+            self.assertEqual(
+                self.manager._fetch_v2_project_status(), "active"
+            )
+            self.assertEqual(
+                self.manager._v2_context["server_state"], "active"
+            )
+            self.assertEqual(
+                store.get_project_by_id(project_id)["server_state"], "active"
+            )
+            self.assertNotEqual(
+                self.manager.current_sync_state, "project_purged"
+            )
+
+    def test_project_that_vanished_after_a_commit_is_still_purged(self):
+        """Absence only means a purge once the server has accepted a commit."""
+        project_id = "6d0be1a4-70cc-4a1f-8c33-2b9c5f1e77a2"
+
+        class _Rpc:
+            def __init__(self, name):
+                self.name = name
+
+            def execute(self):
+                if self.name == "get_project_status":
+                    raise RuntimeError("P0001: PROJECT_NOT_FOUND")
+                return SimpleNamespace(data=[])
+
+        # No table(): the RPC has answered, so reaching the compatibility
+        # path would be a mistake and this client makes that mistake loud.
+        class _Client:
+            def rpc(self, name, params):
+                return _Rpc(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            context = store.configure_project(
+                str(Path(temp_dir, "작품", "집필모드")),
+                "작품",
+                project_id,
+            )
+            operation = store.enqueue(
+                context, "메인/원고/001화.txt", "서버가 받아준 원고"
+            )
+            store.mark_attempt(operation["operation_id"])
+            store.mark_success(operation["operation_id"], {"revision": 1})
+
+            self.manager._v2_store = store
+            self.manager._v2_context = context
+            self.manager._v2_wpm = SimpleNamespace()
+            self.manager._v2_device_id = "device"
+            self.manager.supabase = _Client()
+
+            self.assertEqual(
+                self.manager._fetch_v2_project_status(), "purged"
+            )
+            self.assertEqual(
+                self.manager._v2_context["server_state"], "purged"
+            )
+
+    def test_missing_status_rpc_does_not_purge_a_project_never_uploaded(self):
+        """The compatibility path must not read an absent row as a purge."""
+        project_id = "b3c9f1d2-5e47-4a08-9f61-8d20c4a7be35"
+
+        class _Rpc:
+            def __init__(self, name):
+                self.name = name
+
+            def execute(self):
+                if self.name == "get_project_status":
+                    raise RuntimeError("function does not exist")
+                return SimpleNamespace(data=[])
+
+        class _Table:
+            def select(self, *args, **kwargs):
+                return self
+
+            def eq(self, *args, **kwargs):
+                return self
+
+            def limit(self, *args, **kwargs):
+                return self
+
+            def execute(self):
+                return SimpleNamespace(data=[])
+
+        class _Client:
+            def rpc(self, name, params):
+                return _Rpc(name)
+
+            def table(self, name):
+                return _Table()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            context = store.configure_project(
+                str(Path(temp_dir, "작품", "집필모드")),
+                "작품",
+                project_id,
+            )
+            store.enqueue(context, "메인/원고/001화.txt", "첫 회차")
+            self.manager._v2_store = store
+            self.manager._v2_context = context
+            self.manager._v2_wpm = SimpleNamespace()
+            self.manager._v2_device_id = "device"
+            self.manager.supabase = _Client()
+
+            self.assertEqual(
+                self.manager._fetch_v2_project_status(), "active"
+            )
+            self.assertEqual(
+                store.get_project_by_id(project_id)["server_state"], "active"
+            )
+
 
 class _FakeLabel:
     def __init__(self):

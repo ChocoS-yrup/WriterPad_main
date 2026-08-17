@@ -1072,6 +1072,26 @@ class SyncV2Store:
             ).fetchone()
             return dict(row)
 
+    def has_server_acknowledged_commit(self, local_key):
+        """서버가 이 작품의 커밋을 받아준 적이 있는지 알려줍니다.
+
+        0 보다 큰 revision 은 서버 응답으로만 생긴다. 그래서 이 값이
+        아직 서버에 올린 적 없는 작품과, 올렸는데 사라진 작품을 가른다.
+        """
+        with self._reader() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM sync_documents
+                WHERE local_key = ? AND revision > 0
+                UNION ALL
+                SELECT 1 FROM sync_folders
+                WHERE local_key = ? AND revision > 0
+                LIMIT 1
+                """,
+                (local_key, local_key),
+            ).fetchone()
+            return row is not None
+
     def begin_project_import(
         self,
         writing_root_path,
