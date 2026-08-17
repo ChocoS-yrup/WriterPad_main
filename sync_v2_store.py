@@ -3494,8 +3494,13 @@ class SyncV2Store:
                 )
                 for row in rows
             }
+            # A superseded or cancelled operation has finished; it is not
+            # still on its way. It will never report again, and where one
+            # was superseded its content already moved to the successor.
+            # Holding out for 'committed' from one of those keeps the order
+            # — and the folder publication riding with it — back for good.
             if any(
-                statuses.get(operation_id) != "completed"
+                statuses.get(operation_id) not in {"completed", "cancelled"}
                 for operation_id in operation_ids
             ):
                 return None

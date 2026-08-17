@@ -280,6 +280,61 @@ class SyncV2StoreTestCase(unittest.TestCase):
         )
         self.assertEqual(kept["local_key"], other["local_key"])
 
+    def test_barrier_releases_when_a_waited_operation_was_superseded(self):
+        """A superseded operation is finished, not still on its way.
+
+        Saving the same document again supersedes the commit already
+        queued for it: the newer one carries the content and the older one
+        never reports again. A barrier that only counts 'committed' waits
+        on it for good, and the binder order it holds — folder publication
+        rides along with it — never reaches the server.
+        """
+        first = self.store.enqueue(
+            self.context, "메인/원고/025화.txt", "처음 저장"
+        )
+        waited = self.store.enqueue(
+            self.context, "메인/원고/025화.txt", "이름을 바꾸고 다시 저장"
+        )
+
+        settled = self.store.enqueue(
+            self.context, "메인/설정집/구세계/마법체계.txt", "복원된 문서"
+        )
+        self.store.mark_attempt(settled["operation_id"])
+        self.store.mark_success(settled["operation_id"], {"revision": 1})
+
+        self.store.defer_tree_order(
+            self.context,
+            json.dumps({"메인/설정집": ["구세계"]}, ensure_ascii=False),
+            [waited["operation_id"], settled["operation_id"]],
+        )
+
+        # The earlier commit landing is what supersedes the one the barrier
+        # is waiting on: its content moves to a fresh successor operation.
+        self.store.mark_attempt(first["operation_id"])
+        self.store.mark_success(first["operation_id"], {"revision": 2})
+
+        raw = sqlite3.connect(self.db_path)
+        try:
+            last_event = raw.execute(
+                """
+                SELECT event_type FROM sync_operation_events
+                WHERE operation_id = ?
+                ORDER BY event_sequence DESC LIMIT 1
+                """,
+                (waited["operation_id"],),
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(
+            last_event, "superseded",
+            "이 시험은 superseded 로 끝난 작업을 전제로 한다",
+        )
+
+        self.assertIsNotNone(
+            self.store.ready_tree_order_barrier(self.context["local_key"]),
+            "superseded 를 기다리느라 barrier 가 풀리지 않았다",
+        )
+
     def test_server_acknowledgement_counts_folders_not_only_documents(self):
         """A project can prove itself uploaded through folders alone.
 
