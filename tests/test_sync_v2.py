@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -204,6 +205,80 @@ class SyncV2StoreTestCase(unittest.TestCase):
 
         self.assertEqual(queued["operation_id"], operation["operation_id"])
         self.assertEqual(queued["content"], "영구 보관할 내용")
+
+    def test_append_only_guards_open_for_a_purge_and_shut_behind_it(self):
+        """Only a permanent deletion may take the operation log with it.
+
+        The attempt and event rows carry an operation_id but no foreign
+        key, so nothing sweeps them up on their own. Left behind they are
+        orphans pointing at an operation that no longer exists.
+        """
+        operation = self.store.enqueue(
+            self.context, "메인/원고/001화.txt", "서버가 받아준 원고"
+        )
+        self.store.mark_attempt(operation["operation_id"])
+        self.store.mark_success(operation["operation_id"], {"revision": 1})
+
+        def delete_operation_directly(operation_id):
+            raw = sqlite3.connect(self.db_path)
+            try:
+                raw.execute(
+                    "DELETE FROM sync_operations WHERE operation_id = ?",
+                    (operation_id,),
+                )
+            finally:
+                raw.close()
+
+        def count(table):
+            raw = sqlite3.connect(self.db_path)
+            try:
+                return raw.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            finally:
+                raw.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            delete_operation_directly(operation["operation_id"])
+
+        self.assertTrue(
+            self.store.purge_project_records(self.context["project_id"])
+        )
+
+        for table in (
+            "sync_projects", "sync_documents", "sync_operations",
+            "sync_operation_events", "sync_operation_attempts",
+            "sync_purge_gate",
+        ):
+            self.assertEqual(count(table), 0, f"{table} 에 기록이 남았다")
+
+        # The guard has to be shut again, not merely shut for that one call.
+        second = self.store.enqueue(
+            self.store.configure_project(
+                str(Path(self.temp.name, "집필모드")), "테스트 작품"
+            ),
+            "메인/원고/002화.txt",
+            "다음 회차",
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            delete_operation_directly(second["operation_id"])
+
+    def test_purge_records_leaves_an_unrelated_work_untouched(self):
+        other = self.store.configure_project(
+            str(Path(self.temp.name, "다른 작품", "집필모드")), "다른 작품"
+        )
+        kept = self.store.enqueue(other, "메인/원고/001화.txt", "남아야 할 원고")
+        self.store.enqueue(self.context, "메인/원고/001화.txt", "지워질 원고")
+
+        self.store.purge_project_records(self.context["project_id"])
+
+        self.assertIsNone(
+            self.store.get_project_by_id(self.context["project_id"])
+        )
+        self.assertIsNotNone(self.store.get_project_by_id(other["project_id"]))
+        self.assertEqual(self.store.counts(other["local_key"])["pending"], 1)
+        self.assertIsNotNone(
+            self.store.get_document(other["local_key"], "메인/원고/001화.txt")
+        )
+        self.assertEqual(kept["local_key"], other["local_key"])
 
     def test_server_acknowledgement_counts_folders_not_only_documents(self):
         """A project can prove itself uploaded through folders alone.

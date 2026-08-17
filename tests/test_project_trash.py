@@ -170,9 +170,61 @@ class ProjectTrashServiceTestCase(unittest.TestCase):
 
         self.assertEqual(self.server.calls[-1][0], "purge_project")
         self.assertIn(project_id, self.server.purged)
-        self.assertEqual(
-            self.store.get_project_by_id(project_id)["server_state"], "purged"
+        # Server row and local files are both gone now, so the binding
+        # describes nothing and must not stay behind holding the path.
+        self.assertIsNone(self.store.get_project_by_id(project_id))
+
+    def test_purged_path_accepts_a_different_server_work_of_the_same_name(self):
+        """A name must not stay poisoned once its work is fully deleted.
+
+        The writer deletes a work here, makes one of the same name on the
+        other device, then imports it back. A binding left at the old path
+        turns that import away, and only renaming the work gets around it.
+
+        The old work is fully synced, which is the ordinary way a work
+        reaches the trash — its operation log is complete rather than
+        empty, and that log is what a plain cascade cannot touch.
+        """
+        self.create_project("검증01")
+        old_project_id = self.bind_project("검증01")
+        writing_root = str(Path(self.pm.workspace_dir, "검증01", "집필모드"))
+        binding = self.store.get_project_by_id(old_project_id)
+        operation = self.store.enqueue(
+            {
+                "local_key": binding["local_key"],
+                "project_id": old_project_id,
+                "project_name": "검증01",
+            },
+            "메인/원고/001화.txt",
+            "서버가 받아준 원고",
         )
+        self.store.mark_attempt(operation["operation_id"])
+        self.store.mark_success(operation["operation_id"], {"revision": 1})
+
+        self.service.purge_project(self.service.trash_project("검증01"))
+
+        self.assertIsNone(self.store.get_project_by_id(old_project_id))
+
+        replacement_id = str(uuid.uuid4())
+        self.assertNotEqual(replacement_id, old_project_id)
+        context = self.store.begin_project_import(
+            writing_root, "검증01", replacement_id
+        )
+
+        self.assertEqual(context["project_id"], replacement_id)
+
+    def test_a_trashed_project_keeps_its_binding_so_restore_can_reconnect(self):
+        """Trashing is reversible, so the binding has to survive it."""
+        self.create_project("되살릴 작품")
+        project_id = self.bind_project("되살릴 작품")
+
+        entry = self.service.trash_project("되살릴 작품")
+
+        self.assertIsNotNone(self.store.get_project_by_id(project_id))
+
+        self.service.restore_project(entry)
+
+        self.assertIsNotNone(self.store.get_project_by_id(project_id))
 
     def test_locally_remaining_purged_project_moves_to_local_trash(self):
         source = self.create_project("서버 영구 삭제 작품")

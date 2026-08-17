@@ -571,8 +571,23 @@ class SyncV2Store:
                 SELECT RAISE(ABORT, 'IMMUTABLE_OPERATION_INTENT');
             END;
 
-            CREATE TRIGGER IF NOT EXISTS sync_operations_no_delete
+            -- Permanently deleting a work is the one time these records may
+            -- legitimately go. A row here opens the append-only guards, and
+            -- purge_project_records puts it in and takes it out inside a
+            -- single transaction, so a rollback leaves the guards closed.
+            CREATE TABLE IF NOT EXISTS sync_purge_gate (
+                purge_id TEXT PRIMARY KEY,
+                opened_at TEXT NOT NULL
+            );
+
+            -- The delete guards are dropped and rebuilt rather than created
+            -- if absent: a database made before the gate existed still has
+            -- the older unconditional trigger under the same name, and
+            -- CREATE ... IF NOT EXISTS would leave that one in place.
+            DROP TRIGGER IF EXISTS sync_operations_no_delete;
+            CREATE TRIGGER sync_operations_no_delete
             BEFORE DELETE ON sync_operations
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_OPERATION');
             END;
@@ -582,8 +597,10 @@ class SyncV2Store:
             BEGIN
                 SELECT RAISE(ABORT, 'IMMUTABLE_OPERATION_INTENT');
             END;
-            CREATE TRIGGER IF NOT EXISTS sync_structure_operations_no_delete
+            DROP TRIGGER IF EXISTS sync_structure_operations_no_delete;
+            CREATE TRIGGER sync_structure_operations_no_delete
             BEFORE DELETE ON sync_structure_operations
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_OPERATION');
             END;
@@ -592,8 +609,10 @@ class SyncV2Store:
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
             END;
-            CREATE TRIGGER IF NOT EXISTS sync_operation_events_no_delete
+            DROP TRIGGER IF EXISTS sync_operation_events_no_delete;
+            CREATE TRIGGER sync_operation_events_no_delete
             BEFORE DELETE ON sync_operation_events
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
             END;
@@ -602,8 +621,10 @@ class SyncV2Store:
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_ATTEMPT');
             END;
-            CREATE TRIGGER IF NOT EXISTS sync_operation_attempts_no_delete
+            DROP TRIGGER IF EXISTS sync_operation_attempts_no_delete;
+            CREATE TRIGGER sync_operation_attempts_no_delete
             BEFORE DELETE ON sync_operation_attempts
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_ATTEMPT');
             END;
@@ -612,8 +633,10 @@ class SyncV2Store:
             BEGIN
                 SELECT RAISE(ABORT, 'IMMUTABLE_BATCH_METADATA');
             END;
-            CREATE TRIGGER IF NOT EXISTS sync_contract_batches_no_delete
+            DROP TRIGGER IF EXISTS sync_contract_batches_no_delete;
+            CREATE TRIGGER sync_contract_batches_no_delete
             BEFORE DELETE ON sync_contract_batches
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'IMMUTABLE_BATCH_METADATA');
             END;
@@ -622,8 +645,10 @@ class SyncV2Store:
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_BATCH_RESULT');
             END;
-            CREATE TRIGGER IF NOT EXISTS sync_contract_batch_results_no_delete
+            DROP TRIGGER IF EXISTS sync_contract_batch_results_no_delete;
+            CREATE TRIGGER sync_contract_batch_results_no_delete
             BEFORE DELETE ON sync_contract_batch_results
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_BATCH_RESULT');
             END;
@@ -632,8 +657,10 @@ class SyncV2Store:
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_RECOVERY');
             END;
-            CREATE TRIGGER IF NOT EXISTS sync_structure_recovery_no_delete
+            DROP TRIGGER IF EXISTS sync_structure_recovery_no_delete;
+            CREATE TRIGGER sync_structure_recovery_no_delete
             BEFORE DELETE ON sync_structure_recovery
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_RECOVERY');
             END;
@@ -1045,6 +1072,90 @@ class SyncV2Store:
                 (project_id,),
             )
             return cursor.rowcount > 0
+
+    def purge_project_records(self, project_id):
+        """작품이 영구 삭제됐을 때 그 지역 기록을 남김없이 지웁니다.
+
+        영구 삭제는 이 id 들이 정당하게 사라지는 유일한 경우다. 서버 행이
+        없어졌으니 어떤 operation id 도 다시 재생될 수 없고 시도 기록을
+        되물을 상대도 없다. 그 외의 모든 경로에서는 append-only 방벽이
+        그대로 닫혀 있다.
+
+        시도·사건 기록은 operation_id 를 들고 있지만 외래키가 없어 연쇄로
+        따라 지워지지 않는다. 그대로 두면 고아로 남으므로 여기서 id 로
+        직접 지운다.
+        """
+        try:
+            project_id = str(uuid.UUID(str(project_id)))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        purge_id = str(uuid.uuid4())
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT local_key FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            local_key = row["local_key"]
+            operation_ids = [
+                item["operation_id"]
+                for item in connection.execute(
+                    """
+                    SELECT operation_id FROM sync_operations
+                    WHERE local_key = ?
+                    UNION
+                    SELECT operation_id FROM sync_structure_operations
+                    WHERE local_key = ?
+                    """,
+                    (local_key, local_key),
+                ).fetchall()
+            ]
+            connection.execute(
+                "INSERT INTO sync_purge_gate (purge_id, opened_at)"
+                " VALUES (?, ?)",
+                (purge_id, _utc_now()),
+            )
+            try:
+                for operation_id in operation_ids:
+                    connection.execute(
+                        "DELETE FROM sync_operation_events"
+                        " WHERE operation_id = ?",
+                        (operation_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM sync_operation_attempts"
+                        " WHERE operation_id = ?",
+                        (operation_id,),
+                    )
+                # Results point at their batch with no delete rule, so they
+                # have to go before the batches they hold down.
+                connection.execute(
+                    """
+                    DELETE FROM sync_contract_batch_results
+                    WHERE batch_id IN (
+                        SELECT batch_id FROM sync_contract_batches
+                        WHERE local_key = ?
+                    )
+                    """,
+                    (local_key,),
+                )
+                connection.execute(
+                    "DELETE FROM sync_contract_diagnostics WHERE local_key = ?",
+                    (local_key,),
+                )
+                # Everything else hangs off the project row by local_key and
+                # goes with it.
+                connection.execute(
+                    "DELETE FROM sync_projects WHERE project_id = ?",
+                    (project_id,),
+                )
+            finally:
+                connection.execute(
+                    "DELETE FROM sync_purge_gate WHERE purge_id = ?",
+                    (purge_id,),
+                )
+            return True
 
     def set_project_server_state(self, project_id, state):
         if state not in {"active", "trashed", "purged"}:

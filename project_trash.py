@@ -515,4 +515,11 @@ class ProjectTrashService:
         except OSError:
             raise ProjectTrashError(LOCAL_STORAGE_ERROR) from None
 
+        if entry.project_id:
+            # The server row and the local files are both gone, so these
+            # records describe nothing. Left behind, the binding holds the
+            # path against another work of the same name: an import checks
+            # the path before the id and refuses one already spoken for.
+            self.store.purge_project_records(entry.project_id)
+
         return True
