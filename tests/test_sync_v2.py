@@ -2398,6 +2398,99 @@ class SyncV2RpcTestCase(unittest.TestCase):
             self.assertIn("읽기 전용", message)
             callback.assert_called_once()
 
+    def test_folder_restore_hands_the_tree_order_barrier_its_operations(self):
+        """Restoring a folder has to give the barrier real operation ids.
+
+        The binder holds its tree order back until the restored documents
+        land on the server. record_restore returned the moved document
+        rows, which carry no operation id, so the barrier had nothing to
+        wait on and turned the restore away instead.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "폴더 복원 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, "폴더 복원 작품", "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            folder_path = "메인/설정집/구세계"
+            live_path = f"{folder_path}/마법체계.txt"
+            content = "구세계의 마법은 계약으로 움직인다"
+            self.assertTrue(wpm.write_text_file(live_path, content))
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            manager.configure_v2(
+                wpm, wpm.current_project, str(uuid.uuid4()), store=store
+            )
+            created = store.enqueue(manager._v2_context, live_path, content)
+            store.mark_success(created["operation_id"], {"revision": 1})
+
+            with patch.object(manager, "retry_pending_syncs"):
+                trash_path = wpm.move_to_trash(folder_path)
+                manager.record_tombstone(folder_path, trash_path)
+                removal = store.next_ready_operation(
+                    manager._v2_context["local_key"]
+                )
+                store.mark_success(removal["operation_id"], {"revision": 2})
+
+                restored_path = wpm.restore_from_trash(trash_path)
+                operations = manager.record_restore(
+                    trash_path,
+                    restored_path,
+                    original_rel_path=folder_path,
+                    retry=False,
+                )
+
+                self.assertTrue(
+                    [
+                        operation for operation in operations
+                        if operation.get("operation_id")
+                    ],
+                    "복원이 barrier 에 줄 operation id 를 하나도 남기지 않았다",
+                )
+
+                barrier = manager.defer_tree_order_until_operations(
+                    {"메인/설정집": ["구세계"]}, operations
+                )
+
+            self.assertIsNotNone(barrier)
+
+    def test_tree_order_with_nothing_in_flight_is_recorded_not_refused(self):
+        """An order with nothing to wait behind still has to be recorded.
+
+        A folder can come back with no document work of its own. Refusing
+        the barrier there took the whole restore down; the order simply has
+        no reason to wait.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "빈 폴더 복원 작품"
+            wpm.writing_root_path = str(
+                Path(temp_dir, "빈 폴더 복원 작품", "집필모드")
+            )
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            store = SyncV2Store(str(Path(temp_dir, "sync.sqlite3")))
+            manager = SyncManager()
+            manager.configure_v2(
+                wpm, wpm.current_project, str(uuid.uuid4()), store=store
+            )
+
+            with patch.object(manager, "retry_pending_syncs"):
+                recorded = manager.defer_tree_order_until_operations(
+                    {"메인/설정집": ["빈 폴더"]},
+                    [{"document_id": "operation id 가 없는 행"}],
+                )
+
+            self.assertIsNotNone(recorded)
+            self.assertIsNotNone(
+                store.get_document(
+                    manager._v2_context["local_key"],
+                    "__antigravity__/tree-order.json",
+                )
+            )
+
     def test_repeated_delete_and_restore_keep_one_document_uuid(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             wpm = WritingProjectManager()

@@ -1140,6 +1140,12 @@ class SyncManager(QObject):
             for operation in (operations or [])
             if isinstance(operation, dict) and operation.get("operation_id")
         ]
+        if not operation_ids:
+            # Nothing is in flight for the order to wait behind — an empty
+            # folder came back, or every document was already settled. The
+            # order still has to be recorded, so commit it now rather than
+            # raising and taking the whole restore down with it.
+            return self.record_tree_order(tree_order, retry=False)
         with self._structure_mutation_gate:
             barrier = self._v2_store.defer_tree_order(
                 self._v2_context,
@@ -6888,13 +6894,18 @@ class SyncManager(QObject):
                 for document in moved:
                     content = self._v2_wpm.read_text_file(document["local_path"])
                     if content is not None:
-                        self._v2_store.enqueue(
+                        operation = self._v2_store.enqueue(
                             self._v2_context,
                             document["local_path"],
                             content,
                             relative_path=document["local_path"],
                             is_deleted=False,
                         )
+                        # The binder holds its tree order back until these
+                        # land, and it needs the operation id to know what
+                        # it is waiting for. The moved row alone identifies
+                        # the document but not the work in flight.
+                        document["operation_id"] = operation["operation_id"]
         self._publish_sync_state()
         if retry:
             self.retry_pending_syncs()
