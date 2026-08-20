@@ -74,6 +74,7 @@ class TypewriterModeTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+        cls.app.setQuitOnLastWindowClosed(False)
 
     def _editor(self, width=480, height=280):
         editor = SmartTextEdit()
@@ -292,17 +293,12 @@ class TypewriterModeTestCase(unittest.TestCase):
 
 
 class RealAssistantConstructionTestCase(unittest.TestCase):
-    """The real widget tree, not stubs.
-
-    Every other typewriter test replaces the mode widgets with stubs, so a
-    construction-time crash in the real AI panels went unnoticed: the paired
-    editors share one QTextDocument, and touching its root frame layout before
-    the views exist kills Qt outright.
-    """
+    """Exercise the real widget tree without replacing its panels with stubs."""
 
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+        cls.app.setQuitOnLastWindowClosed(False)
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -338,7 +334,10 @@ class RealAssistantConstructionTestCase(unittest.TestCase):
     def test_assistant_mode_builds_with_saved_typewriter_settings(self):
         widget = AssistantModeWidget()
         self.addCleanup(widget.deleteLater)
-        self.addCleanup(widget.close)
+        # AssistantModeWidget is embedded in the real main window. Calling its
+        # closeEvent directly requests application-wide shutdown and can wake
+        # unrelated aboutToQuit workers retained by the full test process.
+        self.addCleanup(widget.tray_icon.hide)
 
         restored = [
             panel.text_edit.typewriter_enabled
