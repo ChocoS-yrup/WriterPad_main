@@ -72,19 +72,29 @@ jobs:
       - name: Install pinned Windows dependencies
         run: python -m pip install -r requirements-stage8.txt
 
-      - name: Configure passive Windows crash dumps
+      - name: Register passive postmortem crash capture
         shell: pwsh
         run: |
           # Do not attach a debugger before the test. The previous CDB run
-          # changed the timing and all 621 tests passed. WER writes a dump only
-          # after an unhandled crash, preserving the original test process.
+          # changed the timing and all 621 tests passed. ProcDump is registered
+          # as AeDebug and starts only after an unhandled crash.
           $dumpDir = Join-Path $env:RUNNER_TEMP "writerpad-crash-dumps"
           New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
-          $werKey = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\python.exe"
-          New-Item -Path $werKey -Force | Out-Null
-          New-ItemProperty -Path $werKey -Name DumpFolder -PropertyType ExpandString -Value $dumpDir -Force | Out-Null
-          New-ItemProperty -Path $werKey -Name DumpCount -PropertyType DWord -Value 4 -Force | Out-Null
-          New-ItemProperty -Path $werKey -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP "procdump.zip"
+          $toolsDir = Join-Path $env:RUNNER_TEMP "procdump"
+          Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Procdump.zip" -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $toolsDir -Force
+          $procdump = Join-Path $toolsDir "procdump64.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $procdump
+          if ($signature.Status -ne "Valid" -or
+              $signature.SignerCertificate.Subject -notlike "*Microsoft*") {
+            throw "ProcDump signature is not valid Microsoft code"
+          }
+          & $procdump -accepteula -ma -i $dumpDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "ProcDump postmortem registration failed: $LASTEXITCODE"
+          }
+          "PROCDUMP_PATH=$procdump" | Out-File -FilePath $env:GITHUB_ENV -Append
           "WRITERPAD_DUMP_DIR=$dumpDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Run Windows client tests without an attached debugger
@@ -123,12 +133,12 @@ jobs:
           }
           "CDB_PATH=$cdb" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Analyze passive Windows crash dump
+      - name: Analyze postmortem Windows crash dump
         if: steps.windows_tests.outcome == 'failure'
         shell: pwsh
         run: |
-          # WER finishes the dump before allowing the crashed process to exit,
-          # but poll briefly so filesystem visibility cannot race this step.
+          # The postmortem debugger finishes before WER terminates the crashed
+          # process, but poll briefly so filesystem visibility cannot race.
           $dumps = @()
           for ($poll = 0; $poll -lt 15; $poll++) {
             $dumps = @(Get-ChildItem -LiteralPath $env:WRITERPAD_DUMP_DIR -Filter "*.dmp" -File -ErrorAction SilentlyContinue)
@@ -136,9 +146,9 @@ jobs:
             Start-Sleep -Seconds 2
           }
           Write-Host "Uninstrumented test exit code: $env:WRITERPAD_TEST_EXIT_CODE"
-          Write-Host "WER dump count: $($dumps.Count)"
+          Write-Host "Postmortem dump count: $($dumps.Count)"
           if ($dumps.Count -eq 0) {
-            throw "The uninstrumented test failed but WER produced no crash dump"
+            throw "The uninstrumented test failed but the postmortem debugger produced no crash dump"
           }
           $commands = @(
             ".echo ===== WER CRASH DUMP ====="
@@ -157,6 +167,17 @@ jobs:
             }
           }
           throw "Original uninstrumented Windows tests failed; native dump analysis is above"
+
+      - name: Unregister postmortem debugger
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:PROCDUMP_PATH -and (Test-Path -LiteralPath $env:PROCDUMP_PATH)) {
+            & $env:PROCDUMP_PATH -accepteula -u
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "ProcDump postmortem unregistration failed: $LASTEXITCODE"
+            }
+          }
 
       - name: Build distributable executable
         if: steps.windows_tests.outcome == 'success'
