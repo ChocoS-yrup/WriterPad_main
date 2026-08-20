@@ -301,6 +301,7 @@ class SyncManagerStateTestCase(unittest.TestCase):
         self.assertIn("config_source = 'release_cloud_config.json'", spec)
         self.assertIn("assert_release_config_buildable(config_source)", spec)
         self.assertIn("(config_source, '.')", spec)
+        self.assertIn("if Path(config_source).is_file() else []", spec)
         source = Path("sync_manager.py").read_text(encoding="utf-8")
         self.assertNotIn("SUPABASE_EMAIL", source)
         self.assertNotIn("SUPABASE_PASSWORD", source)

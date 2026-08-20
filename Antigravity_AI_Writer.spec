@@ -1,10 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from cloud_config import assert_release_config_buildable
 
 
 config_source = 'release_cloud_config.json'
 assert_release_config_buildable(config_source)
+config_datas = [(config_source, '.')] if Path(config_source).is_file() else []
 
 
 a = Analysis(
@@ -15,10 +18,9 @@ a = Analysis(
         ('style.qss', '.'),
         ('app_icon.ico', '.'),
         ('model_catalog.json', '.'),
-        # This validated file contains URL and publishable key fields only.
-        # User sessions remain in Windows Credential Manager.
-        (config_source, '.'),
-    ],
+        # When present, this validated file contains URL and publishable key
+        # fields only. User sessions remain in Windows Credential Manager.
+    ] + config_datas,
     hiddenimports=['markdown', 'keyring', 'unicodedata2'],
     hookspath=[],
     hooksconfig={},
