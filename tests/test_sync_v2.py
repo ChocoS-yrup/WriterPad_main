@@ -218,6 +218,12 @@ class SyncV2StoreTestCase(unittest.TestCase):
         )
         self.store.mark_attempt(operation["operation_id"])
         self.store.mark_success(operation["operation_id"], {"revision": 1})
+        rename = self.store.record_folder_rename_intent(
+            self.context["local_key"],
+            "메인/메모장/옛 이름",
+            "메인/메모장/새 이름",
+        )
+        self.store.complete_folder_rename_intent(rename["intent_id"])
 
         def delete_operation_directly(operation_id):
             raw = sqlite3.connect(self.db_path)
@@ -246,6 +252,8 @@ class SyncV2StoreTestCase(unittest.TestCase):
         for table in (
             "sync_projects", "sync_documents", "sync_operations",
             "sync_operation_events", "sync_operation_attempts",
+            "sync_folder_rename_intents",
+            "sync_folder_rename_intent_events",
             "sync_purge_gate",
         ):
             self.assertEqual(count(table), 0, f"{table} 에 기록이 남았다")
@@ -393,6 +401,129 @@ class SyncV2StoreTestCase(unittest.TestCase):
                 "메인/메모장/최종 이름",
             )["intent_id"],
             first["intent_id"],
+        )
+
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in reopened.folder_rename_intent_events(
+                    first["intent_id"]
+                )
+            ],
+            ["recorded", "retargeted"],
+        )
+
+    def test_folder_rename_completion_is_append_only_and_event_derived(self):
+        local_key = self.context["local_key"]
+        intent = self.store.record_folder_rename_intent(
+            local_key,
+            "메인/메모장/완료 전",
+            "메인/메모장/완료 후",
+        )
+
+        completed = self.store.complete_folder_rename_intent(intent["intent_id"])
+        repeated = self.store.complete_folder_rename_intent(intent["intent_id"])
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(repeated["status"], "completed")
+        self.assertIsNone(self.store.pending_folder_rename_intent(
+            local_key,
+            "메인/메모장/완료 전",
+            "메인/메모장/완료 후",
+        ))
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in self.store.folder_rename_intent_events(
+                    intent["intent_id"]
+                )
+            ],
+            ["recorded", "completed"],
+        )
+
+        raw = sqlite3.connect(self.db_path)
+        try:
+            stored_status = raw.execute(
+                "SELECT status FROM sync_folder_rename_intents WHERE intent_id = ?",
+                (intent["intent_id"],),
+            ).fetchone()[0]
+            self.assertEqual(stored_status, "pending")
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "FOLDER_RENAME_STATUS_EVENT_ONLY"
+            ):
+                raw.execute(
+                    "UPDATE sync_folder_rename_intents SET status = 'completed' "
+                    "WHERE intent_id = ?",
+                    (intent["intent_id"],),
+                )
+            raw.rollback()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "APPEND_ONLY_EVENT"):
+                raw.execute(
+                    "UPDATE sync_folder_rename_intent_events "
+                    "SET event_type = 'retargeted' WHERE intent_id = ? "
+                    "AND event_sequence = 2",
+                    (intent["intent_id"],),
+                )
+        finally:
+            raw.close()
+
+        reopened = SyncV2Store(self.db_path)
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in reopened.folder_rename_intent_events(
+                    intent["intent_id"]
+                )
+            ],
+            ["recorded", "completed"],
+        )
+
+    def test_legacy_completed_folder_rename_status_migrates_to_events(self):
+        local_key = self.context["local_key"]
+        intent = self.store.record_folder_rename_intent(
+            local_key,
+            "메인/메모장/레거시 전",
+            "메인/메모장/레거시 후",
+        )
+        raw = sqlite3.connect(self.db_path)
+        try:
+            raw.execute(
+                "INSERT INTO sync_purge_gate (purge_id, opened_at) VALUES (?, ?)",
+                (str(uuid.uuid4()), "legacy-test"),
+            )
+            raw.execute(
+                "DELETE FROM sync_folder_rename_intent_events WHERE intent_id = ?",
+                (intent["intent_id"],),
+            )
+            raw.execute(
+                "DROP TRIGGER sync_folder_rename_intents_status_event_only"
+            )
+            raw.execute(
+                "UPDATE sync_folder_rename_intents SET status = 'completed' "
+                "WHERE intent_id = ?",
+                (intent["intent_id"],),
+            )
+            raw.execute("DELETE FROM sync_purge_gate")
+            raw.execute("PRAGMA user_version = 8004")
+            raw.commit()
+        finally:
+            raw.close()
+
+        migrated = SyncV2Store(self.db_path)
+
+        self.assertIsNone(migrated.pending_folder_rename_intent(
+            local_key,
+            "메인/메모장/레거시 전",
+            "메인/메모장/레거시 후",
+        ))
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in migrated.folder_rename_intent_events(
+                    intent["intent_id"]
+                )
+            ],
+            ["recorded", "completed"],
         )
 
 

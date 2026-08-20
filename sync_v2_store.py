@@ -35,7 +35,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8004
+STAGE8_USER_VERSION = 8005
 
 
 def _utc_now():
@@ -232,6 +232,23 @@ class SyncV2Store:
                     ON sync_folder_rename_intents(
                         local_key, status, old_path, new_path
                     );
+
+                CREATE TABLE IF NOT EXISTS sync_folder_rename_intent_events (
+                    event_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL REFERENCES
+                        sync_folder_rename_intents(intent_id) ON DELETE CASCADE,
+                    event_sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL
+                        CHECK (event_type IN ('recorded', 'retargeted', 'completed')),
+                    recorded_at TEXT NOT NULL,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(intent_id, event_sequence)
+                );
+
+                CREATE INDEX IF NOT EXISTS sync_folder_rename_intent_events_idx
+                    ON sync_folder_rename_intent_events(
+                        intent_id, event_sequence
+                    );
                 """
             )
             self._migrate_contract_schema(connection)
@@ -253,6 +270,13 @@ class SyncV2Store:
         return str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"writerpad:stage8:legacy:{operation_id}:{event_type}",
+        ))
+
+    @staticmethod
+    def _legacy_folder_rename_event_id(intent_id, event_type):
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"writerpad:folder-rename-intent:legacy:{intent_id}:{event_type}",
         ))
 
     def _migrate_contract_schema(self, connection):
@@ -481,6 +505,49 @@ class SyncV2Store:
                     ),
                 )
 
+        # Folder rename proof predates the append-only contract queues.  Preserve
+        # its legacy snapshot once, then derive every subsequent status from the
+        # local intent event stream instead of mutating the snapshot column.
+        legacy_rename_intents = connection.execute(
+            "SELECT * FROM sync_folder_rename_intents ORDER BY created_at, intent_id"
+        ).fetchall()
+        for row in legacy_rename_intents:
+            detail = canonical_json({
+                "old_path": row["old_path"],
+                "new_path": row["new_path"],
+                "source": "legacy_snapshot",
+            })
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO sync_folder_rename_intent_events (
+                    event_id, intent_id, event_sequence, event_type,
+                    recorded_at, detail_json
+                ) VALUES (?, ?, 1, 'recorded', ?, ?)
+                """,
+                (
+                    self._legacy_folder_rename_event_id(
+                        row["intent_id"], "recorded"
+                    ),
+                    row["intent_id"], row["created_at"], detail,
+                ),
+            )
+            if row["status"] == "completed":
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO sync_folder_rename_intent_events (
+                        event_id, intent_id, event_sequence, event_type,
+                        recorded_at, detail_json
+                    ) VALUES (?, ?, 2, 'completed', ?, ?)
+                    """,
+                    (
+                        self._legacy_folder_rename_event_id(
+                            row["intent_id"], "completed"
+                        ),
+                        row["intent_id"], row["updated_at"],
+                        canonical_json({"source": "legacy_snapshot"}),
+                    ),
+                )
+
         connection.execute(
             """
             UPDATE sync_projects
@@ -580,6 +647,14 @@ class SyncV2Store:
                 opened_at TEXT NOT NULL
             );
 
+            DROP TRIGGER IF EXISTS sync_folder_rename_intents_status_event_only;
+            CREATE TRIGGER sync_folder_rename_intents_status_event_only
+            BEFORE UPDATE OF status ON sync_folder_rename_intents
+            WHEN NEW.status <> OLD.status
+            BEGIN
+                SELECT RAISE(ABORT, 'FOLDER_RENAME_STATUS_EVENT_ONLY');
+            END;
+
             -- The delete guards are dropped and rebuilt rather than created
             -- if absent: a database made before the gate existed still has
             -- the older unconditional trigger under the same name, and
@@ -612,6 +687,18 @@ class SyncV2Store:
             DROP TRIGGER IF EXISTS sync_operation_events_no_delete;
             CREATE TRIGGER sync_operation_events_no_delete
             BEFORE DELETE ON sync_operation_events
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
+            END;
+            CREATE TRIGGER IF NOT EXISTS sync_folder_rename_intent_events_no_update
+            BEFORE UPDATE ON sync_folder_rename_intent_events
+            BEGIN
+                SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
+            END;
+            DROP TRIGGER IF EXISTS sync_folder_rename_intent_events_no_delete;
+            CREATE TRIGGER sync_folder_rename_intent_events_no_delete
+            BEFORE DELETE ON sync_folder_rename_intent_events
             WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
             BEGIN
                 SELECT RAISE(ABORT, 'APPEND_ONLY_EVENT');
@@ -3528,6 +3615,79 @@ class SyncV2Store:
                 (barrier_id,),
             )
 
+    @staticmethod
+    def _folder_rename_intent_events_for(connection, intent_id):
+        return connection.execute(
+            """
+            SELECT * FROM sync_folder_rename_intent_events
+            WHERE intent_id = ? ORDER BY event_sequence
+            """,
+            (intent_id,),
+        ).fetchall()
+
+    def _folder_rename_intent_state(self, connection, intent_id):
+        events = self._folder_rename_intent_events_for(connection, intent_id)
+        if not events:
+            raise RuntimeError("folder rename intent has no append-only event history")
+        for expected, event in enumerate(events, 1):
+            if event["event_sequence"] != expected:
+                raise RuntimeError(
+                    "folder rename intent event sequence is not contiguous"
+                )
+        return "completed" if events[-1]["event_type"] == "completed" else "pending"
+
+    def _folder_rename_intent_dict(self, connection, row):
+        if row is None:
+            return None
+        result = dict(row)
+        result["status"] = self._folder_rename_intent_state(
+            connection, result["intent_id"]
+        )
+        return result
+
+    def _append_folder_rename_intent_event(
+        self, connection, intent_id, event_type, *, detail=None
+    ):
+        row = connection.execute(
+            "SELECT intent_id FROM sync_folder_rename_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(intent_id)
+        if event_type not in {"recorded", "retargeted", "completed"}:
+            raise ValueError("invalid folder rename intent event")
+        events = self._folder_rename_intent_events_for(connection, intent_id)
+        if not events:
+            if event_type != "recorded":
+                raise RuntimeError("folder rename intent must start with recorded")
+            sequence = 1
+        else:
+            current = events[-1]["event_type"]
+            if current == "completed":
+                if event_type == "completed":
+                    return dict(events[-1])
+                raise RuntimeError("folder rename intent is completed")
+            if event_type == "recorded":
+                raise RuntimeError("folder rename intent is already recorded")
+            sequence = events[-1]["event_sequence"] + 1
+        event_id = str(uuid.uuid4())
+        connection.execute(
+            """
+            INSERT INTO sync_folder_rename_intent_events (
+                event_id, intent_id, event_sequence, event_type,
+                recorded_at, detail_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id, intent_id, sequence, event_type, _utc_now(),
+                canonical_json(detail or {}),
+            ),
+        )
+        return dict(connection.execute(
+            "SELECT * FROM sync_folder_rename_intent_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone())
+
     def record_folder_rename_intent(self, local_key, old_path, new_path):
         """Durably record an explicit local folder rename, coalescing chains."""
         old_path = _normalize_path(old_path)
@@ -3536,14 +3696,19 @@ class SyncV2Store:
             raise ValueError("invalid folder rename intent")
         now = _utc_now()
         with self._transaction() as connection:
-            previous = connection.execute(
-                """
-                SELECT * FROM sync_folder_rename_intents
-                WHERE local_key = ? AND status = 'pending' AND new_path = ?
-                ORDER BY updated_at DESC LIMIT 1
-                """,
-                (local_key, old_path),
-            ).fetchone()
+            previous = next((
+                row for row in connection.execute(
+                    """
+                    SELECT * FROM sync_folder_rename_intents
+                    WHERE local_key = ? AND new_path = ?
+                    ORDER BY updated_at DESC, intent_id
+                    """,
+                    (local_key, old_path),
+                ).fetchall()
+                if self._folder_rename_intent_state(
+                    connection, row["intent_id"]
+                ) == "pending"
+            ), None)
             if previous:
                 connection.execute(
                     """
@@ -3553,16 +3718,26 @@ class SyncV2Store:
                     (new_path, now, previous["intent_id"]),
                 )
                 intent_id = previous["intent_id"]
+                self._append_folder_rename_intent_event(
+                    connection,
+                    intent_id,
+                    "retargeted",
+                    detail={"old_path": old_path, "new_path": new_path},
+                )
             else:
-                existing = connection.execute(
-                    """
-                    SELECT * FROM sync_folder_rename_intents
-                    WHERE local_key = ? AND status = 'pending'
-                      AND old_path = ? AND new_path = ?
-                    ORDER BY updated_at DESC LIMIT 1
-                    """,
-                    (local_key, old_path, new_path),
-                ).fetchone()
+                existing = next((
+                    row for row in connection.execute(
+                        """
+                        SELECT * FROM sync_folder_rename_intents
+                        WHERE local_key = ? AND old_path = ? AND new_path = ?
+                        ORDER BY updated_at DESC, intent_id
+                        """,
+                        (local_key, old_path, new_path),
+                    ).fetchall()
+                    if self._folder_rename_intent_state(
+                        connection, row["intent_id"]
+                    ) == "pending"
+                ), None)
                 if existing:
                     intent_id = existing["intent_id"]
                     connection.execute(
@@ -3583,50 +3758,78 @@ class SyncV2Store:
                         """,
                         (intent_id, local_key, old_path, new_path, now, now),
                     )
+                    self._append_folder_rename_intent_event(
+                        connection,
+                        intent_id,
+                        "recorded",
+                        detail={"old_path": old_path, "new_path": new_path},
+                    )
             row = connection.execute(
                 "SELECT * FROM sync_folder_rename_intents WHERE intent_id = ?",
                 (intent_id,),
             ).fetchone()
-            return dict(row)
+            return self._folder_rename_intent_dict(connection, row)
 
     def pending_folder_rename_intent(self, local_key, old_path, new_path):
         old_path = _normalize_path(old_path)
         new_path = _normalize_path(new_path)
         with self._reader() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
                 SELECT * FROM sync_folder_rename_intents
                 WHERE local_key = ? AND old_path = ? AND new_path = ?
-                  AND status = 'pending'
-                ORDER BY updated_at DESC LIMIT 1
+                ORDER BY updated_at DESC, intent_id
                 """,
                 (local_key, old_path, new_path),
-            ).fetchone()
-            return dict(row) if row else None
+            ).fetchall()
+            return next((
+                self._folder_rename_intent_dict(connection, row)
+                for row in rows
+                if self._folder_rename_intent_state(
+                    connection, row["intent_id"]
+                ) == "pending"
+            ), None)
 
     def pending_folder_rename_intents(self, local_key):
         with self._reader() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM sync_folder_rename_intents
-                WHERE local_key = ? AND status = 'pending'
+                WHERE local_key = ?
                 ORDER BY created_at, intent_id
                 """,
                 (local_key,),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [
+                self._folder_rename_intent_dict(connection, row)
+                for row in rows
+                if self._folder_rename_intent_state(
+                    connection, row["intent_id"]
+                ) == "pending"
+            ]
+
+    def folder_rename_intent_events(self, intent_id):
+        with self._reader() as connection:
+            return [
+                {**dict(row), "detail": json.loads(row["detail_json"])}
+                for row in self._folder_rename_intent_events_for(
+                    connection, str(intent_id)
+                )
+            ]
 
     def complete_folder_rename_intent(self, intent_id):
-        now = _utc_now()
         with self._transaction() as connection:
-            connection.execute(
-                """
-                UPDATE sync_folder_rename_intents
-                SET status = 'completed', updated_at = ?
-                WHERE intent_id = ?
-                """,
-                (now, str(intent_id)),
+            intent_id = str(intent_id)
+            row = connection.execute(
+                "SELECT * FROM sync_folder_rename_intents WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._append_folder_rename_intent_event(
+                connection, intent_id, "completed"
             )
+            return self._folder_rename_intent_dict(connection, row)
 
     def tree_order_barrier(self, local_key):
         with self._reader() as connection:
