@@ -39,6 +39,10 @@ class WritingIdleAutosaveTestCase(unittest.TestCase):
             lambda requested: content if requested == path else None,
             persisted,
         )
+        # These tests exercise autosave state only.  Starting a real lease
+        # QThread here makes the controller's local lifetime race the worker
+        # startup on slower Windows CI runners.
+        controller.acquire_lock_async = MagicMock()
         controller.pending_autosave_paths.add(path)
         return path, wpm, sync_manager, persisted, controller
 
