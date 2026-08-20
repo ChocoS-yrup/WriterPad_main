@@ -589,6 +589,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(promoted["supersedes_operation_id"], second["operation_id"])
         self.assertEqual(promoted["base_revision"], 1)
         self.assertEqual(promoted["base_content"], "첫 저장")
+        self.assertEqual(self.store.operation_state_divergences(), [])
 
     def test_unsent_saves_for_one_document_keep_immutable_intents(self):
         first = self.store.enqueue(
@@ -700,6 +701,10 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(successor["content"], "자동 병합본")
         self.assertEqual(successor["supersedes_operation_id"], first["operation_id"])
         self.assertEqual(cancelled["status"], "cancelled")
+        events = self.store.operation_events(first["operation_id"])
+        self.assertIn("conflict_detected", [event["event_type"] for event in events])
+        self.assertEqual(events[-1]["event_type"], "superseded")
+        self.assertEqual(self.store.operation_state_divergences(), [])
 
     def test_remote_rename_rebase_keeps_uuid_and_changes_only_server_path(self):
         original = self.store.ensure_document(
@@ -728,6 +733,68 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(original_operation["relative_path"], "메인/원고/옛이름.txt")
         self.assertEqual(successor["relative_path"], "메인/원고/새이름.txt")
         self.assertEqual(successor["supersedes_operation_id"], edited["operation_id"])
+        self.assertEqual(self.store.operation_state_divergences(), [])
+
+    def test_divergent_operation_status_does_not_block_store_open(self):
+        operation = self.store.enqueue(
+            self.context, "메인/원고/어긋남.txt", "서버에 보낼 내용"
+        )
+        self.store.mark_attempt(operation["operation_id"])
+        self.store.mark_success(operation["operation_id"], {"revision": 1})
+
+        raw = sqlite3.connect(self.db_path)
+        try:
+            raw.execute(
+                "UPDATE sync_operations SET status = 'pending' "
+                "WHERE operation_id = ?",
+                (operation["operation_id"],),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = SyncV2Store(self.db_path)
+        divergences = reopened.operation_state_divergences()
+
+        self.assertEqual(divergences, [{
+            "operation_id": operation["operation_id"],
+            "stored_status": "pending",
+            "derived_status": "completed",
+        }])
+
+    def test_8005_upgrade_materializes_event_derived_status_once(self):
+        operation = self.store.enqueue(
+            self.context, "메인/원고/이관.txt", "이관할 내용"
+        )
+        self.store.mark_attempt(operation["operation_id"])
+        self.store.mark_success(operation["operation_id"], {"revision": 1})
+
+        raw = sqlite3.connect(self.db_path)
+        try:
+            raw.execute(
+                "UPDATE sync_operations SET status = 'pending' "
+                "WHERE operation_id = ?",
+                (operation["operation_id"],),
+            )
+            raw.execute("PRAGMA user_version = 8005")
+            raw.commit()
+        finally:
+            raw.close()
+
+        migrated = SyncV2Store(self.db_path)
+
+        self.assertEqual(migrated.operation_state_divergences(), [])
+        raw = sqlite3.connect(self.db_path)
+        try:
+            stored = raw.execute(
+                "SELECT status FROM sync_operations WHERE operation_id = ?",
+                (operation["operation_id"],),
+            ).fetchone()[0]
+            version = raw.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(stored, "completed")
+        self.assertEqual(version, 8006)
 
     def test_simultaneous_overlapping_save_is_kept_as_conflict(self):
         created = self.store.enqueue(self.context, "메인/원고/동시저장.txt", "공통 문장\n")

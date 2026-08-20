@@ -35,7 +35,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8005
+STAGE8_USER_VERSION = 8006
 
 
 def _utc_now():
@@ -505,6 +505,33 @@ class SyncV2Store:
                     ),
                 )
 
+        # Before 8006 the document queue already derived state from events,
+        # but kept the legacy status column frozen at its insertion snapshot.
+        # Materialize it once during upgrade so future divergence checks expose
+        # new write-path omissions instead of reporting every historical row.
+        if current_version < 8006:
+            operation_ids = connection.execute(
+                "SELECT operation_id FROM sync_operations ORDER BY queue_id"
+            ).fetchall()
+            for operation in operation_ids:
+                try:
+                    derived = self._derived_state(
+                        connection, operation["operation_id"]
+                    )
+                except RuntimeError:
+                    # A malformed history must remain visible to the explicit
+                    # divergence audit; opening the whole store should not hide
+                    # every unrelated project's queue.
+                    continue
+                connection.execute(
+                    """
+                    UPDATE sync_operations
+                    SET status = ?, updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (derived, now, operation["operation_id"]),
+                )
+
         # Folder rename proof predates the append-only contract queues.  Preserve
         # its legacy snapshot once, then derive every subsequent status from the
         # local intent event stream instead of mutating the snapshot column.
@@ -859,6 +886,7 @@ class SyncV2Store:
             sequence = 1
         if event_type not in EVENT_STATE:
             raise SyncContractError("INVALID_ARGUMENT")
+        recorded_at = _utc_now()
         connection.execute(
             """
             INSERT INTO sync_operation_events (
@@ -867,9 +895,21 @@ class SyncV2Store:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                event_id, operation_id, sequence, event_type, _utc_now(),
+                event_id, operation_id, sequence, event_type, recorded_at,
                 error_code, related_operation_id, detail_json,
             ),
+        )
+        # `status` is a queryable projection for diagnostics and old callers;
+        # the append-only event remains the source of truth.  Keeping both in
+        # this transaction lets operation_state_divergences() identify any
+        # future path that changes only one side.
+        connection.execute(
+            """
+            UPDATE sync_operations
+            SET status = ?, updated_at = ?
+            WHERE operation_id = ?
+            """,
+            (self._event_state(event_type), recorded_at, operation_id),
         )
         return dict(connection.execute(
             "SELECT * FROM sync_operation_events WHERE event_id = ?", (event_id,)
@@ -948,7 +988,13 @@ class SyncV2Store:
         ).fetchall()
         for row in rows:
             operation_id = row["operation_id"]
-            if self._derived_state(connection, operation_id) != "inflight":
+            try:
+                state = self._derived_state(connection, operation_id)
+            except RuntimeError:
+                # Leave corrupt/missing histories untouched for the explicit
+                # divergence audit instead of making the entire store fail open.
+                continue
+            if state != "inflight":
                 continue
             self._finish_attempt(
                 connection, operation_id, "transport_unknown",
@@ -991,6 +1037,44 @@ class SyncV2Store:
     def operation_events(self, operation_id):
         with self._reader() as connection:
             return [dict(row) for row in self._events_for(connection, operation_id)]
+
+    def operation_state_divergences(self, local_key=None):
+        """Return document operations whose status projection disagrees.
+
+        Events remain authoritative.  The stored status is deliberately only a
+        projection so this audit can expose a durable write path that changed a
+        row without appending its corresponding event (or vice versa).
+        Structure operations have no duplicate status column and therefore no
+        second state to compare.
+        """
+        params = []
+        where = ""
+        if local_key:
+            where = "WHERE local_key = ?"
+            params.append(local_key)
+        with self._reader() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT operation_id, status FROM sync_operations
+                {where} ORDER BY queue_id
+                """,
+                params,
+            ).fetchall()
+            divergences = []
+            for row in rows:
+                try:
+                    derived = self._derived_state(
+                        connection, row["operation_id"]
+                    )
+                except RuntimeError:
+                    derived = None
+                if derived != row["status"]:
+                    divergences.append({
+                        "operation_id": row["operation_id"],
+                        "stored_status": row["status"],
+                        "derived_status": derived,
+                    })
+            return divergences
 
     def operation_attempts(self, operation_id):
         with self._reader() as connection:
@@ -2622,6 +2706,13 @@ class SyncV2Store:
             self._finish_attempt(
                 connection, operation_id, "conflict", error_code="REVISION_CONFLICT"
             )
+            if self._derived_state(connection, operation_id) != "conflict":
+                self._append_event(
+                    connection,
+                    operation_id,
+                    "conflict_detected",
+                    error_code="REVISION_CONFLICT",
+                )
             context = {
                 "local_key": operation["local_key"],
                 "project_id": operation["project_id"],

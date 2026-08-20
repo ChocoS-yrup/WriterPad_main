@@ -1312,6 +1312,7 @@ class ContractStoreTests(unittest.TestCase):
         self.assertNotEqual(successor["operation_id"], original["operation_id"])
         self.assertEqual(successor["supersedes_operation_id"], original["operation_id"])
         self.assertEqual((successor["base_revision"], successor["content"]), (2, "merged"))
+        self.assertEqual(self.store.operation_state_divergences(), [])
         with closing(sqlite3.connect(self.db_path)) as connection:
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute(
