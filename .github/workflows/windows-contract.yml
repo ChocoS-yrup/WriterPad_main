@@ -72,7 +72,34 @@ jobs:
       - name: Install pinned Windows dependencies
         run: python -m pip install -r requirements-stage8.txt
 
-      - name: Install native Windows debugger
+      - name: Configure passive Windows crash dumps
+        shell: pwsh
+        run: |
+          # Do not attach a debugger before the test. The previous CDB run
+          # changed the timing and all 621 tests passed. WER writes a dump only
+          # after an unhandled crash, preserving the original test process.
+          $dumpDir = Join-Path $env:RUNNER_TEMP "writerpad-crash-dumps"
+          New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
+          $werKey = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\python.exe"
+          New-Item -Path $werKey -Force | Out-Null
+          New-ItemProperty -Path $werKey -Name DumpFolder -PropertyType ExpandString -Value $dumpDir -Force | Out-Null
+          New-ItemProperty -Path $werKey -Name DumpCount -PropertyType DWord -Value 4 -Force | Out-Null
+          New-ItemProperty -Path $werKey -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null
+          "WRITERPAD_DUMP_DIR=$dumpDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Run Windows client tests without an attached debugger
+        id: windows_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          & $python -X faulthandler -m unittest discover -s tests -v
+          $testExitCode = $LASTEXITCODE
+          "WRITERPAD_TEST_EXIT_CODE=$testExitCode" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit $testExitCode
+
+      - name: Install debugger after the uninstrumented failure
+        if: steps.windows_tests.outcome == 'failure'
         shell: pwsh
         run: |
           $cdb = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
@@ -96,29 +123,47 @@ jobs:
           }
           "CDB_PATH=$cdb" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Run Windows client tests under native debugger
+      - name: Analyze passive Windows crash dump
+        if: steps.windows_tests.outcome == 'failure'
         shell: pwsh
         run: |
-          # faulthandler produced no traceback for the Qt exit. CDB stops on
-          # an access violation or the final process-exit event, then prints
-          # every native thread stack before quitting.
+          # WER finishes the dump before allowing the crashed process to exit,
+          # but poll briefly so filesystem visibility cannot race this step.
+          $dumps = @()
+          for ($poll = 0; $poll -lt 15; $poll++) {
+            $dumps = @(Get-ChildItem -LiteralPath $env:WRITERPAD_DUMP_DIR -Filter "*.dmp" -File -ErrorAction SilentlyContinue)
+            if ($dumps.Count -gt 0) { break }
+            Start-Sleep -Seconds 2
+          }
+          Write-Host "Uninstrumented test exit code: $env:WRITERPAD_TEST_EXIT_CODE"
+          Write-Host "WER dump count: $($dumps.Count)"
+          if ($dumps.Count -eq 0) {
+            throw "The uninstrumented test failed but WER produced no crash dump"
+          }
           $commands = @(
-            "sxe av"
-            "g"
-            ".echo ===== NATIVE BREAK EVENT ====="
+            ".echo ===== WER CRASH DUMP ====="
             ".lastevent"
+            ".ecxr"
+            "!analyze -v"
             "~* kv 100"
             "lm"
             "q"
           ) -join ";"
-          $python = (Get-Command python).Source
-          & $env:CDB_PATH -y "srv*$env:RUNNER_TEMP\symbols*https://msdl.microsoft.com/download/symbols" -c $commands $python -X faulthandler -m unittest discover -s tests -v
-          throw "Native diagnostic run completed; inspect the CDB break event above"
+          foreach ($dump in $dumps) {
+            Write-Host "Analyzing $($dump.FullName) ($($dump.Length) bytes)"
+            & $env:CDB_PATH -y "srv*$env:RUNNER_TEMP\symbols*https://msdl.microsoft.com/download/symbols" -c $commands -z $dump.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "CDB failed to analyze $($dump.FullName): $LASTEXITCODE"
+            }
+          }
+          throw "Original uninstrumented Windows tests failed; native dump analysis is above"
 
       - name: Build distributable executable
+        if: steps.windows_tests.outcome == 'success'
         run: python -m PyInstaller --noconfirm --clean Antigravity_AI_Writer.spec
 
       - name: Record executable digest
+        if: steps.windows_tests.outcome == 'success'
         shell: pwsh
         run: |
           $artifact = Get-Item -LiteralPath dist/Antigravity_AI_Writer.exe
