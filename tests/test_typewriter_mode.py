@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -332,20 +334,41 @@ class RealAssistantConstructionTestCase(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def test_assistant_mode_builds_with_saved_typewriter_settings(self):
-        widget = AssistantModeWidget()
-        self.addCleanup(widget.deleteLater)
-        # AssistantModeWidget is embedded in the real main window. Calling its
-        # closeEvent directly requests application-wide shutdown and can wake
-        # unrelated aboutToQuit workers retained by the full test process.
-        self.addCleanup(widget.tray_icon.hide)
+        # This widget owns application-wide tray and shutdown behavior. Exercise
+        # its real tree in a process that can follow the same lifetime as the app
+        # instead of leaking its deferred Qt teardown into unrelated widget tests.
+        child = """
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PyQt6.QtWidgets import QApplication
+from mode_assistant import AssistantModeWidget
 
-        restored = [
-            panel.text_edit.typewriter_enabled
-            for panel in widget.left_panels[:4] + widget.right_panels[:4]
-        ]
-
-        self.assertEqual(len(restored), 8)
-        self.assertTrue(all(restored))
+app = QApplication.instance() or QApplication([])
+widget = AssistantModeWidget()
+restored = [
+    panel.text_edit.typewriter_enabled
+    for panel in widget.left_panels[:4] + widget.right_panels[:4]
+]
+assert len(restored) == 8
+assert all(restored)
+widget.close()
+app.processEvents()
+"""
+        completed = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", child],
+            cwd=Path(__file__).resolve().parents[1],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"assistant construction subprocess failed\n"
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
 
     def test_reloading_a_document_restores_the_typewriter_margin(self):
         """setPlainText 는 rootFrame 서식을 기본값으로 되돌린다.
