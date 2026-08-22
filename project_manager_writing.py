@@ -392,6 +392,14 @@ class WritingProjectManager:
         if os.path.exists(target_path):
             raise FileExistsError("복원할 위치에 같은 이름의 항목이 이미 있습니다.")
 
+        # Ask before making room. The identity transaction refuses these two
+        # cases anyway, but by then the parent directory would already exist
+        # with nothing naming it, and the project would refuse to open over a
+        # divergence the writer never caused.
+        self._refuse_unfollowable_restore(
+            trash_rel_path.replace("\\", "/"),
+            target_rel_path.replace("\\", "/"),
+        )
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
         self._relocate_with_identity(
             trash_rel_path.replace("\\", "/"),
@@ -401,6 +409,27 @@ class WritingProjectManager:
         index.pop(name, None)
         self._save_trash_index(index)
         return os.path.relpath(target_path, self.writing_root_path).replace("\\", "/")
+
+    def _refuse_unfollowable_restore(self, source_rel, target_rel):
+        """Stop a restore identity could not follow, before anything is created."""
+        from project_creation_v1 import (
+            RELOCATION_PARENT_MISSING,
+            RELOCATION_TARGET_RECORDED,
+            relocation_blocker,
+        )
+
+        blocker = relocation_blocker(
+            os.path.dirname(self.writing_root_path), source_rel, target_rel
+        )
+        if blocker == RELOCATION_PARENT_MISSING:
+            raise ValueError(
+                "원래 있던 폴더가 남아 있지 않아 그 자리로 복원할 수 없습니다. "
+                "'선택 위치로 복원'으로 폴더를 지정해주세요."
+            )
+        if blocker == RELOCATION_TARGET_RECORDED:
+            raise FileExistsError(
+                "복원할 위치를 이미 다른 항목이 차지하고 있습니다."
+            )
 
     def _relocate_with_identity(self, source_rel, target_rel, apply_filesystem):
         """Move a node on disk and follow it in identity, keeping its UUID.

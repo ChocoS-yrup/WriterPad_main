@@ -808,6 +808,33 @@ def journalled_relocate(project_root, moves, apply_filesystem):
     return identity, result
 
 
+RELOCATION_TARGET_RECORDED = "target_recorded"
+RELOCATION_PARENT_MISSING = "parent_missing"
+
+
+def relocation_blocker(project_root, source_rel, target_rel):
+    """Which rule stops identity following this move, or None when none does.
+
+    ``relocate_path`` refuses the same two cases, but only once the caller has
+    already made room on disk. A caller that creates the destination first has
+    to ask before it does: a refusal that arrives afterwards leaves a directory
+    nothing names, which is a project that will not open.
+
+    Nothing here writes, and a tree with no identity or a source it does not
+    know is not blocked — those move on the filesystem alone.
+    """
+    if not os.path.exists(identity_path(project_root)):
+        return None
+    if node_for_path(project_root, source_rel) is None:
+        return None
+    if node_for_path(project_root, target_rel) is not None:
+        return RELOCATION_TARGET_RECORDED
+    parent_rel = target_rel.rsplit("/", 1)[0] if "/" in target_rel else None
+    if parent_rel and node_for_path(project_root, parent_rel) is None:
+        return RELOCATION_PARENT_MISSING
+    return None
+
+
 def relocate_path(project_root, source_rel, target_rel, apply_filesystem):
     """Move one node on disk and follow it in identity, keeping its UUID.
 
@@ -815,9 +842,10 @@ def relocate_path(project_root, source_rel, target_rel, apply_filesystem):
     test) just gets the filesystem move: there is nothing to keep in sync, and
     inventing an entry here would issue a UUID outside a creation.
 
-    A target identity already knows, reached from a source it also knows, is
-    two nodes for one path. That is refused before anything moves, because
-    picking one of them is exactly the guess the shared contract forbids.
+    A target identity already knows, or a target whose parent it does not, is
+    refused before anything moves. Picking one of two nodes for one path, or
+    parenting a node to nothing, is exactly the guess the shared contract
+    forbids.
     """
     node = None
     if os.path.exists(identity_path(project_root)):
@@ -825,18 +853,19 @@ def relocate_path(project_root, source_rel, target_rel, apply_filesystem):
     if node is None:
         return apply_filesystem()
 
-    if node_for_path(project_root, target_rel) is not None:
+    blocker = relocation_blocker(project_root, source_rel, target_rel)
+    if blocker == RELOCATION_TARGET_RECORDED:
         raise CreationError(
             f"{target_rel!r} is already recorded under another uuid; "
             f"{source_rel!r} cannot be moved onto it"
         )
-
-    parent_rel = target_rel.rsplit("/", 1)[0] if "/" in target_rel else None
-    parent = node_for_path(project_root, parent_rel) if parent_rel else None
-    if parent_rel and parent is None:
+    if blocker == RELOCATION_PARENT_MISSING:
         raise CreationError(
             f"no folder identity for the parent of {target_rel!r}"
         )
+
+    parent_rel = target_rel.rsplit("/", 1)[0] if "/" in target_rel else None
+    parent = node_for_path(project_root, parent_rel) if parent_rel else None
     parent_uuid = parent["uuid"] if parent else None
     move = {
         "uuid": node["uuid"],

@@ -373,6 +373,60 @@ class TrashIdentityTestCase(unittest.TestCase):
                 return node
         return None
 
+    def _purge_original_parent(self):
+        """원래 부모 폴더를 휴지통을 거쳐 영구 삭제한다."""
+        memo = creation.node_for_path(self.root, "메인/메모장")
+        create_item(
+            self.root, memo["uuid"], "사라질 폴더", True, uuid_factory=self.uuids
+        )
+        folder_rel = "메인/메모장/사라질 폴더"
+        moved_rel = self.wpm.move_item(self.source_rel, folder_rel)
+        trashed_document = self.wpm.move_to_trash(moved_rel)
+        trashed_folder = self.wpm.move_to_trash(folder_rel)
+        self.wpm.delete_from_trash(trashed_folder)
+        return trashed_document, folder_rel
+
+    def test_restoring_under_a_purged_parent_creates_nothing(self):
+        """따라갈 수 없는 복원은 파일 트리를 건드리기 전에 거절해야 한다."""
+        trashed_document, folder_rel = self._purge_original_parent()
+        before = sorted(creation.tracked_tree_entries(writing_root(self.root)))
+
+        with self.assertRaises(ValueError) as caught:
+            self.wpm.restore_from_trash(trashed_document)
+
+        self.assertIn("선택 위치로 복원", str(caught.exception))
+        # 거절이 부모 디렉터리를 만들어 두고 가면 프로젝트가 열리지 않는다.
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(writing_root(self.root), *folder_rel.split("/"))
+            )
+        )
+        self.assertEqual(
+            sorted(creation.tracked_tree_entries(writing_root(self.root))), before
+        )
+        self.assertEqual(
+            creation.prepare_open(self.root)["status"], creation.OPEN_OK
+        )
+
+    def test_restoring_to_a_chosen_folder_still_works_after_that(self):
+        """거절된 뒤에도 안내한 대로 다른 폴더를 고르면 복원된다."""
+        trashed_document, _folder_rel = self._purge_original_parent()
+
+        restored = self.wpm.restore_from_trash(
+            trashed_document, destination_parent="메인/메모장"
+        )
+
+        self.assertEqual(restored, "메인/메모장/버릴 메모.txt")
+        node = self._node(self.document_uuid)
+        self.assertEqual(node["legacy_path"], restored)
+        self.assertEqual(
+            node["parent_uuid"],
+            creation.node_for_path(self.root, "메인/메모장")["uuid"],
+        )
+        self.assertEqual(
+            creation.prepare_open(self.root)["status"], creation.OPEN_OK
+        )
+
     def test_trashing_keeps_the_uuid_and_reparents_under_trash(self):
         trash_uuid = creation.node_for_path(self.root, creation.TRASH_PATH)["uuid"]
 
