@@ -7036,6 +7036,62 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertFalse(journal.exists())
         self.assertFalse(target.exists())
 
+    def _restore_from_binder(self, trash_path):
+        """휴지통 항목 하나를 바인더에서 복원할 때 도는 그 경로를 태운다."""
+        panel = SimpleNamespace(
+            wpm=self.wpm,
+            sync_manager=self.manager,
+            load_tree_data=MagicMock(),
+            binder_tree=MagicMock(),
+            defer_tree_order_until_operations=MagicMock(),
+        )
+        item = MagicMock()
+        item.data.return_value = trash_path
+        order = copy.deepcopy(
+            self.wpm.project_settings.get("tree_order", {})
+        ) or {"<root>": ["메모장"]}
+        with patch.object(
+            WritingTreeMixin, "_is_live_qt_object", return_value=True
+        ), patch.object(
+            WritingTreeMixin, "_current_tree_order_snapshot", return_value=order
+        ), patch.object(
+            self.manager, "retry_pending_syncs", return_value=False
+        ), patch("writing_tree.QMessageBox.information"), patch(
+            "writing_tree.QMessageBox.warning"
+        ) as warned:
+            WritingTreeMixin.restore_trash_item(panel, item)
+        self.assertEqual(warned.call_args_list, [], "복원이 실패했다")
+        return panel
+
+    def test_restoring_an_empty_folder_publishes_it_as_live_again(self):
+        """빈 폴더 복원은 발행할 문서가 없다. 그래도 살아났다고 알려야 한다."""
+        create_item_at_path(
+            self._project_root(), "메인/메모장", "삭제실험", True
+        )
+        trash_path = self.wpm.move_to_trash("메인/메모장/삭제실험")
+        before = self.store.counts(self.context["local_key"])["pending"]
+
+        self._restore_from_binder(trash_path)
+
+        after = self.store.counts(self.context["local_key"])["pending"]
+        self.assertGreater(
+            after, before, "복원이 아무것도 발행하지 않았다"
+        )
+        queued = self.store.next_ready_operation(self.context["local_key"])
+        self.assertEqual(queued["relative_path"], TREE_ORDER_DOCUMENT_PATH)
+        # 폴더는 identity 상 휴지통 밖으로 돌아왔고, 그 자리가 서버에
+        # 발행할 상태를 정한다.
+        node = self._identity_node("메인/메모장/삭제실험")
+        self.assertIsNotNone(node)
+        self.assertFalse(
+            any(
+                folder["legacy_path"] == node["legacy_path"]
+                and folder["wants_deleted"]
+                for folder in self.manager._publishable_identity_folders()
+            )
+        )
+        self._assert_project_still_opens()
+
     def test_a_pull_is_not_recorded_applied_while_identity_disagrees(self):
         self.assertTrue(self.manager._identity_audit_is_clean())
 

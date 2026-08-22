@@ -940,9 +940,21 @@ class WritingTreeMixin:
                 if hasattr(self, "controller"):
                     self.controller.rename_path(rel_path, restored_path)
                 self.load_tree_data()
-                if operations and sync_manager is not None:
+                if sync_manager is not None:
                     tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
-                    if any(
+                    if not operations:
+                        # A folder with no documents in it restores without a
+                        # single document operation to publish. The tree order
+                        # is then the only thing that tells the server this
+                        # folder is alive again, and the server is still
+                        # holding a tombstone for it: skip this and the next
+                        # pull follows that tombstone and takes the folder
+                        # straight back to 휴지통. Deleting publishes
+                        # unconditionally for the same reason.
+                        WritingTreeMixin._persist_tree_order(
+                            self, tree_order, retry=False
+                        )
+                    elif any(
                         operation.get("contract_structure_intents")
                         or operation.get("contract_document_changes")
                         for operation in operations
@@ -955,7 +967,7 @@ class WritingTreeMixin:
                         self.defer_tree_order_until_operations(
                             operations, tree_order=tree_order
                         )
-            if operations and sync_manager is not None:
+            if sync_manager is not None:
                 sync_manager.retry_pending_syncs()
             QMessageBox.information(self, "복원 완료", f"다음 위치로 복원했습니다.\n{restored_path}")
         except Exception as e:
