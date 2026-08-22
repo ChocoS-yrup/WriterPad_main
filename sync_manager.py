@@ -5432,6 +5432,30 @@ class SyncManager(QObject):
         ]
         return self._adopt_remote_identity(entries)
 
+    def _record_identity_diagnostic(self, event, **metadata):
+        """Record an identity finding where it survives being looked for.
+
+        The rotating log is read by nobody after 256KB. These are the states a
+        verification run and a recovery both have to see, so they go in the
+        database beside the other structure diagnostics — deduplicated, because
+        a standing divergence is re-found on every single pull.
+        """
+        store = self._v2_store
+        context = self._v2_context or {}
+        if store is None or not context.get("local_key"):
+            return
+        try:
+            store.record_diagnostic(
+                context["local_key"],
+                event,
+                dedupe=True,
+                project_id=context.get("project_id"),
+                **metadata,
+            )
+        except Exception:
+            # Instrumentation never decides whether a pull may finish.
+            pass
+
     def _identity_conflict_detail(self):
         """Say which kind of divergence stopped this pull being recorded.
 
@@ -5455,10 +5479,9 @@ class SyncManager(QObject):
         """Refuse to finish a pull whose structure or identity did not apply."""
         self._v2_last_pull_apply_blocked = True
         self._v2_identity_apply_failed = True
-        self._diagnostics.record(
-            "sync_structure_apply_blocked",
-            state=self._stable_error_code(error) or type(error).__name__,
-            pending_count=self.pending_retry_count,
+        self._record_identity_diagnostic(
+            "identity_apply_blocked",
+            error_code=self._stable_error_code(error) or type(error).__name__,
         )
         self._set_sync_state(
             "conflict",
@@ -5508,10 +5531,9 @@ class SyncManager(QObject):
             ]
             self._v2_store.replace_folder_snapshots(local_key, restored)
         except Exception as error:
-            self._diagnostics.record(
-                "sync_folder_projection_restore_failed",
-                state=self._stable_error_code(error) or type(error).__name__,
-                pending_count=self.pending_retry_count,
+            self._record_identity_diagnostic(
+                "folder_projection_restore_failed",
+                error_code=self._stable_error_code(error) or type(error).__name__,
             )
 
     def _identity_uuid_divergences(self):
@@ -5621,14 +5643,14 @@ class SyncManager(QObject):
             if conflict["legacy_path"] in known:
                 continue
             self._v2_identity_uuid_conflicts.append(conflict)
-            self._diagnostics.record(
-                "sync_identity_uuid_conflict",
-                state=(
-                    f"path={conflict['legacy_path']};"
-                    f"recorded={conflict['recorded']};"
-                    f"proven={conflict['proven']}"
-                ),
-                pending_count=self.pending_retry_count,
+            # The path is deliberately not recorded: diagnostics carry ids and
+            # states, never anything a manuscript tree is named with. The two
+            # ids are enough to find both sides.
+            self._record_identity_diagnostic(
+                "identity_uuid_conflict",
+                entity_id=conflict["recorded"],
+                state=f"proven={conflict['proven']}",
+                error_code="IDENTITY_UUID_CONFLICT",
             )
 
     def _remote_identity_ancestor_entries(self, relative_path, folder_ids=None):
@@ -5807,41 +5829,37 @@ class SyncManager(QObject):
         try:
             report = audit(project_root)
         except (IdentityError, CreationError, OSError) as error:
-            state = self._stable_error_code(error) or type(error).__name__
-            self._diagnostics.record(
-                "sync_identity_audit_failed",
-                state=state,
-                pending_count=self.pending_retry_count,
+            self._record_identity_diagnostic(
+                "identity_audit_failed",
+                error_code=self._stable_error_code(error) or type(error).__name__,
             )
             return False
         try:
             crossed = self._identity_uuid_divergences()
         except Exception as error:
             # An audit that cannot run is not a clean audit.
-            state = self._stable_error_code(error) or type(error).__name__
-            self._diagnostics.record(
-                "sync_identity_audit_failed",
-                state=state,
-                pending_count=self.pending_retry_count,
+            self._record_identity_diagnostic(
+                "identity_audit_failed",
+                error_code=self._stable_error_code(error) or type(error).__name__,
             )
             return False
         if crossed:
-            self._diagnostics.record(
-                "sync_identity_uuid_divergence",
+            self._record_identity_diagnostic(
+                "identity_uuid_divergence",
                 state=f"paths={len(crossed)}",
-                pending_count=self.pending_retry_count,
+                error_code="IDENTITY_UUID_DIVERGENCE",
             )
             return False
         if not any(report.values()):
             return True
-        self._diagnostics.record(
-            "sync_identity_divergence",
+        self._record_identity_diagnostic(
+            "identity_tree_divergence",
             state=(
                 f"missing_on_disk={len(report['missing_on_disk'])};"
                 f"missing_in_identity={len(report['missing_in_identity'])};"
                 f"pending_journals={len(report['pending_journals'])}"
             ),
-            pending_count=self.pending_retry_count,
+            error_code="IDENTITY_TREE_DIVERGENCE",
         )
         return False
 

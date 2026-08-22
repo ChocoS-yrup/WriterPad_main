@@ -6800,12 +6800,34 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.assertFalse(self.manager._identity_audit_is_clean())
 
+        # 회전하는 로그가 아니라 DB 에 남아야 검증과 복구가 찾을 수 있다.
+        # 경로는 넣지 않는다. 진단은 id 와 상태만 싣는다.
+        recorded_events = {
+            item["event"] for item in
+            self.store.diagnostics(self.context["local_key"])
+        }
+        self.assertIn("identity_uuid_conflict", recorded_events)
+        conflict = next(
+            item for item in self.store.diagnostics(self.context["local_key"])
+            if item["event"] == "identity_uuid_conflict"
+        )
+        self.assertIn(recorded, conflict["metadata_json"])
+        self.assertIn(proven, conflict["metadata_json"])
+        self.assertNotIn("메모장", conflict["metadata_json"])
+
         # 다음 실행에서도, 저장된 projection 과의 교차 감사가 같은 것을 잡는다.
         self.manager._v2_identity_uuid_conflicts = []
         self.assertEqual(
             self.manager._identity_uuid_divergences(), ["메인/메모장"]
         )
         self.assertFalse(self.manager._identity_audit_is_clean())
+        self.assertIn(
+            "identity_uuid_divergence",
+            {
+                item["event"] for item in
+                self.store.diagnostics(self.context["local_key"])
+            },
+        )
 
     def test_a_failed_identity_adoption_never_finishes_the_pull(self):
         """채택이 실패하면 sync_folders 만 앞서간 채 성공으로 끝나면 안 된다."""
