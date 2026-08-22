@@ -18,13 +18,19 @@ from PyQt6.QtWidgets import QApplication, QLineEdit
 
 from mode_writing import BinderTreeWidget, RenameDelegate, WritingModeWidget
 from project_creation_v1 import (
+    OPEN_OK,
+    CreationError,
+    audit,
     create_item_at_path,
     create_project,
     create_volume,
     node_for_path,
+    prepare_open,
+    project_journal_dir,
+    recover_project,
     writing_root,
 )
-from project_identity_v1 import read_identity
+from project_identity_v1 import IdentityError, read_identity
 from project_manager_writing import WritingProjectManager
 from sync_manager import (
     LockWorker,
@@ -3460,6 +3466,11 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.manager._v2_wpm = self.wpm
         self.manager._v2_device_id = str(uuid.uuid4())
         self.manager._v2_protected_paths_provider = None
+        # 이 매니저는 시험 사이에 공유된다. pull 한 번 동안만 쓰는 상태는
+        # 앞 시험이 남긴 것을 물려받으면 안 된다.
+        self.manager._v2_last_pull_apply_blocked = False
+        self.manager._v2_identity_apply_failed = False
+        self.manager._v2_identity_uuid_conflicts = []
         self.tree_document_id = str(uuid.uuid5(
             uuid.UUID(self.context["project_id"]), TREE_ORDER_DOCUMENT_PATH
         ))
@@ -6483,6 +6494,538 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
 
         panel._schedule_remote_tree_refresh.assert_called_once_with()
         panel.save_tree_order.assert_not_called()
+
+    # 원격 snapshot 이 만든 것은 전부 identity 가 이름을 가지고 있어야 한다.
+    # 그렇지 않으면 이번 세션은 멀쩡해 보이고 다음 실행에서 프로젝트가 막힌다.
+
+    def _project_root(self):
+        return os.path.dirname(self.wpm.writing_root_path)
+
+    def _identity_node(self, legacy_path):
+        return node_for_path(self._project_root(), legacy_path)
+
+    def _assert_project_still_opens(self):
+        # 열기가 먼저다. 끝나지 않은 저널을 마무리하는 것이 그 일이고,
+        # 감사는 그러고 나서 남은 것을 본다.
+        self.assertEqual(
+            prepare_open(self._project_root())["status"], OPEN_OK
+        )
+        report = audit(self._project_root())
+        self.assertEqual(report["missing_in_identity"], [])
+        self.assertEqual(report["missing_on_disk"], [])
+        self.assertEqual(report["pending_journals"], [])
+        # 경로 감사만 통과하는 것으로는 부족하다. 같은 경로를 다른 UUID 로
+        # 가리키는 것은 여기에서만 보인다.
+        self.assertEqual(self.manager._identity_uuid_divergences(), [])
+        self.assertTrue(self.manager._identity_audit_is_clean())
+
+    @staticmethod
+    def _folder_row(folder_id, parent_folder_id, name, revision=1):
+        return {
+            "folder_id": folder_id,
+            "parent_folder_id": parent_folder_id,
+            "name": name,
+            "revision": revision,
+            "is_deleted": False,
+        }
+
+    def _new_folder_rows(self, name, revision=1):
+        """메인/메모장 아래 새 폴더 하나를 가진 서버 folder projection.
+
+        이미 존재하는 폴더는 identity 가 기록한 그 UUID 로 온다. 여기에 무작위
+        UUID 를 쓰면 시험하려던 것과 무관하게 표준 폴더 UUID 충돌이 생기고,
+        그러면 정상 경로를 시험한 것이 아니게 된다.
+        """
+        main_id = self._identity_node("메인")["uuid"]
+        memo_id = self._identity_node("메인/메모장")["uuid"]
+        folder_id = str(uuid.uuid4())
+        return folder_id, [
+            self._folder_row(main_id, None, "메인"),
+            self._folder_row(memo_id, main_id, "메모장"),
+            self._folder_row(folder_id, memo_id, name, revision),
+        ]
+
+    def test_remote_new_folder_is_recorded_under_the_server_folder_id(self):
+        name = "삭제실험-아이패드 (복구됨)"
+        folder_id, rows = self._new_folder_rows(name)
+        tree_order = {"<root>": ["메모장"], "메인/메모장": [name]}
+
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote(tree_order)], strict=True, folder_rows=rows
+        )
+
+        target = f"메인/메모장/{name}"
+        self.assertTrue(Path(self.wpm.writing_root_path, target).is_dir())
+        node = self._identity_node(target)
+        self.assertIsNotNone(node, "원격 신규 폴더가 identity 에 없다")
+        self.assertEqual(node["uuid"], folder_id)
+        self.assertEqual(node["kind"], "folder")
+        self.assertEqual(
+            node["parent_uuid"], self._identity_node("메인/메모장")["uuid"]
+        )
+        self.assertEqual(
+            self.store.get_folder_by_id(folder_id)["local_path"], target
+        )
+        self._assert_project_still_opens()
+
+    def test_remote_nested_folders_record_the_parent_before_the_child(self):
+        tree_order = {
+            "<root>": ["메모장"],
+            "메인/메모장": ["새 상자"],
+            "메인/메모장/새 상자": ["더 깊은 상자"],
+        }
+
+        self._apply(tree_order)
+
+        parent = self._identity_node("메인/메모장/새 상자")
+        child = self._identity_node("메인/메모장/새 상자/더 깊은 상자")
+        self.assertIsNotNone(parent)
+        self.assertIsNotNone(child)
+        self.assertEqual(child["parent_uuid"], parent["uuid"])
+        self.assertEqual(parent["kind"], "folder")
+        self.assertEqual(child["kind"], "folder")
+        self._assert_project_still_opens()
+
+    def test_remote_folder_named_txt_is_recorded_as_a_folder(self):
+        folder_id, rows = self._new_folder_rows("자료.txt")
+        tree_order = {"<root>": ["메모장"], "메인/메모장": ["자료.txt"]}
+
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote(tree_order)], strict=True, folder_rows=rows
+        )
+
+        node = self._identity_node("메인/메모장/자료.txt")
+        self.assertIsNotNone(node)
+        self.assertEqual(node["uuid"], folder_id)
+        self.assertEqual(node["kind"], "folder")
+        self.assertEqual(node["title"], "자료.txt")
+        self._assert_project_still_opens()
+
+    def test_a_remote_folder_and_its_document_are_both_recorded(self):
+        folder_id, rows = self._new_folder_rows("새 상자")
+        document_id = str(uuid.uuid4())
+        document_path = "메인/메모장/새 상자/문서.txt"
+        tree_order = {
+            "<root>": ["메모장"],
+            "메인/메모장": ["새 상자"],
+            "메인/메모장/새 상자": ["문서.txt"],
+        }
+
+        self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(tree_order),
+                {
+                    "document_id": document_id,
+                    "relative_path": document_path,
+                    "content": "본문",
+                    "revision": 1,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=rows,
+        )
+
+        folder = self._identity_node("메인/메모장/새 상자")
+        document = self._identity_node(document_path)
+        self.assertEqual(folder["uuid"], folder_id)
+        self.assertIsNotNone(document, "원격 신규 문서가 identity 에 없다")
+        self.assertEqual(document["uuid"], document_id)
+        self.assertEqual(document["kind"], "document")
+        self.assertEqual(document["parent_uuid"], folder["uuid"])
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, document_path).read_text(
+                encoding="utf-8"
+            ),
+            "본문",
+        )
+        self._assert_project_still_opens()
+
+    def test_remote_folder_rename_keeps_the_uuid_and_the_child_path(self):
+        main_id = self._identity_node("메인")["uuid"]
+        folder_id = str(uuid.uuid4())
+        document_id = str(uuid.uuid4())
+        old_rows = [
+            self._folder_row(main_id, None, "메인"),
+            self._folder_row(folder_id, main_id, "이름전"),
+        ]
+        self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(
+                    {"<root>": ["이름전"], "메인/이름전": ["보존.txt"]}
+                ),
+                {
+                    "document_id": document_id,
+                    "relative_path": "메인/이름전/보존.txt",
+                    "content": "원고",
+                    "revision": 1,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=old_rows,
+        )
+        self.assertEqual(
+            self._identity_node("메인/이름전")["uuid"], folder_id
+        )
+
+        new_rows = [
+            self._folder_row(main_id, None, "메인"),
+            self._folder_row(folder_id, main_id, "이름후", revision=2),
+        ]
+        versions = [
+            {**old_rows[1], "operation_kind": "rename"},
+            {**new_rows[1], "operation_kind": "rename"},
+        ]
+
+        self.manager._apply_v2_remote_documents(
+            [
+                self._tree_remote(
+                    {"<root>": ["이름후"], "메인/이름후": ["보존.txt"]},
+                    revision=2,
+                ),
+                {
+                    "document_id": document_id,
+                    "relative_path": "메인/이름후/보존.txt",
+                    "content": "원고",
+                    "revision": 2,
+                    "is_deleted": False,
+                },
+            ],
+            strict=True,
+            folder_rows=new_rows,
+            folder_versions=versions,
+        )
+
+        self.assertIsNone(self._identity_node("메인/이름전"))
+        renamed = self._identity_node("메인/이름후")
+        moved_child = self._identity_node("메인/이름후/보존.txt")
+        self.assertEqual(renamed["uuid"], folder_id)
+        self.assertEqual(moved_child["uuid"], document_id)
+        self.assertEqual(moved_child["parent_uuid"], renamed["uuid"])
+        self._assert_project_still_opens()
+
+    def test_an_interrupted_adoption_leaves_nothing_half_applied(self):
+        name = "중단된 폴더"
+        folder_id, rows = self._new_folder_rows(name)
+        tree_order = {"<root>": ["메모장"], "메인/메모장": [name]}
+        remote = [self._tree_remote(tree_order)]
+        real_makedirs = os.makedirs
+
+        def fail_new_folder(target, *args, **kwargs):
+            if str(target).endswith(name):
+                raise OSError("의도한 생성 실패")
+            return real_makedirs(target, *args, **kwargs)
+
+        with patch(
+            "project_creation_v1.os.makedirs", side_effect=fail_new_folder
+        ):
+            with self.assertRaises(OSError):
+                self.manager._apply_v2_remote_documents(
+                    remote, strict=True, folder_rows=rows
+                )
+
+        self.assertFalse(
+            Path(self.wpm.writing_root_path, "메인", "메모장", name).exists()
+        )
+        self.assertIsNone(self._identity_node(f"메인/메모장/{name}"))
+        self._assert_project_still_opens()
+
+        # 재시작한 뒤 같은 snapshot 은 서버가 발급한 그 id 로 다시 자리잡는다.
+        self.manager._apply_v2_remote_documents(
+            remote, strict=True, folder_rows=rows
+        )
+
+        self.assertEqual(
+            self._identity_node(f"메인/메모장/{name}")["uuid"], folder_id
+        )
+        self._assert_project_still_opens()
+
+    def test_an_adoption_journal_left_by_a_kill_finishes_on_the_next_open(self):
+        name = "저널 폴더"
+        folder_id, rows = self._new_folder_rows(name)
+        tree_order = {"<root>": ["메모장"], "메인/메모장": [name]}
+        journal_dir = project_journal_dir(self._project_root())
+        real_unlink = os.unlink
+
+        def keep_journal(target, *args, **kwargs):
+            if os.path.dirname(os.path.abspath(str(target))) == journal_dir:
+                return None
+            return real_unlink(target, *args, **kwargs)
+
+        with patch("project_creation_v1.os.unlink", side_effect=keep_journal):
+            self.manager._apply_v2_remote_documents(
+                [self._tree_remote(tree_order)], strict=True, folder_rows=rows
+            )
+
+        self.assertTrue(list(Path(journal_dir).glob("*.json")))
+        self.assertEqual(
+            audit(self._project_root())["missing_in_identity"], []
+        )
+
+        self.assertEqual(
+            prepare_open(self._project_root())["status"], OPEN_OK
+        )
+        self.assertEqual(
+            self._identity_node(f"메인/메모장/{name}")["uuid"], folder_id
+        )
+        self.assertFalse(list(Path(journal_dir).glob("*.json")))
+
+    def test_a_snapshot_claiming_another_uuid_for_a_known_path_is_reported(self):
+        """경로만 같고 UUID 가 다른 주장은 조용히 지나가면 안 된다."""
+        recorded = self._identity_node("메인/메모장")["uuid"]
+        proven = str(uuid.uuid4())
+        main_id = self._identity_node("메인")["uuid"]
+        rows = [
+            self._folder_row(main_id, None, "메인"),
+            self._folder_row(proven, main_id, "메모장"),
+        ]
+
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote({"<root>": ["메모장"], "메인/메모장": []})],
+            strict=True,
+            folder_rows=rows,
+        )
+
+        # 기록된 id 는 다른 기기·백업·저널이 이미 가리키는 id 다. 덮어쓰지 않는다.
+        self.assertEqual(self._identity_node("메인/메모장")["uuid"], recorded)
+        # 경로 감사만으로는 보이지 않는다. 이것이 이 결함의 모양이었다.
+        self.assertEqual(audit(self._project_root())["missing_in_identity"], [])
+        self.assertEqual(audit(self._project_root())["missing_on_disk"], [])
+        # 그러나 이번 pull 이 그 주장을 봤다는 사실은 남는다.
+        self.assertEqual(
+            [item["legacy_path"] for item in
+             self.manager._v2_identity_uuid_conflicts],
+            ["메인/메모장"],
+        )
+        self.assertFalse(self.manager._identity_audit_is_clean())
+
+        # 다음 실행에서도, 저장된 projection 과의 교차 감사가 같은 것을 잡는다.
+        self.manager._v2_identity_uuid_conflicts = []
+        self.assertEqual(
+            self.manager._identity_uuid_divergences(), ["메인/메모장"]
+        )
+        self.assertFalse(self.manager._identity_audit_is_clean())
+
+    def test_a_failed_identity_adoption_never_finishes_the_pull(self):
+        """채택이 실패하면 sync_folders 만 앞서간 채 성공으로 끝나면 안 된다."""
+        name = "채택 실패 폴더"
+        folder_id, rows = self._new_folder_rows(name)
+        tree_order = {"<root>": ["메모장"], "메인/메모장": [name]}
+        before = self.store.list_folders(self.context["local_key"])
+
+        with patch.object(
+            SyncManager,
+            "_adopt_remote_tree_folders",
+            side_effect=CreationError("의도한 채택 실패"),
+        ):
+            changes = self.manager._apply_v2_remote_documents(
+                [self._tree_remote(tree_order)],
+                strict=False,
+                folder_rows=rows,
+            )
+
+        self.assertEqual(changes, [])
+        self.assertTrue(self.manager._v2_last_pull_apply_blocked)
+        self.assertEqual(self.manager.current_sync_state, "conflict")
+        self.assertIsNone(self._identity_node(f"메인/메모장/{name}"))
+        # 이름 붙이지 못한 폴더 행을 데이터베이스에 남겨두지 않는다.
+        after = self.store.list_folders(self.context["local_key"])
+        self.assertEqual(
+            [row["folder_id"] for row in after],
+            [row["folder_id"] for row in before],
+        )
+        self.assertIsNone(self.store.get_folder_by_id(folder_id))
+        self.assertEqual(self.manager._identity_uuid_divergences(), [])
+        self._assert_project_still_opens()
+
+    def test_a_failed_identity_release_keeps_a_journal_instead_of_the_files(self):
+        """identity 제거가 실패하면 반대 방향 손상 대신 저널이 남아야 한다."""
+        name = "회수 실패 폴더"
+        folder_id, rows = self._new_folder_rows(name)
+        tree_order = {"<root>": ["메모장"], "메인/메모장": [name]}
+        journal_dir = project_journal_dir(self._project_root())
+
+        with patch(
+            "project_creation_v1.remove_nodes",
+            side_effect=IdentityError("의도한 회수 실패"),
+        ):
+            with patch.object(
+                self.wpm, "save_settings", return_value=False
+            ):
+                with self.assertRaises(OSError):
+                    self._apply_direct(tree_order)
+
+        # identity 를 되돌리지 못했으므로 그 디렉터리도 그대로 있어야 한다.
+        self.assertIsNotNone(self._identity_node(f"메인/메모장/{name}"))
+        self.assertTrue(
+            Path(self.wpm.writing_root_path, "메인", "메모장", name).is_dir()
+        )
+        self.assertEqual(audit(self._project_root())["missing_on_disk"], [])
+        self.assertEqual(audit(self._project_root())["missing_in_identity"], [])
+        # 끝내지 못한 회수는 다음 열기가 보게 될 저널로 남는다.
+        self.assertTrue(list(Path(journal_dir).glob("*.json")))
+
+        self.assertEqual(
+            prepare_open(self._project_root())["status"], OPEN_OK
+        )
+        self.assertFalse(list(Path(journal_dir).glob("*.json")))
+
+    def test_a_disk_error_inside_an_identity_transaction_blocks_the_pull(self):
+        """디스크 오류도 채택 거부와 똑같이 pull 을 막아야 한다."""
+        name = "디스크 오류 폴더"
+        folder_id, rows = self._new_folder_rows(name)
+        tree_order = {"<root>": ["메모장"], "메인/메모장": [name]}
+        before = self.store.list_folders(self.context["local_key"])
+
+        with patch(
+            "project_identity_v1.write_identity",
+            side_effect=OSError("disk full"),
+        ):
+            changes = self.manager._apply_v2_remote_documents(
+                [self._tree_remote(tree_order)],
+                strict=False,
+                folder_rows=rows,
+            )
+
+        self.assertEqual(changes, [])
+        self.assertTrue(self.manager._v2_last_pull_apply_blocked)
+        self.assertEqual(self.manager.current_sync_state, "conflict")
+        self.assertIsNone(self._identity_node(f"메인/메모장/{name}"))
+        self.assertIsNone(self.store.get_folder_by_id(folder_id))
+        self.assertEqual(
+            [
+                row["folder_id"] for row in
+                self.store.list_folders(self.context["local_key"])
+            ],
+            [row["folder_id"] for row in before],
+        )
+        self._assert_project_still_opens()
+
+    def test_a_landed_rename_keeps_its_row_while_a_failed_new_folder_loses_one(self):
+        """되감기는 snapshot 전체가 아니라 이름 붙이지 못한 행만 가져간다."""
+        main_id = self._identity_node("메인")["uuid"]
+        memo_id = self._identity_node("메인/메모장")["uuid"]
+        renamed_id = str(uuid.uuid4())
+        created_id = str(uuid.uuid4())
+        old_rows = [
+            self._folder_row(main_id, None, "메인"),
+            self._folder_row(memo_id, main_id, "메모장"),
+            self._folder_row(renamed_id, main_id, "이름전"),
+        ]
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote({"<root>": ["이름전", "메모장"], "메인/이름전": []})],
+            strict=True,
+            folder_rows=old_rows,
+        )
+        self.assertEqual(self._identity_node("메인/이름전")["uuid"], renamed_id)
+
+        new_rows = [
+            self._folder_row(main_id, None, "메인"),
+            self._folder_row(memo_id, main_id, "메모장"),
+            self._folder_row(renamed_id, main_id, "이름후", revision=2),
+            self._folder_row(created_id, memo_id, "새 폴더"),
+        ]
+        versions = [
+            {**old_rows[2], "operation_kind": "rename"},
+            {**new_rows[2], "operation_kind": "rename"},
+        ]
+        remote = [self._tree_remote(
+            {
+                "<root>": ["이름후", "메모장"],
+                "메인/이름후": [],
+                "메인/메모장": ["새 폴더"],
+            },
+            revision=2,
+        )]
+
+        with patch(
+            "project_creation_v1.adopt_remote_nodes",
+            side_effect=CreationError("의도한 채택 실패"),
+        ):
+            self.manager._apply_v2_remote_documents(
+                remote,
+                strict=False,
+                folder_rows=new_rows,
+                folder_versions=versions,
+            )
+
+        self.assertTrue(self.manager._v2_last_pull_apply_blocked)
+        # 디스크에서 이미 이름이 바뀐 폴더의 행은 새 경로 그대로 남는다.
+        self.assertTrue(
+            Path(self.wpm.writing_root_path, "메인", "이름후").is_dir()
+        )
+        self.assertEqual(self._identity_node("메인/이름후")["uuid"], renamed_id)
+        renamed_row = self.store.get_folder_by_id(renamed_id)
+        self.assertEqual(renamed_row["local_path"], "메인/이름후")
+        self.assertEqual(renamed_row["revision"], 2)
+        # 아무 데도 만들어지지 못한 폴더의 행만 사라진다.
+        self.assertIsNone(self.store.get_folder_by_id(created_id))
+        self.assertIsNone(self._identity_node("메인/메모장/새 폴더"))
+        self.assertFalse(
+            Path(self.wpm.writing_root_path, "메인", "메모장", "새 폴더").exists()
+        )
+        self._assert_project_still_opens()
+
+    def test_a_release_resume_that_cannot_delete_keeps_its_journal(self):
+        """지우지 못한 항목이 있으면 다음 실행이 다시 시도할 수 있어야 한다."""
+        name = "회수 중단 폴더"
+        target = Path(self.wpm.writing_root_path, "메인", "메모장", name)
+        target.mkdir()
+        journal_dir = Path(project_journal_dir(self._project_root()))
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        journal = Path(journal_dir, f"{uuid.uuid4()}.json")
+        journal.write_text(
+            json.dumps(
+                {
+                    "format_version": 1,
+                    "transaction_id": str(uuid.uuid4()),
+                    "kind": "release_adopted",
+                    "project_root": self._project_root(),
+                    "removals": [{
+                        "uuid": str(uuid.uuid4()),
+                        "legacy_path": f"메인/메모장/{name}",
+                        "kind": "folder",
+                    }],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        real_rmdir = os.rmdir
+
+        def fail_rmdir(directory, *args, **kwargs):
+            if str(directory).endswith(name):
+                raise OSError("의도한 삭제 실패")
+            return real_rmdir(directory, *args, **kwargs)
+
+        with patch("project_creation_v1.os.rmdir", side_effect=fail_rmdir):
+            recover_project(self._project_root())
+
+        self.assertTrue(target.is_dir())
+        self.assertTrue(journal.exists(), "회수 저널이 사라졌다")
+        self.assertEqual(
+            audit(self._project_root())["pending_journals"],
+            [json.loads(journal.read_text(encoding="utf-8"))["transaction_id"]],
+        )
+
+        # 오류가 지나간 다음 실행이 끝을 맺는다.
+        self._assert_project_still_opens()
+        self.assertFalse(journal.exists())
+        self.assertFalse(target.exists())
+
+    def test_a_pull_is_not_recorded_applied_while_identity_disagrees(self):
+        self.assertTrue(self.manager._identity_audit_is_clean())
+
+        stray = Path(self.wpm.writing_root_path, "메인", "메모장", "이름없음.txt")
+        stray.write_text("정체성 밖", encoding="utf-8")
+
+        self.assertFalse(self.manager._identity_audit_is_clean())
+
+        stray.unlink()
+
+        self.assertTrue(self.manager._identity_audit_is_clean())
+
 
 
 class WritingManualSaveTestCase(unittest.TestCase):

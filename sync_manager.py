@@ -69,6 +69,14 @@ MAX_WINDOWS_DIRECTORY_PATH = 247
 TREE_ROOT_STORAGE_NAMES = ROOT_STORAGE_NAMES
 
 
+class RemoteRenameSkipped(Exception):
+    """A prevalidated remote rename failed its final mutable checks.
+
+    Raised from inside the identity transaction so the journal is dropped and
+    identity stays exactly where the unmoved directory is.
+    """
+
+
 def supabase_config_dir():
     """Return the directory that holds public Supabase client settings."""
     return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -519,6 +527,8 @@ class SyncManager(QObject):
         self._local_structure_generation = 0
         self._v2_untracked_recovery_paths = set()
         self._v2_last_pull_apply_blocked = False
+        self._v2_identity_apply_failed = False
+        self._v2_identity_uuid_conflicts = []
         self._auth_refresh_generation = 0
         self._auth_retry_blocked = False
         self._shutting_down = False
@@ -3489,27 +3499,22 @@ class SyncManager(QObject):
         except (OSError, ValueError, FileExistsError):
             return False
 
-    @classmethod
-    def _rollback_remote_empty_folder_renames(cls, writing_root, renamed_items):
-        root = os.path.abspath(writing_root)
-        for item in reversed(renamed_items):
-            old_full = item["old_full_path"]
-            new_full = item["new_full_path"]
+    def _rollback_remote_empty_folder_renames(self, writing_root, renamed_items):
+        """Put the renamed empty directories back, identity along with them.
+
+        The undo is the same prevalidated rename read backwards, so a directory
+        that stopped being safe to move in the meantime is left alone.
+        """
+        for item in reversed(renamed_items or ()):
             try:
-                if (
-                    os.path.commonpath([root, old_full]) != root
-                    or os.path.commonpath([root, new_full]) != root
-                    or os.path.lexists(old_full)
-                    or not cls._safe_existing_tree_directory(
-                        root, item["new_relative_path"]
-                    )
-                ):
-                    continue
-                with os.scandir(new_full) as entries:
-                    if next(entries, None) is not None:
-                        continue
-                os.rename(new_full, old_full)
-            except (OSError, ValueError, FileExistsError):
+                self._relocate_remote_empty_folder({
+                    "old_relative_path": item["new_relative_path"],
+                    "new_relative_path": item["old_relative_path"],
+                    "old_full_path": item["new_full_path"],
+                    "new_full_path": item["old_full_path"],
+                })
+            except Exception:
+                # A rollback runs inside a raise. It reports nothing of its own.
                 pass
 
     def _save_remote_tree_order_settings(self, tree_order):
@@ -3765,6 +3770,7 @@ class SyncManager(QObject):
         remote_document_changes=None,
         remote_folder_paths=None,
         has_remote_folder_projection=False,
+        remote_folder_ids=None,
     ):
         planned_generation = self.local_structure_generation
         if is_deleted:
@@ -3809,6 +3815,7 @@ class SyncManager(QObject):
                 remote_folder_paths=remote_folder_paths,
                 explicit_tree_folder_paths=explicit_tree_folder_paths,
                 has_remote_folder_projection=has_remote_folder_projection,
+                remote_folder_ids=remote_folder_ids,
             )
 
     def _apply_remote_tree_order_document_locked(
@@ -3822,6 +3829,7 @@ class SyncManager(QObject):
         remote_folder_paths=None,
         explicit_tree_folder_paths=None,
         has_remote_folder_projection=False,
+        remote_folder_ids=None,
     ):
         folder_plan = self._build_remote_tree_folder_plan(
             self._v2_wpm.writing_root_path,
@@ -3938,13 +3946,24 @@ class SyncManager(QObject):
                 merged_order[new_path] = copy.deepcopy(remote_order[new_path])
         created_paths = []
         renamed_items = []
+        adopted_nodes = []
         settings_save_attempted = False
         try:
             for item in rename_plan:
-                if self._apply_remote_empty_folder_rename(
-                    self._v2_wpm.writing_root_path, item
-                ):
+                if self._relocate_remote_empty_folder(item):
                     renamed_items.append(item)
+            adopted_nodes = self._adopt_remote_tree_folders(
+                folder_plan, renamed_items, remote_folder_ids
+            )
+            # Adoption issues the ids before the directories exist, so the
+            # directories it creates roll back with everything else this
+            # snapshot made.
+            adopted_paths = {node["legacy_path"] for node in adopted_nodes}
+            created_paths.extend(
+                item["full_path"]
+                for item in folder_plan
+                if not item["exists"] and item["relative_path"] in adopted_paths
+            )
             for item in folder_plan:
                 if item["exists"] or any(
                     item["full_path"] == renamed["new_full_path"]
@@ -3987,9 +4006,17 @@ class SyncManager(QObject):
                     self._v2_wpm.save_settings()
                 except Exception:
                     pass
-            self._rollback_remote_tree_folders(
-                self._v2_wpm.writing_root_path, created_paths
-            )
+            try:
+                self._release_adopted_identity(
+                    adopted_nodes,
+                    lambda: self._rollback_remote_tree_folders(
+                        self._v2_wpm.writing_root_path, created_paths
+                    ),
+                )
+            except Exception:
+                # The journal this left behind is the recovery path. Never let
+                # it replace the failure that started the rollback.
+                pass
             self._rollback_remote_empty_folder_renames(
                 self._v2_wpm.writing_root_path, renamed_items
             )
@@ -4399,9 +4426,22 @@ class SyncManager(QObject):
                 old_full = os.path.join(root, action["old_path"])
                 new_full = os.path.join(root, action["new_path"])
                 if action["kind"] == "rename":
-                    os.rename(old_full, new_full)
+                    self._relocate_remote_identity(
+                        action["old_path"],
+                        action["new_path"],
+                        lambda old_full=old_full, new_full=new_full: os.rename(
+                            old_full, new_full
+                        ),
+                    )
                 elif action["kind"] == "remove_empty_source":
-                    os.rmdir(old_full)
+                    # The directory is already at the new path. Only a leftover
+                    # empty source is dropped, and identity follows it if it is
+                    # the node that still names the old path.
+                    self._relocate_remote_identity(
+                        action["old_path"],
+                        action["new_path"],
+                        lambda old_full=old_full: os.rmdir(old_full),
+                    )
                 applied_actions.append(action)
                 self._v2_store.move_local_path(
                     self._v2_context["local_key"],
@@ -4428,10 +4468,14 @@ class SyncManager(QObject):
                 new_full = os.path.join(root, action["new_path"])
                 try:
                     if action["kind"] == "rename" and not os.path.lexists(old_full):
-                        os.rename(new_full, old_full)
+                        self._relocate_remote_identity(
+                            action["new_path"],
+                            action["old_path"],
+                            lambda: os.rename(new_full, old_full),
+                        )
                     elif action["kind"] == "remove_empty_source" and not os.path.lexists(old_full):
                         os.mkdir(old_full)
-                except OSError:
+                except Exception:
                     pass
             raise
 
@@ -4552,6 +4596,9 @@ class SyncManager(QObject):
         maps to the same new prefix and the remote tree confirms the old folder is
         gone. Otherwise the existing per-document conflict-safe path is retained.
         """
+        from project_creation_v1 import CreationError
+        from project_identity_v1 import IdentityError
+
         remote_folders = self._remote_tree_folder_paths(
             remote_documents, remote_live_document_paths
         )
@@ -4656,8 +4703,12 @@ class SyncManager(QObject):
             except (ValueError, FileExistsError):
                 continue
             try:
-                os.rename(old_full, new_full)
-            except OSError:
+                self._relocate_remote_identity(
+                    old_prefix,
+                    new_prefix,
+                    lambda: os.rename(old_full, new_full),
+                )
+            except (OSError, ValueError, CreationError, IdentityError):
                 continue
             moved.append((old_prefix, new_prefix))
         return moved
@@ -4726,7 +4777,12 @@ class SyncManager(QObject):
     ):
         if not self.is_v2_enabled or not self._v2_wpm:
             return []
+        from project_creation_v1 import CreationError
+        from project_identity_v1 import IdentityError
+
         self._v2_last_pull_apply_blocked = False
+        self._v2_identity_apply_failed = False
+        self._v2_identity_uuid_conflicts = []
         try:
             protected = set(
                 (self._v2_protected_paths_provider or (lambda: set()))() or set()
@@ -4750,6 +4806,15 @@ class SyncManager(QObject):
             and self._v2_store.has_active_structure_kind(
                 self._v2_context["local_key"], "tree_order"
             )
+        )
+        # The folder projection is written before identity can follow it, so
+        # the rows it replaces are kept until this apply is known to have
+        # landed. A blocked pull must not leave the database describing folders
+        # identity never heard of.
+        previous_folder_snapshots = (
+            self._v2_store.list_folders(self._v2_context["local_key"])
+            if folder_rows is not None
+            else None
         )
 
         try:
@@ -4788,9 +4853,15 @@ class SyncManager(QObject):
             remote_documents,
             identity_result.get("path_projections", ()),
         )
+        resolved_folder_rows = self._folder_rows_with_tree_paths(folder_rows)
         remote_folder_paths = {
-            item["local_path"]
-            for item in self._folder_rows_with_tree_paths(folder_rows).values()
+            item["local_path"] for item in resolved_folder_rows.values()
+        }
+        # Identity adopts the peer's folder id for the paths this pull creates,
+        # so the server's proof of who a directory is has to reach that far.
+        remote_folder_ids = {
+            self._tree_path_comparison_key(item["local_path"]): folder_id
+            for folder_id, item in resolved_folder_rows.items()
         }
 
         remote_live_document_paths = set()
@@ -4865,6 +4936,7 @@ class SyncManager(QObject):
                         changes,
                         remote_folder_paths,
                         folder_rows is not None,
+                        remote_folder_ids=remote_folder_ids,
                     )
                     if change:
                         changes.append(change)
@@ -5083,10 +5155,23 @@ class SyncManager(QObject):
                                 raise OSError("REMOTE_DOCUMENT_WRITE_FAILED")
                             continue
                     else:
-                        local_path = self._v2_wpm.materialize_remote_tombstone(
-                            remote_path, content, deleted_at, document_id
+                        known_path = self._identity_live_document_path(
+                            document_id
                         )
-                        created_tombstone_path = local_path
+                        if known_path and os.path.exists(full_path(known_path)):
+                            os.makedirs(full_path("메인/휴지통"), exist_ok=True)
+                            local_path = self._v2_wpm.move_to_trash(
+                                known_path, deleted_at, document_id
+                            )
+                            renamed_from, renamed_to = known_path, local_path
+                        else:
+                            local_path = self._v2_wpm.materialize_remote_tombstone(
+                                remote_path, content, deleted_at, document_id
+                            )
+                            created_tombstone_path = local_path
+                    self._settle_remote_identity(
+                        old_path, local_path, document_id, remote_folder_ids
+                    )
                     if not self._v2_wpm.write_text_file(local_path, content):
                         if created_tombstone_path:
                             self._v2_wpm.delete_from_trash(created_tombstone_path)
@@ -5119,7 +5204,16 @@ class SyncManager(QObject):
                             duplicate_unicode_path = old_path
                         else:
                             os.makedirs(os.path.dirname(new_full), exist_ok=True)
-                            os.rename(old_full, new_full)
+                            self._adopt_remote_identity(
+                                self._remote_identity_ancestor_entries(
+                                    local_path, remote_folder_ids
+                                )
+                            )
+                            self._relocate_remote_identity(
+                                old_path,
+                                local_path,
+                                lambda: os.rename(old_full, new_full),
+                            )
                             renamed_from, renamed_to = old_path, local_path
                     elif repair_unicode_path and os.path.exists(new_full):
                         try:
@@ -5147,11 +5241,22 @@ class SyncManager(QObject):
                                 raise
                             continue
 
+                    adopted = self._settle_remote_identity(
+                        old_path, local_path, document_id, remote_folder_ids
+                    )
                     if not self._v2_wpm.write_text_file(local_path, content):
+                        self._release_adopted_document(adopted, local_path)
                         if renamed_from and renamed_to:
                             try:
-                                os.rename(full_path(renamed_to), full_path(renamed_from))
-                            except OSError:
+                                self._relocate_remote_identity(
+                                    renamed_to,
+                                    renamed_from,
+                                    lambda: os.rename(
+                                        full_path(renamed_to),
+                                        full_path(renamed_from),
+                                    ),
+                                )
+                            except Exception:
                                 pass
                         if strict:
                             raise OSError("REMOTE_DOCUMENT_WRITE_FAILED")
@@ -5194,8 +5299,15 @@ class SyncManager(QObject):
                             pass
                     if renamed_from and renamed_to:
                         try:
-                            os.rename(full_path(renamed_to), full_path(renamed_from))
-                        except OSError:
+                            self._relocate_remote_identity(
+                                renamed_to,
+                                renamed_from,
+                                lambda: os.rename(
+                                    full_path(renamed_to),
+                                    full_path(renamed_from),
+                                ),
+                            )
+                        except Exception:
                             pass
                     if strict:
                         raise RuntimeError(
@@ -5235,6 +5347,14 @@ class SyncManager(QObject):
                         state=f"revision={revision};reason={code}",
                         pending_count=self.pending_retry_count,
                     )
+                if self._v2_identity_apply_failed or isinstance(
+                    error, (CreationError, IdentityError)
+                ):
+                    # Identity is not per-document work that can be skipped and
+                    # still add up to a finished pull. The folder projection is
+                    # already stored, so a pull that fails to name what it
+                    # stored has to say so instead of reporting nothing.
+                    self._block_pull_with_conflict(error)
                 print(f"Failed to apply remote v2 document: {error}")
         if tree_order_rows is not None and not defer_contract_tree_order:
             try:
@@ -5257,7 +5377,473 @@ class SyncManager(QObject):
         changes.extend(
             self._apply_remote_folder_tombstones(folder_rows, protected)
         )
+        if self._v2_identity_apply_failed:
+            # A deferred partial snapshot legitimately leaves the projection
+            # ahead of the tree; an identity failure leaves it describing
+            # folders nothing here can name.
+            self._restore_folder_snapshots(
+                previous_folder_snapshots, identity_result
+            )
         return changes
+
+    def _relocate_remote_empty_folder(self, item):
+        """Rename one proven empty directory, taking its identity node along."""
+        def apply_filesystem():
+            if not self._apply_remote_empty_folder_rename(
+                self._v2_wpm.writing_root_path, item
+            ):
+                raise RemoteRenameSkipped(item["old_relative_path"])
+            return True
+
+        try:
+            self._relocate_remote_identity(
+                item["old_relative_path"],
+                item["new_relative_path"],
+                apply_filesystem,
+            )
+        except RemoteRenameSkipped:
+            return False
+        return True
+
+    def _adopt_remote_tree_folders(self, folder_plan, renamed_items, folder_ids):
+        """Record every directory this tree snapshot is about to materialize.
+
+        The server's folder id is used wherever the pull carries one. A folder
+        the peer has no stable id for — a legacy tree-order-only entry — gets a
+        local id, exactly as it would had the writer created it here; the
+        outbound side then publishes that id rather than inventing a second one.
+
+        Directories that already exist are recorded too. They are in the tree
+        the open check audits either way, so leaving them unnamed is the same
+        divergence, only discovered later.
+        """
+        renamed_paths = {item["new_full_path"] for item in renamed_items or ()}
+        ids = folder_ids or {}
+        entries = [
+            {
+                "legacy_path": item["relative_path"],
+                "kind": "folder",
+                "uuid": ids.get(
+                    self._tree_path_comparison_key(item["relative_path"])
+                ),
+            }
+            for item in folder_plan
+            if item["full_path"] not in renamed_paths
+        ]
+        return self._adopt_remote_identity(entries)
+
+    def _identity_conflict_detail(self):
+        """Say which kind of divergence stopped this pull being recorded.
+
+        Neither message may promise that nothing changed. Both are found by
+        auditing what the apply already did, and by then a folder or a document
+        the snapshot brought can be on disk.
+        """
+        if self._v2_identity_uuid_conflicts:
+            return (
+                "같은 폴더를 서로 다른 UUID로 가리키고 있습니다. "
+                "일부 원격 변경이 로컬에 반영되었을 수 있습니다. "
+                "복구하기 전까지 동기화를 완료로 기록하지 않습니다."
+            )
+        return (
+            "원격 구조를 적용한 뒤 identity와 파일 트리가 어긋났습니다. "
+            "일부 원격 변경이 로컬에 반영되었을 수 있습니다. "
+            "동기화를 완료로 기록하지 않았습니다."
+        )
+
+    def _block_pull_with_conflict(self, error):
+        """Refuse to finish a pull whose structure or identity did not apply."""
+        self._v2_last_pull_apply_blocked = True
+        self._v2_identity_apply_failed = True
+        self._diagnostics.record(
+            "sync_structure_apply_blocked",
+            state=self._stable_error_code(error) or type(error).__name__,
+            pending_count=self.pending_retry_count,
+        )
+        self._set_sync_state(
+            "conflict",
+            "원격 구조를 identity 에 기록하지 못해 동기화를 완료로 "
+            "기록하지 않았습니다. 다음 동기화에서 다시 시도합니다.",
+        )
+
+    def _restore_folder_snapshots(self, previous, identity_result):
+        """Take back the folder rows this apply could not name — and only those.
+
+        A snapshot is not all-or-nothing: an exact folder-id rename can land
+        while a new folder beside it fails to be adopted. The renamed directory
+        is on disk under its new name, so its new row is what the tree shows
+        and must stay. The failed folder exists nowhere but in the database,
+        and is the row that has to go.
+        """
+        if previous is None:
+            return
+        local_key = self._v2_context["local_key"]
+        moved = [
+            (
+                self._tree_path_comparison_key(change.get("old_local_path")),
+                change.get("new_local_path"),
+            )
+            for change in (identity_result or {}).get("changes") or ()
+            if change.get("kind") == "folder_identity_rename"
+            and change.get("old_local_path")
+        ]
+
+        def followed_a_landed_rename(row):
+            key = self._tree_path_comparison_key(row.get("local_path"))
+            return any(
+                key == old_key or key.startswith(old_key + "/")
+                for old_key, _new_path in moved
+            )
+
+        try:
+            current = {
+                str(row["folder_id"]): row
+                for row in self._v2_store.list_folders(local_key)
+            }
+            restored = [
+                current[str(row["folder_id"])]
+                if followed_a_landed_rename(row) and str(row["folder_id"]) in current
+                else row
+                for row in previous
+            ]
+            self._v2_store.replace_folder_snapshots(local_key, restored)
+        except Exception as error:
+            self._diagnostics.record(
+                "sync_folder_projection_restore_failed",
+                state=self._stable_error_code(error) or type(error).__name__,
+                pending_count=self.pending_retry_count,
+            )
+
+    def _identity_uuid_divergences(self):
+        """Rows whose id disagrees with the identity node at the same path.
+
+        The path audit cannot see this: both sides name the same folder, and
+        only the ids differ. That is the shape a pull leaves behind when it
+        adopts nothing and the projection is written anyway, and it is what
+        makes the next outbound publish re-issue an id the server already has.
+        """
+        from project_creation_v1 import read_identity
+
+        project_root = self._identity_project_root()
+        if not project_root:
+            return []
+        nodes = read_identity(project_root)["nodes"]
+        by_path = {node["legacy_path"]: node for node in nodes}
+        by_uuid = {node["uuid"]: node for node in nodes}
+
+        local_key = self._v2_context["local_key"]
+        rows = [
+            (str(row.get("folder_id")), row)
+            for row in self._v2_store.list_folders(local_key)
+        ]
+        rows.extend(
+            (str(row.get("document_id")), row)
+            for row in self._v2_store.list_documents(local_key)
+        )
+        divergences = []
+        for entity_id, row in rows:
+            if row.get("is_deleted"):
+                continue
+            try:
+                local_path = self._safe_relative_path(row.get("local_path"))
+            except ValueError:
+                continue
+            if not local_path or is_internal_sync_path(local_path):
+                continue
+            at_path = by_path.get(local_path)
+            if at_path is not None and at_path["uuid"] != entity_id:
+                divergences.append(local_path)
+                continue
+            at_uuid = by_uuid.get(entity_id)
+            if at_uuid is not None and at_uuid["legacy_path"] != local_path:
+                divergences.append(local_path)
+        return sorted(set(divergences))
+
+    def _identity_project_root(self):
+        """The project directory whose identity file this pull must follow."""
+        root = getattr(self._v2_wpm, "writing_root_path", None)
+        if not root:
+            return None
+        from project_creation_v1 import identity_path
+
+        project_root = os.path.dirname(os.path.abspath(root))
+        if not os.path.exists(identity_path(project_root)):
+            # A legacy tree has no identity of record yet. Importing it is an
+            # explicit user action, never a side effect of a pull.
+            return None
+        return project_root
+
+    def _identity_call(self, action):
+        """Run one identity transaction, remembering that a failure was one.
+
+        What went wrong matters less than where: a full disk raises ``OSError``
+        and a refused adoption raises ``CreationError``, and either way this
+        pull has stored rows it could not name. The exception is re-raised
+        unchanged so callers still see the real error.
+        """
+        try:
+            return action()
+        except RemoteRenameSkipped:
+            raise
+        except BaseException as error:
+            self._v2_identity_apply_failed = True
+            raise
+
+    def _adopt_remote_identity(self, entries):
+        """Record the peer's ids for paths this pull is about to materialize.
+
+        A path identity already knows keeps its recorded id, so a snapshot that
+        claims a different one is noted rather than applied: the id is what
+        makes two items the same item, and only a recovery that has both sides
+        in front of it may change one.
+        """
+        from project_creation_v1 import adopt_remote_nodes, identity_uuid_conflicts
+
+        project_root = self._identity_project_root()
+        if not project_root or not entries:
+            return []
+        return self._identity_call(lambda: self._adopt_checked_identity(
+            project_root, entries, identity_uuid_conflicts, adopt_remote_nodes
+        ))
+
+    def _adopt_checked_identity(
+        self, project_root, entries, find_conflicts, adopt
+    ):
+        conflicts = find_conflicts(project_root, entries)
+        if conflicts:
+            self._note_identity_uuid_conflicts(conflicts)
+        return adopt(project_root, entries)
+
+    def _note_identity_uuid_conflicts(self, conflicts):
+        """Keep a snapshot's disagreeing ids where the success gate can see them."""
+        known = {item["legacy_path"] for item in self._v2_identity_uuid_conflicts}
+        for conflict in conflicts:
+            if conflict["legacy_path"] in known:
+                continue
+            self._v2_identity_uuid_conflicts.append(conflict)
+            self._diagnostics.record(
+                "sync_identity_uuid_conflict",
+                state=(
+                    f"path={conflict['legacy_path']};"
+                    f"recorded={conflict['recorded']};"
+                    f"proven={conflict['proven']}"
+                ),
+                pending_count=self.pending_retry_count,
+            )
+
+    def _remote_identity_ancestor_entries(self, relative_path, folder_ids=None):
+        """The folders above ``relative_path``, under the peer's ids where known.
+
+        A document cannot be recorded under a folder that has no UUID, and the
+        folders a pull creates arrive in the same snapshot, so the ancestors are
+        always offered for adoption first.
+        """
+        parts = str(relative_path or "").split("/")
+        ids = folder_ids or {}
+        return [
+            {
+                "legacy_path": "/".join(parts[:depth]),
+                "kind": "folder",
+                "uuid": ids.get(
+                    self._tree_path_comparison_key("/".join(parts[:depth]))
+                ),
+            }
+            for depth in range(1, len(parts))
+        ]
+
+    def _adopt_remote_identity_path(
+        self, relative_path, kind, entity_uuid, folder_ids=None
+    ):
+        """Record one remote path, and any ancestor identity does not know yet."""
+        entries = self._remote_identity_ancestor_entries(
+            relative_path, folder_ids
+        )
+        entries.append({
+            "legacy_path": relative_path,
+            "kind": kind,
+            "uuid": entity_uuid,
+        })
+        return self._adopt_remote_identity(entries)
+
+    def _release_adopted_identity(self, nodes, apply_filesystem):
+        """Give back ids adopted for a snapshot that did not land.
+
+        Identity is given back first and the entries follow only once that
+        write has landed. A failed release therefore keeps both, which still
+        opens, instead of deleting directories that identity would go on
+        naming.
+        """
+        from project_creation_v1 import release_adopted_nodes
+
+        project_root = self._identity_project_root()
+        if not project_root or not nodes:
+            return apply_filesystem()
+        return self._identity_call(
+            lambda: release_adopted_nodes(project_root, nodes, apply_filesystem)
+        )
+
+    def _identity_live_document_path(self, entity_uuid):
+        """Where identity says a document is when the sync store has no row.
+
+        Identity is the local authority for a document's location, so a remote
+        delete for a file this device created but never published moves that
+        file into 휴지통 instead of writing a second copy beside it. The copy
+        was the file identity could not name afterwards.
+        """
+        project_root = self._identity_project_root()
+        if not project_root:
+            return None
+        node = self._identity_node_by_uuid(project_root, entity_uuid)
+        if node is None or node["kind"] != "document":
+            return None
+        legacy_path = node["legacy_path"]
+        return legacy_path if is_live_document_path(legacy_path) else None
+
+    def _release_adopted_document(self, adopted, local_path):
+        """Give back the id and the placeholder of a document that never landed.
+
+        Adoption issues the id before the bytes exist, so a write that fails
+        would otherwise leave an empty file that the next attempt reads as a
+        conflicting copy of the same path.
+        """
+        node = next(
+            (
+                item for item in adopted or ()
+                if item["kind"] == "document"
+                and item["legacy_path"] == local_path
+            ),
+            None,
+        )
+        if node is None:
+            return
+        target = os.path.join(
+            os.path.abspath(self._v2_wpm.writing_root_path),
+            local_path.replace("/", os.sep),
+        )
+
+        def remove_placeholder():
+            if os.path.isfile(target) and os.path.getsize(target) == 0:
+                os.unlink(target)
+
+        try:
+            self._release_adopted_identity([node], remove_placeholder)
+        except Exception:
+            pass
+
+    def _identity_node_by_uuid(self, project_root, entity_uuid):
+        from project_creation_v1 import read_identity
+
+        if not entity_uuid:
+            return None
+        for node in read_identity(project_root)["nodes"]:
+            if node["uuid"] == str(entity_uuid):
+                return node
+        return None
+
+    def _relocate_remote_identity(self, old_path, new_path, apply_filesystem):
+        """Move a remote-driven path and take its identity node with it."""
+        from project_creation_v1 import relocate_path
+
+        project_root = self._identity_project_root()
+        if not project_root:
+            return apply_filesystem()
+        return self._identity_call(
+            lambda: relocate_path(
+                project_root, old_path, new_path, apply_filesystem
+            )
+        )
+
+    def _settle_remote_identity(
+        self, old_path, new_path, entity_uuid, folder_ids=None
+    ):
+        """Name a document this pull has already written to ``new_path``.
+
+        The bytes can land before identity can follow them — a preserved trash
+        copy, a path repaired in place — so the node is moved, or recorded for
+        the first time, afterwards. A node that already names the path is left
+        exactly as it is, which keeps a repeated pull free.
+
+        The node only follows when its own file is gone. A copy taken beside a
+        file that is still there is a new node, never a move that would leave
+        the original unnamed.
+        """
+        from project_creation_v1 import node_for_path
+
+        project_root = self._identity_project_root()
+        if not project_root or not new_path:
+            return []
+        if node_for_path(project_root, new_path) is not None:
+            return []
+        node = node_for_path(project_root, old_path) if old_path else None
+        if node is None:
+            node = self._identity_node_by_uuid(project_root, entity_uuid)
+        root = os.path.abspath(self._v2_wpm.writing_root_path)
+        if node is not None and not os.path.lexists(
+            os.path.join(root, node["legacy_path"].replace("/", os.sep))
+        ):
+            self._relocate_remote_identity(
+                node["legacy_path"], new_path, lambda: None
+            )
+            return []
+        return self._adopt_remote_identity_path(
+            new_path, "document", entity_uuid, folder_ids
+        )
+
+    def _identity_audit_is_clean(self):
+        """Whether identity and the file tree still agree after an apply.
+
+        A snapshot that materialized a file identity does not name opens as a
+        blocked project on the next launch. Calling that pull applied would
+        hide the divergence until then, so it is reported and retried instead.
+        """
+        from project_creation_v1 import CreationError, audit
+        from project_identity_v1 import IdentityError
+
+        project_root = self._identity_project_root()
+        if not project_root:
+            return True
+        if self._v2_identity_uuid_conflicts:
+            return False
+        try:
+            report = audit(project_root)
+        except (IdentityError, CreationError, OSError) as error:
+            state = self._stable_error_code(error) or type(error).__name__
+            self._diagnostics.record(
+                "sync_identity_audit_failed",
+                state=state,
+                pending_count=self.pending_retry_count,
+            )
+            return False
+        try:
+            crossed = self._identity_uuid_divergences()
+        except Exception as error:
+            # An audit that cannot run is not a clean audit.
+            state = self._stable_error_code(error) or type(error).__name__
+            self._diagnostics.record(
+                "sync_identity_audit_failed",
+                state=state,
+                pending_count=self.pending_retry_count,
+            )
+            return False
+        if crossed:
+            self._diagnostics.record(
+                "sync_identity_uuid_divergence",
+                state=f"paths={len(crossed)}",
+                pending_count=self.pending_retry_count,
+            )
+            return False
+        if not any(report.values()):
+            return True
+        self._diagnostics.record(
+            "sync_identity_divergence",
+            state=(
+                f"missing_on_disk={len(report['missing_on_disk'])};"
+                f"missing_in_identity={len(report['missing_in_identity'])};"
+                f"pending_journals={len(report['pending_journals'])}"
+            ),
+            pending_count=self.pending_retry_count,
+        )
+        return False
 
     def _identity_folder_by_uuid(self, folder_uuid):
         from project_creation_v1 import identity_folder_nodes
@@ -5472,6 +6058,19 @@ class SyncManager(QObject):
                     tree_order_rows=tree_order_rows,
                 )
                 if self._v2_last_pull_apply_blocked:
+                    return
+                # A structure pull is audited whether or not it reported a
+                # change: the apply that quietly skipped its identity work is
+                # exactly the one that reports nothing.
+                audited = bool(changes or folder_rows or tree_order_rows)
+                if audited and not self._identity_audit_is_clean():
+                    # Something landed that identity cannot name. Reporting the
+                    # pull as applied would hide that until the next launch
+                    # refuses to open the project.
+                    self._v2_last_pull_apply_blocked = True
+                    self._set_sync_state(
+                        "conflict", self._identity_conflict_detail()
+                    )
                     return
                 recovered_count = self._recover_untracked_local_files_after_pull(
                     documents

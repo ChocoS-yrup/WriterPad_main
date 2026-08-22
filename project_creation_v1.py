@@ -440,6 +440,181 @@ def create_volume(project_root, uuid_factory=None):
     return _run_item_transaction(project_root, "create_volume", nodes, uuid_factory)
 
 
+def adopt_remote_nodes(project_root, entries, uuid_factory=None):
+    """Record the ids a peer already issued for items a pull is materializing.
+
+    Each entry carries ``legacy_path``, ``kind`` and the ``uuid`` the server
+    proved for that path. That uuid is used exactly as given: a snapshot that
+    arrives with a folder id is that folder, and minting a second id for it
+    here is what left the file tree and identity disagreeing after a pull.
+    Only a path no peer has an id for gets a generated one, which is the same
+    thing that happens when the writer creates it locally.
+
+    A path identity already knows keeps the id it already has, so an
+    interrupted pull can repeat the whole batch. It is never re-pointed at the
+    id the snapshot carries: a recorded id is the one other devices, backups
+    and journals already refer to. When the two disagree, that is a divergence
+    to report — ``identity_uuid_conflicts`` names them — and never something to
+    resolve by overwriting one side here.
+
+    A parent that identity does not know, a kind that disagrees with the
+    recorded one, or an id already recorded at another path is refused: the
+    pull must be deferred rather than guessed at.
+
+    Nodes are created through the ordinary journalled transaction, so the ids
+    are durable before the first directory or file exists.
+    """
+    if not os.path.exists(identity_path(project_root)):
+        return []
+
+    identity = read_identity(project_root)
+    by_path = {node["legacy_path"]: node for node in identity["nodes"]}
+    by_uuid = {node["uuid"]: node for node in identity["nodes"]}
+    next_order = {}
+    for node in identity["nodes"]:
+        parent = node["parent_uuid"]
+        next_order[parent] = max(
+            next_order.get(parent, 0), int(node["order"]) + 1
+        )
+
+    pending = []
+    # Shallowest first: a node cannot be recorded before its parent, and the
+    # batch may carry both.
+    for entry in sorted(
+        entries, key=lambda item: str(item.get("legacy_path") or "").count("/")
+    ):
+        legacy_path = str(entry.get("legacy_path") or "")
+        kind = str(entry.get("kind") or "")
+        if not legacy_path or kind not in KINDS:
+            raise CreationError(f"unusable remote node {entry!r}")
+
+        existing = by_path.get(legacy_path)
+        if existing is not None:
+            if existing["kind"] != kind:
+                raise CreationError(
+                    f"{legacy_path!r} is recorded as a {existing['kind']}, "
+                    f"the snapshot calls it a {kind}"
+                )
+            continue
+
+        parent_uuid = None
+        if "/" in legacy_path:
+            parent_path = legacy_path.rsplit("/", 1)[0]
+            parent = by_path.get(parent_path)
+            if parent is None or parent["kind"] != KIND_FOLDER:
+                raise CreationError(
+                    f"no folder identity for the parent of {legacy_path!r}"
+                )
+            parent_uuid = parent["uuid"]
+
+        node_uuid = str(entry.get("uuid") or "") or _new_uuid(uuid_factory)
+        clashing = by_uuid.get(node_uuid)
+        if clashing is not None:
+            raise CreationError(
+                f"{node_uuid} is already recorded at "
+                f"{clashing['legacy_path']!r}, not {legacy_path!r}"
+            )
+
+        order = next_order.get(parent_uuid, 0)
+        next_order[parent_uuid] = order + 1
+        node = identity_node({
+            "uuid": node_uuid,
+            "kind": kind,
+            "parent_uuid": parent_uuid,
+            "legacy_path": legacy_path,
+            "order": order,
+        })
+        by_path[legacy_path] = node
+        by_uuid[node_uuid] = node
+        pending.append(node)
+
+    if not pending:
+        return []
+
+    root = writing_root(project_root)
+    created = [
+        node for node in pending
+        if not os.path.lexists(
+            os.path.join(root, node["legacy_path"].replace("/", os.sep))
+        )
+    ]
+    transaction_id = _new_uuid(uuid_factory)
+    try:
+        _run_item_transaction(
+            project_root, "adopt_remote", pending, uuid_factory, transaction_id
+        )
+    except BaseException:
+        _discard_adoption(project_root, transaction_id, created)
+        raise
+    return pending
+
+
+def identity_uuid_conflicts(project_root, entries):
+    """Report entries whose path identity knows under a different id.
+
+    Adoption skips a path it already knows, which is right — the recorded id is
+    the one everything else already refers to — but skipping quietly is what
+    let a folder keep one uuid here and another on the server. Nothing here
+    writes; the caller decides that a pull carrying such a claim cannot be
+    reported as applied.
+    """
+    if not os.path.exists(identity_path(project_root)):
+        return []
+    recorded = {
+        node["legacy_path"]: node
+        for node in read_identity(project_root)["nodes"]
+    }
+    conflicts = []
+    for entry in entries or ():
+        legacy_path = str(entry.get("legacy_path") or "")
+        proven = str(entry.get("uuid") or "")
+        node = recorded.get(legacy_path)
+        if not proven or node is None or node["uuid"] == proven:
+            continue
+        conflicts.append({
+            "legacy_path": legacy_path,
+            "recorded": node["uuid"],
+            "proven": proven,
+        })
+    return conflicts
+
+
+def _discard_adoption(project_root, transaction_id, created):
+    """Drop a half-applied adoption instead of resuming it.
+
+    A creation journal is resumed because only it remembers what the writer
+    asked for. An adoption remembers nothing of the sort: every id in it is the
+    server's, or one nothing has referenced yet, so the next pull carrying the
+    same snapshot adopts exactly the same ids. Leaving the transaction pending
+    would instead materialize part of a snapshot the pull rolled back.
+
+    Only entries this transaction created are removed, only while they are
+    still empty, and never once identity has recorded them.
+    """
+    journal = os.path.join(
+        project_journal_dir(project_root), f"{transaction_id}.json"
+    )
+    if os.path.exists(journal):
+        os.unlink(journal)
+    try:
+        recorded = {node["uuid"] for node in read_identity(project_root)["nodes"]}
+    except (IdentityError, OSError):
+        return
+    root = writing_root(project_root)
+    for node in reversed(created):
+        if node["uuid"] in recorded:
+            continue
+        target = os.path.join(root, node["legacy_path"].replace("/", os.sep))
+        try:
+            if node["kind"] == KIND_FOLDER:
+                if _is_empty_dir(target):
+                    os.rmdir(target)
+            elif os.path.isfile(target) and os.path.getsize(target) == 0:
+                os.unlink(target)
+        except OSError:
+            pass
+
+
 OPEN_OK = "ok"
 OPEN_LEGACY = "legacy"
 OPEN_BLOCKED = "blocked"
@@ -633,6 +808,52 @@ def journalled_relocate(project_root, moves, apply_filesystem):
     return identity, result
 
 
+def relocate_path(project_root, source_rel, target_rel, apply_filesystem):
+    """Move one node on disk and follow it in identity, keeping its UUID.
+
+    A project with no identity file (a legacy tree, or a bare manager in a
+    test) just gets the filesystem move: there is nothing to keep in sync, and
+    inventing an entry here would issue a UUID outside a creation.
+
+    A target identity already knows, reached from a source it also knows, is
+    two nodes for one path. That is refused before anything moves, because
+    picking one of them is exactly the guess the shared contract forbids.
+    """
+    node = None
+    if os.path.exists(identity_path(project_root)):
+        node = node_for_path(project_root, source_rel)
+    if node is None:
+        return apply_filesystem()
+
+    if node_for_path(project_root, target_rel) is not None:
+        raise CreationError(
+            f"{target_rel!r} is already recorded under another uuid; "
+            f"{source_rel!r} cannot be moved onto it"
+        )
+
+    parent_rel = target_rel.rsplit("/", 1)[0] if "/" in target_rel else None
+    parent = node_for_path(project_root, parent_rel) if parent_rel else None
+    if parent_rel and parent is None:
+        raise CreationError(
+            f"no folder identity for the parent of {target_rel!r}"
+        )
+    parent_uuid = parent["uuid"] if parent else None
+    move = {
+        "uuid": node["uuid"],
+        "parent_uuid": parent_uuid,
+        "legacy_path": target_rel,
+        "title": target_rel.rsplit("/", 1)[-1],
+    }
+    if parent_uuid != node["parent_uuid"]:
+        # Only an actual reparenting takes a new sibling slot. Renaming in
+        # place must keep the position the writer put the item in.
+        move["order"] = next_order_under(project_root, parent_uuid)
+    if node["kind"] == KIND_DOCUMENT and move["title"].endswith(".txt"):
+        move["title"] = move["title"][: -len(".txt")]
+    _identity, result = journalled_relocate(project_root, [move], apply_filesystem)
+    return result
+
+
 def journalled_remove(project_root, removals, apply_filesystem):
     """Delete files and their identity entries as one recoverable transaction.
 
@@ -667,6 +888,90 @@ def journalled_remove(project_root, removals, apply_filesystem):
     )
     os.unlink(journal)
     return identity, result
+
+
+def release_adopted_nodes(project_root, nodes, apply_filesystem):
+    """Drop adopted ids, and the entries they name only if that write landed.
+
+    An ordinary removal deletes the files first because the writer asked for
+    the deletion and identity has to follow it. Nothing asked for this one: it
+    undoes an adoption a pull could not finish. So identity goes first, and the
+    entries are only removed once they are nameless. Deleting them on a failed
+    identity write would turn a rollback into the opposite corruption — nodes
+    naming files that are gone, which is what refuses to open — while keeping
+    both leaves a tree that still opens: named directories nothing has
+    published yet, which the next pull reconciles.
+
+    The journal records the intent before either step, so an interrupted
+    release is something the next open sees rather than something nobody knows
+    happened.
+    """
+    if not nodes:
+        return None, apply_filesystem()
+
+    transaction_id = _new_uuid(None)
+    journal = os.path.join(
+        project_journal_dir(project_root), f"{transaction_id}.json"
+    )
+    _write_json_atomic(
+        journal,
+        {
+            "format_version": JOURNAL_VERSION,
+            "transaction_id": transaction_id,
+            "kind": "release_adopted",
+            "project_root": project_root,
+            "removals": [
+                {"uuid": node["uuid"], "legacy_path": node["legacy_path"],
+                 "kind": node["kind"]}
+                for node in nodes
+            ],
+        },
+    )
+    # A failure here deliberately leaves the journal behind: identity and the
+    # tree still agree, and the next open is told that this release is unfinished.
+    identity = remove_nodes(project_root, [node["uuid"] for node in nodes])
+    result = apply_filesystem()
+    os.unlink(journal)
+    return identity, result
+
+
+def _finish_release_adopted(entry, journal_path):
+    """Finish an interrupted release without deleting anything that holds bytes.
+
+    Whatever identity still records stays exactly where it is — that half of
+    the release simply did not happen. What identity no longer records is
+    removed only while it is empty, which is all an adoption can have created.
+
+    A delete that fails keeps the journal. Dropping it would leave a directory
+    nothing names and no record that anything meant to remove it, which is a
+    project that will not open and cannot say why. Repeating the removal is
+    free: an entry already gone is skipped.
+    """
+    project_root = entry["project_root"]
+    root = writing_root(project_root)
+    recorded = {node["uuid"] for node in read_identity(project_root)["nodes"]}
+    unfinished = False
+    for removal in reversed(entry["removals"]):
+        if removal["uuid"] in recorded:
+            continue
+        target = os.path.join(
+            root, removal["legacy_path"].replace("/", os.sep)
+        )
+        try:
+            if removal.get("kind") == KIND_FOLDER:
+                if _is_empty_dir(target):
+                    os.rmdir(target)
+            elif os.path.isfile(target) and os.path.getsize(target) == 0:
+                os.unlink(target)
+        except OSError:
+            # A lock or a full volume can pass. Anything this transaction is
+            # not allowed to remove — a directory someone has put a file in —
+            # is not an error and is left to the audit to report.
+            unfinished = True
+    if unfinished:
+        return []
+    os.unlink(journal_path)
+    return entry["removals"]
 
 
 def _finish_remove(entry, journal_path):
@@ -727,6 +1032,8 @@ def recover_project(project_root):
             _finish_relocate(entry, journal_path)
         elif entry.get("kind") == "remove":
             _finish_remove(entry, journal_path)
+        elif entry.get("kind") == "release_adopted":
+            _finish_release_adopted(entry, journal_path)
         else:
             _finish_item_transaction(entry, journal_path)
         results.append((entry["transaction_id"], entry["kind"]))
