@@ -6501,6 +6501,23 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
     def _project_root(self):
         return os.path.dirname(self.wpm.writing_root_path)
 
+    def _live_folder_ids(self, rows=None):
+        """projection 이 지금 살아 있다고 말하는 폴더들.
+
+        서버가 tombstone 한 폴더의 행은 지워지지 않고 은퇴한다 — id 와 revision 이
+        나중의 복원에 필요하기 때문이다. 그래서 "행이 없다" 가 아니라 "live 가
+        아니다" 가 되감기의 불변식이다.
+        """
+        rows = self.store.list_folders(self.context["local_key"]) if rows is None else rows
+        return [row["folder_id"] for row in rows if not row["is_deleted"]]
+
+    def _assert_not_live(self, folder_id):
+        row = self.store.get_folder_by_id(folder_id)
+        self.assertTrue(
+            row is None or row["is_deleted"],
+            f"{folder_id} 가 live 행으로 남았다",
+        )
+
     def _identity_node(self, legacy_path):
         return node_for_path(self._project_root(), legacy_path)
 
@@ -6851,13 +6868,11 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertTrue(self.manager._v2_last_pull_apply_blocked)
         self.assertEqual(self.manager.current_sync_state, "conflict")
         self.assertIsNone(self._identity_node(f"메인/메모장/{name}"))
-        # 이름 붙이지 못한 폴더 행을 데이터베이스에 남겨두지 않는다.
-        after = self.store.list_folders(self.context["local_key"])
+        # 이름 붙이지 못한 폴더를 live 행으로 남겨두지 않는다.
         self.assertEqual(
-            [row["folder_id"] for row in after],
-            [row["folder_id"] for row in before],
+            self._live_folder_ids(), self._live_folder_ids(before)
         )
-        self.assertIsNone(self.store.get_folder_by_id(folder_id))
+        self._assert_not_live(folder_id)
         self.assertEqual(self.manager._identity_uuid_divergences(), [])
         self._assert_project_still_opens()
 
@@ -6914,13 +6929,9 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertTrue(self.manager._v2_last_pull_apply_blocked)
         self.assertEqual(self.manager.current_sync_state, "conflict")
         self.assertIsNone(self._identity_node(f"메인/메모장/{name}"))
-        self.assertIsNone(self.store.get_folder_by_id(folder_id))
+        self._assert_not_live(folder_id)
         self.assertEqual(
-            [
-                row["folder_id"] for row in
-                self.store.list_folders(self.context["local_key"])
-            ],
-            [row["folder_id"] for row in before],
+            self._live_folder_ids(), self._live_folder_ids(before)
         )
         self._assert_project_still_opens()
 
@@ -6982,7 +6993,7 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertEqual(renamed_row["local_path"], "메인/이름후")
         self.assertEqual(renamed_row["revision"], 2)
         # 아무 데도 만들어지지 못한 폴더의 행만 사라진다.
-        self.assertIsNone(self.store.get_folder_by_id(created_id))
+        self._assert_not_live(created_id)
         self.assertIsNone(self._identity_node("메인/메모장/새 폴더"))
         self.assertFalse(
             Path(self.wpm.writing_root_path, "메인", "메모장", "새 폴더").exists()

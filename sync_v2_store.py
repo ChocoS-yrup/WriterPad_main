@@ -48,6 +48,12 @@ def _normalize_path(path):
     )
 
 
+# Where a folder row goes once the server projection stops listing it. The
+# row stays for its id and revision; the path only has to be one no live folder
+# can ever hold, because sync_folders is unique on (local_key, local_path).
+FOLDER_TOMBSTONE_PREFIX = "__folder_tombstone__"
+
+
 class SyncV2Store:
     """SQLite-backed identity, revision and durable operation queue for sync v2."""
 
@@ -1760,7 +1766,23 @@ class SyncV2Store:
             return [dict(row) for row in rows]
 
     def replace_folder_snapshots(self, local_key, snapshots):
-        """Replace the server-proven folder ID projection without inventing IDs."""
+        """Apply the server-proven folder ID projection without inventing IDs.
+
+        A folder the projection no longer lists is one the server has
+        tombstoned. Dropping its row took the revision with it, and the
+        revision is what a later restore has to name to say what it is
+        restoring from — a non-create intent with no revision is invalid by the
+        contract's own rule. So the row is kept and marked deleted instead.
+
+        A retired row keeps the path it was last seen at, because that is what
+        says where the folder was. Only when the incoming projection claims
+        that exact path does the row move aside — ``UNIQUE(local_key,
+        local_path)`` allows just one holder — and then to a path no live
+        folder can ever take. Nothing addresses a folder by that marker:
+        ``get_folder_by_path`` reads live rows only and the storage-name index
+        excludes deleted ones. The iPad projection keeps tombstones the same
+        way, per folder id.
+        """
         normalized = []
         for snapshot in snapshots or []:
             folder_id = str(uuid.UUID(str(snapshot["folder_id"])))
@@ -1795,23 +1817,42 @@ class SyncV2Store:
             ):
                 raise SyncContractError("FOLDER_PROJECT_IDENTITY_CONFLICT")
             folder_ids = {item[0] for item in normalized}
+            # Retire what the projection dropped, keeping its id, revision and
+            # the path it was last known at. A restore commits against that
+            # revision, and the contract planner reads that path.
+            retire = (
+                "UPDATE sync_folders SET is_deleted = 1, updated_at = ? "
+                "WHERE local_key = ? AND is_deleted = 0"
+            )
             if folder_ids:
                 placeholders = ",".join("?" for _ in folder_ids)
                 connection.execute(
-                    f"DELETE FROM sync_folders WHERE local_key = ? "
-                    f"AND folder_id NOT IN ({placeholders})",
-                    (local_key, *sorted(folder_ids)),
+                    f"{retire} AND folder_id NOT IN ({placeholders})",
+                    (now, local_key, *sorted(folder_ids)),
                 )
+            else:
+                connection.execute(retire, (now, local_key))
+
+            # Only a retired row standing on a path the incoming projection
+            # claims has to move, and it moves to a path no live folder can
+            # hold. Everything else keeps where it was.
+            incoming_paths = sorted({item[2] for item in normalized})
+            if incoming_paths:
+                connection.execute(
+                    "UPDATE sync_folders "
+                    f"SET local_path = '{FOLDER_TOMBSTONE_PREFIX}/' || folder_id, "
+                    "updated_at = ? "
+                    "WHERE local_key = ? AND is_deleted = 1 "
+                    f"AND local_path IN ({','.join('?' for _ in incoming_paths)})",
+                    (now, local_key, *incoming_paths),
+                )
+                # Vacate the paths the incoming rows are about to take.
                 for folder_id in sorted(folder_ids):
                     connection.execute(
                         "UPDATE sync_folders SET local_path = ? "
                         "WHERE folder_id = ? AND local_key = ?",
                         (f"__folder_transition__/{folder_id}", folder_id, local_key),
                     )
-            else:
-                connection.execute(
-                    "DELETE FROM sync_folders WHERE local_key = ?", (local_key,)
-                )
             for item in normalized:
                 (
                     folder_id, parent_id, local_path, name, storage_name_key,

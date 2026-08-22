@@ -593,6 +593,101 @@ class ContractStoreTests(unittest.TestCase):
             "cancelled",
         )
 
+    def test_a_pull_between_delete_and_restore_keeps_the_row_it_needs(self):
+        """서버가 폴더를 tombstone 한 뒤 pull 이 와도 복원 intent 를 만들 수 있어야 한다.
+
+        폴더 projection 은 서버의 live 행을 받아 통째로 교체한다. 삭제된 폴더는
+        live 집합에 없으므로, 그 행을 지워버리면 revision 이 함께 사라진다.
+        계약은 create 가 아닌 intent 에 revision 1 이상을 요구하므로, revision 을
+        잃으면 복원 intent 를 만들 수 없다 — 그리고 아무 말 없이 빈 목록이 된다.
+        """
+        manager = self._contract_manager()
+        parent = self._folder_snapshot("메인/메모장")
+        created_path = "메인/메모장/새 폴더"
+        created = self._folder_snapshot(
+            created_path, parent_id=parent["folder_id"], revision=4
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, created]
+        )
+        folder_id = created["folder_id"]
+
+        delete_operations = manager.record_tombstone(
+            created_path, "메인/휴지통/새 폴더", retry=False
+        )
+        manager.queue_contract_path_change_with_order(
+            delete_operations, {"메인/메모장": []}, retry=False
+        )
+        self.assertTrue(self.store.get_folder_by_id(folder_id)["is_deleted"])
+
+        # 여기서 pull 이 한 번 돈다. 서버는 그 폴더를 live 로 주지 않는다.
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent]
+        )
+        retired = self.store.get_folder_by_id(folder_id)
+        self.assertIsNotNone(retired, "삭제된 폴더의 행이 사라졌다")
+        self.assertTrue(retired["is_deleted"])
+        self.assertEqual(retired["revision"], 4, "복원이 걸 revision 이 사라졌다")
+        self.assertEqual(retired["local_path"], created_path)
+
+        restore_operations = manager.record_restore(
+            "메인/휴지통/새 폴더",
+            created_path,
+            original_rel_path=created_path,
+            retry=False,
+        )
+        restore_request = manager.queue_contract_path_change_with_order(
+            restore_operations,
+            {"메인/메모장": ["새 폴더"]},
+            retry=False,
+        )
+        intents = restore_request["ordered_intents"]
+        self.assertIn("restore", [item["intent_kind"] for item in intents])
+        restore_intent = next(
+            item for item in intents if item["intent_kind"] == "restore"
+        )
+        self.assertEqual(restore_intent["entity_id"], folder_id)
+        # create 가 아닌 intent 는 revision 1 이상이어야 한다.
+        self.assertGreaterEqual(restore_intent["base_revision"], 1)
+        self.assertEqual(restore_intent["base_revision"], 4)
+
+    def test_a_retired_row_only_moves_when_a_live_folder_claims_its_path(self):
+        """은퇴한 행은 자기 경로를 지킨다. 그 경로를 새 폴더가 가져갈 때만 비켜난다."""
+        parent = self._folder_snapshot("메인/메모장")
+        contested = "메인/메모장/같은 자리"
+        quiet = "메인/메모장/조용한 자리"
+        first = self._folder_snapshot(
+            contested, parent_id=parent["folder_id"], revision=2
+        )
+        second = self._folder_snapshot(
+            quiet, parent_id=parent["folder_id"], revision=3
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, first, second]
+        )
+
+        # 서버가 둘 다 내리고, 그중 한 자리를 새 폴더가 차지한다.
+        replacement = self._folder_snapshot(
+            contested, parent_id=parent["folder_id"], revision=1
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], [parent, replacement]
+        )
+
+        moved = self.store.get_folder_by_id(first["folder_id"])
+        stayed = self.store.get_folder_by_id(second["folder_id"])
+        self.assertTrue(moved["is_deleted"])
+        self.assertTrue(stayed["is_deleted"])
+        self.assertEqual(moved["revision"], 2)
+        self.assertEqual(stayed["revision"], 3)
+        self.assertEqual(
+            stayed["local_path"], quiet, "다투지 않은 행이 자리를 잃었다"
+        )
+        self.assertNotEqual(moved["local_path"], contested)
+        # 그 자리는 새 폴더가 live 로 가진다.
+        live = self.store.get_folder_by_path(self.context["local_key"], contested)
+        self.assertEqual(live["folder_id"], replacement["folder_id"])
+
     def test_folder_create_delete_restore_are_atomic_lifecycle_batches(self):
         manager = self._contract_manager()
         parent = self._folder_snapshot("메인/메모장")

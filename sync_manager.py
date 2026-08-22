@@ -2464,6 +2464,7 @@ class SyncManager(QObject):
             for item in self._v2_store.list_folders(
                 self._v2_context["local_key"]
             )
+            if not item.get("is_deleted")
         }
         return any(
             isinstance(row, dict)
@@ -4267,11 +4268,15 @@ class SyncManager(QObject):
             self._tree_path_comparison_key(f"메인/{storage_name}")
             for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
         }
+        # Live rows only. A retired row keeps its id and revision for a later
+        # restore, but its path is a tombstone marker and would be read here as
+        # the folder's previous location.
         stored = {
             str(item["folder_id"]): item
             for item in self._v2_store.list_folders(
                 self._v2_context["local_key"]
             )
+            if not item.get("is_deleted")
         }
         # ``folders`` is the stable identity projection. If tree-order omits a
         # user-created identified folder, the two server projections are from
@@ -5594,11 +5599,14 @@ class SyncManager(QObject):
                 str(row["folder_id"]): row
                 for row in self._v2_store.list_folders(local_key)
             }
+            # Retired rows are re-derived by the projection itself. Handing one
+            # back would republish it as a live folder at its tombstone path.
             restored = [
                 current[str(row["folder_id"])]
                 if followed_a_landed_rename(row) and str(row["folder_id"]) in current
                 else row
                 for row in previous
+                if not row.get("is_deleted")
             ]
             self._v2_store.replace_folder_snapshots(local_key, restored)
         except Exception as error:
@@ -7288,6 +7296,9 @@ class SyncManager(QObject):
     ):
         old_rel_path = self._safe_relative_path(old_rel_path)
         new_rel_path = self._safe_relative_path(new_rel_path)
+        # The projection retires a folder the server tombstoned instead of
+        # dropping it, so the row that says what revision a restore commits
+        # against is still here.
         folders = [
             folder for folder in self._v2_store.list_folders(
                 self._v2_context["local_key"]
@@ -7358,7 +7369,6 @@ class SyncManager(QObject):
                 "pending_folders": pending_folders,
             },
         }
-
     def record_path_change(self, old_rel_path, new_rel_path, retry=True):
         if not self.is_v2_enabled:
             return []
