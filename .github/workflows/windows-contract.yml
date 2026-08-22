@@ -72,16 +72,106 @@ jobs:
       - name: Install pinned Windows dependencies
         run: python -m pip install -r requirements-stage8.txt
 
-      - name: Run Windows client tests
-        # -X faulthandler: a Qt widget test can take the interpreter down
-        # without raising, and unittest then prints nothing at all. This makes
-        # the runner dump the C stack so the next failure names its own cause.
-        run: python -X faulthandler -m unittest discover -s tests -v
+      - name: Install ProcDump exception monitor
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $env:RUNNER_TEMP "writerpad-crash-dumps"
+          New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP "procdump.zip"
+          $toolsDir = Join-Path $env:RUNNER_TEMP "procdump"
+          Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Procdump.zip" -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $toolsDir -Force
+          $procdump = Join-Path $toolsDir "procdump64.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $procdump
+          if ($signature.Status -ne "Valid" -or
+              $signature.SignerCertificate.Subject -notlike "*Microsoft*") {
+            throw "ProcDump signature is not valid Microsoft code"
+          }
+          "PROCDUMP_PATH=$procdump" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "WRITERPAD_DUMP_DIR=$dumpDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Run Windows client tests under ProcDump exception monitor
+        id: windows_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          # This is the last diagnostic fallback. Unlike the passive attempts,
+          # ProcDump attaches as an exception monitor and may change timing.
+          & $env:PROCDUMP_PATH -accepteula -ma -e -x $env:WRITERPAD_DUMP_DIR $python -X faulthandler -m unittest discover -s tests -v
+          $monitorExitCode = $LASTEXITCODE
+          $dumps = @(Get-ChildItem -LiteralPath $env:WRITERPAD_DUMP_DIR -Filter "*.dmp" -File -ErrorAction SilentlyContinue)
+          "WRITERPAD_TEST_EXIT_CODE=$monitorExitCode" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "ProcDump monitor exit code: $monitorExitCode"
+          Write-Host "ProcDump immediate dump count: $($dumps.Count)"
+          if ($dumps.Count -gt 0) { exit 1 }
+          exit $monitorExitCode
+
+      - name: Install debugger after the uninstrumented failure
+        if: steps.windows_tests.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $cdb = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+          if (-not (Test-Path -LiteralPath $cdb)) {
+            $installer = Join-Path $env:RUNNER_TEMP "winsdksetup.exe"
+            Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2272610" -OutFile $installer
+            $signature = Get-AuthenticodeSignature -LiteralPath $installer
+            if ($signature.Status -ne "Valid" -or
+                $signature.SignerCertificate.Subject -notlike "*Microsoft*") {
+              throw "Windows SDK installer signature is not valid Microsoft code"
+            }
+            $install = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+              "/features", "OptionId.WindowsDesktopDebuggers", "/quiet", "/norestart"
+            )
+            if ($install.ExitCode -ne 0) {
+              throw "Windows debugger installation failed: $($install.ExitCode)"
+            }
+          }
+          if (-not (Test-Path -LiteralPath $cdb)) {
+            throw "cdb.exe was not installed"
+          }
+          "CDB_PATH=$cdb" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Analyze ProcDump exception dump
+        if: steps.windows_tests.outcome == 'failure'
+        shell: pwsh
+        run: |
+          # Poll briefly so ProcDump filesystem visibility cannot race.
+          $dumps = @()
+          for ($poll = 0; $poll -lt 15; $poll++) {
+            $dumps = @(Get-ChildItem -LiteralPath $env:WRITERPAD_DUMP_DIR -Filter "*.dmp" -File -ErrorAction SilentlyContinue)
+            if ($dumps.Count -gt 0) { break }
+            Start-Sleep -Seconds 2
+          }
+          Write-Host "Uninstrumented test exit code: $env:WRITERPAD_TEST_EXIT_CODE"
+          Write-Host "ProcDump exception dump count: $($dumps.Count)"
+          if ($dumps.Count -eq 0) {
+            throw "The ProcDump-monitored test failed but produced no crash dump"
+          }
+          $commands = @(
+            ".echo ===== WER CRASH DUMP ====="
+            ".lastevent"
+            ".ecxr"
+            "!analyze -v"
+            "~* kv 100"
+            "lm"
+            "q"
+          ) -join ";"
+          foreach ($dump in $dumps) {
+            Write-Host "Analyzing $($dump.FullName) ($($dump.Length) bytes)"
+            & $env:CDB_PATH -y "srv*$env:RUNNER_TEMP\symbols*https://msdl.microsoft.com/download/symbols" -c $commands -z $dump.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "CDB failed to analyze $($dump.FullName): $LASTEXITCODE"
+            }
+          }
+          throw "Original uninstrumented Windows tests failed; native dump analysis is above"
 
       - name: Build distributable executable
+        if: steps.windows_tests.outcome == 'success'
         run: python -m PyInstaller --noconfirm --clean Antigravity_AI_Writer.spec
 
       - name: Record executable digest
+        if: steps.windows_tests.outcome == 'success'
         shell: pwsh
         run: |
           $artifact = Get-Item -LiteralPath dist/Antigravity_AI_Writer.exe
