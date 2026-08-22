@@ -545,6 +545,23 @@ class SyncManager(QObject):
         self.supabase = None
         self.init_supabase()
 
+    def release_v2(self):
+        """Serve no project at all until something valid is attached.
+
+        One manager serves every project this process opens, so leaving the
+        previous one attached is how a refused project ends up publishing into
+        the project the writer opened before it. Dropping the context is what
+        makes ``is_v2_enabled`` false, and an in-flight pull that lands
+        afterwards finds nothing to apply.
+        """
+        self._cancel_scheduled_v2_retry(reset_backoff=True)
+        self._v2_context = None
+        self._v2_wpm = None
+        self._v2_untracked_recovery_paths = set()
+        self._v2_last_pull_apply_blocked = False
+        self._v2_identity_apply_failed = False
+        self._v2_identity_uuid_conflicts = []
+
     def configure_v2(
         self,
         wpm,
@@ -554,13 +571,27 @@ class SyncManager(QObject):
         project_id=None,
         recover_local_changes=True,
     ):
-        """Attach the current Windows writing project to the durable v2 store."""
+        """Attach the current Windows writing project to the durable v2 store.
+
+        A project that could not be opened has no writing root, and this
+        manager is shared by the whole process. Attaching one anyway used to
+        register the working directory as a project; refusing without letting
+        go would be worse still, because the binder would show the refused
+        project while every publish still addressed the last one that opened.
+        So the refusal releases first and changes nothing else.
+        """
         from runtime_profile import forced_project_id
+        writing_root_path = getattr(wpm, "writing_root_path", None)
+        if not str(writing_root_path or "").strip():
+            self.release_v2()
+            raise ValueError(
+                "열 수 없는 프로젝트는 동기화에 연결하지 않습니다."
+            )
         self._cancel_scheduled_v2_retry(reset_backoff=True)
         self._v2_store = store or self._v2_store or SyncV2Store()
         self._v2_wpm = wpm
         self._v2_device_id = str(device_id)
-        local_key = self._v2_store.local_key_for(wpm.writing_root_path)
+        local_key = self._v2_store.local_key_for(writing_root_path)
         project_was_configured = self._v2_store.get_project(local_key) is not None
         selected_project_id = project_id or forced_project_id() or None
         self._v2_context = self._v2_store.configure_project(
@@ -4775,7 +4806,13 @@ class SyncManager(QObject):
         folder_versions=None,
         tree_order_rows=None,
     ):
-        if not self.is_v2_enabled or not self._v2_wpm:
+        if (
+            not self.is_v2_enabled
+            or not self._v2_wpm
+            or not getattr(self._v2_wpm, "writing_root_path", None)
+        ):
+            # Without a root there is nowhere to apply anything, and every path
+            # below starts by making one absolute.
             return []
         from project_creation_v1 import CreationError
         from project_identity_v1 import IdentityError
@@ -6057,6 +6094,10 @@ class SyncManager(QObject):
         self._v2_pull_worker = worker
 
         def handle_result(success, payload):
+            if not self.is_v2_enabled:
+                # Released while this pull was in flight. Whatever it carries
+                # belongs to a project this manager no longer serves.
+                return
             if success:
                 if isinstance(payload, dict):
                     documents = payload.get("documents") or []

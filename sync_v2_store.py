@@ -1089,7 +1089,18 @@ class SyncV2Store:
 
     @staticmethod
     def local_key_for(writing_root_path):
-        return os.path.normcase(os.path.abspath(writing_root_path or ""))
+        """The durable key for one writing root. An empty root has none.
+
+        ``abspath("")`` is the current working directory, which for a packaged
+        build is the folder the executable sits in. Reading a missing writing
+        root as "here" registered the application's own directory as a project
+        and left the sync layer believing it was configured.
+        """
+        if not str(writing_root_path or "").strip():
+            raise ValueError(
+                "집필 루트가 없는 프로젝트는 동기화 대상이 아닙니다."
+            )
+        return os.path.normcase(os.path.abspath(writing_root_path))
 
     @staticmethod
     def _identity_uuid(local_key, local_path, kind):

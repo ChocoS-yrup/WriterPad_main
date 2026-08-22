@@ -7106,6 +7106,142 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
 
 
 
+class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
+    """열 수 없는 프로젝트는 동기화 계층에 자기 자리를 만들지 않는다.
+
+    SyncManager 는 프로세스 전체가 공유한다. 열기가 거부된 프로젝트를 그대로
+    연결하면 집필 루트가 없어 local_key 가 현재 작업 디렉터리 — 패키지 빌드에서는
+    실행 파일이 있는 폴더 — 가 되고, 거기에 유령 프로젝트가 등록된다. 연결만
+    건너뛰는 것으로도 부족하다. 직전 프로젝트의 context 가 남으면 바인더는 B 를
+    보여주면서 발행은 A 로 간다.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = str(Path(self.temp.name, "작품목록"))
+        os.makedirs(self.workspace, exist_ok=True)
+        self.store = SyncV2Store(str(Path(self.temp.name, "sync.sqlite3")))
+        self.manager = SyncManager()
+        previous = (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_wpm,
+            self.manager._v2_device_id,
+        )
+        self.addCleanup(self._restore, previous)
+
+    def _restore(self, previous):
+        (
+            self.manager._v2_store,
+            self.manager._v2_context,
+            self.manager._v2_wpm,
+            self.manager._v2_device_id,
+        ) = previous
+
+    def _open(self, title, blocked=False):
+        """프로젝트를 하나 만들고, 필요하면 열기가 거부되게 만든 뒤 연다."""
+        create_project(self.workspace, title)
+        if blocked:
+            # identity 가 모르는 파일 하나면 열기 감사가 거부한다.
+            Path(
+                self.workspace, title, "집필모드", "메인", "메모장", "이름없음.txt"
+            ).write_text("정체성 밖", encoding="utf-8")
+        wpm = WritingProjectManager()
+        wpm.workspace_dir = self.workspace
+        verdict = wpm.initialize_project(title)
+        return wpm, verdict
+
+    def _projects(self):
+        db = sqlite3.connect(str(Path(self.temp.name, "sync.sqlite3")))
+        try:
+            return [row[0] for row in db.execute(
+                "SELECT local_key FROM sync_projects"
+            )]
+        finally:
+            db.close()
+
+    def test_a_blocked_project_registers_nothing(self):
+        wpm, verdict = self._open("차단됨", blocked=True)
+        self.assertNotEqual(verdict["status"], OPEN_OK)
+        self.assertIsNone(wpm.writing_root_path)
+
+        with self.assertRaises(ValueError):
+            self.manager.configure_v2(
+                wpm, "차단됨", str(uuid.uuid4()), store=self.store
+            )
+
+        self.assertEqual(self._projects(), [])
+        self.assertFalse(self.manager.is_v2_enabled)
+
+    def test_an_empty_writing_root_has_no_local_key(self):
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.store.local_key_for(value)
+        # 실제 경로는 그대로 동작한다.
+        self.assertTrue(self.store.local_key_for(self.workspace))
+
+    def test_configuring_an_empty_root_activates_no_context(self):
+        wpm = WritingProjectManager()
+        wpm.workspace_dir = self.workspace
+
+        with self.assertRaises(ValueError):
+            self.manager.configure_v2(
+                wpm, "이름만", str(uuid.uuid4()), store=self.store
+            )
+
+        self.assertIsNone(self.manager._v2_context)
+        self.assertFalse(self.manager.is_v2_enabled)
+        self.assertEqual(self._projects(), [])
+
+    def test_a_blocked_project_releases_the_one_opened_before_it(self):
+        healthy, verdict = self._open("정상")
+        self.assertEqual(verdict["status"], OPEN_OK)
+        self.manager.configure_v2(
+            healthy, "정상", str(uuid.uuid4()), store=self.store
+        )
+        self.assertTrue(self.manager.is_v2_enabled)
+        first_key = self.manager._v2_context["local_key"]
+
+        blocked, _verdict = self._open("차단됨", blocked=True)
+        with self.assertRaises(ValueError):
+            self.manager.configure_v2(
+                blocked, "차단됨", str(uuid.uuid4()), store=self.store
+            )
+
+        # 거부만 하고 놓아주지 않으면 발행이 '정상' 으로 계속 나간다.
+        self.assertIsNone(self.manager._v2_context)
+        self.assertIsNone(self.manager._v2_wpm)
+        self.assertFalse(self.manager.is_v2_enabled)
+        self.assertEqual(self._projects(), [first_key])
+
+    def test_a_remote_apply_without_a_root_is_refused_not_crashed(self):
+        healthy, _verdict = self._open("정상")
+        self.manager.configure_v2(
+            healthy, "정상", str(uuid.uuid4()), store=self.store
+        )
+        # 열기가 거부되면 매니저가 아직 붙들고 있는 wpm 의 루트가 사라진다.
+        healthy.writing_root_path = None
+
+        applied = self.manager._apply_v2_remote_documents(
+            [{
+                "document_id": str(uuid.uuid4()),
+                "relative_path": "메인/메모장/문서.txt",
+                "content": "본문",
+                "revision": 1,
+                "is_deleted": False,
+            }],
+            strict=True,
+        )
+
+        self.assertEqual(applied, [])
+
+
 class WritingManualSaveTestCase(unittest.TestCase):
     def test_scheduled_remote_refresh_does_not_clear_a_new_inline_editor(self):
         panel = WritingTreeMixin()

@@ -297,10 +297,17 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         from sync_manager import load_or_create_device_id
         self.session_id = load_or_create_device_id()
 
-        if self.pm.current_project:
+        from project_creation_v1 import OPEN_OK as _OPEN_OK
+
+        if (self.open_verdict or {}).get("status") == _OPEN_OK:
             self.sync_manager.configure_v2(
                 self.wpm, self.pm.current_project, self.session_id
             )
+        else:
+            # A project the open check refused is not a sync target. Say so to
+            # the shared manager, or it keeps serving whichever project opened
+            # before this one.
+            self.sync_manager.release_v2()
         
         self.is_dirty_left = False
         self.is_dirty_right = False
