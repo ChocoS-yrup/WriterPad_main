@@ -411,26 +411,33 @@ class V2StructureBatchWorker(QThread):
 class V2PullWorker(QThread):
     resultReady = pyqtSignal(bool, object)
 
-    def __init__(self, sync_manager):
+    def __init__(self, sync_manager, project_id=None):
         super().__init__()
         self.sync_manager = sync_manager
+        # The manager is shared and its context can be swapped while this
+        # request is in the air. Ask about the project this pull was started
+        # for, not whichever one is open when the reply is being built.
+        self.project_id = project_id
 
     def run(self):
         try:
-            documents = self.sync_manager._fetch_v2_project_documents()
+            project_id = self.project_id
+            documents = self.sync_manager._fetch_v2_project_documents(
+                project_id=project_id
+            )
             folders = self.sync_manager._fetch_v2_project_folders(
-                self.sync_manager.supabase
+                self.sync_manager.supabase, project_id=project_id
             )
             folder_versions = (
                 self.sync_manager._fetch_v2_project_folder_versions(
-                    self.sync_manager.supabase
+                    self.sync_manager.supabase, project_id=project_id
                 )
                 if self.sync_manager._needs_folder_history(folders)
                 else []
             )
             tree_orders = (
                 self.sync_manager._fetch_v2_project_tree_orders(
-                    self.sync_manager.supabase
+                    self.sync_manager.supabase, project_id=project_id
                 )
                 if self.sync_manager._uses_contract_structure()
                 else []
@@ -491,6 +498,7 @@ class SyncManager(QObject):
         self.current_sync_state = "saved"
         self._v2_store = None
         self._v2_context = None
+        self._v2_context_generation = 0
         self._v2_wpm = None
         self._v2_device_id = None
         self._v2_worker = None
@@ -545,6 +553,21 @@ class SyncManager(QObject):
         self.supabase = None
         self.init_supabase()
 
+    def _v2_pull_identity(self):
+        """What a pull is for. A reply only counts while all of it still holds.
+
+        The generation alone would catch a release, and the ids alone would
+        catch a swap that happens to reuse the generation. Together they also
+        catch the case that fooled the first attempt: released, then another
+        project attached before the old reply arrived.
+        """
+        context = self._v2_context or {}
+        return (
+            self._v2_context_generation,
+            str(context.get("project_id") or ""),
+            str(context.get("local_key") or ""),
+        )
+
     def release_v2(self):
         """Serve no project at all until something valid is attached.
 
@@ -556,6 +579,9 @@ class SyncManager(QObject):
         """
         self._cancel_scheduled_v2_retry(reset_backoff=True)
         self._v2_context = None
+        # Every request already in the air belongs to the generation that is
+        # ending here. None of them may land on whatever is attached next.
+        self._v2_context_generation += 1
         self._v2_wpm = None
         self._v2_untracked_recovery_paths = set()
         self._v2_last_pull_apply_blocked = False
@@ -598,6 +624,9 @@ class SyncManager(QObject):
             wpm.writing_root_path, project_name, selected_project_id
         )
         self._v2_context["writer_device_id"] = self._v2_device_id
+        # A new project is a new generation, even when the one before it was
+        # released first: a reply from the old one must not pass for this one.
+        self._v2_context_generation += 1
         deterministic_ids = bool(forced_project_id() and not project_id)
         root = getattr(wpm, "writing_root_path", None)
         self._v2_untracked_recovery_paths = set()
@@ -2340,8 +2369,13 @@ class SyncManager(QObject):
         if must_release:
             self._release_v2_lease_async(document_id)
 
+    def _pull_project_id(self, project_id=None):
+        """The project a request is about: the one it froze, or the one open."""
+        return str(project_id or (self._v2_context or {}).get("project_id") or "")
+
     def _fetch_v2_project_documents(
-        self, require_connection=False, check_project_status=True
+        self, require_connection=False, check_project_status=True,
+        project_id=None,
     ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             if require_connection:
@@ -2361,7 +2395,7 @@ class SyncManager(QObject):
                 "document_id,relative_path,content,revision,is_deleted,deleted_at,"
                 "parent_folder_id,name,structure_revision,updated_at"
             )
-            .eq("project_id", self._v2_context["project_id"])
+            .eq("project_id", self._pull_project_id(project_id))
             .execute(),
             self.supabase,
         )
@@ -2374,14 +2408,14 @@ class SyncManager(QObject):
             raise RuntimeError("INVALID_RESPONSE")
         return data
 
-    def _fetch_v2_project_folders(self, client):
+    def _fetch_v2_project_folders(self, client, project_id=None):
         """Read the stable folder projection used by newer iPad clients."""
         response = self._call_with_session(
             lambda: client.table("folders")
             .select(
                 "folder_id,parent_folder_id,name,revision,is_deleted,updated_at"
             )
-            .eq("project_id", self._v2_context["project_id"])
+            .eq("project_id", self._pull_project_id(project_id))
             .execute(),
             client,
         )
@@ -2390,14 +2424,14 @@ class SyncManager(QObject):
             raise RuntimeError("INVALID_FOLDER_RESPONSE")
         return data
 
-    def _fetch_v2_project_folder_versions(self, client):
+    def _fetch_v2_project_folder_versions(self, client, project_id=None):
         """Read folder history needed to bootstrap an exact rename identity."""
         response = self._call_with_session(
             lambda: client.table("folder_versions")
             .select(
                 "folder_id,parent_folder_id,name,revision,is_deleted,operation_kind,created_at"
             )
-            .eq("project_id", self._v2_context["project_id"])
+            .eq("project_id", self._pull_project_id(project_id))
             .execute(),
             client,
         )
@@ -2406,13 +2440,13 @@ class SyncManager(QObject):
             raise RuntimeError("INVALID_FOLDER_VERSION_RESPONSE")
         return data
 
-    def _fetch_v2_project_tree_orders(self, client):
+    def _fetch_v2_project_tree_orders(self, client, project_id=None):
         response = self._call_with_session(
             lambda: client.table("tree_orders")
             .select(
                 "tree_order_id,parent_folder_id,children,revision,updated_at"
             )
-            .eq("project_id", self._v2_context["project_id"])
+            .eq("project_id", self._pull_project_id(project_id))
             .execute(),
             client,
         )
@@ -6090,13 +6124,16 @@ class SyncManager(QObject):
             except RuntimeError:
                 self._v2_pull_worker = None
 
-        worker = V2PullWorker(self)
+        started_for = self._v2_pull_identity()
+        worker = V2PullWorker(self, project_id=started_for[1])
         self._v2_pull_worker = worker
 
         def handle_result(success, payload):
-            if not self.is_v2_enabled:
-                # Released while this pull was in flight. Whatever it carries
-                # belongs to a project this manager no longer serves.
+            if not self.is_v2_enabled or self._v2_pull_identity() != started_for:
+                # This reply belongs to the project that was open when the
+                # request went out. Releasing, or opening another project, ends
+                # that generation: nothing in the reply may be applied to
+                # whatever is attached now.
                 return
             if success:
                 if isinstance(payload, dict):

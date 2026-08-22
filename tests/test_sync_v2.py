@@ -7220,6 +7220,100 @@ class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
         self.assertFalse(self.manager.is_v2_enabled)
         self.assertEqual(self._projects(), [first_key])
 
+    def _configure(self, title):
+        wpm, verdict = self._open(title)
+        self.assertEqual(verdict["status"], OPEN_OK)
+        self.manager.configure_v2(
+            wpm, title, str(uuid.uuid4()), store=self.store
+        )
+        return wpm
+
+    def _late_payload(self, path="메인/메모장/늦은 문서.txt"):
+        return {
+            "documents": [{
+                "document_id": str(uuid.uuid4()),
+                "relative_path": path,
+                "content": "A 의 본문",
+                "revision": 1,
+                "is_deleted": False,
+            }],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+        }
+
+    def _pull_handler(self):
+        """pull_remote_changes_async 가 결과에 붙이는 그 처리기를 꺼내온다."""
+        captured = {}
+
+        class _Worker:
+            resultReady = SimpleNamespace(connect=lambda cb: captured.setdefault("result", cb))
+            finished = SimpleNamespace(connect=lambda cb: None)
+
+            def __init__(self, manager, project_id=None):
+                captured["project_id"] = project_id
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.V2PullWorker", _Worker), patch.object(
+            self.manager, "_start_worker"
+        ), patch.object(
+            type(self.manager), "supabase", SimpleNamespace(), create=True
+        ), patch("sync_manager.is_forced_offline", return_value=False):
+            self.manager.pull_remote_changes_async()
+        return captured
+
+    def test_a_pull_started_for_one_project_never_lands_on_the_next(self):
+        """A 로 나간 요청이 B 가 열린 뒤 도착해도 B 에 적용되면 안 된다."""
+        first = self._configure("정상")
+        pull = self._pull_handler()
+        self.assertIn("result", pull)
+        # worker 는 시작 당시의 project_id 를 얼려서 들고 간다.
+        self.assertEqual(pull["project_id"], self.manager._v2_context["project_id"])
+
+        self.manager.release_v2()
+        second = self._configure("정상2")
+        before_state = self.manager.current_sync_state
+        target = Path(second.writing_root_path, "메인", "메모장", "늦은 문서.txt")
+
+        # A 의 응답이 이제야 도착한다.
+        pull["result"](True, self._late_payload())
+
+        self.assertFalse(target.exists(), "A 의 문서가 B 에 만들어졌다")
+        self.assertIsNone(
+            self.store.get_document(
+                self.manager._v2_context["local_key"], "메인/메모장/늦은 문서.txt"
+            )
+        )
+        self.assertEqual(self.manager.current_sync_state, before_state)
+
+    def test_a_pull_that_lands_while_nothing_is_attached_is_dropped(self):
+        first = self._configure("정상")
+        pull = self._pull_handler()
+        root = first.writing_root_path
+
+        self.manager.release_v2()
+        pull["result"](True, self._late_payload())
+
+        self.assertFalse(
+            Path(root, "메인", "메모장", "늦은 문서.txt").exists()
+        )
+
+    def test_a_pull_whose_project_is_unchanged_still_applies(self):
+        """격리가 정상 경로까지 막아버리면 그것도 결함이다."""
+        wpm = self._configure("정상")
+        pull = self._pull_handler()
+
+        pull["result"](True, self._late_payload())
+
+        self.assertTrue(
+            Path(wpm.writing_root_path, "메인", "메모장", "늦은 문서.txt").is_file()
+        )
+
     def test_a_remote_apply_without_a_root_is_refused_not_crashed(self):
         healthy, _verdict = self._open("정상")
         self.manager.configure_v2(
