@@ -13,7 +13,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
 
-from project_dialogs import ProjectSelectionDialog, ServerProjectImportDialog
+from project_dialogs import (
+    ProjectSelectionDialog,
+    ServerProjectCatalogWorker,
+    ServerProjectImportDialog,
+)
 from project_trash import TrashedProject
 from server_project_import import (
     LOCAL_MISSING,
@@ -64,6 +68,16 @@ class _ServerTrashService:
             trashed_at="2026-07-29T10:00:00+00:00",
             server_available=True,
         )
+
+
+class _WaitObservedCatalogWorker(ServerProjectCatalogWorker):
+    def __init__(self, service):
+        super().__init__(service)
+        self.wait_calls = 0
+
+    def wait(self, *args, **kwargs):
+        self.wait_calls += 1
+        return super().wait(*args, **kwargs)
 
 
 def _project(name="서버 작품", imported=False, incomplete=False):
@@ -241,6 +255,17 @@ class ServerProjectImportUiTestCase(unittest.TestCase):
         self.assertTrue(self._process_until(lambda: not dialog.is_busy))
         self.assertEqual(dialog.list_widget.count(), 1)
         self.assertTrue(dialog.refresh_button.isEnabled())
+
+    def test_finished_worker_is_joined_before_dialog_releases_it(self):
+        dialog = self._dialog()
+        worker = _WaitObservedCatalogWorker(
+            SimpleNamespace(list_projects=lambda: [])
+        )
+
+        dialog._start_worker(worker, "catalog")
+
+        self.assertTrue(self._process_until(lambda: not dialog.is_busy))
+        self.assertGreaterEqual(worker.wait_calls, 1)
 
     def test_import_worker_uses_selected_local_name_and_accepts_after_success(self):
         dialog = self._dialog()

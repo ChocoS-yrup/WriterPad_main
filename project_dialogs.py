@@ -399,17 +399,28 @@ class ServerProjectImportDialog(QDialog):
         self._worker_result = None
         self._set_busy(True)
         worker.resultReady.connect(self._record_worker_result)
-        worker.finished.connect(self._finish_worker)
+        # Keep a Python reference until QThread has completely exited.  The
+        # dialog field is cleared by _finish_worker; without this capture the
+        # wrapper can be destroyed while Qt is still emitting finished, which
+        # aborts the whole process with "QThread ... is still running".
+        worker.finished.connect(
+            lambda worker=worker: self._finish_worker(worker)
+        )
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _record_worker_result(self, success, payload):
         self._worker_result = (bool(success), payload)
 
-    def _finish_worker(self):
+    def _finish_worker(self, worker):
+        # QThread.finished can be delivered just before all native thread
+        # cleanup is complete.  wait() is normally immediate here and makes it
+        # safe to release the dialog's last strong reference.
+        worker.wait()
         action = self._worker_action
         result = self._worker_result
-        self._worker = None
+        if self._worker is worker:
+            self._worker = None
         self._worker_action = None
         self._worker_result = None
         self._set_busy(False)
@@ -969,16 +980,20 @@ class ProjectManagementDialog(QDialog):
         self._worker_result = None
         self._set_busy(True)
         worker.resultReady.connect(self._record_worker_result)
-        worker.finished.connect(self._finish_worker)
+        worker.finished.connect(
+            lambda worker=worker: self._finish_worker(worker)
+        )
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _record_worker_result(self, action, success, payload):
         self._worker_result = (action, bool(success), payload)
 
-    def _finish_worker(self):
+    def _finish_worker(self, worker):
+        worker.wait()
         result = self._worker_result
-        self._worker = None
+        if self._worker is worker:
+            self._worker = None
         self._worker_result = None
         self._set_busy(False)
 
@@ -1238,16 +1253,20 @@ class ProjectTrashDialog(QDialog):
         self._worker_result = None
         self._set_busy(True)
         worker.resultReady.connect(self._record_worker_result)
-        worker.finished.connect(self._finish_worker)
+        worker.finished.connect(
+            lambda worker=worker: self._finish_worker(worker)
+        )
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _record_worker_result(self, action, success, payload):
         self._worker_result = (action, bool(success), payload)
 
-    def _finish_worker(self):
+    def _finish_worker(self, worker):
+        worker.wait()
         result = self._worker_result
-        self._worker = None
+        if self._worker is worker:
+            self._worker = None
         self._worker_result = None
         self._set_busy(False)
 
