@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import sys
+import unicodedata
 import tempfile
 import unittest
 import uuid
@@ -2461,14 +2462,57 @@ class PreflightOutputIntegrityTests(unittest.TestCase):
         self.assertNotIn("\nacquired=true", rendered)
         self.assertIn("\\x0a", rendered)
 
-    def test_terminal_control_sequences_do_not_survive(self):
-        for value in ("\x1b[2J", "before\rafter", "tab\there", "null\x00byte", "\x7f"):
-            with self.subTest(value=repr(value)):
+    def test_nothing_that_can_end_a_line_survives(self):
+        """splitlines is how any reader of this record will parse it.
+
+        NEL, U+2028 and U+2029 all end a line there, so escaping the C0 range
+        alone still leaves three ways to write an extra result into the record.
+        """
+        for label, value in (
+            ("LF", "a\nb"),
+            ("CR", "a\rb"),
+            ("NEL", "a\x85b"),
+            ("line separator", "a\u2028b"),
+            ("paragraph separator", "a\u2029b"),
+            ("vertical tab", "a\x0bb"),
+            ("form feed", "a\x0cb"),
+            ("file separator", "a\x1cb"),
+        ):
+            with self.subTest(character=label):
                 rendered = self._shown("profile", value)
-                self.assertEqual(len(rendered.splitlines()), 1)
-                for character in value:
-                    if character < " " or character == "\x7f":
-                        self.assertNotIn(character, rendered)
+                self.assertEqual(len(rendered.splitlines()), 1, label)
+
+    def test_nothing_invisible_or_reordering_survives(self):
+        """A line break is not the whole risk.
+
+        A control sequence rewrites the screen, and a bidi override reorders
+        what is on the line, so a reader is shown something other than what the
+        run wrote.
+        """
+        for label, value in (
+            ("escape", "a\x1b[2Jb"),
+            ("C1 control sequence introducer", "a\x9b2Jb"),
+            ("backspace", "a\bb"),
+            ("null", "a\x00b"),
+            ("delete", "a\x7fb"),
+            ("right-to-left override", "a\u202eb"),
+            ("zero width space", "a\u200bb"),
+            ("byte order mark", "a\ufeffb"),
+        ):
+            with self.subTest(character=label):
+                rendered = self._shown("profile", value).rstrip("\n")
+                self.assertEqual(len(rendered.splitlines()), 1, label)
+                for character in rendered:
+                    self.assertNotIn(
+                        unicodedata.category(character),
+                        ("Cc", "Cf", "Cs", "Zl", "Zp"),
+                        f"{label} left {character!r} in the record",
+                    )
+
+    def test_an_escape_says_which_character_it_replaced(self):
+        """A record that hides what was there is only half a record."""
+        self.assertIn("x0a", self._shown("profile", "a\nb"))
+        self.assertIn("u2028", self._shown("profile", "a\u2028b"))
 
     def test_ordinary_values_are_left_exactly_as_they_are(self):
         for value in (
@@ -2477,6 +2521,8 @@ class PreflightOutputIntegrityTests(unittest.TestCase):
             "C:\\Users\\writer\\AppData\\Local\\AntigravityWriter\\sync_v2.sqlite3",
             "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
             "[3]",
+            "D:/안티그래비티/작가님 힘내세요",
+            "메인/메모장/1화.txt",
         ):
             with self.subTest(value=value):
                 self.assertEqual(self._shown("k", value), f"k={value}\n")

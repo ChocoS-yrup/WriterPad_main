@@ -70,6 +70,7 @@ import json
 import shutil
 import sqlite3
 import sys
+import unicodedata
 import tempfile
 import uuid
 from pathlib import Path
@@ -104,6 +105,11 @@ CONTRACT_COLUMNS = (
 )
 
 
+# Control, format, and line or paragraph separator. Everything that can end
+# a line, start a control sequence, or reorder what is already on one.
+_UNPRINTABLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -130,18 +136,32 @@ def _one_line(value):
     """One field, one line, whatever the field came from.
 
     Some of what gets printed here arrives from the environment, and this output
-    is kept as the record of what a run found. A value carrying a newline would
-    not merely look wrong: it would add lines that read exactly like results,
-    and somebody reading the record afterwards would see a verdict that was
-    never reached.
+    is kept as the record of what a run found. A value carrying a line break
+    would not merely look wrong: it would add lines that read exactly like
+    results, and somebody reading the record afterwards would see a verdict that
+    was never reached.
+
+    Escaping only the C0 controls is not enough. NEL, U+2028 and U+2029 all
+    split a line under str.splitlines(), which is how any reader of this record
+    will parse it, and the C1 range carries its own control sequences. Nor is a
+    line break the whole risk: a bidi override reorders what is on the line, so
+    a reader sees text that is not what was written.
+
+    So the rule is by category rather than by list -- anything that is a
+    control, a format character, or a line or paragraph separator becomes a
+    visible escape. Everything legible survives, Korean paths included, because
+    an unreadable record is its own kind of useless.
     """
-    text = str(value)
-    return "".join(
-        character
-        if character >= " " and character != "\x7f"
-        else "\\x%02x" % ord(character)
-        for character in text
-    )
+    escaped = []
+    for character in str(value):
+        if unicodedata.category(character) in _UNPRINTABLE_CATEGORIES:
+            point = ord(character)
+            escaped.append(
+                "\\x%02x" % point if point < 0x100 else "\\u%04x" % point
+            )
+        else:
+            escaped.append(character)
+    return "".join(escaped)
 
 
 def show_lease_scope():
