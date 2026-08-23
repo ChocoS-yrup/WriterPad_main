@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import os
 import sqlite3
@@ -6,7 +7,7 @@ import sys
 import tempfile
 import unittest
 import uuid
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -2232,6 +2233,122 @@ class ContractHandshakeGateTests(unittest.TestCase):
         self.assertIsNone(self._project()["contract_path_enabled_at"])
         self.assertFalse(self.manager.contract_path_enabled())
         self.assertFalse(self.manager._uses_contract_structure())
+
+
+def _preflight_module():
+    """Load the preflight script, which lives outside any package."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "contract_path_preflight.py"
+    spec = importlib.util.spec_from_file_location("contract_path_preflight", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ContractPreflightVerdictTests(unittest.TestCase):
+    """The preflight decides STOP or proceed, so its verdicts are load-bearing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def _verdict(self, reply, project_id=LIVE_PROJECT_ID):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            self.preflight.print_handshake(project_id, reply)
+        lines = [
+            line.split("=", 1)[1]
+            for line in stream.getvalue().splitlines()
+            if line.startswith("verdict=")
+        ]
+        self.assertEqual(len(lines), 1, stream.getvalue())
+        return lines[0]
+
+    def test_the_recorded_active_reply_clears_the_preflight(self):
+        verdict = self._verdict(json.loads(LIVE_ACTIVE_REPLY))
+        self.assertNotIn("STOP", verdict)
+        self.assertIn("LEGACY/0", verdict)
+
+    def test_the_recorded_inactive_reply_offers_nothing_to_open(self):
+        verdict = self._verdict(json.loads(LIVE_INACTIVE_REPLY))
+        self.assertNotIn("STOP", verdict)
+        self.assertIn("does not support", verdict)
+
+    def test_a_promoted_project_stops_the_preflight(self):
+        """A promotion is a separate approval, so seeing one has to halt this."""
+        for mode, epoch in (("MIGRATING", 1), ("ID_BASED", 1), ("MIGRATING", 2)):
+            with self.subTest(mode=mode, epoch=epoch):
+                reply = json.loads(LIVE_ACTIVE_REPLY)
+                reply["project_sync_mode"] = mode
+                reply["migration_epoch"] = epoch
+                verdict = self._verdict(reply)
+                self.assertIn("STOP", verdict)
+                self.assertIn(f"{mode}/{epoch}", verdict)
+
+    def test_literals_that_do_not_match_the_pin_stop_the_preflight(self):
+        cases = (
+            ({"server_protocol_version": 4,
+              "supported_protocol_versions": [4]}, "PROTOCOL_TOO_OLD"),
+            ({"canonical_contract_sha256": "0" * 64},
+             "CONTRACT_DIGEST_MISMATCH"),
+            ({"contract_version": "0.3.0"}, "CONTRACT_DIGEST_MISMATCH"),
+            ({"server_contract_sha256": "0" * 64,
+              "canonical_contract_sha256": "0" * 64,
+              "contract_version": None}, "CONTRACT_DIGEST_MISMATCH"),
+            ({"server_capabilities": list(SERVER_CAPABILITIES[:-1])},
+             "CAPABILITY_MISMATCH"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                reply = json.loads(LIVE_ACTIVE_REPLY)
+                reply.update(overrides)
+                verdict = self._verdict(reply)
+                self.assertIn("STOP", verdict)
+                self.assertIn(expected, verdict)
+
+    def test_a_reply_about_another_project_stops_the_preflight(self):
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["project_id"] = OTHER_PROJECT_ID
+        self.assertIn("STOP", self._verdict(reply))
+
+    def test_an_unreadable_reply_stops_the_preflight(self):
+        for reply in (None, [], "supported", 3):
+            with self.subTest(reply=repr(reply)):
+                self.assertIn("STOP", self._verdict(reply))
+
+    def test_an_empty_project_row_is_not_reported_as_a_bad_server_answer(self):
+        """Nothing recorded yet is a different thing from a refused handshake."""
+        self.assertEqual(
+            self.preflight.stored_compatibility({
+                "project_sync_mode": "LEGACY",
+                "migration_epoch": 0,
+                "server_protocol_version": None,
+                "active_contract_sha256": None,
+                "server_capabilities_json": None,
+            }),
+            "NOT RECORDED",
+        )
+        self.assertEqual(
+            self.preflight.stored_compatibility({
+                "project_sync_mode": "LEGACY",
+                "migration_epoch": 0,
+                "server_protocol_version": 3,
+                "active_contract_sha256": CANONICAL_CONTRACT_SHA256,
+                "server_capabilities_json": json.dumps(list(SERVER_CAPABILITIES)),
+            }),
+            "PASS",
+        )
+
+    def test_the_preflight_prints_nothing_a_cp949_console_cannot_render(self):
+        """It is run from a Windows console, where a stray dash aborts the run."""
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts" / "contract_path_preflight.py"
+        )
+        source = path.read_text(encoding="utf-8")
+        offenders = sorted({character for character in source if ord(character) > 127})
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
