@@ -481,23 +481,41 @@ class ServerActionWorker(QThread):
             self.resultReady.emit(False, error)
 
 class SupabaseAuthLease:
-    """The exclusive right to exchange this machine's stored session.
+    """The exclusive right to exchange one profile's stored session.
 
     The application and the preflight are both clients of one credential, and
     an exchange retires whatever the other is holding. Checking that the other
     is not running is a guess that goes stale the moment it is made; holding one
     lock for as long as the work lasts does not.
 
+    Which credential that is comes from runtime_profile.credential_lease_name(),
+    the one place the name is built. A stored session belongs to one Windows
+    account and one profile, so the lock does too: two holders that could never
+    retire each other's token have nothing to gain by waiting on each other,
+    and a single fixed name only stopped work that was never in danger.
+
     One namespace, and no falling back to another. A fallback would put the two
     holders in different rooms, each certain it was alone.
     """
 
-    NAME = "Global\\AntigravityWriterSupabaseAuth"
     _ERROR_ALREADY_EXISTS = 183
 
     def __init__(self, name=None):
-        self.name = name or self.NAME
+        # Resolved when the lock is taken, not when this is built. SyncManager
+        # holds one of these as a class attribute, so construction happens at
+        # import -- before anything has said which profile is running, and in
+        # processes where the name cannot be built at all. That is a stop when
+        # somebody asks for the lock, not an import that fails.
+        self._name = name
         self._handle = None
+
+    @property
+    def name(self):
+        if self._name is not None:
+            return self._name
+        from runtime_profile import credential_lease_name
+
+        return credential_lease_name()
 
     @property
     def held(self):
@@ -512,6 +530,10 @@ class SupabaseAuthLease:
             import ctypes
             from ctypes import wintypes
 
+            # Including the name. Without it there is no object to open, and
+            # carrying on under some other name would be the fallback this
+            # deliberately does not have.
+            name = self.name
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel32.CreateMutexW.restype = wintypes.HANDLE
             kernel32.CreateMutexW.argtypes = [
@@ -519,7 +541,7 @@ class SupabaseAuthLease:
             ]
         except Exception:
             return None
-        handle = kernel32.CreateMutexW(None, True, self.name)
+        handle = kernel32.CreateMutexW(None, True, name)
         error = ctypes.get_last_error()
         if not handle:
             return None

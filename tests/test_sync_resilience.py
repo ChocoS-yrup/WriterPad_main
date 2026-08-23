@@ -3,6 +3,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -15,8 +16,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import runtime_profile
 import sync_manager
 from cloud_config import classify_cloud_error
+from runtime_profile import credential_lease_name
 from sync_manager import SupabaseAuthLease, SyncManager, auth_error_facts
 from sync_v2_store import SyncV2Store
 from writing_controller import WritingController
@@ -664,9 +667,10 @@ class AuthLeaseTestCase(unittest.TestCase):
 
     def test_there_is_one_namespace_and_no_falling_back(self):
         """Two namespaces would put the holders in separate rooms."""
-        self.assertTrue(SupabaseAuthLease.NAME.startswith("Global\\"))
-        source = Path(sync_manager.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("Local\\Antigravity", source)
+        self.assertTrue(credential_lease_name().startswith("Global\\"))
+        for module in (sync_manager, runtime_profile):
+            source = Path(module.__file__).read_text(encoding="utf-8")
+            self.assertNotIn("Local\\Antigravity", source)
 
     def test_a_client_is_not_built_at_all_without_the_lease(self):
         """Handing back a signed-out client is not fail-closed. The paths that
@@ -782,9 +786,15 @@ class CredentialClaimedAtStartupTestCase(unittest.TestCase):
 
 
 class _CredentialHolder:
-    """Another process, holding the real machine-wide credential lock."""
+    """Another process, holding the real credential lock for one profile.
 
-    def __init__(self):
+    The profile decides which lock that is, so a holder has to be able to run
+    under a chosen one: the question is not only whether a second process is
+    shut out, but whether a process sharing no credential with it gets through.
+    """
+
+    def __init__(self, profile=None):
+        self.profile = profile
         self.process = None
 
     def __enter__(self):
@@ -799,8 +809,11 @@ class _CredentialHolder:
             "print('held', SyncManager.acquire_auth_lease(), flush=True)\n"
             "sys.stdin.readline()\n"
         )
+        environment = dict(os.environ)
+        if self.profile is not None:
+            environment["ANTIGRAVITY_PROFILE"] = self.profile
         self.process = subprocess.Popen(
-            [sys.executable, "-c", source],
+            [sys.executable, "-c", source], env=environment,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
         )
         line = self.process.stdout.readline().strip()
@@ -826,6 +839,146 @@ class _CredentialHolder:
                     pass
         self.process = None
         return False
+
+
+class CredentialLeaseScopeTestCase(unittest.TestCase):
+    """One lock per stored session: this Windows account, this profile.
+
+    Sessions are stored per profile -- security_manager.service_name() appends
+    ANTIGRAVITY_PROFILE to the keyring service -- so two profiles can neither
+    read nor retire each other's token. A lock they share stops work that was
+    never in danger, and because a process that cannot take it builds no client
+    at all, what it stops is the other profile's entire connection to the
+    server: no sync, no preflight. The A/B dual-instance test is exactly that
+    pair of profiles.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        probe = SupabaseAuthLease()
+        if probe.acquire() is None:
+            raise unittest.SkipTest(
+                "no kernel object can be created in this namespace here"
+            )
+        probe.release()
+
+    def setUp(self):
+        # Constructing SyncManager takes the lock for whatever profile this
+        # process is running under; these cases decide the profile themselves.
+        SyncManager.release_auth_lease()
+        self.leases = []
+        self.run_id = uuid.uuid4().hex[:8]
+
+    def tearDown(self):
+        for lease in self.leases:
+            lease.release()
+
+    @contextlib.contextmanager
+    def _profile(self, profile):
+        with patch.dict(os.environ, {"ANTIGRAVITY_PROFILE": profile}):
+            yield
+
+    def _take(self, profile):
+        """Take the real lock under a profile, the way the application does."""
+        lease = SupabaseAuthLease()
+        self.leases.append(lease)
+        with self._profile(profile):
+            return lease.acquire()
+
+    def _name(self, profile):
+        with self._profile(profile):
+            return credential_lease_name()
+
+    def _in_another_process(self, profile, body):
+        source = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(sync_manager.__file__).parent)!r})\n"
+            "from runtime_profile import credential_lease_name\n"
+            + body
+        )
+        environment = dict(os.environ)
+        environment["ANTIGRAVITY_PROFILE"] = profile
+        result = subprocess.run(
+            [sys.executable, "-c", source], env=environment,
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_two_holders_on_one_profile_shut_each_other_out(self):
+        """The case the lock exists for: one credential, one exchanger."""
+        profile = f"locktest-{self.run_id}"
+        with _CredentialHolder(profile=profile):
+            self.assertIs(self._take(profile), False)
+
+    def test_two_holders_on_different_profiles_do_not(self):
+        """Neither can spend the other's token, so neither may block it."""
+        with _CredentialHolder(profile=f"locktest-{self.run_id}-a"):
+            self.assertIs(self._take(f"locktest-{self.run_id}-b"), True)
+
+    def test_the_default_profile_is_not_blocked_by_a_named_one(self):
+        """The reported defect, in the shape it was reported: an instance on
+        one profile left the default profile with no server at all."""
+        with _CredentialHolder(profile=f"locktest-{self.run_id}"):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ANTIGRAVITY_PROFILE", None)
+                lease = SupabaseAuthLease()
+                self.leases.append(lease)
+                self.assertIs(lease.acquire(), True)
+
+    def test_the_name_is_the_same_from_one_run_to_the_next(self):
+        """Anything per-run in the name would leave every run alone in a room
+        of its own, which is the failure this lock exists to prevent."""
+        profile = f"locktest-{self.run_id}"
+        body = "print(credential_lease_name())\n"
+        first = self._in_another_process(profile, body)
+        second = self._in_another_process(profile, body)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, self._name(profile))
+
+    def test_a_profile_name_no_object_name_could_hold_still_works(self):
+        """The profile arrives from the environment, so it is not ours to
+        trust: a backslash in it would quietly name a different object, and a
+        long one would run past the length an object name allows. It reaches
+        the name as a digest, so it can do neither."""
+        profile = "..\\Global\\Session?*|" + "가" * 400 + f"-{self.run_id}"
+        name = self._name(profile)
+
+        self.assertTrue(name.startswith("Global\\"))
+        self.assertNotIn("\\", name[len("Global\\"):])
+        self.assertLess(len(name), 260)
+        self.assertNotEqual(name, self._name(f"locktest-{self.run_id}"))
+        # Usable, not merely well shaped.
+        self.assertIs(self._take(profile), True)
+
+    def test_the_name_differs_per_windows_account(self):
+        """Two accounts do not share a credential store, so they must not share
+        a lock. The SID is read from the process token and not from the
+        environment, which whoever starts us can write."""
+        profile = f"locktest-{self.run_id}"
+        with self._profile(profile):
+            mine = credential_lease_name()
+            with patch.object(
+                runtime_profile, "user_sid", lambda: "S-1-5-21-9-9-9-1001"
+            ):
+                theirs = credential_lease_name()
+                theirs_again = credential_lease_name()
+
+        self.assertNotEqual(mine, theirs)
+        self.assertEqual(theirs, theirs_again)
+
+    def test_a_name_that_cannot_be_built_is_a_stop(self):
+        """No name, no lock, no work. Carrying on under some other name is the
+        fallback that would put two holders in separate rooms."""
+        with patch.object(
+            runtime_profile, "user_sid", side_effect=OSError("no process token")
+        ):
+            lease = SupabaseAuthLease()
+            self.leases.append(lease)
+
+            self.assertIsNone(lease.acquire())
+            self.assertFalse(lease.held)
 
 
 class CredentialHeldElsewhereTestCase(unittest.TestCase):

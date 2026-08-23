@@ -11,10 +11,11 @@
                            wiring, because it does not use it.
 
   --credential-lock-check  asks one question: can this process take the
-                           machine-wide credential lock. Reports and exits. No
-                           client is built, no handshake is attempted, and no
-                           request can leave, so it is the mode to use when what
-                           is being tested is the locking itself.
+                           credential lock for the profile it is running under.
+                           Reports and exits. No client is built, no handshake
+                           is attempted, and no request can leave, so it is the
+                           mode to use when what is being tested is the locking
+                           itself.
 
   --application-handshake  the end-to-end check. Runs the real
                            SyncManager.perform_contract_handshake() against a
@@ -34,9 +35,31 @@ Read-only does not extend to the stored session. Both handshake modes build a
 real client, which spends the saved refresh token and is issued a new one, and
 that new pair is written to the credential store the same way the application
 writes it. So before either of them touches the network this takes the same
-machine-wide lock the application takes before it exchanges a session, and
-holds it until the run is over. Anything else already holding it -- the
-application, another copy of this -- means stopping, not waiting.
+lock the application takes before it exchanges a session, and holds it until
+the run is over. Anything else already holding it -- the application, another
+copy of this -- means stopping, not waiting.
+
+The lock is per Windows account and per profile, because the stored session is:
+security_manager.service_name() appends ANTIGRAVITY_PROFILE to the keyring
+service, so a run under one profile can neither read nor retire another's
+token. Both sides build the name from runtime_profile.credential_lease_name(),
+and the digest printed under [credential lock] is that name -- two runs
+contend only when the digest matches.
+
+Verifying the lock offline, without touching the real login:
+
+  1. Pick a profile that has no stored session, and use it on both sides:
+     set ANTIGRAVITY_PROFILE=locktest for the application and for this tool.
+  2. Start the application under that profile. It claims the lock at startup.
+  3. Run this with --credential-lock-check under the same profile. It must
+     report acquired=false and STOP, and its digest must equal the one the
+     failed run prints.
+  4. Close the application and run it again. It must report acquired=true.
+
+Running the application under one profile and checking from another proves
+nothing now: they are different locks by design, and both sides will report
+the lock free. The profile has to match, and the printed digest is what says
+whether it does.
 """
 
 from __future__ import annotations
@@ -101,6 +124,23 @@ def show(key, value):
     if isinstance(value, bool):
         value = "true" if value else "false"
     print(f"{key}={value}")
+
+
+def show_lease_scope():
+    """Which credential lock this run would contend for.
+
+    The profile is printed because it is what a verification run has to match,
+    and the name because matching it is the proof that two runs are contending
+    at all. Neither discloses anything: the name reaches print as a digest, so
+    the account it is scoped to does not.
+    """
+    from runtime_profile import credential_lease_name, profile_name
+
+    show("profile", profile_name() or "(default)")
+    try:
+        show("lock", credential_lease_name())
+    except Exception:
+        show("lock", "unavailable on this machine")
 
 
 def print_client_pin():
@@ -689,10 +729,10 @@ def main():
         # Deliberately before the database is opened and before anything that
         # could build a client. This mode exists so the lock can be tested
         # without a run that might proceed to the server if the test fails.
-        from sync_manager import SupabaseAuthLease, SyncManager
+        from sync_manager import SyncManager
 
         print("[credential lock]")
-        show("lock", SupabaseAuthLease.NAME)
+        show_lease_scope()
         lease = SyncManager.acquire_auth_lease()
         show(
             "acquired",
@@ -733,10 +773,10 @@ def main():
         # Taking the same lock the application takes is what makes that safe;
         # asking whether the application is running would be a question whose
         # answer is already stale by the time it is acted on.
-        from sync_manager import SupabaseAuthLease, SyncManager
+        from sync_manager import SyncManager
 
         print("[credential lock]")
-        show("lock", SupabaseAuthLease.NAME)
+        show_lease_scope()
         lease = SyncManager.acquire_auth_lease()
         show(
             "acquired",
