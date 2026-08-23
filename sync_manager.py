@@ -1,3 +1,4 @@
+import base64
 import copy
 import hashlib
 import os
@@ -2287,11 +2288,57 @@ class SyncManager(QObject):
             SHUTDOWN_GRACE_MS if timeout_ms is None else timeout_ms
         ) / 1000.0
         if not SyncManager._session_exchanges_idle.wait(timeout):
+            # Say so. A token exchange that outlived the budget means the store
+            # may hold a token the server has already retired, and the next
+            # launch being refused is otherwise unexplained.
+            print(
+                "Supabase token exchange still in flight at shutdown; "
+                "the stored session may be a step behind."
+            )
             return False
         if not SyncManager._session_restore_lock.acquire(timeout=timeout):
+            print(
+                "Supabase session store still busy at shutdown; "
+                "the stored session may be a step behind."
+            )
             return False
         SyncManager._session_restore_lock.release()
         return True
+
+    # How long before a token actually expires this treats it as expired. A
+    # request that leaves inside this window can still be in flight when it
+    # lapses, and a write that comes back 401 has to be retried after the fact,
+    # which is the retry worth not needing.
+    SESSION_EXPIRY_LEEWAY_SECONDS = 90
+
+    @staticmethod
+    def _seconds_until_expiry(access_token):
+        """How long this token has left, read without verifying it.
+
+        Only ever asked about time. Which of two sessions is current is a
+        question about lineage and this cannot answer it: every token is issued
+        with the same lifetime, so two rotations a moment apart look identical
+        here.
+        """
+        try:
+            payload = str(access_token).split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+            expires_at = int(claims.get("exp") or 0)
+        except Exception:
+            return None
+        if not expires_at:
+            return None
+        return expires_at - int(time.time())
+
+    @staticmethod
+    def _session_is_near_expiry(access_token):
+        remaining = SyncManager._seconds_until_expiry(access_token)
+        if remaining is None:
+            # Unreadable says nothing either way, and refreshing on every call
+            # because of it would be its own problem.
+            return False
+        return remaining <= SyncManager.SESSION_EXPIRY_LEEWAY_SECONDS
 
     def _adopt_stored_session(self, client):
         """Take the session somebody else already refreshed, instead of racing.
@@ -2483,6 +2530,22 @@ class SyncManager(QObject):
     def _call_with_session(self, action, client=None):
         """Execute one server action with at most one token recovery retry."""
         client = client or self.supabase
+        # Renew before sending rather than after being refused. A refused write
+        # has already been attempted, and retrying it means reasoning about
+        # whether the first attempt landed.
+        stored_access = ""
+        try:
+            from security_manager import SecurityManager
+            stored_access, _stored_refresh = SecurityManager.get_supabase_session()
+        except Exception:
+            stored_access = ""
+        if stored_access and self._session_is_near_expiry(stored_access):
+            try:
+                self.ensure_session_valid(client, force_refresh=True)
+            except Exception:
+                # Renewing early is an optimization. If it cannot be done, the
+                # ordinary path below still gets its one recovery attempt.
+                pass
         self.ensure_session_valid(client)
         try:
             return action()
@@ -8196,9 +8259,13 @@ class SyncManager(QObject):
             # 기다린 뒤 남은 작업은 다음 실행으로 넘긴다.
             drained = self.wait_all_workers(SHUTDOWN_GRACE_MS)
         self._diagnostics.flush(timeout_ms=SHUTDOWN_GRACE_MS)
-        # Workers are drained, but an auth refresh runs on the client library's
-        # own timer thread and is not one of them.
-        self.await_session_writes()
+        # Workers are drained, but a token exchange is not one of them, and the
+        # window that loses a token is between the server answering and the
+        # answer being stored. Timing out here does not hold the shutdown up:
+        # the budget is spent, and refusing to close would be worse than closing
+        # with a session that is one rotation behind.
+        if not self.await_session_writes():
+            drained = False
         if drained and self.supabase is not None:
             # 워커가 아직 client 를 쓰고 있을 수 있으므로 완전히 비었을 때만 닫는다.
             self._close_supabase_client(self.supabase)

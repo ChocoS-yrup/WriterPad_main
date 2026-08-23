@@ -53,6 +53,14 @@ def _access_token(tag):
     return f"header.{payload}.{tag}"
 
 
+def _expiring_token(seconds_left):
+    """A token that lapses in the given number of seconds."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": int(time.time()) + int(seconds_left)}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
 def _session(tag):
     return SimpleNamespace(
         access_token=_access_token(tag),
@@ -214,6 +222,27 @@ class StoredSessionLineageTestCase(unittest.TestCase):
 
         self.assertEqual(observed["while_in_flight"], False)
         self.assertEqual(observed["after_it_landed"], True)
+
+    def test_a_timed_out_barrier_says_so_and_still_lets_shutdown_finish(self):
+        """Refusing to close would be worse than closing one rotation behind."""
+        release = threading.Event()
+        printed = io.StringIO()
+
+        def exchange():
+            with SyncManager._session_exchange_in_flight():
+                release.wait(2.0)
+
+        worker = threading.Thread(target=exchange)
+        worker.start()
+        time.sleep(0.05)
+        with contextlib.redirect_stdout(printed):
+            waited = SyncManager.await_session_writes(timeout_ms=50)
+        release.set()
+        worker.join()
+
+        self.assertFalse(waited)
+        self.assertIn("still in flight at shutdown", printed.getvalue())
+        self.assertIn("a step behind", printed.getvalue())
 
     def test_shutdown_returns_at_once_when_nothing_is_in_flight(self):
         self.assertTrue(SyncManager.await_session_writes(timeout_ms=50))
@@ -423,6 +452,69 @@ class SingleRefreshAuthorityTestCase(unittest.TestCase):
         self.assertEqual(self.rotations, ["refresh"])
         self.assertEqual(keyring.refresh, "refresh-rotated")
         self.assertEqual(client._antigravity_refresh_token, "refresh-rotated")
+
+    def test_a_token_near_expiry_is_renewed_before_the_call_goes_out(self):
+        """Renewing after a refusal means retrying a write that may have landed."""
+        client = _Client()
+        keyring = _Keyring(access=_expiring_token(30), refresh="refresh-mine")
+        client._antigravity_refresh_token = "refresh-mine"
+        calls = []
+        with patch("security_manager.SecurityManager", keyring), patch.object(
+            SyncManager, "_persist_supabase_session", return_value=True
+        ):
+            self.manager._call_with_session(lambda: calls.append("call") or "ok", client)
+
+        self.assertEqual(calls, ["call"])
+        self.assertEqual(client.auth.refresh_calls, 1)
+
+    def test_a_token_with_time_left_is_not_renewed(self):
+        client = _Client()
+        keyring = _Keyring(access=_expiring_token(3600), refresh="refresh-mine")
+        with patch("security_manager.SecurityManager", keyring), patch.object(
+            SyncManager, "_persist_supabase_session", return_value=True
+        ):
+            self.manager._call_with_session(lambda: "ok", client)
+
+        self.assertEqual(client.auth.refresh_calls, 0)
+
+    def test_an_unreadable_token_does_not_trigger_a_refresh_every_call(self):
+        client = _Client()
+        keyring = _Keyring(access="not-a-jwt", refresh="refresh-mine")
+        with patch("security_manager.SecurityManager", keyring), patch.object(
+            SyncManager, "_persist_supabase_session", return_value=True
+        ):
+            self.manager._call_with_session(lambda: "ok", client)
+
+        self.assertEqual(client.auth.refresh_calls, 0)
+
+    def test_the_installed_library_really_has_its_timer_off(self):
+        """Checking the option we passed only proves we passed it.
+
+        This builds the actual client the application builds, against an
+        address nothing answers on, and asks the auth object it produced. No
+        request is made: construction is local.
+        """
+        try:
+            import httpx
+            from supabase import ClientOptions, create_client
+        except Exception as error:
+            self.skipTest(f"supabase client not installed ({type(error).__name__})")
+
+        transport = httpx.Client(timeout=0.01)
+        try:
+            client = create_client(
+                "https://unreachable.invalid",
+                "sb_publishable_" + "x" * 32,
+                options=ClientOptions(
+                    httpx_client=transport, auto_refresh_token=False
+                ),
+            )
+            auth = client.auth
+            self.assertFalse(getattr(auth, "_auto_refresh_token", True))
+            # And nothing was scheduled to fire behind our back.
+            self.assertIsNone(getattr(auth, "_refresh_token_timer", None))
+        finally:
+            transport.close()
 
     def test_no_client_refreshes_on_a_timer_of_its_own(self):
         """A timer inside the library is neither serialized nor waited for."""
