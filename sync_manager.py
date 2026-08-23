@@ -1,4 +1,3 @@
-import base64
 import copy
 import hashlib
 import os
@@ -492,6 +491,10 @@ class SyncManager(QObject):
     # any manager instance existing. Reentrant because persisting happens while
     # the restore that produced the session still holds it.
     _session_restore_lock = threading.RLock()
+    # Bumped whenever somebody signs in or out. Every client records the
+    # generation it was built in, so a callback from a client that belongs to a
+    # session the writer has already ended cannot write to the store.
+    _session_generation = 0
 
     def __new__(cls, *args, **kwargs):
         with QMutexLocker(cls._mutex):
@@ -2106,6 +2109,8 @@ class SyncManager(QObject):
             client._antigravity_httpx_client = custom_httpx_client
 
             authenticated = False
+            client._antigravity_refresh_token = ""
+            client._antigravity_session_generation = SyncManager._session_generation
             # A process can build several clients at once, and refresh tokens
             # rotate the moment one is used. Two unserialized restores race, and
             # the one that loses is told its token is invalid -- which looks
@@ -2128,7 +2133,12 @@ class SyncManager(QObject):
                         if auth_response else None
                     )
                     if session:
-                        SyncManager._persist_supabase_session(session)
+                        SyncManager._persist_supabase_session(
+                            session,
+                            expected_previous=refresh_token,
+                            generation=client._antigravity_session_generation,
+                        )
+                        SyncManager._remember_client_session(client, session)
                         authenticated = True
                         user = getattr(session, "user", None)
                         client._antigravity_email = getattr(user, "email", "") or ""
@@ -2155,7 +2165,19 @@ class SyncManager(QObject):
                     if session and event_name in {
                         "SIGNED_IN", "TOKEN_REFRESHED", "USER_UPDATED"
                     }:
-                        SyncManager._persist_supabase_session(session)
+                        if not SyncManager._persist_supabase_session(
+                            session,
+                            expected_previous=getattr(
+                                client, "_antigravity_refresh_token", ""
+                            ),
+                            generation=getattr(
+                                client, "_antigravity_session_generation", None
+                            ),
+                        ):
+                            # A refused write means this client is behind. It
+                            # must not claim the store's session as its own.
+                            return
+                        SyncManager._remember_client_session(client, session)
                         client._antigravity_authenticated = True
                         user = getattr(session, "user", None)
                         client._antigravity_email = getattr(user, "email", "") or ""
@@ -2214,23 +2236,45 @@ class SyncManager(QObject):
         return True
 
     @staticmethod
-    def _session_expiry(access_token):
-        """The exp claim, read without verifying, only to order two sessions.
+    def await_session_writes(timeout_ms=None):
+        """Wait for any rotation that is mid-flight to finish being stored.
 
-        Nothing is trusted from this. It answers one question -- which of two
-        sessions the server issued later -- and a token that cannot be read at
-        all sorts as oldest.
+        The client library refreshes on a timer of its own, on a thread no
+        worker drain knows about. Closing while one is between exchanging a
+        token and writing it down leaves the spent one in the store, and the
+        next launch is refused for a session nobody ended.
         """
-        try:
-            payload = str(access_token).split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-            return int(claims.get("exp") or 0)
-        except Exception:
-            return 0
+        timeout = (
+            SHUTDOWN_GRACE_MS if timeout_ms is None else timeout_ms
+        ) / 1000.0
+        if not SyncManager._session_restore_lock.acquire(timeout=timeout):
+            return False
+        SyncManager._session_restore_lock.release()
+        return True
 
     @staticmethod
-    def _persist_supabase_session(session):
+    def _remember_client_session(client, session):
+        """Record which refresh token this client now holds."""
+        try:
+            client._antigravity_refresh_token = getattr(
+                session, "refresh_token", ""
+            ) or ""
+        except Exception:
+            pass
+
+    @staticmethod
+    def _persist_supabase_session(
+        session, expected_previous=None, generation=None
+    ):
+        """Store a session only if it descends from what is stored right now.
+
+        Several clients write to one credential slot, each spending the saved
+        refresh token and being issued another. Ordering the writes by anything
+        the token says about time does not work: two rotations a moment apart
+        carry the same expiry, and the later write wins the tie regardless of
+        which session is live. What does hold is lineage -- a client may replace
+        exactly the token it was given, and nothing else.
+        """
         access_token = getattr(session, "access_token", "")
         refresh_token = getattr(session, "refresh_token", "")
         if not (access_token and refresh_token):
@@ -2238,17 +2282,28 @@ class SyncManager(QObject):
         try:
             from security_manager import SecurityManager
             with SyncManager._session_restore_lock:
-                stored_access, _stored_refresh = (
+                if (
+                    generation is not None
+                    and generation != SyncManager._session_generation
+                ):
+                    # This client belongs to a session that has since been
+                    # ended or replaced by an explicit sign-in.
+                    return False
+                _stored_access, stored_refresh = (
                     SecurityManager.get_supabase_session()
                 )
-                if stored_access and SyncManager._session_expiry(
-                    stored_access
-                ) > SyncManager._session_expiry(access_token):
-                    # Several clients refresh on their own schedules and all
-                    # write to one slot. A callback that arrives late carries a
-                    # session older than what is already stored, and letting it
-                    # land leaves a spent refresh token behind for the next
-                    # restore to be refused for.
+                if stored_refresh and stored_refresh == refresh_token:
+                    # The same rotation arriving twice. Already done.
+                    return True
+                if (
+                    expected_previous
+                    and stored_refresh
+                    and stored_refresh != expected_previous
+                ):
+                    # Somebody else rotated after this client read the store, so
+                    # what is held here is a spent token. Writing it back would
+                    # leave the next restore presenting a token the server has
+                    # already retired.
                     return False
                 SecurityManager.save_supabase_session(access_token, refresh_token)
             return True
@@ -2305,7 +2360,16 @@ class SyncManager(QObject):
                     session, "refresh_token", ""
                 ):
                     raise RuntimeError("AUTH_REQUIRED")
-                self._persist_supabase_session(session)
+                self._persist_supabase_session(
+                    session,
+                    expected_previous=getattr(
+                        client, "_antigravity_refresh_token", ""
+                    ),
+                    generation=getattr(
+                        client, "_antigravity_session_generation", None
+                    ),
+                )
+                self._remember_client_session(client, session)
                 client._antigravity_authenticated = True
                 self._auth_retry_blocked = False
                 return True
@@ -2382,8 +2446,15 @@ class SyncManager(QObject):
             session = getattr(response, "session", None)
             if not session:
                 return False, "로그인 세션을 받지 못했습니다."
-            self._persist_supabase_session(session)
+            # A deliberate sign-in outranks whatever any older client is still
+            # holding, and retires those clients' claim on the store.
+            with SyncManager._session_restore_lock:
+                SyncManager._session_generation += 1
+                generation = SyncManager._session_generation
+                self._persist_supabase_session(session, generation=generation)
             try:
+                self.supabase._antigravity_session_generation = generation
+                self._remember_client_session(self.supabase, session)
                 self.supabase._antigravity_authenticated = True
             except Exception:
                 pass
@@ -2408,7 +2479,11 @@ class SyncManager(QObject):
         except Exception:
             pass
         from security_manager import SecurityManager
-        SecurityManager.clear_supabase_session()
+        with SyncManager._session_restore_lock:
+            # Retire every client built before this point, so a callback still
+            # in flight cannot write the session back after it was ended.
+            SyncManager._session_generation += 1
+            SecurityManager.clear_supabase_session()
         try:
             if self.supabase:
                 self.supabase._antigravity_authenticated = False
@@ -8018,6 +8093,9 @@ class SyncManager(QObject):
             # 기다린 뒤 남은 작업은 다음 실행으로 넘긴다.
             drained = self.wait_all_workers(SHUTDOWN_GRACE_MS)
         self._diagnostics.flush(timeout_ms=SHUTDOWN_GRACE_MS)
+        # Workers are drained, but an auth refresh runs on the client library's
+        # own timer thread and is not one of them.
+        self.await_session_writes()
         if drained and self.supabase is not None:
             # 워커가 아직 client 를 쓰고 있을 수 있으므로 완전히 비었을 때만 닫는다.
             self._close_supabase_client(self.supabase)
