@@ -22,6 +22,7 @@ from sync_contract import (
     build_atomic_structure_request,
     build_document_commit_request,
     normalize_storage_name,
+    read_handshake_compatibility,
     require_server_compatibility,
     safe_trace,
     validate_atomic_structure_response,
@@ -44,6 +45,89 @@ from unicode15_casefold import (
 PROJECT_ID = "00000000-0000-4000-8000-000000000201"
 DEVICE_ID = "60000000-0000-4000-8000-000000000201"
 BATCH_ID = "10000000-0000-4000-8000-000000000201"
+OTHER_PROJECT_ID = "00000000-0000-4000-8000-000000000202"
+
+
+LIVE_PROJECT_ID = "01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2"
+
+# Recorded from staging on 2026-08-23, before the 0.2.0 allowlist row was
+# switched on.
+LIVE_INACTIVE_REPLY = (
+    '{"supported":false,"project_id":"01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2",'
+    '"migration_epoch":0,"contract_version":null,"project_sync_mode":"LEGACY",'
+    '"server_capabilities":[],"server_contract_sha256":null,'
+    '"server_protocol_version":null,"canonical_contract_sha256":null,'
+    '"supported_protocol_versions":[]}'
+)
+
+# Recorded from the same project after the row was switched on. Note the mode:
+# an allowlisted contract does not move a project off LEGACY, and epoch stays 0.
+LIVE_ACTIVE_REPLY = (
+    '{"supported":true,"project_id":"01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2",'
+    '"migration_epoch":0,"contract_version":"0.2.0",'
+    '"project_sync_mode":"LEGACY","server_capabilities":'
+    '["atomic_structure_commit","contract_allowlist_validation",'
+    '"project_mode_migration_lock","folder_tombstones","id_tree_validation",'
+    '"legacy_epoch_zero_adapter","storage_name_v1","document_commit_v1"],'
+    '"server_contract_sha256":'
+    '"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",'
+    '"server_protocol_version":3,"canonical_contract_sha256":'
+    '"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",'
+    '"supported_protocol_versions":[3]}'
+)
+
+
+def live_reply(raw, project_id=PROJECT_ID, **overrides):
+    """One of the recorded replies, readdressed to the fixture's project."""
+    handshake = json.loads(raw)
+    handshake["project_id"] = project_id
+    handshake.update(overrides)
+    return handshake
+
+
+def supported_handshake(project_id=PROJECT_ID, **overrides):
+    """The reply the server sends with the 0.2.0 allowlist row switched on."""
+    return live_reply(LIVE_ACTIVE_REPLY, project_id, **overrides)
+
+
+def unsupported_handshake(project_id=PROJECT_ID, **overrides):
+    """The reply the server sends with no allowlist row for this client."""
+    return live_reply(LIVE_INACTIVE_REPLY, project_id, **overrides)
+
+
+def arm_contract_handshake(manager, outcome="supported"):
+    """Leave behind the reading a fresh handshake would have recorded."""
+    manager._contract_handshake = {
+        "generation": manager._v2_context_generation,
+        "project_id": manager._v2_context["project_id"],
+        "identity": manager._contract_identity(),
+        "contract_sha256": CANONICAL_CONTRACT_SHA256,
+        "observed_at": "",
+        "outcome": outcome,
+    }
+    manager._contract_handshake_attempt = manager._v2_context_generation
+
+
+class _HandshakeClient:
+    """A Supabase stand-in that answers get_sync_handshake and counts calls."""
+
+    def __init__(self, reply, email="writer@example.invalid"):
+        self.reply = reply
+        self.calls = []
+        # ``ensure_session_valid`` leaves a client with no auth alone, which is
+        # what keeps these cases off the token refresh path entirely.
+        self.auth = None
+        self._antigravity_email = email
+        self._antigravity_authenticated = True
+
+    def rpc(self, name, params):
+        self.calls.append((name, dict(params)))
+        return SimpleNamespace(execute=self._answer)
+
+    def _answer(self):
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return SimpleNamespace(data=self.reply)
 
 
 def contract_root():
@@ -339,6 +423,7 @@ class ContractStoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _activate_id_based(self):
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
         self.store.activate_contract_project(
             self.context["local_key"],
             project_sync_mode="MIGRATING",
@@ -362,6 +447,7 @@ class ContractStoreTests(unittest.TestCase):
         manager._v2_store = self.store
         manager._v2_context = {**self.context, **project}
         manager._v2_device_id = DEVICE_ID
+        arm_contract_handshake(manager)
         manager._v2_wpm = SimpleNamespace(
             writing_root_path=str(Path(self.temp.name) / "writing"),
             read_text_file=lambda _path: None,
@@ -976,6 +1062,7 @@ class ContractStoreTests(unittest.TestCase):
             server_contract_sha256=CANONICAL_CONTRACT_SHA256,
             server_capabilities=SERVER_CAPABILITIES,
         )
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
         manager = SyncManager()
         manager._v2_store = self.store
         manager._v2_context = {**self.context, **project}
@@ -986,6 +1073,7 @@ class ContractStoreTests(unittest.TestCase):
             project_settings={"tree_order": {}},
             save_settings=lambda: True,
         )
+        arm_contract_handshake(manager)
         parent = self._folder_snapshot("메인/메모장")
         self.store.replace_folder_snapshots(
             self.context["local_key"], [parent]
@@ -1625,6 +1713,525 @@ class LegacyMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(db_path)) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], STAGE8_USER_VERSION)
                 self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+
+class ContractHandshakeGateTests(unittest.TestCase):
+    """The handshake reports; only a local decision opens the write path."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = SyncV2Store(str(Path(self.temp.name) / "sync.sqlite3"))
+        self.context = self.store.configure_project(
+            str(Path(self.temp.name) / "writing"), "Handshake", PROJECT_ID
+        )
+        self.manager = SyncManager()
+        self.manager._v2_store = self.store
+        self.manager._v2_context = dict(self.context)
+        self.manager._v2_device_id = DEVICE_ID
+        self.manager._v2_wpm = SimpleNamespace(
+            writing_root_path=str(Path(self.temp.name) / "writing"),
+            read_text_file=lambda _path: None,
+            project_settings={"tree_order": {}},
+            save_settings=lambda: True,
+        )
+        Path(self.manager._v2_wpm.writing_root_path).mkdir(
+            parents=True, exist_ok=True
+        )
+        # One manager serves the whole process, so a reading left by an earlier
+        # case would otherwise arm this one.
+        self.manager._forget_contract_handshake()
+        self.manager._contract_handshake_error = ""
+
+    def tearDown(self):
+        self.manager._forget_contract_handshake()
+        self.manager.supabase = None
+        self.manager._v2_context = None
+        self.manager._v2_store = None
+        self.manager._v2_device_id = None
+        self.manager._v2_wpm = None
+        self.temp.cleanup()
+
+    def _attach(self, reply):
+        client = _HandshakeClient(reply)
+        self.manager.supabase = client
+        return client
+
+    def _project(self):
+        return self.store.get_project(self.context["local_key"])
+
+    def test_supported_handshake_alone_does_not_open_the_contract_path(self):
+        """The gate is the whole point: server assent is not local consent."""
+        self._attach(supported_handshake())
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertTrue(self.manager.contract_handshake_is_fresh())
+        # The server state was recorded in full ...
+        project = self._project()
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        self.assertEqual(project["server_protocol_version"], 3)
+        self.assertEqual(
+            project["active_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+        # ... and the write path is still the legacy one.
+        self.assertFalse(project["contract_path_enabled"])
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_open_gate_with_a_fresh_handshake_turns_the_path_on(self):
+        client = self._attach(supported_handshake())
+        project = self.manager.enable_contract_path()
+
+        self.assertTrue(project["contract_path_enabled"])
+        self.assertTrue(project["contract_path_enabled_at"])
+        self.assertTrue(self.manager._uses_contract_structure())
+        self.assertEqual(client.calls[-1][0], "get_sync_handshake")
+        self.assertEqual(client.calls[-1][1], {
+            "p_project_id": PROJECT_ID,
+            "p_contract_sha256": CANONICAL_CONTRACT_SHA256,
+        })
+
+    def test_activation_takes_its_own_handshake_and_never_a_stored_one(self):
+        """A positive from earlier in the session cannot stand in for now."""
+        self._attach(supported_handshake())
+        self.manager.perform_contract_handshake()
+        self.assertTrue(self.manager.contract_handshake_is_fresh())
+
+        # The server withdrew support between the reading and the activation.
+        client = self._attach(unsupported_handshake())
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.enable_contract_path()
+
+        self.assertEqual(raised.exception.code, "CONTRACT_NOT_ALLOWED")
+        self.assertEqual(client.calls[-1][0], "get_sync_handshake")
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_open_gate_without_a_fresh_reading_keeps_the_path_closed(self):
+        """Both halves are required, in the other direction too."""
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+        self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="MIGRATING",
+            migration_epoch=1,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.assertTrue(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_unsupported_reply_stores_nothing_and_arms_nothing(self):
+        self._attach(unsupported_handshake())
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "unsupported")
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        project = self._project()
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        self.assertIsNone(project["server_protocol_version"])
+        self.assertIsNone(project["active_contract_sha256"])
+        self.assertIsNone(project["server_capabilities_json"])
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_digest_protocol_and_capability_faults_are_each_refused(self):
+        cases = (
+            # A server on a different contract, answering consistently about it.
+            ({"server_contract_sha256": "0" * 64,
+              "canonical_contract_sha256": "0" * 64,
+              "contract_version": None}, "CONTRACT_DIGEST_MISMATCH"),
+            # A server that has not reached protocol 3 yet.
+            ({"server_protocol_version": 2,
+              "supported_protocol_versions": [2]}, "PROTOCOL_TOO_OLD"),
+            ({"server_capabilities": list(SERVER_CAPABILITIES[:-1])},
+             "CAPABILITY_MISMATCH"),
+            # LEGACY is the mode the live reply carries, and it owns epoch 0.
+            ({"migration_epoch": 1}, "STALE_MIGRATION_EPOCH"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                self.manager._forget_contract_handshake()
+                self._attach(supported_handshake(**overrides))
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(raised.exception.code, expected)
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self._project()["contract_path_enabled"])
+                self.assertEqual(
+                    self._project()["project_sync_mode"], "LEGACY"
+                )
+
+    def test_malformed_compatibility_fields_normalize_to_invalid_argument(self):
+        """A null protocol version is the shape the live reply already has."""
+        cases = (
+            ("server_protocol_version", None),
+            ("server_protocol_version", ""),
+            ("server_protocol_version", "3"),
+            ("server_protocol_version", True),
+            ("server_contract_sha256", None),
+            ("server_contract_sha256", CANONICAL_CONTRACT_SHA256.upper()),
+            ("server_contract_sha256", CANONICAL_CONTRACT_SHA256[:32]),
+            ("server_capabilities", None),
+            ("server_capabilities", "atomic_structure_commit"),
+            ("server_capabilities", [1, 2, 3]),
+            ("project_sync_mode", None),
+            ("project_sync_mode", "ID_BASED_V2"),
+            ("migration_epoch", None),
+            ("migration_epoch", "1"),
+            ("migration_epoch", -1),
+            ("supported_protocol_versions", 3),
+            ("supported_protocol_versions", "3"),
+            ("supported_protocol_versions", [None]),
+            ("supported_protocol_versions", ["3"]),
+            ("supported_protocol_versions", [True]),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=repr(value)):
+                self.manager._forget_contract_handshake()
+                self._attach(supported_handshake(**{field: value}))
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_require_server_compatibility_never_raises_a_bare_type_error(self):
+        """The contract error is the only thing callers have to catch."""
+        common = {
+            "project_sync_mode": "MIGRATING",
+            "migration_epoch": 1,
+            "server_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "server_capabilities": SERVER_CAPABILITIES,
+        }
+        for value in (None, "", "three", [], {}, 3.5):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(SyncContractError) as raised:
+                    require_server_compatibility(
+                        server_protocol_version=value, **common
+                    )
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        for value in (None, "folders", 7):
+            with self.subTest(capabilities=repr(value)):
+                candidate = dict(common, server_capabilities=value)
+                with self.assertRaises(SyncContractError):
+                    require_server_compatibility(
+                        server_protocol_version=3, **candidate
+                    )
+
+    def test_read_handshake_compatibility_rejects_a_non_mapping(self):
+        for reply in (None, [], "supported", 3):
+            with self.subTest(reply=repr(reply)):
+                with self.assertRaises(SyncContractError) as raised:
+                    read_handshake_compatibility(reply)
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+
+    def test_a_reply_about_another_project_is_refused(self):
+        self._attach(supported_handshake(project_id=OTHER_PROJECT_ID))
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.perform_contract_handshake()
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(self._project()["project_sync_mode"], "LEGACY")
+
+    def test_server_and_network_failures_leave_the_legacy_path_working(self):
+        failures = (
+            RuntimeError("FORBIDDEN"),
+            RuntimeError("INVALID_ARGUMENT"),
+            RuntimeError("NETWORK_UNAVAILABLE"),
+            RuntimeError("permission denied for function get_sync_handshake"),
+        )
+        for failure in failures:
+            with self.subTest(failure=str(failure)):
+                self.manager._forget_contract_handshake()
+                self.manager._contract_handshake_attempt = None
+                self._attach(failure)
+                # The quiet, once-per-project call swallows every one of these.
+                self.assertIsNone(self.manager._ensure_contract_handshake())
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+                # And the legacy queue still takes work.
+                operation = self.store.enqueue(
+                    self.manager._v2_context,
+                    "failure.txt",
+                    str(failure),
+                    relative_path="failure.txt",
+                )
+                self.assertEqual(operation["status"], "pending")
+                self.assertEqual(operation["relative_path"], "failure.txt")
+
+    def test_a_withdrawn_answer_disarms_the_session(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        # Any later call that comes back with one of the withdrawing codes
+        # drops the reading, and the gate alone cannot hold the path open.
+        with self.assertRaises(RuntimeError):
+            self.manager._call_with_session(
+                lambda: (_ for _ in ()).throw(RuntimeError("FORBIDDEN")),
+                self.manager.supabase,
+            )
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertTrue(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_signing_in_as_somebody_else_drops_the_reading(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        self.manager.supabase._antigravity_email = "other@example.invalid"
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_releasing_the_project_drops_the_reading(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        self.manager.release_v2()
+        self.assertIsNone(self.manager._contract_handshake)
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+
+    def test_the_handshake_is_asked_once_per_opened_project(self):
+        client = self._attach(supported_handshake())
+        for _ in range(4):
+            self.manager._ensure_contract_handshake()
+        self.assertEqual(len(client.calls), 1)
+
+        # A new generation is a new project binding, and that asks again.
+        self.manager._v2_context_generation += 1
+        self.manager._ensure_contract_handshake()
+        self.assertEqual(len(client.calls), 2)
+
+    def test_closing_the_gate_by_hand_stops_using_the_contract_path(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        project = self.manager.disable_contract_path()
+        self.assertFalse(project["contract_path_enabled"])
+        self.assertIsNone(project["contract_path_enabled_at"])
+        self.assertFalse(self.manager._uses_contract_structure())
+        # The server reading it was carrying stays on the row as the last
+        # observation. It is diagnostic now, and it opens nothing.
+        self.assertEqual(project["server_protocol_version"], 3)
+        self.assertEqual(
+            project["active_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+
+    def test_the_recorded_active_reply_is_read_exactly_as_the_server_sent_it(self):
+        """The live answer is LEGACY at epoch 0, and it must stay that way."""
+        self._attach(live_reply(LIVE_ACTIVE_REPLY))
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertEqual(reading["project_sync_mode"], "LEGACY")
+        self.assertEqual(reading["migration_epoch"], 0)
+        project = self._project()
+        # An allowlisted contract does not promote the project. Mode and epoch
+        # are exactly where they were, and only the server facts were written.
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        self.assertEqual(project["server_protocol_version"], 3)
+        self.assertEqual(
+            project["active_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+        self.assertEqual(
+            json.loads(project["server_capabilities_json"]),
+            sorted(SERVER_CAPABILITIES),
+        )
+        # And the write path is still closed, which is the whole arrangement.
+        self.assertFalse(project["contract_path_enabled"])
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_the_recorded_inactive_reply_writes_nothing(self):
+        self._attach(live_reply(LIVE_INACTIVE_REPLY))
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "unsupported")
+        project = self._project()
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertIsNone(project["server_protocol_version"])
+        self.assertIsNone(project["active_contract_sha256"])
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_the_recorded_active_reply_opens_the_path_once_the_gate_is_open(self):
+        self._attach(live_reply(LIVE_ACTIVE_REPLY))
+        project = self.manager.enable_contract_path()
+
+        self.assertTrue(project["contract_path_enabled"])
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        # LEGACY at epoch 0 is a contract-capable state through the epoch-zero
+        # adapter, so the path is genuinely live without any promotion.
+        self.assertTrue(self.manager._uses_contract_structure())
+
+    def test_a_server_that_has_dropped_this_protocol_is_refused(self):
+        """server_protocol_version is a ceiling; the set is the real answer."""
+        self._attach(supported_handshake(
+            server_protocol_version=4, supported_protocol_versions=[4]
+        ))
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.perform_contract_handshake()
+
+        self.assertEqual(raised.exception.code, "PROTOCOL_TOO_OLD")
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertEqual(self._project()["project_sync_mode"], "LEGACY")
+        self.assertIsNone(self._project()["server_protocol_version"])
+
+    def test_a_server_that_still_accepts_this_protocol_is_taken(self):
+        self._attach(supported_handshake(
+            server_protocol_version=4, supported_protocol_versions=[3, 4]
+        ))
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertEqual(self._project()["server_protocol_version"], 4)
+
+    def test_a_scalar_outside_the_servers_own_set_is_refused(self):
+        self._attach(supported_handshake(
+            server_protocol_version=9, supported_protocol_versions=[3]
+        ))
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.perform_contract_handshake()
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+
+    def test_a_reply_that_disagrees_with_itself_about_the_contract_is_refused(self):
+        cases = (
+            {"canonical_contract_sha256": "0" * 64},
+            {"contract_version": "0.3.0"},
+            {"contract_version": "0.1.0"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                self.manager._forget_contract_handshake()
+                self._attach(supported_handshake(**overrides))
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(
+                    raised.exception.code, "CONTRACT_DIGEST_MISMATCH"
+                )
+                self.assertFalse(self.manager._uses_contract_structure())
+                self.assertEqual(
+                    self._project()["project_sync_mode"], "LEGACY"
+                )
+
+    def test_an_absent_protocol_set_falls_back_to_the_scalar_alone(self):
+        """The field is not in the contract's required five; missing is allowed."""
+        reply = supported_handshake()
+        reply.pop("supported_protocol_versions")
+        self._attach(reply)
+        self.assertEqual(
+            self.manager.perform_contract_handshake()["outcome"], "supported"
+        )
+
+    def _server_moved_the_project_to_migrating(self):
+        """Exactly what a handshake records once the server promotes a project.
+
+        The gate is never touched here. Recording server state is all a
+        handshake is allowed to do.
+        """
+        return self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="MIGRATING",
+            migration_epoch=1,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+
+    def test_a_promoted_project_still_writes_legacy_while_the_gate_is_closed(self):
+        """The write shape follows the gate, not the mode the server reported.
+
+        project_sync_mode is the server's to move. If a document write read it
+        alone, the server could put this client on contract-native commits by
+        promoting the project, and the gate would never be consulted.
+        """
+        self._server_moved_the_project_to_migrating()
+        self.assertFalse(self.store.contract_path_enabled(self.context["local_key"]))
+
+        operation = self.store.enqueue(
+            self.manager._v2_context, "가.txt", "본문", relative_path="가.txt"
+        )
+        self.assertEqual(operation["provenance_kind"], "LEGACY_EPOCH_0")
+        self.assertEqual(operation["sync_protocol_version"], 2)
+        self.assertIsNone(operation["batch_id"])
+        self.assertIsNone(operation["contract_version"])
+        self.assertIsNone(operation["canonical_contract_sha256"])
+
+    def test_a_closed_gate_limits_the_write_and_never_edits_the_observation(self):
+        """Holding a write back is not the same as rewriting what was observed.
+
+        The mode and epoch on the project row are the server's answer. They stay
+        exactly as the handshake recorded them, and remain readable for
+        diagnosis, while the gate governs only the shape of the write.
+        """
+        self._server_moved_the_project_to_migrating()
+        before = self._project()
+
+        for name in ("가.txt", "나.txt", "다.txt"):
+            self.store.enqueue(
+                self.manager._v2_context, name, "본문", relative_path=name
+            )
+
+        after = self._project()
+        for column in (
+            "project_sync_mode", "migration_epoch", "server_protocol_version",
+            "active_contract_sha256", "server_capabilities_json",
+        ):
+            with self.subTest(column=column):
+                self.assertEqual(after[column], before[column])
+        # The observation is intact and still says MIGRATING ...
+        self.assertEqual(after["project_sync_mode"], "MIGRATING")
+        self.assertEqual(after["migration_epoch"], 1)
+        # ... while the gate it does not control is still shut.
+        self.assertFalse(after["contract_path_enabled"])
+
+    def test_a_promoted_project_writes_contract_batches_once_the_gate_opens(self):
+        self._server_moved_the_project_to_migrating()
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+
+        operation = self.store.enqueue(
+            self.manager._v2_context, "나.txt", "본문", relative_path="나.txt"
+        )
+        self.assertEqual(operation["provenance_kind"], "CONTRACT_BATCH")
+        self.assertEqual(operation["sync_protocol_version"], 3)
+        self.assertTrue(operation["batch_id"])
+        self.assertEqual(operation["contract_version"], CONTRACT_VERSION)
+        self.assertEqual(
+            operation["canonical_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+
+    def test_a_structure_batch_is_refused_while_the_gate_is_closed(self):
+        """The store checks the gate too, so a forgetful caller cannot skip it."""
+        self._server_moved_the_project_to_migrating()
+        intents = [{
+            "entity_kind": "folder",
+            "entity_id": str(uuid.uuid4()),
+            "intent_kind": "create",
+            "base_revision": 0,
+            "payload": {"name": "메모장"},
+        }]
+        with self.assertRaises(SyncContractError) as raised:
+            self.store.create_structure_batch(
+                self.manager._v2_context, DEVICE_ID, intents
+            )
+        self.assertEqual(raised.exception.code, "CONTRACT_NOT_ALLOWED")
+
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+        request = self.store.create_structure_batch(
+            self.manager._v2_context, DEVICE_ID, intents
+        )
+        self.assertEqual(request["project_sync_mode"], "MIGRATING")
+
+    def test_the_gate_defaults_to_closed_on_a_fresh_project(self):
+        self.assertFalse(self._project()["contract_path_enabled"])
+        self.assertIsNone(self._project()["contract_path_enabled_at"])
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
 
 
 if __name__ == "__main__":

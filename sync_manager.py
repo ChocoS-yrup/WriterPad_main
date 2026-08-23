@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import os
 import json
 import re
@@ -15,7 +16,7 @@ from PyQt6.QtCore import (
     QMetaObject, Qt,
 )
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from cloud_config import (
     CLOUD_INVALID_MESSAGE,
@@ -23,7 +24,12 @@ from cloud_config import (
     load_cloud_client_config,
 )
 from runtime_profile import is_forced_offline
-from sync_contract import SyncContractError, require_server_compatibility
+from sync_contract import (
+    CANONICAL_CONTRACT_SHA256,
+    SyncContractError,
+    read_handshake_compatibility,
+    require_server_compatibility,
+)
 from binder_order import (
     ROOT_STORAGE_NAMES,
     canonical_manuscript_children,
@@ -422,6 +428,11 @@ class V2PullWorker(QThread):
     def run(self):
         try:
             project_id = self.project_id
+            # The pull for an opened project is where the handshake happens: it
+            # is off the UI thread, a connection is already assumed, and asking
+            # once per opened project is the whole policy. The reading has to be
+            # in hand before the structure branch below consults it.
+            self.sync_manager._ensure_contract_handshake()
             documents = self.sync_manager._fetch_v2_project_documents(
                 project_id=project_id
             )
@@ -499,6 +510,12 @@ class SyncManager(QObject):
         self._v2_store = None
         self._v2_context = None
         self._v2_context_generation = 0
+        # The last handshake reading, and the generation it was asked for.
+        # Both live in memory only: restarting the app is one of the events
+        # that has to make an old reading stop counting.
+        self._contract_handshake = None
+        self._contract_handshake_attempt = None
+        self._contract_handshake_error = ""
         self._v2_wpm = None
         self._v2_device_id = None
         self._v2_worker = None
@@ -582,6 +599,7 @@ class SyncManager(QObject):
         # Every request already in the air belongs to the generation that is
         # ending here. None of them may land on whatever is attached next.
         self._v2_context_generation += 1
+        self._forget_contract_handshake()
         self._v2_wpm = None
         self._v2_untracked_recovery_paths = set()
         self._v2_last_pull_apply_blocked = False
@@ -905,11 +923,204 @@ class SyncManager(QObject):
         self._publish_sync_state()
         return recovery_id
 
+    # The answers that mean a handshake taken earlier in this session no longer
+    # describes the server: access was lost, the pin stopped matching, or the
+    # project moved out from under the reading.
+    _CONTRACT_HANDSHAKE_INVALIDATING = frozenset({
+        "AUTH_REQUIRED", "AUTH_EXPIRED", "FORBIDDEN",
+        "CONTRACT_NOT_ALLOWED", "CONTRACT_DIGEST_MISMATCH",
+        "PROTOCOL_TOO_OLD", "CAPABILITY_MISMATCH", "STALE_MIGRATION_EPOCH",
+    })
+
+    def _contract_identity(self):
+        """A short, one-way marker for whoever is signed in.
+
+        A handshake answers for one account's membership, so a reading has to
+        stop counting when somebody else signs in. The address itself is never
+        kept anywhere - only this digest of it.
+        """
+        try:
+            email = str(getattr(self.supabase, "_antigravity_email", "") or "")
+        except Exception:
+            email = ""
+        if not email:
+            return ""
+        return hashlib.sha256(email.encode("utf-8")).hexdigest()[:16]
+
+    def _forget_contract_handshake(self):
+        """Drop the reading so nothing downstream can act on it any more."""
+        self._contract_handshake = None
+        self._contract_handshake_attempt = None
+
+    def _forget_stale_contract_handshake(self, error):
+        """Drop the reading when a server answer has overtaken it."""
+        if self._stable_error_code(error) in self._CONTRACT_HANDSHAKE_INVALIDATING:
+            self._forget_contract_handshake()
+
+    def _contract_handshake_reading(self):
+        """The last handshake, but only while it still describes what is open."""
+        reading = self._contract_handshake
+        if not isinstance(reading, dict) or not self.is_v2_enabled:
+            return None
+        if reading.get("generation") != self._v2_context_generation:
+            return None
+        if reading.get("project_id") != self._v2_context.get("project_id"):
+            return None
+        if reading.get("contract_sha256") != CANONICAL_CONTRACT_SHA256:
+            return None
+        if reading.get("identity") != self._contract_identity():
+            return None
+        return reading
+
+    def contract_handshake_is_fresh(self):
+        """True only while a supported reading for this exact context stands."""
+        reading = self._contract_handshake_reading()
+        return bool(reading and reading.get("outcome") == "supported")
+
+    def contract_handshake_state(self):
+        """The last reading, for diagnostics. Never a reason to do anything."""
+        reading = self._contract_handshake_reading()
+        return {
+            "fresh": bool(reading and reading.get("outcome") == "supported"),
+            "observed_at": (reading or {}).get("observed_at", ""),
+            "outcome": (reading or {}).get("outcome", ""),
+            "last_error": self._contract_handshake_error,
+            "path_enabled": self.contract_path_enabled(),
+        }
+
+    def perform_contract_handshake(self, *, require_connection=False):
+        """Ask the server what it supports for the project that is open.
+
+        The reply is recorded and nothing more. It never opens the contract
+        path: that stays a separate, local, deliberate act. The reading is tied
+        to the project, the account and the client digest that produced it, so
+        it cannot survive any of them moving.
+        """
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        self._forget_contract_handshake()
+        if is_forced_offline() or not self.supabase:
+            if require_connection:
+                raise RuntimeError("NETWORK_UNAVAILABLE")
+            return None
+
+        generation = self._v2_context_generation
+        project_id = self._v2_context["project_id"]
+        identity = self._contract_identity()
+        response = self._call_with_session(
+            lambda: self.supabase.rpc("get_sync_handshake", {
+                "p_project_id": project_id,
+                "p_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            }).execute(),
+            self.supabase,
+        )
+        handshake = self._response_data(response)
+        if not isinstance(handshake, dict):
+            raise SyncContractError("INVALID_ARGUMENT", "invalid handshake")
+        answered = handshake.get("project_id")
+        if answered is not None and str(answered) != project_id:
+            # The answer is about a different project, so none of it applies
+            # here. Storing it would bind one project's state to another.
+            raise SyncContractError("INVALID_ARGUMENT", "handshake project mismatch")
+
+        reading = {
+            "generation": generation,
+            "project_id": project_id,
+            "identity": identity,
+            "contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "outcome": "unsupported",
+        }
+        if handshake.get("supported") is not True:
+            # An unsupported answer leaves nothing behind. There is no partial
+            # state to store and nothing that could be promoted later.
+            self._contract_handshake_error = ""
+            self._contract_handshake = reading
+            return reading
+
+        compatibility = read_handshake_compatibility(handshake)
+        if generation != self._v2_context_generation:
+            raise RuntimeError("PROJECT_CONTEXT_CHANGED")
+        project = self.activate_contract_project(**compatibility)
+        reading["outcome"] = "supported"
+        reading["project_sync_mode"] = project["project_sync_mode"]
+        reading["migration_epoch"] = int(project["migration_epoch"] or 0)
+        self._contract_handshake_error = ""
+        self._contract_handshake = reading
+        return reading
+
+    def _ensure_contract_handshake(self):
+        """Ask once for the project that is open, then leave the server alone.
+
+        The call is read-only but it costs the server a membership, settings
+        and allowlist lookup every time. Polling it would buy nothing: a stale
+        positive never arms the contract path, and explicit activation takes a
+        fresh reading of its own.
+        """
+        if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
+            return None
+        if self._contract_handshake_attempt == self._v2_context_generation:
+            return self._contract_handshake_reading()
+        try:
+            reading = self.perform_contract_handshake()
+        except Exception as error:
+            # A handshake is diagnostic. The legacy path does not depend on it
+            # and must not fall over because the server refused, the arguments
+            # were rejected, or the network dropped.
+            self._contract_handshake_error = (
+                self._stable_error_code(error) or "HANDSHAKE_FAILED"
+            )
+            reading = None
+        self._contract_handshake_attempt = self._v2_context_generation
+        return reading
+
+    def contract_path_enabled(self):
+        if not self.is_v2_enabled:
+            return False
+        return self._v2_store.contract_path_enabled(self._v2_context["local_key"])
+
+    def enable_contract_path(self):
+        """Open the local gate, against a handshake taken at this moment.
+
+        A reading from earlier in the session says what the server answered
+        then. Activation is the one point that has to be answered by the server
+        as it stands now, so this always calls out again instead of trusting
+        what is already stored.
+        """
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        reading = self.perform_contract_handshake(require_connection=True)
+        if not reading or reading.get("outcome") != "supported":
+            raise SyncContractError("CONTRACT_NOT_ALLOWED")
+        project = self._v2_store.set_contract_path_enabled(
+            self._v2_context["local_key"], True
+        )
+        self._publish_sync_state()
+        return project
+
+    def disable_contract_path(self):
+        """Close the local gate and drop the reading that armed it."""
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        project = self._v2_store.set_contract_path_enabled(
+            self._v2_context["local_key"], False
+        )
+        self._forget_contract_handshake()
+        self._publish_sync_state()
+        return project
+
     def _uses_contract_structure(self):
         if not self.is_v2_enabled:
             return False
         project = self._v2_store.get_project(self._v2_context["local_key"])
         if not project:
+            return False
+        # Three separate things have to hold, and a server that switches an
+        # allowlist row on can only ever supply the first of them. Without the
+        # other two, turning the server side on moves nothing here.
+        if not project.get("contract_path_enabled"):
+            return False
+        if not self.contract_handshake_is_fresh():
             return False
         try:
             require_server_compatibility(
@@ -1962,6 +2173,7 @@ class SyncManager(QObject):
 
     def _mark_auth_required(self, error=None):
         self._auth_retry_blocked = True
+        self._forget_contract_handshake()
         # 로그인 만료는 오프라인이 아니다. offline 로 표시하면 네트워크를
         # 확인하라는 안내가 나가고 정작 필요한 재로그인은 안내되지 않는다.
         self._last_failure_offline = False
@@ -2017,12 +2229,14 @@ class SyncManager(QObject):
         try:
             return action()
         except Exception as error:
+            self._forget_stale_contract_handshake(error)
             if self._stable_error_code(error) != "AUTH_EXPIRED":
                 raise
         self.ensure_session_valid(client, force_refresh=True)
         try:
             return action()
         except Exception as error:
+            self._forget_stale_contract_handshake(error)
             if self._stable_error_code(error) in {"AUTH_EXPIRED", "AUTH_REQUIRED"}:
                 self._mark_auth_required(error)
                 raise RuntimeError("AUTH_REQUIRED") from error
@@ -2111,6 +2325,7 @@ class SyncManager(QObject):
         except Exception:
             pass
         self._auth_retry_blocked = True
+        self._forget_contract_handshake()
         self._publish_sync_state()
 
     def authenticated_email(self):

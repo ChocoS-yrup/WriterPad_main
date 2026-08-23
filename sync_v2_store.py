@@ -299,6 +299,14 @@ class SyncV2Store:
             "active_contract_sha256 TEXT",
             "server_capabilities_json TEXT",
             "contract_validated_at TEXT",
+            # The local gate for the contract write path. A handshake proves what
+            # the server supports; this column records that a person decided to
+            # use it. It stays off until somebody turns it on, and it sits in the
+            # project row so the decision is visible next to the server state it
+            # applies to.
+            "contract_path_enabled INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (contract_path_enabled IN (0, 1))",
+            "contract_path_enabled_at TEXT",
         ):
             self._add_column(connection, "sync_projects", definition)
 
@@ -1169,6 +1177,43 @@ class SyncV2Store:
                 "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
             ).fetchone()
             return dict(row) if row else None
+
+    def set_contract_path_enabled(self, local_key, enabled):
+        """Record the local decision to use the contract write path.
+
+        Storing server state and opening this gate are separate acts on
+        purpose. A handshake can be replayed by the server turning an allowlist
+        row on; this row only changes when somebody asks for it here.
+        """
+        enabled = bool(enabled)
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT local_key FROM sync_projects WHERE local_key = ?",
+                (local_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(local_key)
+            connection.execute(
+                """
+                UPDATE sync_projects
+                SET contract_path_enabled = ?, contract_path_enabled_at = ?,
+                    updated_at = ?
+                WHERE local_key = ?
+                """,
+                (1 if enabled else 0, now if enabled else None, now, local_key),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
+            ).fetchone())
+
+    def contract_path_enabled(self, local_key):
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT contract_path_enabled FROM sync_projects WHERE local_key = ?",
+                (local_key,),
+            ).fetchone()
+            return bool(row and row["contract_path_enabled"])
 
     def activate_contract_project(
         self,
@@ -2278,7 +2323,16 @@ class SyncV2Store:
         ).fetchone()
         if project is None:
             raise KeyError(context["local_key"])
-        mode = project["project_sync_mode"] or "LEGACY"
+        observed_mode = project["project_sync_mode"] or "LEGACY"
+        # project_sync_mode is the server's to move, and a handshake records
+        # whatever it reports. The gate is not the server's to move. So the
+        # observed value stays on the project row untouched, as the last thing
+        # the server said, and only the shape of this write is held back: a
+        # branch that read the observed mode alone would emit a contract batch
+        # for a path nobody opened here.
+        effective_write_mode = (
+            observed_mode if project["contract_path_enabled"] else "LEGACY"
+        )
         payload = self._payload_for_document(
             local_path, relative_path, base_content, content, is_deleted
         )
@@ -2293,11 +2347,11 @@ class SyncV2Store:
             "delete" if is_deleted else
             "create" if int(base_revision or 0) == 0 else "update"
         )
-        if mode != "LEGACY" and base_revision is None:
+        if effective_write_mode != "LEGACY" and base_revision is None:
             provenance = "LOCAL_DEFERRED"
             protocol_version = SYNC_PROTOCOL_VERSION
             capabilities_json = canonical_json(list(CLIENT_CAPABILITIES))
-        elif mode != "LEGACY":
+        elif effective_write_mode != "LEGACY":
             provenance = "CONTRACT_BATCH"
             protocol_version = SYNC_PROTOCOL_VERSION
             contract_version = CONTRACT_VERSION
@@ -2318,7 +2372,7 @@ class SyncV2Store:
                 intent_kind = "update"
             request = build_document_commit_request(
                 project_id=context["project_id"],
-                project_sync_mode=mode,
+                project_sync_mode=effective_write_mode,
                 migration_epoch=int(project["migration_epoch"] or 0),
                 writer_device_id=context.get("writer_device_id") or uuid.uuid4(),
                 document_id=document["document_id"],
@@ -2352,7 +2406,7 @@ class SyncV2Store:
                     batch["sync_protocol_version"], batch["contract_version"],
                     batch["canonical_contract_sha256"],
                     canonical_json(batch["client_capabilities"]),
-                    batch["batch_payload_sha256"], mode,
+                    batch["batch_payload_sha256"], effective_write_mode,
                     int(project["migration_epoch"] or 0), canonical_json(request),
                     json_sha256(request), _utc_now(),
                 ),
@@ -3207,6 +3261,11 @@ class SyncV2Store:
             ).fetchone()
             if project is None:
                 raise KeyError(context["local_key"])
+            if not project["contract_path_enabled"]:
+                # The caller is expected to have consulted the gate already.
+                # Checking again here means a future caller that forgets cannot
+                # put a contract batch on the queue.
+                raise SyncContractError("CONTRACT_NOT_ALLOWED")
             capabilities = json.loads(project["server_capabilities_json"] or "[]")
             require_server_compatibility(
                 project_sync_mode=project["project_sync_mode"],
