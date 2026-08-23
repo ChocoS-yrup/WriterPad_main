@@ -123,7 +123,25 @@ def show(key, value):
         value = ""
     if isinstance(value, bool):
         value = "true" if value else "false"
-    print(f"{key}={value}")
+    print(f"{key}={_one_line(value)}")
+
+
+def _one_line(value):
+    """One field, one line, whatever the field came from.
+
+    Some of what gets printed here arrives from the environment, and this output
+    is kept as the record of what a run found. A value carrying a newline would
+    not merely look wrong: it would add lines that read exactly like results,
+    and somebody reading the record afterwards would see a verdict that was
+    never reached.
+    """
+    text = str(value)
+    return "".join(
+        character
+        if character >= " " and character != "\x7f"
+        else "\\x%02x" % ord(character)
+        for character in text
+    )
 
 
 def show_lease_scope():

@@ -544,6 +544,52 @@ class SingleRefreshAuthorityTestCase(unittest.TestCase):
                     self._call(client)
                 self.assertEqual(client.auth.refresh_calls, expected)
 
+    def test_a_fresh_client_ignores_a_stored_session_about_to_lapse(self):
+        """The store may hold somebody else's session, or a spent one."""
+        client = _Client()
+        client._antigravity_access_token = _expiring_token(3600)
+        keyring = _Keyring(access=_expiring_token(5), refresh="refresh-stored")
+
+        with patch("security_manager.SecurityManager", keyring):
+            self._call(client)
+
+        self.assertEqual(client.auth.refresh_calls, 0)
+
+    def test_a_stale_client_adopts_a_newer_stored_session_rather_than_rotating(self):
+        """Adopting costs one local exchange; rotating costs everyone else."""
+        client = _Client()
+        client._antigravity_access_token = _expiring_token(5)
+        client._antigravity_refresh_token = "refresh-mine"
+        adopted = []
+        client.auth.set_session = lambda access, refresh: (
+            adopted.append(refresh)
+            or SimpleNamespace(session=SimpleNamespace(
+                access_token=access, refresh_token=refresh,
+                user=SimpleNamespace(email="writer@example.com"),
+            ))
+        )
+        keyring = _Keyring(
+            access=_expiring_token(3600), refresh="refresh-newer"
+        )
+
+        with patch("security_manager.SecurityManager", keyring):
+            self._call(client)
+
+        self.assertEqual(adopted, ["refresh-newer"])
+        self.assertEqual(client.auth.refresh_calls, 0)
+
+    def test_both_near_expiry_rotates_exactly_once(self):
+        """Nothing newer to adopt, so this really is the client that rotates."""
+        client = _Client()
+        client._antigravity_access_token = _expiring_token(5)
+        client._antigravity_refresh_token = "refresh-mine"
+        keyring = _Keyring(access=_expiring_token(5), refresh="refresh-mine")
+
+        with patch("security_manager.SecurityManager", keyring):
+            self._call(client)
+
+        self.assertEqual(client.auth.refresh_calls, 1)
+
     def test_a_restored_session_leaves_its_expiry_on_the_client(self):
         """The proactive path needs the access token, so remembering must keep it."""
         client = SimpleNamespace()

@@ -2433,6 +2433,55 @@ class CredentialLockCheckTests(unittest.TestCase):
                 self.assertIn("network_used=false", output)
 
 
+class PreflightOutputIntegrityTests(unittest.TestCase):
+    """The output is kept as the record of what a run found."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def _shown(self, key, value):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            self.preflight.show(key, value)
+        return stream.getvalue()
+
+    def test_a_value_cannot_add_lines_that_read_like_results(self):
+        """The profile arrives from the environment; the rest of this is a record.
+
+        Without folding it, a profile name carrying newlines writes its own
+        verdict into the record, and whoever reads it afterwards sees a run that
+        passed when it did not.
+        """
+        rendered = self._shown(
+            "profile", "evil\nacquired=true\nverdict=the credential is free"
+        )
+
+        self.assertEqual(len(rendered.splitlines()), 1)
+        self.assertNotIn("\nacquired=true", rendered)
+        self.assertIn("\\x0a", rendered)
+
+    def test_terminal_control_sequences_do_not_survive(self):
+        for value in ("\x1b[2J", "before\rafter", "tab\there", "null\x00byte", "\x7f"):
+            with self.subTest(value=repr(value)):
+                rendered = self._shown("profile", value)
+                self.assertEqual(len(rendered.splitlines()), 1)
+                for character in value:
+                    if character < " " or character == "\x7f":
+                        self.assertNotIn(character, rendered)
+
+    def test_ordinary_values_are_left_exactly_as_they_are(self):
+        for value in (
+            "(default)",
+            "Global\\AntigravityWriterSupabaseAuth-0123456789abcdef",
+            "C:\\Users\\writer\\AppData\\Local\\AntigravityWriter\\sync_v2.sqlite3",
+            "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+            "[3]",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self._shown("k", value), f"k={value}\n")
+
+
 class ContractApplicationHandshakeTests(unittest.TestCase):
     """The end-to-end check: the real client path, driven against a copy.
 
