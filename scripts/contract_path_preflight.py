@@ -17,6 +17,13 @@
                            mode to use when what is being tested is the locking
                            itself.
 
+  --activate-contract-path opens the local gate for one named project, and
+                           only after everything that would make that a mistake
+                           has been ruled out. Reports and changes nothing
+                           unless --apply is given as well. This is the one mode
+                           that writes to the live database, and it writes one
+                           column of one row.
+
   --application-handshake  the end-to-end check. Runs the real
                            SyncManager.perform_contract_handshake() against a
                            throwaway copy of the database, lets it record what
@@ -501,6 +508,306 @@ def build_manager(store, project, device_id):
     return manager
 
 
+def gate_snapshot(database: Path):
+    """Every gate on the machine, so the ones not being opened can be shown shut."""
+    _version, _present, rows = read_projects(database)
+    return {
+        row["project_id"]: (
+            bool(row.get("contract_path_enabled")),
+            row.get("contract_path_enabled_at") or "",
+        )
+        for row in rows
+    }
+
+
+def project_work_counts(database: Path, local_key: str):
+    """What is still owed on one project. Opening a gate over unfinished work
+    would change the shape of writes that were queued under the old one."""
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+        def count(table, where, parameters):
+            if table not in tables:
+                return 0
+            return int(connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {where}", parameters
+            ).fetchone()[0])
+
+        return {
+            "queued_operations": count(
+                "sync_operations", "local_key = ?", (local_key,)
+            ),
+            "operations_with_errors": count(
+                "sync_operations", "local_key = ? AND last_error != ''", (local_key,)
+            ),
+            "documents_in_conflict": count(
+                "sync_documents",
+                "local_key = ? AND (conflict_local IS NOT NULL"
+                " OR conflict_remote IS NOT NULL)",
+                (local_key,),
+            ),
+            "contract_batches": count(
+                "sync_contract_batches", "local_key = ?", (local_key,)
+            ),
+        }
+    finally:
+        connection.close()
+
+
+def run_activation(live: Path, project_id: str, confirm_id: str, apply_change: bool):
+    """Open one project's gate, after ruling out everything that would make it
+    a mistake. Without --apply nothing is written and the checks still run."""
+    from sync_manager import SyncManager
+    from sync_v2_store import SyncV2Store
+    from sync_contract import (
+        CANONICAL_CONTRACT_SHA256, SERVER_CAPABILITIES, SYNC_PROTOCOL_VERSION,
+    )
+
+    checks = Checks()
+    print("[activation]")
+    show("mode", "apply" if apply_change else "dry run - nothing will be written")
+    show("target_project_id", project_id)
+    # Typing it twice is the whole point: fifteen other projects are one
+    # character away, and the gate is not something to open on a typo.
+    checks.require(
+        "the project id was given twice and matched",
+        bool(project_id) and project_id == confirm_id,
+        "--project-id and --confirm-project-id differ",
+    )
+    if checks.failed:
+        checks.report()
+        show("verdict", "STOP - the two project ids do not match")
+        return 1
+
+    digest_before = file_sha256(live)
+    gates_before = gate_snapshot(live)
+    _version, _present, rows_before = read_projects(live)
+    row_before = next(
+        (row for row in rows_before if row["project_id"] == project_id), {}
+    )
+    checks.require(
+        "the project is one row in this database",
+        list(gates_before).count(project_id) == 1,
+        f"{list(gates_before).count(project_id)} rows match",
+    )
+    if project_id not in gates_before:
+        checks.report()
+        show("verdict", "STOP - no such project here")
+        return 1
+    show("other_projects", len(gates_before) - 1)
+    checks.require(
+        "its gate is shut to begin with",
+        gates_before[project_id][0] is False,
+        "it is already open",
+    )
+
+    store = SyncV2Store(str(live))
+    project = store.get_project_by_id(project_id)
+    local_key = project["local_key"]
+    work = project_work_counts(live, local_key)
+    for name, value in work.items():
+        show(name, value)
+    checks.require(
+        "nothing is still owed on it",
+        not any(work.values()),
+        "queued work, errors, conflicts or batches are present",
+    )
+
+    device_id = project.get("writer_device_id") or str(uuid.uuid4())
+    manager = SyncManager()
+    manager.release_v2()
+    manager._v2_store = store
+    manager._v2_context = {
+        "local_key": local_key,
+        "project_id": project_id,
+        "writer_device_id": device_id,
+    }
+    manager._v2_device_id = device_id
+    manager._forget_contract_handshake()
+
+    client = SyncManager.create_supabase_client()
+    if client is None or not getattr(client, "_antigravity_authenticated", False):
+        show(
+            "client",
+            "RESTORE FAILED - the stored session was kept"
+            if client is not None else "NO CLIENT",
+        )
+        show(
+            "restore_error_kind",
+            getattr(client, "_antigravity_restore_error_kind", "") or "(none)",
+        )
+        checks.require("a signed-in client is available", False, "not authenticated")
+        checks.report()
+        show("verdict", "STOP - sign in from the application first")
+        return 1
+    manager.supabase = client
+    checks.require("a signed-in client is available", True)
+    print()
+
+    try:
+        print("[fresh handshake]")
+        try:
+            reading = manager.perform_contract_handshake(require_connection=True)
+        except Exception as error:
+            code = getattr(error, "code", "") or type(error).__name__
+            show("perform_contract_handshake", f"RAISED {code}")
+            checks.require("the handshake completed", False, code)
+            reading = None
+        if reading is not None:
+            show("outcome", reading.get("outcome"))
+            show("observed_project_sync_mode", reading.get("project_sync_mode"))
+            show("observed_migration_epoch", reading.get("migration_epoch"))
+            show("handshake_is_fresh", manager.contract_handshake_is_fresh())
+            checks.require("the handshake completed", True)
+            checks.require(
+                "the server supports this client",
+                reading.get("outcome") == "supported",
+                str(reading.get("outcome")),
+            )
+            checks.require(
+                "it answered LEGACY at epoch 0",
+                (reading.get("project_sync_mode"), reading.get("migration_epoch"))
+                == ("LEGACY", 0),
+                f'{reading.get("project_sync_mode")}/{reading.get("migration_epoch")}',
+            )
+
+        stored = store.get_project_by_id(project_id)
+        show("recorded_server_protocol_version", stored["server_protocol_version"])
+        show("recorded_contract_sha256", stored["active_contract_sha256"])
+        capabilities = json.loads(stored["server_capabilities_json"] or "[]")
+        show("recorded_capabilities", len(capabilities))
+        checks.require(
+            "the digest is the one this client is pinned to",
+            stored["active_contract_sha256"] == CANONICAL_CONTRACT_SHA256,
+            "digest differs from the pin",
+        )
+        checks.require(
+            "the protocol is one this client speaks",
+            int(stored["server_protocol_version"] or 0) >= SYNC_PROTOCOL_VERSION,
+            f'protocol {stored["server_protocol_version"]}',
+        )
+        missing = sorted(set(SERVER_CAPABILITIES) - set(capabilities))
+        checks.require(
+            "every capability this client needs is offered",
+            not missing,
+            f"missing {len(missing)}",
+        )
+        print()
+
+        if checks.failed:
+            checks.report()
+            show(
+                "verdict",
+                "STOP - " + ", ".join(name for name, _p, _d in checks.failed),
+            )
+            return 1
+
+        if not apply_change:
+            checks.report()
+            show("gate_after", gate_snapshot(live)[project_id][0])
+            show(
+                "verdict",
+                "every check passed; re-run with --apply to open the gate",
+            )
+            return 0
+
+        gates_mid = gate_snapshot(live)
+        work_mid = project_work_counts(live, local_key)
+        store.set_contract_path_enabled(local_key, True)
+        gates_after = gate_snapshot(live)
+        work_after = project_work_counts(live, local_key)
+
+        print("[what changed]")
+        moved = [
+            other for other in gates_after
+            if gates_after[other] != gates_mid.get(other)
+        ]
+        show("gate_rows_changed", len(moved))
+        show("gate_after", gates_after[project_id][0])
+        show("gate_opened_at", gates_after[project_id][1])
+        checks.require(
+            "exactly one gate moved", moved == [project_id],
+            f"{len(moved)} moved",
+        )
+        checks.require(
+            "the other gates are where they were",
+            all(
+                gates_after[other] == gates_before[other]
+                for other in gates_after if other != project_id
+            ),
+            "another project's gate moved",
+        )
+        checks.require(
+            "opening it queued nothing",
+            work_after == work_mid,
+            "the queue or the batch table moved",
+        )
+        stored_after = store.get_project_by_id(project_id)
+        checks.require(
+            "mode and epoch are untouched",
+            (stored_after["project_sync_mode"],
+             int(stored_after["migration_epoch"] or 0)) == ("LEGACY", 0),
+            f'{stored_after["project_sync_mode"]}/{stored_after["migration_epoch"]}',
+        )
+        print()
+        checks.report()
+        if checks.failed:
+            show(
+                "verdict",
+                "STOP - " + ", ".join(name for name, _p, _d in checks.failed),
+            )
+            return 1
+        show("verdict", "the gate is open for this project and no other")
+        return 0
+    finally:
+        try:
+            manager.release_v2()
+            manager.supabase = None
+            manager._v2_store = None
+            manager._v2_device_id = None
+        except Exception:
+            pass
+        print()
+        # A handshake records what the server said, so this file is expected to
+        # change even on a dry run. Reporting a digest that moved and stopping
+        # there would say nothing about whether it moved for a good reason, so
+        # what moved is named instead.
+        print("[target row, before -> after]")
+        _v, _p, rows_after = read_projects(live)
+        row_after = next(
+            (row for row in rows_after if row["project_id"] == project_id), {}
+        )
+        moved_fields = [
+            column for column in CONTRACT_COLUMNS
+            if row_before.get(column) != row_after.get(column)
+        ]
+        if not moved_fields:
+            show("changed", "(nothing)")
+        for column in moved_fields:
+            show(column, f"{row_before.get(column)!r} -> {row_after.get(column)!r}")
+        untouched_gates = [
+            other for other in gates_before
+            if other != project_id
+            and gate_snapshot(live).get(other) != gates_before[other]
+        ]
+        show("other_project_gates_moved", len(untouched_gates))
+        print()
+        print("[database file]")
+        show("sha256_before", digest_before)
+        show("sha256_after", file_sha256(live))
+        show(
+            "note",
+            "a handshake records the server's answer, so this file moves even "
+            "on a dry run; the fields above say what moved",
+        )
+
+
 def run_application_handshake(live: Path, only_project: str):
     """Drive the real client path against a copy and prove the gate held."""
     from sync_manager import SyncManager
@@ -761,6 +1068,23 @@ def main():
         "--project", default="",
         help="limit the handshake modes to one project id",
     )
+    parser.add_argument(
+        "--activate-contract-path", action="store_true",
+        help="open the local contract gate for one project, after every check "
+             "passes. Reports only unless --apply is given",
+    )
+    parser.add_argument(
+        "--project-id", default="",
+        help="the project whose gate to open",
+    )
+    parser.add_argument(
+        "--confirm-project-id", default="",
+        help="the same id again; they must match",
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="actually open the gate. Without it nothing is written",
+    )
     args = parser.parse_args()
 
     if args.credential_lock_check:
@@ -806,7 +1130,7 @@ def main():
 
     status = 0
     holds_credential = False
-    if args.rpc_handshake or args.application_handshake:
+    if args.rpc_handshake or args.application_handshake or args.activate_contract_path:
         # Both of these build a real client and spend the stored refresh token.
         # Taking the same lock the application takes is what makes that safe;
         # asking whether the application is running would be a question whose
@@ -838,19 +1162,30 @@ def main():
             run_handshakes(projects, only_project)
         if args.application_handshake:
             status = run_application_handshake(database, only_project)
+        if args.activate_contract_path:
+            status = run_activation(
+                database,
+                args.project_id.strip(),
+                args.confirm_project_id.strip(),
+                args.apply,
+            )
     finally:
         if holds_credential:
             from sync_manager import SyncManager as _SyncManager
 
             _SyncManager.release_auth_lease()
 
-    after = file_sha256(database)
-    print("[database file]")
-    show("sha256_after", after)
-    show("unchanged", after == before)
-    if after != before:
-        show("verdict", "STOP - the live database changed during a preflight")
-        status = 1
+    if not args.activate_contract_path:
+        # Every other mode promises not to write. This is where that promise is
+        # checked rather than asserted. Activation writes deliberately and
+        # accounts for its own changes, field by field, above.
+        after = file_sha256(database)
+        print("[database file]")
+        show("sha256_after", after)
+        show("unchanged", after == before)
+        if after != before:
+            show("verdict", "STOP - the live database changed during a preflight")
+            status = 1
     return status
 
 

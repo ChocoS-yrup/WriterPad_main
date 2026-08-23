@@ -2434,6 +2434,216 @@ class CredentialLockCheckTests(unittest.TestCase):
                 self.assertIn("network_used=false", output)
 
 
+CANARY_ID = "4df996c8-6443-4429-9dad-8fe3573af3d1"
+BYSTANDER_ID = "00000000-0000-4000-8000-0000000009a1"
+
+
+class ContractPathActivationTests(unittest.TestCase):
+    """Opening one gate, and being able to say afterwards that it was one.
+
+    Every case runs against a throwaway database and a stand-in server. The
+    machine's own database and login are never involved.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.live = Path(self.temp.name) / "sync_v2.sqlite3"
+        self.store = SyncV2Store(str(self.live))
+        self.context = self.store.configure_project(
+            str(Path(self.temp.name) / "canary"), "Canary", CANARY_ID
+        )
+        # A second project, so "one gate moved" is a claim with something to be
+        # wrong about.
+        self.bystander = self.store.configure_project(
+            str(Path(self.temp.name) / "bystander"), "Bystander", BYSTANDER_ID
+        )
+
+    def tearDown(self):
+        manager = SyncManager()
+        manager.release_v2()
+        manager.supabase = None
+        manager._v2_store = None
+        manager._v2_device_id = None
+        self.temp.cleanup()
+
+    def _run(self, reply=None, apply_change=False, project_id=CANARY_ID,
+             confirm_id=None):
+        client = _AuthenticatedClient(
+            json.loads(LIVE_ACTIVE_REPLY) if reply is None else reply
+        )
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "create_supabase_client",
+            staticmethod(lambda config=None: client),
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.run_activation(
+                    self.live,
+                    project_id,
+                    project_id if confirm_id is None else confirm_id,
+                    apply_change,
+                )
+        return status, stream.getvalue(), client
+
+    def _gate(self, project_id):
+        row = self.store.get_project_by_id(project_id)
+        return bool(row["contract_path_enabled"])
+
+    @staticmethod
+    def _value(output, key):
+        for line in output.splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+        return None
+
+    def test_a_dry_run_checks_everything_and_writes_nothing(self):
+        status, output, client = self._run(apply_change=False)
+
+        self.assertEqual(status, 0, output)
+        self.assertIn("dry run", self._value(output, "mode"))
+        self.assertNotIn("=FAIL", output)
+        self.assertIn("re-run with --apply", self._value(output, "verdict"))
+        # The handshake really ran, and the gate really did not move.
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(self._gate(CANARY_ID))
+        self.assertFalse(self._gate(BYSTANDER_ID))
+
+    def test_applying_opens_that_gate_and_only_that_gate(self):
+        status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(status, 0, output)
+        self.assertTrue(self._gate(CANARY_ID))
+        self.assertFalse(self._gate(BYSTANDER_ID))
+        self.assertEqual(self._value(output, "gate_rows_changed"), "1")
+        self.assertTrue(self._value(output, "gate_opened_at"))
+        self.assertNotIn("=FAIL", output)
+
+    def test_the_handshake_happens_exactly_once(self):
+        _status, _output, client = self._run(apply_change=True)
+
+        self.assertEqual([name for name, _params in client.calls],
+                         ["get_sync_handshake"])
+        self.assertEqual(
+            client.calls[0][1]["p_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+
+    def test_opening_the_gate_queues_no_work(self):
+        _status, output, _client = self._run(apply_change=True)
+
+        self.assertIn("opening it queued nothing=PASS", output)
+        self.assertEqual(self._value(output, "queued_operations"), "0")
+        self.assertEqual(self._value(output, "contract_batches"), "0")
+
+    def test_mode_and_epoch_are_left_alone(self):
+        self._run(apply_change=True)
+        row = self.store.get_project_by_id(CANARY_ID)
+
+        self.assertEqual(row["project_sync_mode"], "LEGACY")
+        self.assertEqual(row["migration_epoch"], 0)
+
+    def test_two_ids_that_differ_stop_before_anything_is_read(self):
+        status, output, client = self._run(
+            apply_change=True, confirm_id=BYSTANDER_ID
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("do not match", self._value(output, "verdict"))
+        self.assertEqual(client.calls, [])
+        self.assertFalse(self._gate(CANARY_ID))
+        self.assertFalse(self._gate(BYSTANDER_ID))
+
+    def test_a_project_that_is_not_here_stops(self):
+        status, output, client = self._run(
+            apply_change=True, project_id="00000000-0000-4000-8000-0000000009ff"
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("no such project", self._value(output, "verdict"))
+        self.assertEqual(client.calls, [])
+
+    def test_a_gate_that_is_already_open_stops(self):
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+        status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("STOP", self._value(output, "verdict"))
+        self.assertIn("its gate is shut to begin with=FAIL", output)
+
+    def test_work_still_owed_stops(self):
+        """A write queued under the old shape must not be overtaken by the new."""
+        self.store.enqueue(
+            self.context, "1화.txt", "본문", relative_path="1화.txt"
+        )
+        status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("nothing is still owed on it=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_a_server_that_does_not_support_this_client_stops(self):
+        status, output, _client = self._run(
+            reply=json.loads(LIVE_INACTIVE_REPLY), apply_change=True
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("the server supports this client=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_a_promoted_project_stops(self):
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["project_sync_mode"] = "MIGRATING"
+        reply["migration_epoch"] = 1
+        status, output, _client = self._run(reply=reply, apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("it answered LEGACY at epoch 0=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_literals_that_do_not_match_the_pin_stop(self):
+        cases = (
+            ({"server_contract_sha256": "0" * 64,
+              "canonical_contract_sha256": "0" * 64,
+              "contract_version": None}, "the digest is the one"),
+            ({"server_protocol_version": 2,
+              "supported_protocol_versions": [2]}, "the protocol is one"),
+            ({"server_capabilities": list(SERVER_CAPABILITIES[:-1])},
+             "every capability this client needs"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                self.setUp()
+                try:
+                    reply = json.loads(LIVE_ACTIVE_REPLY)
+                    reply.update(overrides)
+                    status, output, _client = self._run(
+                        reply=reply, apply_change=True
+                    )
+                    self.assertEqual(status, 1)
+                    self.assertIn(expected, output)
+                    self.assertFalse(self._gate(CANARY_ID))
+                finally:
+                    self.tearDown()
+
+    def test_a_handshake_that_cannot_complete_stops(self):
+        error = RuntimeError("Invalid Refresh Token: Already Used")
+        error.status = 400
+        status, output, _client = self._run(reply=error, apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("the handshake completed=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_the_report_says_how_many_other_projects_were_left_alone(self):
+        _status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(self._value(output, "other_projects"), "1")
+        self.assertIn("the other gates are where they were=PASS", output)
+
+
 class PreflightOutputIntegrityTests(unittest.TestCase):
     """The output is kept as the record of what a run found."""
 
