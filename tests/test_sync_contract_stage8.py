@@ -2351,5 +2351,189 @@ class ContractPreflightVerdictTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class _AuthenticatedClient(_HandshakeClient):
+    """A stand-in that create_supabase_client can hand back, ready to call."""
+
+    def rpc(self, name, params):
+        self.calls.append((name, dict(params)))
+        reply = self.reply
+        if isinstance(reply, dict):
+            # The real server answers about whichever project was asked for.
+            reply = dict(reply, project_id=params["p_project_id"])
+        return SimpleNamespace(execute=lambda: SimpleNamespace(data=reply))
+
+
+class ContractApplicationHandshakeTests(unittest.TestCase):
+    """The end-to-end check: the real client path, driven against a copy.
+
+    The RPC preflight proves what the server answers. These prove the wiring:
+    that perform_contract_handshake records what it should, and that the gate
+    holds afterwards against a write.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.live = Path(self.temp.name) / "sync_v2.sqlite3"
+        store = SyncV2Store(str(self.live))
+        store.configure_project(
+            str(Path(self.temp.name) / "writing"), "Preflight", PROJECT_ID
+        )
+
+    def tearDown(self):
+        manager = SyncManager()
+        manager.release_v2()
+        manager.supabase = None
+        manager._v2_store = None
+        manager._v2_device_id = None
+        self.temp.cleanup()
+
+    def _run(self, reply):
+        client = _AuthenticatedClient(reply)
+        digest_before = self.preflight.file_sha256(self.live)
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "create_supabase_client", staticmethod(lambda config=None: client)
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.run_application_handshake(self.live, "")
+        output = stream.getvalue()
+        # Whatever else happened, the live database is not what was worked on.
+        self.assertEqual(self.preflight.file_sha256(self.live), digest_before)
+        return status, output, client
+
+    @staticmethod
+    def _checks(output):
+        return dict(
+            line.split("=", 1)
+            for line in output.splitlines()
+            if "=PASS" in line or "=FAIL" in line.split("=", 1)[-1][:4]
+        )
+
+    @staticmethod
+    def _value(output, key):
+        for line in output.splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+        return None
+
+    def test_the_recorded_active_reply_runs_the_wiring_and_the_gate_holds(self):
+        status, output, client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+
+        self.assertEqual(status, 0, output)
+        self.assertEqual(client.calls[0][0], "get_sync_handshake")
+        self.assertEqual(
+            client.calls[0][1]["p_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+        # The real client call ran and recorded a supported reading ...
+        self.assertEqual(self._value(output, "outcome"), "supported")
+        self.assertEqual(self._value(output, "handshake_is_fresh"), "true")
+        self.assertEqual(
+            self._value(output, "observed_project_sync_mode"), "LEGACY"
+        )
+        self.assertEqual(self._value(output, "observed_migration_epoch"), "0")
+        # ... and the write path is still shut behind it.
+        self.assertEqual(self._value(output, "uses_contract_structure"), "false")
+        self.assertNotIn("=FAIL", output)
+        self.assertIn("wiring held", self._value(output, "verdict"))
+
+    def test_the_observation_is_recorded_but_the_gate_is_not_touched(self):
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+
+        # The server facts land on the row ...
+        self.assertIn("project.1.server_protocol_version", output)
+        self.assertIn("project.1.active_contract_sha256", output)
+        self.assertIn("project.1.server_capabilities_json", output)
+        # ... and the two gate columns are not among what changed.
+        self.assertNotIn("project.1.contract_path_enabled=", output)
+        self.assertNotIn("project.1.contract_path_enabled_at=", output)
+
+    def test_the_handshake_queues_no_work_of_any_kind(self):
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+        for counter in (
+            "operations_total", "operations_protocol_3",
+            "operations_with_batch_id", "operations_contract_batch",
+            "contract_batches",
+        ):
+            with self.subTest(counter=counter):
+                self.assertIn(f"handshake_queued_nothing.{counter}=PASS", output)
+
+    def test_a_write_through_the_closed_gate_still_comes_out_legacy(self):
+        """The probe is the part that proves the stored state opens nothing."""
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+
+        self.assertEqual(self._value(output, "probe.1.provenance_kind"), "LEGACY_EPOCH_0")
+        self.assertEqual(self._value(output, "probe.1.sync_protocol_version"), "2")
+        self.assertEqual(self._value(output, "probe.1.batch_id"), "(none)")
+        self.assertEqual(self._value(output, "probe.1.contract_version"), "(none)")
+        self.assertIn("probe_write_is_legacy[1]=PASS", output)
+        self.assertIn("probe_created_no_contract_batch=PASS", output)
+        self.assertIn("probe_created_no_protocol_3_operation=PASS", output)
+
+    def test_a_promoted_project_stops_the_run_but_the_gate_still_holds(self):
+        """Two things at once: the promotion halts it, and nothing leaked."""
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["project_sync_mode"] = "MIGRATING"
+        reply["migration_epoch"] = 1
+        status, output, _client = self._run(reply)
+
+        self.assertEqual(status, 1)
+        self.assertIn("observed_mode_is_legacy_epoch_0[1]=FAIL", output)
+        self.assertIn("STOP", self._value(output, "verdict"))
+        # The observation was recorded honestly, exactly as the server sent it.
+        self.assertIn("project.1.project_sync_mode='LEGACY' -> 'MIGRATING'", output)
+        # And the gate held anyway, which is the fix this run exists to prove.
+        self.assertEqual(self._value(output, "uses_contract_structure"), "false")
+        self.assertIn("gate_still_closed[1]=PASS", output)
+        self.assertIn("probe_write_is_legacy[1]=PASS", output)
+        self.assertEqual(self._value(output, "probe.1.provenance_kind"), "LEGACY_EPOCH_0")
+
+    def test_the_recorded_inactive_reply_records_nothing_and_passes(self):
+        status, output, _client = self._run(json.loads(LIVE_INACTIVE_REPLY))
+
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self._value(output, "outcome"), "unsupported")
+        self.assertEqual(self._value(output, "handshake_is_fresh"), "false")
+        self.assertEqual(self._value(output, "project.1.changed"), "(nothing)")
+        self.assertIn("nothing to activate", self._value(output, "verdict"))
+
+    def test_a_server_that_dropped_this_protocol_stops_the_run(self):
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["server_protocol_version"] = 4
+        reply["supported_protocol_versions"] = [4]
+        status, output, _client = self._run(reply)
+
+        self.assertEqual(status, 1)
+        self.assertIn("handshake_completed[1]=FAIL PROTOCOL_TOO_OLD", output)
+        self.assertEqual(self._value(output, "project.1.changed"), "(nothing)")
+
+    def test_an_unauthenticated_client_stops_the_run(self):
+        client = _AuthenticatedClient(json.loads(LIVE_ACTIVE_REPLY))
+        client._antigravity_authenticated = False
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "create_supabase_client",
+            staticmethod(lambda config=None: client),
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.run_application_handshake(self.live, "")
+        self.assertEqual(status, 1)
+        self.assertIn("NOT AUTHENTICATED", stream.getvalue())
+        self.assertEqual(client.calls, [])
+
+    def test_the_run_prints_nothing_that_looks_like_a_credential(self):
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+        lowered = output.lower()
+        for marker in (
+            "access_token", "refresh_token", "apikey", "api_key", "bearer",
+            "authorization", "eyj", "@", "http://", "https://",
+        ):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, lowered)
+
+
 if __name__ == "__main__":
     unittest.main()

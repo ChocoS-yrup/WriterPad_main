@@ -1,18 +1,28 @@
-"""Read-only preflight for the contract write path.
+"""Preflight for the contract write path. Three modes, in widening scope.
 
-Prints the three things a person needs before deciding whether to open the
-local contract gate, and changes none of them:
+  (no flag)                the client pin, plus the local gate and the server
+                           state stored beside it, read out of the live
+                           database with mode=ro. No network.
 
-  1. the client pin, to cross-check against the server allowlist row
-  2. the local gate and the server state stored beside it, read straight out
-     of the live database with mode=ro
-  3. optionally one fresh handshake per project, validated exactly the way the
-     client validates it, held entirely in memory
+  --rpc-handshake          a read-only RPC preflight. Calls get_sync_handshake
+                           once per project and validates the reply the way the
+                           client validates it, entirely in memory. Proves what
+                           the server answers. Proves nothing about the client
+                           wiring, because it does not use it.
 
-This tool never opens the gate, never writes to the database, and never
-promotes a project. It prints no project names, no paths and no document
-content; project ids and metadata only. The database digest is reported before
-and after so a run can be shown to have changed nothing.
+  --application-handshake  the end-to-end check. Runs the real
+                           SyncManager.perform_contract_handshake() against a
+                           throwaway copy of the database, lets it record what
+                           it normally records, and then proves the gate held:
+                           still 0, still LEGACY at epoch 0, no contract batch
+                           and no protocol 3 operation created, and a document
+                           write that still comes out legacy. Exits non-zero if
+                           any of that is false.
+
+Nothing here opens the gate or promotes a project, and nothing writes to the
+live database: the application mode works on a copy. No project names, no
+paths, no document content and no credentials are printed; project ids and
+metadata only.
 """
 
 from __future__ import annotations
@@ -20,8 +30,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import sqlite3
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 
@@ -168,6 +181,20 @@ def print_projects(user_version, present, projects):
         print()
 
 
+QUEUE_COUNTERS = (
+    ("operations_total", "sync_operations", "1 = 1"),
+    ("operations_protocol_3", "sync_operations", "sync_protocol_version >= 3"),
+    ("operations_with_batch_id", "sync_operations", "batch_id IS NOT NULL"),
+    (
+        "operations_contract_batch",
+        "sync_operations",
+        "provenance_kind = 'CONTRACT_BATCH'",
+    ),
+    ("contract_batches", "sync_contract_batches", "1 = 1"),
+    ("documents", "sync_documents", "1 = 1"),
+)
+
+
 def call_handshake(client, project_id):
     response = client.rpc("get_sync_handshake", {
         "p_project_id": project_id,
@@ -274,6 +301,311 @@ def run_handshakes(projects, only_project):
         print()
 
 
+
+def copy_database(live: Path, destination: Path):
+    """Take a consistent copy of the live database without writing to it.
+
+    A file copy of a database with a live write-ahead log can catch it
+    mid-transaction. The backup API reads a committed snapshot, and the source
+    connection is opened read-only so this cannot touch the original.
+    """
+    source = sqlite3.connect(live.as_uri() + "?mode=ro", uri=True)
+    target = sqlite3.connect(str(destination))
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+
+def queue_snapshot(database: Path):
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        counters = {}
+        for name, table, where in QUEUE_COUNTERS:
+            counters[name] = (
+                int(connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {where}"
+                ).fetchone()[0])
+                if table in tables else 0
+            )
+        return counters
+    finally:
+        connection.close()
+
+
+def project_snapshot(database: Path):
+    _, _, rows = read_projects(database)
+    return {row["project_id"]: row for row in rows}
+
+
+def diff_rows(before, after, keys):
+    return [
+        (key, before.get(key), after.get(key))
+        for key in keys
+        if before.get(key) != after.get(key)
+    ]
+
+
+class Checks:
+    """Every invariant the application run has to hold, and whether it did."""
+
+    def __init__(self):
+        self.results = []
+
+    def require(self, name, condition, detail=""):
+        self.results.append((name, bool(condition), detail))
+        return bool(condition)
+
+    @property
+    def failed(self):
+        return [item for item in self.results if not item[1]]
+
+    def report(self):
+        print("[checks]")
+        for name, passed, detail in self.results:
+            show(name, "PASS" if passed else f"FAIL {detail}".strip())
+        print()
+
+
+def build_manager(store, project, device_id):
+    """A manager attached to the copy, holding one project, and nothing else."""
+    from sync_manager import SyncManager
+
+    manager = SyncManager()
+    manager.release_v2()
+    manager._v2_store = store
+    manager._v2_context = {
+        "local_key": project["local_key"],
+        "project_id": project["project_id"],
+        "writer_device_id": device_id,
+    }
+    manager._v2_device_id = device_id
+    manager._forget_contract_handshake()
+    return manager
+
+
+def run_application_handshake(live: Path, only_project: str):
+    """Drive the real client path against a copy and prove the gate held."""
+    from sync_manager import SyncManager
+    from sync_v2_store import SyncV2Store
+
+    checks = Checks()
+    workspace = Path(tempfile.mkdtemp(prefix="contract-preflight-"))
+    copy = workspace / "sync_v2.sqlite3"
+    device_id = str(uuid.uuid4())
+    attached = []
+
+    try:
+        copy_database(live, copy)
+        print("[application handshake]")
+        show("live_database_written", False)
+        show("working_copy", "a throwaway snapshot; the live file is not opened for write")
+        print()
+
+        before_projects = project_snapshot(copy)
+        before_queue = queue_snapshot(copy)
+
+        store = SyncV2Store(str(copy))
+        rows = [
+            row for row in store.list_projects()
+            if not only_project or row["project_id"] == only_project
+        ]
+        if not rows:
+            show("projects", "NONE MATCHED")
+            return 1
+
+        client = SyncManager.create_supabase_client()
+        if client is None or not getattr(client, "_antigravity_authenticated", False):
+            print("[application handshake]")
+            show("client", "NOT AUTHENTICATED - sign in from the app first")
+            print()
+            return 1
+
+        readings = {}
+        for index, project in enumerate(rows, 1):
+            project_id = project["project_id"]
+            manager = build_manager(store, project, device_id)
+            attached.append(manager)
+            manager.supabase = client
+            print(f"[application handshake project {index}]")
+            show("project_id", project_id)
+            show("gate_before", bool(before_projects[project_id]["contract_path_enabled"]))
+            try:
+                reading = manager.perform_contract_handshake(require_connection=True)
+            except Exception as error:
+                # Never the exception text: it can carry a URL or a token
+                # fragment from the transport layer.
+                code = getattr(error, "code", "") or type(error).__name__
+                show("perform_contract_handshake", f"RAISED {code}")
+                checks.require(f"handshake_completed[{index}]", False, code)
+                print()
+                continue
+            show("perform_contract_handshake", "RETURNED")
+            show("outcome", (reading or {}).get("outcome"))
+            show("observed_project_sync_mode", (reading or {}).get("project_sync_mode"))
+            show("observed_migration_epoch", (reading or {}).get("migration_epoch"))
+            show("handshake_is_fresh", manager.contract_handshake_is_fresh())
+            uses_contract = manager._uses_contract_structure()
+            show("uses_contract_structure", uses_contract)
+            readings[project_id] = (reading or {}, uses_contract, manager)
+            checks.require(f"handshake_completed[{index}]", True)
+            # The gate is the whole arrangement: a fresh, supported, compatible
+            # reading is in hand and the write path is still shut.
+            checks.require(
+                f"contract_path_stayed_shut[{index}]", not uses_contract,
+                "the contract path opened without the gate",
+            )
+            print()
+
+        after_projects = project_snapshot(copy)
+        after_queue = queue_snapshot(copy)
+
+        print("[project fields, before -> after]")
+        tracked = [column for column in CONTRACT_COLUMNS]
+        for index, project in enumerate(rows, 1):
+            project_id = project["project_id"]
+            changed = diff_rows(
+                before_projects[project_id], after_projects[project_id], tracked
+            )
+            show(f"project.{index}.id", project_id)
+            if not changed:
+                show(f"project.{index}.changed", "(nothing)")
+            for column, was, now in changed:
+                show(f"project.{index}.{column}", f"{was!r} -> {now!r}")
+            row = after_projects[project_id]
+            checks.require(
+                f"gate_still_closed[{index}]",
+                not row["contract_path_enabled"],
+                "contract_path_enabled moved",
+            )
+            checks.require(
+                f"gate_timestamp_unset[{index}]",
+                not row["contract_path_enabled_at"],
+                "contract_path_enabled_at was written",
+            )
+            checks.require(
+                f"observed_mode_is_legacy_epoch_0[{index}]",
+                (row["project_sync_mode"], int(row["migration_epoch"] or 0))
+                == ("LEGACY", 0),
+                f'{row["project_sync_mode"]}/{row["migration_epoch"]}',
+            )
+        print()
+
+        print("[queue, before -> after handshake]")
+        for name, _table, _where in QUEUE_COUNTERS:
+            show(name, f"{before_queue[name]} -> {after_queue[name]}")
+        print()
+        for name in (
+            "operations_total", "operations_protocol_3",
+            "operations_with_batch_id", "operations_contract_batch",
+            "contract_batches",
+        ):
+            checks.require(
+                f"handshake_queued_nothing.{name}",
+                before_queue[name] == after_queue[name],
+                f"{before_queue[name]} -> {after_queue[name]}",
+            )
+
+        # A handshake that queues nothing proves only that it queued nothing.
+        # Asking the queue for a write is what proves the stored server state
+        # cannot open the contract path on its own.
+        print("[gate probe: one document write per project]")
+        probe_before = queue_snapshot(copy)
+        for index, project in enumerate(rows, 1):
+            context = {
+                "local_key": project["local_key"],
+                "project_id": project["project_id"],
+                "writer_device_id": device_id,
+            }
+            probe_path = f"__contract_gate_probe_{index}__.txt"
+            try:
+                operation = store.enqueue(
+                    context, probe_path, "preflight probe",
+                    relative_path=probe_path,
+                )
+            except Exception as error:
+                code = getattr(error, "code", "") or type(error).__name__
+                show(f"probe.{index}", f"RAISED {code}")
+                checks.require(f"probe_enqueued[{index}]", False, code)
+                continue
+            show(f"probe.{index}.provenance_kind", operation["provenance_kind"])
+            show(f"probe.{index}.sync_protocol_version", operation["sync_protocol_version"])
+            show(f"probe.{index}.batch_id", operation["batch_id"] or "(none)")
+            show(f"probe.{index}.contract_version", operation["contract_version"] or "(none)")
+            checks.require(f"probe_enqueued[{index}]", True)
+            checks.require(
+                f"probe_write_is_legacy[{index}]",
+                operation["provenance_kind"] == "LEGACY_EPOCH_0"
+                and int(operation["sync_protocol_version"] or 0) < 3
+                and not operation["batch_id"]
+                and not operation["contract_version"],
+                "a contract-native write went out through a closed gate",
+            )
+        probe_after = queue_snapshot(copy)
+        print()
+        print("[queue, before -> after probe]")
+        for name, _table, _where in QUEUE_COUNTERS:
+            show(name, f"{probe_before[name]} -> {probe_after[name]}")
+        print()
+        checks.require(
+            "probe_created_no_contract_batch",
+            probe_before["contract_batches"] == probe_after["contract_batches"],
+            f'{probe_before["contract_batches"]} -> {probe_after["contract_batches"]}',
+        )
+        checks.require(
+            "probe_created_no_protocol_3_operation",
+            probe_before["operations_protocol_3"] == probe_after["operations_protocol_3"],
+            f'{probe_before["operations_protocol_3"]} -> '
+            f'{probe_after["operations_protocol_3"]}',
+        )
+
+        supported = [
+            project_id for project_id, (reading, _uses, _m) in readings.items()
+            if reading.get("outcome") == "supported"
+        ]
+        print("[summary]")
+        show("projects_checked", len(rows))
+        show("projects_the_server_supports", len(supported))
+        checks.report()
+        if checks.failed:
+            show("verdict", "STOP - " + ", ".join(name for name, _p, _d in checks.failed))
+            return 1
+        if not supported:
+            show(
+                "verdict",
+                "wiring held; the server supports no checked project, so there "
+                "is nothing to activate",
+            )
+            return 0
+        show(
+            "verdict",
+            "wiring held: supported, recorded as LEGACY/0, gate still 0, "
+            "writes still legacy",
+        )
+        return 0
+    finally:
+        # One manager serves the whole process. Leaving it holding a store on a
+        # directory that is about to be deleted is how the next thing to ask it
+        # for a project gets a database that is no longer there.
+        for manager in attached:
+            try:
+                manager.release_v2()
+                manager.supabase = None
+                manager._v2_store = None
+                manager._v2_device_id = None
+            except Exception:
+                pass
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -281,17 +613,24 @@ def main():
         help="sync database to read; defaults to the live profile database",
     )
     parser.add_argument(
-        "--handshake", action="store_true",
-        help="also call get_sync_handshake once per project (read-only)",
+        "--rpc-handshake", action="store_true",
+        help="read-only RPC preflight: call get_sync_handshake and validate "
+             "the reply in memory, without using the client wiring",
+    )
+    parser.add_argument(
+        "--application-handshake", action="store_true",
+        help="end-to-end check: run the real perform_contract_handshake() "
+             "against a throwaway copy and prove the gate held",
     )
     parser.add_argument(
         "--project", default="",
-        help="limit --handshake to one project id",
+        help="limit the handshake modes to one project id",
     )
     args = parser.parse_args()
 
     database = (args.database or default_database()).resolve(strict=True)
     before = file_sha256(database)
+    only_project = args.project.strip()
 
     print_client_pin()
     user_version, present, projects = read_projects(database)
@@ -301,13 +640,21 @@ def main():
     print()
     print_projects(user_version, present, projects)
 
-    if args.handshake:
-        run_handshakes(projects, args.project.strip())
+    status = 0
+    if args.rpc_handshake:
+        run_handshakes(projects, only_project)
+    if args.application_handshake:
+        status = run_application_handshake(database, only_project)
 
+    after = file_sha256(database)
     print("[database file]")
-    show("sha256_after", file_sha256(database))
-    show("unchanged", file_sha256(database) == before)
+    show("sha256_after", after)
+    show("unchanged", after == before)
+    if after != before:
+        show("verdict", "STOP - the live database changed during a preflight")
+        status = 1
+    return status
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
