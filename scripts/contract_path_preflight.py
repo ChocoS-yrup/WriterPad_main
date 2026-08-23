@@ -23,6 +23,13 @@ Nothing here opens the gate or promotes a project, and nothing writes to the
 live database: the application mode works on a copy. No project names, no
 paths, no document content and no credentials are printed; project ids and
 metadata only.
+
+Read-only does not extend to the stored session. Both handshake modes build a
+real client, which spends the saved refresh token and is issued a new one, and
+that new pair is written to the credential store the same way the application
+writes it. Nothing is lost by this, but the tool is one more client competing
+for the one credential slot, so run it while the application is closed and do
+not run several at once.
 """
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+import base64
 import copy
 import hashlib
 import os
@@ -488,8 +489,9 @@ class SyncManager(QObject):
     _mutex = QMutex()
     # Guards reading, exchanging and storing the saved session. Class level:
     # create_supabase_client is a staticmethod and can run before, or without,
-    # any manager instance existing.
-    _session_restore_lock = threading.Lock()
+    # any manager instance existing. Reentrant because persisting happens while
+    # the restore that produced the session still holds it.
+    _session_restore_lock = threading.RLock()
 
     def __new__(cls, *args, **kwargs):
         with QMutexLocker(cls._mutex):
@@ -2212,6 +2214,22 @@ class SyncManager(QObject):
         return True
 
     @staticmethod
+    def _session_expiry(access_token):
+        """The exp claim, read without verifying, only to order two sessions.
+
+        Nothing is trusted from this. It answers one question -- which of two
+        sessions the server issued later -- and a token that cannot be read at
+        all sorts as oldest.
+        """
+        try:
+            payload = str(access_token).split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+            return int(claims.get("exp") or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
     def _persist_supabase_session(session):
         access_token = getattr(session, "access_token", "")
         refresh_token = getattr(session, "refresh_token", "")
@@ -2219,7 +2237,20 @@ class SyncManager(QObject):
             return False
         try:
             from security_manager import SecurityManager
-            SecurityManager.save_supabase_session(access_token, refresh_token)
+            with SyncManager._session_restore_lock:
+                stored_access, _stored_refresh = (
+                    SecurityManager.get_supabase_session()
+                )
+                if stored_access and SyncManager._session_expiry(
+                    stored_access
+                ) > SyncManager._session_expiry(access_token):
+                    # Several clients refresh on their own schedules and all
+                    # write to one slot. A callback that arrives late carries a
+                    # session older than what is already stored, and letting it
+                    # land leaves a spent refresh token behind for the next
+                    # restore to be refused for.
+                    return False
+                SecurityManager.save_supabase_session(access_token, refresh_token)
             return True
         except Exception as error:
             # Keep the valid in-memory session alive even if Windows Credential

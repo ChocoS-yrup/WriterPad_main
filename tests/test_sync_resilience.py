@@ -1,5 +1,7 @@
+import base64
 import contextlib
 import io
+import json
 import socket
 import threading
 import time
@@ -41,6 +43,102 @@ def _http_error(status_code, message):
     error = RuntimeError(message)
     error.status_code = status_code
     return error
+
+
+def _access_token(expires_at):
+    """A token shaped like the real one, carrying only the claim that orders it."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": int(expires_at)}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def _session(expires_at, tag):
+    return SimpleNamespace(
+        access_token=_access_token(expires_at),
+        refresh_token=f"refresh-{tag}",
+        user=SimpleNamespace(email="writer@example.com"),
+    )
+
+
+class StoredSessionOrderingTestCase(unittest.TestCase):
+    """One credential slot, several clients, each refreshing on its own clock.
+
+    Whichever write lands last wins the slot. If that write is carrying an older
+    session, the refresh token left behind is already spent, and the next
+    restore is refused for a session the writer never ended.
+    """
+
+    def setUp(self):
+        self.now = int(time.time())
+
+    def _persist(self, stored, incoming):
+        keyring = _Keyring(access=stored[0], refresh=stored[1])
+        with patch("security_manager.SecurityManager", keyring):
+            written = SyncManager._persist_supabase_session(incoming)
+        return written, keyring
+
+    def test_a_late_write_carrying_an_older_session_is_refused(self):
+        stored = (_access_token(self.now + 3600), "refresh-current")
+        written, keyring = self._persist(stored, _session(self.now + 60, "stale"))
+
+        self.assertFalse(written)
+        self.assertEqual((keyring.access, keyring.refresh), stored)
+
+    def test_a_newer_session_still_lands(self):
+        stored = (_access_token(self.now + 60), "refresh-old")
+        written, keyring = self._persist(stored, _session(self.now + 3600, "new"))
+
+        self.assertTrue(written)
+        self.assertEqual(keyring.refresh, "refresh-new")
+
+    def test_rewriting_at_the_same_expiry_is_allowed(self):
+        """Equal is not older, and refusing it would strand a live rotation."""
+        stored = (_access_token(self.now + 600), "refresh-a")
+        written, keyring = self._persist(stored, _session(self.now + 600, "b"))
+
+        self.assertTrue(written)
+        self.assertEqual(keyring.refresh, "refresh-b")
+
+    def test_the_first_write_into_an_empty_store_lands(self):
+        written, keyring = self._persist(("", ""), _session(self.now + 600, "first"))
+
+        self.assertTrue(written)
+        self.assertEqual(keyring.refresh, "refresh-first")
+
+    def test_an_unreadable_stored_token_does_not_block_a_real_one(self):
+        """A token that cannot be ordered sorts as oldest, never as newest."""
+        written, keyring = self._persist(
+            ("not-a-jwt", "refresh-x"), _session(self.now + 600, "good")
+        )
+
+        self.assertTrue(written)
+        self.assertEqual(keyring.refresh, "refresh-good")
+
+    def test_a_session_missing_either_half_is_not_written(self):
+        for label, session in (
+            ("no access", SimpleNamespace(access_token="", refresh_token="r")),
+            ("no refresh", SimpleNamespace(access_token=_access_token(1), refresh_token="")),
+        ):
+            with self.subTest(session=label):
+                written, keyring = self._persist(
+                    (_access_token(self.now + 600), "refresh-keep"), session
+                )
+                self.assertFalse(written)
+                self.assertEqual(keyring.refresh, "refresh-keep")
+
+    def test_persisting_from_inside_a_restore_does_not_deadlock(self):
+        """The restore holds the lock while the session it produced is stored."""
+        stored = (_access_token(self.now + 60), "refresh-old")
+        keyring = _Keyring(access=stored[0], refresh=stored[1])
+        with patch("security_manager.SecurityManager", keyring):
+            with SyncManager._session_restore_lock:
+                written = SyncManager._persist_supabase_session(
+                    _session(self.now + 3600, "new")
+                )
+        self.assertTrue(written)
+        self.assertEqual(keyring.refresh, "refresh-new")
+
 
 
 class _Auth:
