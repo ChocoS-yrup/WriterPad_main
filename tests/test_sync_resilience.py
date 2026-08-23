@@ -1,10 +1,45 @@
+import contextlib
+import socket
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from cloud_config import classify_cloud_error
 from sync_manager import SyncManager
 from writing_controller import WritingController
+
+
+class _Keyring:
+    """A stand-in credential store. The real one is never touched here."""
+
+    def __init__(self, access="access-stored", refresh="refresh-stored"):
+        self.access = access
+        self.refresh = refresh
+        self.clears = 0
+
+    def get_supabase_session(self):
+        return (self.access, self.refresh)
+
+    def clear_supabase_session(self):
+        self.clears += 1
+        self.access = ""
+        self.refresh = ""
+
+    def save_supabase_session(self, access, refresh):
+        self.access = access
+        self.refresh = refresh
+
+    @property
+    def present(self):
+        return bool(self.access and self.refresh)
+
+
+def _http_error(status_code, message):
+    error = RuntimeError(message)
+    error.status_code = status_code
+    return error
 
 
 class _Auth:
@@ -35,6 +70,218 @@ class _Client:
     def __init__(self, auth=None):
         self.auth = auth or _Auth()
         self._antigravity_authenticated = True
+
+
+class SessionRestoreTestCase(unittest.TestCase):
+    """A stored session outlives everything except the server refusing it.
+
+    Deleting it on any failed restore turns a dropped connection into a logout
+    the writer has to undo by hand, and it takes the refresh token along, so
+    nothing can recover on its own afterwards.
+    """
+
+    def setUp(self):
+        self.keyring = _Keyring()
+
+    def _discard(self, error, offered=("access-stored", "refresh-stored")):
+        with patch("security_manager.SecurityManager", self.keyring):
+            return SyncManager._discard_rejected_session(
+                classify_cloud_error(error), offered[0], offered[1]
+            )
+
+    def test_transient_failures_keep_the_session(self):
+        transient = {
+            "dns": socket.gaierror("getaddrinfo failed"),
+            "timeout": TimeoutError("request timed out"),
+            "server_500": _http_error(500, "server error"),
+            "server_502": _http_error(502, "bad gateway"),
+            "server_503": _http_error(503, "service unavailable"),
+            "connection_reset": ConnectionResetError("connection reset by peer"),
+            "unrecognized": RuntimeError("something else entirely"),
+        }
+        for label, error in transient.items():
+            with self.subTest(failure=label):
+                self.keyring = _Keyring()
+                self.assertFalse(self._discard(error))
+                self.assertEqual(self.keyring.clears, 0)
+                self.assertTrue(self.keyring.present)
+
+    def test_a_refusal_from_the_server_discards_the_session(self):
+        refusals = {
+            "400": _http_error(400, "Invalid Refresh Token"),
+            "401": _http_error(401, "invalid credentials"),
+            "message_only": RuntimeError("Invalid login credentials"),
+        }
+        for label, error in refusals.items():
+            with self.subTest(refusal=label):
+                self.keyring = _Keyring()
+                self.assertTrue(self._discard(error))
+                self.assertEqual(self.keyring.clears, 1)
+                self.assertFalse(self.keyring.present)
+
+    def test_a_refusal_of_an_already_rotated_token_keeps_the_session(self):
+        """Two clients starting together is the ordinary case, not a logout.
+
+        Refresh tokens rotate on use. The second restore is told its token is
+        invalid, and it is, but only because the first one already exchanged it
+        for the pair now sitting in the store.
+        """
+        self.keyring = _Keyring(access="access-rotated", refresh="refresh-rotated")
+        discarded = self._discard(
+            _http_error(400, "Invalid Refresh Token: Already Used"),
+            offered=("access-stored", "refresh-stored"),
+        )
+        self.assertFalse(discarded)
+        self.assertEqual(self.keyring.clears, 0)
+        self.assertEqual(
+            (self.keyring.access, self.keyring.refresh),
+            ("access-rotated", "refresh-rotated"),
+        )
+
+    def test_a_credential_store_that_cannot_be_read_discards_nothing(self):
+        class _Unreadable(_Keyring):
+            def get_supabase_session(self):
+                raise OSError("credential store unavailable")
+
+        self.keyring = _Unreadable()
+        self.assertFalse(self._discard(_http_error(401, "invalid credentials")))
+        self.assertEqual(self.keyring.clears, 0)
+
+
+class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
+    """The same rule, exercised through create_supabase_client itself."""
+
+    def setUp(self):
+        self.keyring = _Keyring()
+
+    @contextlib.contextmanager
+    def _supabase(self, auth):
+        """Patch what create_supabase_client reaches, once, on this thread.
+
+        Applying the patches inside each worker would have them installing and
+        removing one another's mocks, which is a different race than the one
+        under test.
+        """
+        config = SimpleNamespace(
+            is_ready=True, url="https://example.invalid", publishable_key="pk"
+        )
+
+        def persist(session):
+            self.keyring.save_supabase_session(
+                session.access_token, session.refresh_token
+            )
+            return True
+
+        supabase = SimpleNamespace(
+            create_client=lambda *args, **kwargs: SimpleNamespace(auth=auth),
+            ClientOptions=lambda **kwargs: None,
+        )
+        with patch("security_manager.SecurityManager", self.keyring), \
+                patch.object(
+                    SyncManager, "_persist_supabase_session", staticmethod(persist)
+                ), \
+                patch.dict("sys.modules", {"supabase": supabase}):
+            yield lambda: SyncManager.create_supabase_client(config)
+
+    def test_a_timeout_leaves_the_writer_signed_in(self):
+        auth = SimpleNamespace(
+            set_session=MagicMock(side_effect=TimeoutError("timed out")),
+            on_auth_state_change=MagicMock(),
+        )
+        with self._supabase(auth) as create:
+            client = create()
+
+        self.assertIsNotNone(client)
+        self.assertFalse(client._antigravity_authenticated)
+        self.assertEqual(client._antigravity_restore_error_kind, "timeout")
+        # The session is still there, so the next attempt can recover by itself.
+        self.assertEqual(self.keyring.clears, 0)
+        self.assertTrue(self.keyring.present)
+
+    def test_a_refused_token_signs_the_writer_out(self):
+        auth = SimpleNamespace(
+            set_session=MagicMock(side_effect=_http_error(401, "invalid credentials")),
+            on_auth_state_change=MagicMock(),
+        )
+        with self._supabase(auth) as create:
+            client = create()
+
+        self.assertFalse(client._antigravity_authenticated)
+        self.assertEqual(client._antigravity_restore_error_kind, "authentication")
+        self.assertEqual(self.keyring.clears, 1)
+        self.assertFalse(self.keyring.present)
+
+    def test_a_restored_session_is_persisted_and_reported(self):
+        session = SimpleNamespace(
+            access_token="access-new", refresh_token="refresh-new",
+            user=SimpleNamespace(email="writer@example.com"),
+        )
+        auth = SimpleNamespace(
+            set_session=MagicMock(return_value=SimpleNamespace(session=session)),
+            on_auth_state_change=MagicMock(),
+        )
+        with self._supabase(auth) as create:
+            client = create()
+
+        self.assertTrue(client._antigravity_authenticated)
+        self.assertEqual(client._antigravity_email, "writer@example.com")
+        self.assertEqual(
+            (self.keyring.access, self.keyring.refresh),
+            ("access-new", "refresh-new"),
+        )
+        self.assertEqual(self.keyring.clears, 0)
+
+    def test_clients_starting_together_do_not_race_each_other_out(self):
+        """Four restores at once, against a server that rotates on every use.
+
+        Unserialized, they all read the same refresh token, all spend it, and
+        every one after the first is refused and signs the writer out.
+        """
+        # What the server will still accept. It is not the credential store:
+        # the exchange rotates this the instant it happens, well before the new
+        # pair has been written down anywhere.
+        accepted = {"refresh": self.keyring.refresh}
+        exchanges = []
+        held = threading.Event()
+
+        def set_session(access, refresh):
+            if refresh != accepted["refresh"]:
+                raise _http_error(400, "Invalid Refresh Token: Already Used")
+            index = len(exchanges) + 1
+            accepted["refresh"] = f"refresh-{index}"
+            exchanges.append(refresh)
+            if not held.is_set():
+                # Hold the winner inside the exchange long enough that an
+                # unserialized second caller reads the spent token and is
+                # refused.
+                held.set()
+                time.sleep(0.05)
+            return SimpleNamespace(session=SimpleNamespace(
+                access_token=f"access-{index}", refresh_token=f"refresh-{index}",
+                user=SimpleNamespace(email="writer@example.com"),
+            ))
+
+        auth = SimpleNamespace(
+            set_session=set_session, on_auth_state_change=MagicMock()
+        )
+        results = []
+        with self._supabase(auth) as create:
+            threads = [
+                threading.Thread(target=lambda: results.append(create()))
+                for _ in range(4)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(len(results), 4)
+        for index, client in enumerate(results):
+            with self.subTest(client=index):
+                self.assertTrue(client._antigravity_authenticated)
+        self.assertEqual(len(exchanges), 4)
+        self.assertEqual(self.keyring.clears, 0)
+        self.assertTrue(self.keyring.present)
 
 
 class SyncResilienceTestCase(unittest.TestCase):

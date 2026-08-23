@@ -486,6 +486,10 @@ class SyncManager(QObject):
 
     _instance = None
     _mutex = QMutex()
+    # Guards reading, exchanging and storing the saved session. Class level:
+    # create_supabase_client is a staticmethod and can run before, or without,
+    # any manager instance existing.
+    _session_restore_lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
         with QMutexLocker(cls._mutex):
@@ -2099,31 +2103,39 @@ class SyncManager(QObject):
             )
             client._antigravity_httpx_client = custom_httpx_client
 
-            try:
-                from security_manager import SecurityManager
-                access_token, refresh_token = SecurityManager.get_supabase_session()
-            except Exception:
-                access_token, refresh_token = "", ""
-
             authenticated = False
-            try:
-                auth_response = None
-                if access_token and refresh_token:
-                    auth_response = client.auth.set_session(access_token, refresh_token)
-                session = getattr(auth_response, "session", None) if auth_response else None
-                if session:
-                    SyncManager._persist_supabase_session(session)
-                    authenticated = True
-                    user = getattr(session, "user", None)
-                    client._antigravity_email = getattr(user, "email", "") or ""
-            except Exception as auth_error:
-                classified = classify_cloud_error(auth_error)
-                client._antigravity_restore_error_kind = classified.kind
+            # A process can build several clients at once, and refresh tokens
+            # rotate the moment one is used. Two unserialized restores race, and
+            # the one that loses is told its token is invalid -- which looks
+            # exactly like the account's token having been revoked.
+            with SyncManager._session_restore_lock:
                 try:
                     from security_manager import SecurityManager
-                    SecurityManager.clear_supabase_session()
+                    access_token, refresh_token = SecurityManager.get_supabase_session()
                 except Exception:
-                    pass
+                    access_token, refresh_token = "", ""
+
+                try:
+                    auth_response = None
+                    if access_token and refresh_token:
+                        auth_response = client.auth.set_session(
+                            access_token, refresh_token
+                        )
+                    session = (
+                        getattr(auth_response, "session", None)
+                        if auth_response else None
+                    )
+                    if session:
+                        SyncManager._persist_supabase_session(session)
+                        authenticated = True
+                        user = getattr(session, "user", None)
+                        client._antigravity_email = getattr(user, "email", "") or ""
+                except Exception as auth_error:
+                    classified = classify_cloud_error(auth_error)
+                    client._antigravity_restore_error_kind = classified.kind
+                    SyncManager._discard_rejected_session(
+                        classified, access_token, refresh_token
+                    )
 
             client._antigravity_authenticated = authenticated
 
@@ -2150,6 +2162,46 @@ class SyncManager(QObject):
                 except Exception:
                     pass
             return None
+
+    # The only answer that means the stored session is worth nothing. A name
+    # that would not resolve, a request that timed out, a 5xx, or anything this
+    # code cannot recognize is the network or the server having a bad moment,
+    # and surviving those is the entire reason a refresh token is kept.
+    _SESSION_DISCARDING_ERROR_KINDS = frozenset({"authentication"})
+
+    @staticmethod
+    def _discard_rejected_session(classified, access_token, refresh_token):
+        """Throw the stored session away only when the server refused it.
+
+        Deleting it on any failure turns a dropped connection into a logout the
+        writer has to notice and undo by hand, and it takes the refresh token
+        with it, so nothing can recover on its own afterwards.
+        """
+        if getattr(classified, "kind", "") not in SyncManager._SESSION_DISCARDING_ERROR_KINDS:
+            return False
+        try:
+            from security_manager import SecurityManager
+            stored_access, stored_refresh = SecurityManager.get_supabase_session()
+        except Exception:
+            return False
+        if (stored_access, stored_refresh) != (access_token, refresh_token):
+            # Something else refreshed while this attempt was in the air, so
+            # what the server rejected is a spent token rather than the
+            # account's. With rotating refresh tokens this is the ordinary
+            # outcome of two clients starting together, and clearing here would
+            # log the writer out of a session that is working.
+            return False
+        try:
+            from security_manager import SecurityManager
+            SecurityManager.clear_supabase_session()
+        except Exception:
+            return False
+        # The one place a stored session is thrown away without the writer
+        # asking. Saying so leaves something to read the next time somebody
+        # finds themselves signed out; the kind is safe to print, the tokens
+        # never appear.
+        print(f"Supabase session discarded after {classified.kind} refusal.")
+        return True
 
     @staticmethod
     def _persist_supabase_session(session):
