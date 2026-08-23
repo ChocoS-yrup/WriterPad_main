@@ -2510,18 +2510,52 @@ class ContractApplicationHandshakeTests(unittest.TestCase):
         self.assertIn("handshake_completed[1]=FAIL PROTOCOL_TOO_OLD", output)
         self.assertEqual(self._value(output, "project.1.changed"), "(nothing)")
 
-    def test_an_unauthenticated_client_stops_the_run(self):
+    def _unauthenticated_run(self, stored_session, restore_error_kind=""):
+        """A client that came back signed out, over a stand-in credential store.
+
+        The real store is never read here: whether a session happens to be
+        saved on this machine must not decide what these cases assert.
+        """
         client = _AuthenticatedClient(json.loads(LIVE_ACTIVE_REPLY))
         client._antigravity_authenticated = False
+        if restore_error_kind:
+            client._antigravity_restore_error_kind = restore_error_kind
+        keyring = SimpleNamespace(
+            get_supabase_session=lambda: (
+                ("access", "refresh") if stored_session else ("", "")
+            ),
+        )
         stream = io.StringIO()
-        with patch.object(
+        with patch("security_manager.SecurityManager", keyring), patch.object(
             SyncManager, "create_supabase_client",
             staticmethod(lambda config=None: client),
         ):
             with redirect_stdout(stream):
                 status = self.preflight.run_application_handshake(self.live, "")
+        return status, stream.getvalue(), client
+
+    def test_nobody_signed_in_stops_the_run(self):
+        status, output, client = self._unauthenticated_run(stored_session=False)
+
         self.assertEqual(status, 1)
-        self.assertIn("NOT AUTHENTICATED", stream.getvalue())
+        self.assertIn("NO STORED SESSION", output)
+        self.assertIn("stored_session_present=false", output)
+        self.assertEqual(client.calls, [])
+
+    def test_a_kept_session_that_would_not_restore_stops_the_run_and_says_why(self):
+        """Signed out because the restore failed is a different thing entirely.
+
+        The session is still saved, so this is a bad minute rather than a
+        logout, and the reason has to reach whoever is reading.
+        """
+        status, output, client = self._unauthenticated_run(
+            stored_session=True, restore_error_kind="timeout"
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("RESTORE FAILED", output)
+        self.assertIn("stored_session_present=true", output)
+        self.assertIn("restore_error_kind=timeout", output)
         self.assertEqual(client.calls, [])
 
     def test_the_run_prints_nothing_that_looks_like_a_credential(self):

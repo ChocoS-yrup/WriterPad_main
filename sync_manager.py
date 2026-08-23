@@ -2133,9 +2133,17 @@ class SyncManager(QObject):
                 except Exception as auth_error:
                     classified = classify_cloud_error(auth_error)
                     client._antigravity_restore_error_kind = classified.kind
-                    SyncManager._discard_rejected_session(
+                    if not SyncManager._discard_rejected_session(
                         classified, access_token, refresh_token
-                    )
+                    ):
+                        # Keeping the session is the right answer, but a silent
+                        # failed restore leaves somebody staring at a signed-out
+                        # app with nothing to read. The kind is safe to print;
+                        # the tokens never appear.
+                        print(
+                            "Supabase session restore failed "
+                            f"({classified.kind}); the stored session was kept."
+                        )
 
             client._antigravity_authenticated = authenticated
 

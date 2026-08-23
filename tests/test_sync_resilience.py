@@ -1,4 +1,5 @@
 import contextlib
+import io
 import socket
 import threading
 import time
@@ -188,8 +189,10 @@ class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
             set_session=MagicMock(side_effect=TimeoutError("timed out")),
             on_auth_state_change=MagicMock(),
         )
+        printed = io.StringIO()
         with self._supabase(auth) as create:
-            client = create()
+            with contextlib.redirect_stdout(printed):
+                client = create()
 
         self.assertIsNotNone(client)
         self.assertFalse(client._antigravity_authenticated)
@@ -197,6 +200,10 @@ class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
         # The session is still there, so the next attempt can recover by itself.
         self.assertEqual(self.keyring.clears, 0)
         self.assertTrue(self.keyring.present)
+        # And a kept session that could not be restored says so, or somebody is
+        # left looking at a signed-out app with nothing to read.
+        self.assertIn("timeout", printed.getvalue())
+        self.assertIn("kept", printed.getvalue())
 
     def test_a_refused_token_signs_the_writer_out(self):
         auth = SimpleNamespace(

@@ -439,10 +439,31 @@ def run_application_handshake(live: Path, only_project: str):
             show("projects", "NONE MATCHED")
             return 1
 
+        stored_session = False
+        try:
+            from security_manager import SecurityManager
+            access, refresh = SecurityManager.get_supabase_session()
+            stored_session = bool(access and refresh)
+        except Exception:
+            stored_session = False
+
         client = SyncManager.create_supabase_client()
         if client is None or not getattr(client, "_antigravity_authenticated", False):
             print("[application handshake]")
-            show("client", "NOT AUTHENTICATED - sign in from the app first")
+            show("stored_session_present", stored_session)
+            # Two different situations wear the same "not authenticated" face:
+            # nobody has signed in, or a signed-in session could not be restored
+            # this time. Only the second one has a reason worth reading.
+            show(
+                "restore_error_kind",
+                getattr(client, "_antigravity_restore_error_kind", "") or "(none)",
+            )
+            show(
+                "client",
+                "RESTORE FAILED - the stored session was kept"
+                if stored_session else
+                "NO STORED SESSION - sign in from the app first",
+            )
             print()
             return 1
 
