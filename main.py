@@ -200,6 +200,20 @@ if __name__ == "__main__":
         app.wake_up_server()
         sys.exit(0)
 
+    # Claim the stored Supabase session for this process before anything can
+    # want it. SyncManager is built lazily -- not until a writing project is
+    # opened -- so waiting for it to claim the credential leaves the whole
+    # startup as a window in which another holder can take it and start
+    # exchanging tokens underneath us. Held for the life of the process; the
+    # handle is returned when it exits.
+    from sync_manager import SyncManager
+
+    if SyncManager.acquire_auth_lease() is not True:
+        print(
+            "클라우드 자격 증명을 다른 프로세스가 사용 중입니다. "
+            "이번 실행에서는 서버 동기화를 시작하지 않습니다."
+        )
+
     pid_path = pid_file_path()
     if pid_path:
         from pathlib import Path

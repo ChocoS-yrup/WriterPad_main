@@ -1,8 +1,11 @@
+import ast
 import base64
 import contextlib
 import io
 import json
 import socket
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -657,6 +660,192 @@ class AuthLeaseTestCase(unittest.TestCase):
         self.assertEqual(keyring.clears, 0)
         self.assertTrue(keyring.present)
         self.assertIn("another process holds", printed.getvalue())
+
+
+class CredentialClaimedAtStartupTestCase(unittest.TestCase):
+    """The credential is claimed when the process starts, not when it is wanted.
+
+    SyncManager is built lazily -- not until a writing project is opened -- so a
+    claim that waits for it leaves the whole startup as a window where another
+    holder can take the credential and begin exchanging tokens underneath.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = Path(sync_manager.__file__).with_name("main.py").read_text(
+            encoding="utf-8"
+        )
+        cls.tree = ast.parse(cls.source)
+
+    def _entry_block(self):
+        for node in self.tree.body:
+            if isinstance(node, ast.If) and ast.unparse(node.test).strip() == (
+                "__name__ == '__main__'"
+            ):
+                return node
+        self.fail("main.py has no __main__ entry block")
+
+    @staticmethod
+    def _first_line(node, predicate):
+        return next(
+            (
+                child.lineno
+                for child in ast.walk(node)
+                if predicate(child)
+            ),
+            None,
+        )
+
+    def test_the_claim_happens_before_anything_that_could_want_it(self):
+        block = self._entry_block()
+        claim = self._first_line(
+            block,
+            lambda n: isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "acquire_auth_lease",
+        )
+        window = self._first_line(
+            block,
+            lambda n: isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "MainWindow",
+        )
+        running_guard = self._first_line(
+            block,
+            lambda n: isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "is_running",
+        )
+
+        self.assertIsNotNone(claim, "startup never claims the credential")
+        self.assertIsNotNone(window)
+        self.assertIsNotNone(running_guard)
+        # After the single-instance decision, so a second launch that is about
+        # to exit does not take it from the instance that is staying.
+        self.assertGreater(claim, running_guard)
+        # And before the window exists, because everything that builds a client
+        # hangs off the window.
+        self.assertLess(claim, window)
+
+    def test_a_failed_claim_is_reported_rather_than_ignored(self):
+        block = self._entry_block()
+        claim = next(
+            node for node in ast.walk(block)
+            if isinstance(node, ast.If)
+            and "acquire_auth_lease" in ast.unparse(node.test)
+        )
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "print"
+                for node in ast.walk(claim)
+            ),
+            "a refused claim has to say so",
+        )
+
+
+class CredentialLockoutDisablesSyncTestCase(unittest.TestCase):
+    """Losing the claim closes every server path, not only the signed-in ones."""
+
+    def setUp(self):
+        self.manager = SyncManager()
+        self.original = self.manager.supabase
+        self.original_state = self.manager.cloud_config_state
+
+    def tearDown(self):
+        self.manager.supabase = self.original
+        self.manager.cloud_config_state = self.original_state
+
+    def _client(self, locked_out):
+        client = SimpleNamespace(auth=None, _antigravity_authenticated=False)
+        if locked_out:
+            client._antigravity_credential_locked_out = True
+        return client
+
+    def test_a_locked_out_client_reports_no_network(self):
+        self.manager.cloud_config_state = "ready"
+        self.manager.supabase = self._client(locked_out=True)
+        self.assertFalse(self.manager.cloud_network_enabled)
+
+    def test_an_ordinary_signed_out_client_is_not_treated_the_same(self):
+        """Signed out is recoverable here; locked out is not this process's to
+        recover, and conflating them would let it keep trying."""
+        self.manager.cloud_config_state = "ready"
+        self.manager.supabase = self._client(locked_out=False)
+        self.assertTrue(self.manager.cloud_network_enabled)
+
+    def test_building_a_client_without_the_claim_marks_it_locked_out(self):
+        keyring = _Keyring()
+        set_session = MagicMock()
+        supabase = SimpleNamespace(
+            create_client=lambda *a, **k: SimpleNamespace(
+                auth=SimpleNamespace(
+                    set_session=set_session, on_auth_state_change=MagicMock()
+                )
+            ),
+            ClientOptions=lambda **k: None,
+        )
+        config = SimpleNamespace(
+            is_ready=True, url="https://example.invalid", publishable_key="pk"
+        )
+        with patch("security_manager.SecurityManager", keyring), \
+                patch.dict("sys.modules", {"supabase": supabase}), \
+                patch.object(
+                    SyncManager, "acquire_auth_lease", staticmethod(lambda: False)
+                ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                client = SyncManager.create_supabase_client(config)
+
+        self.assertTrue(client._antigravity_credential_locked_out)
+        set_session.assert_not_called()
+        self.assertEqual(keyring.clears, 0)
+
+
+class CredentialLockReleaseTestCase(unittest.TestCase):
+    """A process that ends gives the credential back, however it ends."""
+
+    def _run(self, body):
+        source = (
+            "import os, sys\n"
+            "os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')\n"
+            f"sys.path.insert(0, {str(Path(sync_manager.__file__).parent)!r})\n"
+            "from sync_manager import SupabaseAuthLease\n"
+            f"lease = SupabaseAuthLease({self.name!r})\n"
+            + body
+        )
+        return subprocess.run(
+            [sys.executable, "-c", source],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def setUp(self):
+        self.name = f"Local\\AntigravityTest-{uuid.uuid4().hex}"
+
+    def test_the_lock_is_free_again_once_the_holder_exits(self):
+        result = self._run("print('held:', lease.acquire())\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("held: True", result.stdout)
+
+        # The holder is gone; the next taker gets it without asking it to let go.
+        after = SupabaseAuthLease(self.name)
+        try:
+            self.assertIs(after.acquire(), True)
+        finally:
+            after.release()
+
+    def test_it_is_free_again_even_when_the_holder_dies_badly(self):
+        result = self._run(
+            "lease.acquire()\n"
+            "raise SystemExit(3)\n"
+        )
+        self.assertEqual(result.returncode, 3)
+
+        after = SupabaseAuthLease(self.name)
+        try:
+            self.assertIs(after.acquire(), True)
+        finally:
+            after.release()
 
 
 class AuthErrorFactsTestCase(unittest.TestCase):

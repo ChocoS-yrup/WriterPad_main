@@ -10,6 +10,12 @@
                            the server answers. Proves nothing about the client
                            wiring, because it does not use it.
 
+  --credential-lock-check  asks one question: can this process take the
+                           machine-wide credential lock. Reports and exits. No
+                           client is built, no handshake is attempted, and no
+                           request can leave, so it is the mode to use when what
+                           is being tested is the locking itself.
+
   --application-handshake  the end-to-end check. Runs the real
                            SyncManager.perform_contract_handshake() against a
                            throwaway copy of the database, lets it record what
@@ -659,6 +665,11 @@ def main():
         help="sync database to read; defaults to the live profile database",
     )
     parser.add_argument(
+        "--credential-lock-check", action="store_true",
+        help="report whether the machine-wide credential lock is free, then "
+             "exit. Builds no client and makes no request",
+    )
+    parser.add_argument(
         "--rpc-handshake", action="store_true",
         help="read-only RPC preflight: call get_sync_handshake and validate "
              "the reply in memory, without using the client wiring",
@@ -673,6 +684,32 @@ def main():
         help="limit the handshake modes to one project id",
     )
     args = parser.parse_args()
+
+    if args.credential_lock_check:
+        # Deliberately before the database is opened and before anything that
+        # could build a client. This mode exists so the lock can be tested
+        # without a run that might proceed to the server if the test fails.
+        from sync_manager import SupabaseAuthLease, SyncManager
+
+        print("[credential lock]")
+        show("lock", SupabaseAuthLease.NAME)
+        lease = SyncManager.acquire_auth_lease()
+        show(
+            "acquired",
+            "unavailable on this machine" if lease is None else bool(lease),
+        )
+        show("network_used", False)
+        if lease is True:
+            SyncManager.release_auth_lease()
+            show("verdict", "the credential is free")
+            return 0
+        show(
+            "verdict",
+            "STOP - something else holds the credential"
+            if lease is False else
+            "STOP - the machine-wide credential lock is unavailable",
+        )
+        return 1
 
     database = (args.database or default_database()).resolve(strict=True)
     before = file_sha256(database)

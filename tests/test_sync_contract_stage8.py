@@ -2363,6 +2363,76 @@ class _AuthenticatedClient(_HandshakeClient):
         return SimpleNamespace(execute=lambda: SimpleNamespace(data=reply))
 
 
+class CredentialLockCheckTests(unittest.TestCase):
+    """The mode that exists so the lock can be tested without a run that might
+    reach the server if the test fails."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def _run(self, lease_result):
+        released = []
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "acquire_auth_lease", staticmethod(lambda: lease_result)
+        ), patch.object(
+            SyncManager, "release_auth_lease",
+            staticmethod(lambda: released.append(True)),
+        ), patch.object(
+            self.preflight, "run_handshakes"
+        ) as handshakes, patch.object(
+            self.preflight, "run_application_handshake"
+        ) as application, patch.object(
+            self.preflight, "read_projects"
+        ) as read_projects, patch.object(
+            sys, "argv", ["contract_path_preflight.py", "--credential-lock-check"]
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.main()
+        return status, stream.getvalue(), handshakes, application, read_projects, released
+
+    def test_a_free_lock_is_reported_and_handed_straight_back(self):
+        status, output, handshakes, application, _read, released = self._run(True)
+
+        self.assertEqual(status, 0)
+        self.assertIn("acquired=true", output)
+        self.assertIn("the credential is free", output)
+        # Reporting is all it does. Holding on would make the check itself the
+        # thing that blocks the next run.
+        self.assertEqual(released, [True])
+        handshakes.assert_not_called()
+        application.assert_not_called()
+
+    def test_a_held_lock_stops_with_a_non_zero_exit(self):
+        status, output, handshakes, application, _read, _released = self._run(False)
+
+        self.assertEqual(status, 1)
+        self.assertIn("acquired=false", output)
+        self.assertIn("STOP", output)
+        handshakes.assert_not_called()
+        application.assert_not_called()
+
+    def test_a_lock_that_cannot_be_taken_at_all_stops_too(self):
+        status, output, _h, _a, _read, _released = self._run(None)
+
+        self.assertEqual(status, 1)
+        self.assertIn("unavailable", output)
+        self.assertIn("STOP", output)
+
+    def test_it_reaches_no_network_and_not_even_the_database(self):
+        """Whatever the answer, nothing that could send a request is entered."""
+        for lease_result in (True, False, None):
+            with self.subTest(lease=repr(lease_result)):
+                _status, output, handshakes, application, read_projects, _r = (
+                    self._run(lease_result)
+                )
+                handshakes.assert_not_called()
+                application.assert_not_called()
+                read_projects.assert_not_called()
+                self.assertIn("network_used=false", output)
+
+
 class ContractApplicationHandshakeTests(unittest.TestCase):
     """The end-to-end check: the real client path, driven against a copy.
 

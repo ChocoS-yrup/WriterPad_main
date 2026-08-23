@@ -2241,6 +2241,11 @@ class SyncManager(QObject):
                         else "auth_lease_held_elsewhere"
                     )
                     client._antigravity_authenticated = False
+                    # Not merely unauthenticated. Without the credential this
+                    # process has no business talking to the server at all, and
+                    # a client that is merely signed out would still be treated
+                    # as a working connection.
+                    client._antigravity_credential_locked_out = True
                     print(
                         "Supabase session left alone: another process holds "
                         "the credential."
@@ -2717,6 +2722,10 @@ class SyncManager(QObject):
 
     @property
     def cloud_network_enabled(self):
+        if getattr(self.supabase, "_antigravity_credential_locked_out", False):
+            # Another process holds the stored session. Every server path is
+            # closed for this one, not just the authenticated ones.
+            return False
         return self.cloud_config_state == "ready" and self.supabase is not None
 
     def cloud_configuration_status(self):
