@@ -482,39 +482,75 @@ class SingleRefreshAuthorityTestCase(unittest.TestCase):
         self.assertEqual(keyring.refresh, "refresh-rotated")
         self.assertEqual(client._antigravity_refresh_token, "refresh-rotated")
 
+    def _call(self, client):
+        with patch.object(
+            SyncManager, "_persist_supabase_session", return_value=True
+        ):
+            return self.manager._call_with_session(lambda: "ok", client)
+
     def test_a_token_near_expiry_is_renewed_before_the_call_goes_out(self):
         """Renewing after a refusal means retrying a write that may have landed."""
         client = _Client()
-        keyring = _Keyring(access=_expiring_token(30), refresh="refresh-mine")
-        client._antigravity_refresh_token = "refresh-mine"
-        calls = []
-        with patch("security_manager.SecurityManager", keyring), patch.object(
-            SyncManager, "_persist_supabase_session", return_value=True
-        ):
-            self.manager._call_with_session(lambda: calls.append("call") or "ok", client)
+        client._antigravity_access_token = _expiring_token(30)
 
-        self.assertEqual(calls, ["call"])
+        self.assertEqual(self._call(client), "ok")
         self.assertEqual(client.auth.refresh_calls, 1)
 
     def test_a_token_with_time_left_is_not_renewed(self):
         client = _Client()
-        keyring = _Keyring(access=_expiring_token(3600), refresh="refresh-mine")
-        with patch("security_manager.SecurityManager", keyring), patch.object(
-            SyncManager, "_persist_supabase_session", return_value=True
-        ):
-            self.manager._call_with_session(lambda: "ok", client)
+        client._antigravity_access_token = _expiring_token(3600)
 
+        self._call(client)
         self.assertEqual(client.auth.refresh_calls, 0)
 
     def test_an_unreadable_token_does_not_trigger_a_refresh_every_call(self):
         client = _Client()
-        keyring = _Keyring(access="not-a-jwt", refresh="refresh-mine")
-        with patch("security_manager.SecurityManager", keyring), patch.object(
-            SyncManager, "_persist_supabase_session", return_value=True
-        ):
-            self.manager._call_with_session(lambda: "ok", client)
+        client._antigravity_access_token = "not-a-jwt"
 
+        self._call(client)
         self.assertEqual(client.auth.refresh_calls, 0)
+
+    def test_a_client_that_holds_no_session_yet_is_not_refreshed(self):
+        client = _Client()
+
+        self._call(client)
+        self.assertEqual(client.auth.refresh_calls, 0)
+
+    def test_the_decision_ignores_what_the_credential_store_holds(self):
+        """Otherwise every call depends on when somebody last signed in here.
+
+        The store may hold a session another client refreshed a moment ago, and
+        it may be seconds from lapsing while this client's own is fresh. Reading
+        it here made an ordinary call's behaviour a function of machine-wide
+        state that the call has nothing to do with -- and made this suite pass
+        or fail on how long ago a person logged in.
+        """
+        for stored, held, expected in (
+            (30, 3600, 0),
+            (3600, 30, 1),
+            (30, None, 0),
+        ):
+            with self.subTest(stored=stored, held=held):
+                client = _Client()
+                if held is not None:
+                    client._antigravity_access_token = _expiring_token(held)
+                keyring = _Keyring(
+                    access=_expiring_token(stored), refresh="refresh-stored"
+                )
+                with patch("security_manager.SecurityManager", keyring):
+                    self._call(client)
+                self.assertEqual(client.auth.refresh_calls, expected)
+
+    def test_a_restored_session_leaves_its_expiry_on_the_client(self):
+        """The proactive path needs the access token, so remembering must keep it."""
+        client = SimpleNamespace()
+        SyncManager._remember_client_session(
+            client,
+            SimpleNamespace(access_token="access-1", refresh_token="refresh-1"),
+        )
+
+        self.assertEqual(client._antigravity_access_token, "access-1")
+        self.assertEqual(client._antigravity_refresh_token, "refresh-1")
 
     def test_the_installed_library_really_has_its_timer_off(self):
         """Checking the option we passed only proves we passed it.

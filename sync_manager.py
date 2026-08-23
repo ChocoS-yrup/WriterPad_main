@@ -2511,10 +2511,19 @@ class SyncManager(QObject):
 
     @staticmethod
     def _remember_client_session(client, session):
-        """Record which refresh token this client now holds."""
+        """Record which session this client now holds.
+
+        The refresh token is what a later write is allowed to replace; the
+        access token is what says how long this client has left. Both belong to
+        the client, because both questions are about it and not about whatever
+        the credential store happens to hold for somebody else.
+        """
         try:
             client._antigravity_refresh_token = getattr(
                 session, "refresh_token", ""
+            ) or ""
+            client._antigravity_access_token = getattr(
+                session, "access_token", ""
             ) or ""
         except Exception:
             pass
@@ -2666,13 +2675,13 @@ class SyncManager(QObject):
         # Renew before sending rather than after being refused. A refused write
         # has already been attempted, and retrying it means reasoning about
         # whether the first attempt landed.
-        stored_access = ""
-        try:
-            from security_manager import SecurityManager
-            stored_access, _stored_refresh = SecurityManager.get_supabase_session()
-        except Exception:
-            stored_access = ""
-        if stored_access and self._session_is_near_expiry(stored_access):
+        #
+        # Asked of the client, not of the credential store. What the store holds
+        # may belong to another client that refreshed a moment ago, and reading
+        # it here would make every call depend on machine-wide state that this
+        # request has nothing to do with.
+        held_access = getattr(client, "_antigravity_access_token", "")
+        if held_access and self._session_is_near_expiry(held_access):
             try:
                 self.ensure_session_valid(client, force_refresh=True)
             except Exception:
