@@ -27,10 +27,10 @@ metadata only.
 Read-only does not extend to the stored session. Both handshake modes build a
 real client, which spends the saved refresh token and is issued a new one, and
 that new pair is written to the credential store the same way the application
-writes it. Nothing is lost by this, but the tool is one more client competing
-for the one credential slot. Both modes therefore refuse to start while the
-application is open or while another copy of this tool is running, and they
-refuse before touching the network.
+writes it. So before either of them touches the network this takes the same
+machine-wide lock the application takes before it exchanges a session, and
+holds it until the run is over. Anything else already holding it -- the
+application, another copy of this -- means stopping, not waiting.
 """
 
 from __future__ import annotations
@@ -73,88 +73,6 @@ CONTRACT_COLUMNS = (
     "server_capabilities_json",
     "contract_validated_at",
 )
-
-
-APP_INSTANCE_KEY = "Antigravity_AI_Writer_App"
-PREFLIGHT_MUTEX_NAMES = (
-    "Global\\AntigravityWriterContractPreflight",
-    "Local\\AntigravityWriterContractPreflight",
-)
-_ERROR_ALREADY_EXISTS = 183
-
-
-def application_is_running():
-    """Ask the application's own single-instance channel, not the process list.
-
-    The application answers on a named pipe it opens at startup. Reading the
-    process table instead would be a guess with a race in it: a name can be
-    anything, and the answer can go stale between looking and acting.
-    """
-    try:
-        import os as _os
-
-        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PyQt6.QtCore import QCoreApplication
-        from PyQt6.QtNetwork import QLocalSocket
-        from runtime_profile import instance_key
-
-        owns_app = QCoreApplication.instance() is None
-        app = QCoreApplication([]) if owns_app else None
-        try:
-            socket = QLocalSocket()
-            socket.connectToServer(instance_key(APP_INSTANCE_KEY))
-            running = socket.waitForConnected(500)
-            socket.abort()
-            return running
-        finally:
-            if app is not None:
-                app.quit()
-    except Exception:
-        # A probe that cannot run must not be read as "nothing is running".
-        return None
-
-
-class SoloRun:
-    """A Windows named mutex, so two copies of this tool cannot overlap."""
-
-    def __init__(self):
-        self.handle = None
-        self.name = ""
-
-    def acquire(self):
-        try:
-            import ctypes
-            from ctypes import wintypes
-        except Exception:
-            return None
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateMutexW.restype = wintypes.HANDLE
-        for name in PREFLIGHT_MUTEX_NAMES:
-            handle = kernel32.CreateMutexW(None, True, name)
-            error = ctypes.get_last_error()
-            if not handle:
-                # The Global namespace can be refused; Local is per-session and
-                # still keeps two runs on this desktop apart.
-                continue
-            if error == _ERROR_ALREADY_EXISTS:
-                kernel32.CloseHandle(handle)
-                return False
-            self.handle, self.name = handle, name
-            return True
-        return None
-
-    def release(self):
-        if not self.handle:
-            return
-        try:
-            import ctypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.ReleaseMutex(self.handle)
-            kernel32.CloseHandle(self.handle)
-        except Exception:
-            pass
-        self.handle = None
 
 
 def file_sha256(path: Path) -> str:
@@ -772,29 +690,32 @@ def main():
     )
 
     status = 0
-    solo = SoloRun()
+    holds_credential = False
     if args.rpc_handshake or args.application_handshake:
         # Both of these build a real client and spend the stored refresh token.
-        # Whatever else is holding that credential has to be gone first, and it
-        # has to be checked before the network is touched rather than after.
-        print("[solo run]")
-        app_running = application_is_running()
+        # Taking the same lock the application takes is what makes that safe;
+        # asking whether the application is running would be a question whose
+        # answer is already stale by the time it is acted on.
+        from sync_manager import SupabaseAuthLease, SyncManager
+
+        print("[credential lock]")
+        show("lock", SupabaseAuthLease.NAME)
+        lease = SyncManager.acquire_auth_lease()
         show(
-            "application_running",
-            "unknown" if app_running is None else app_running,
+            "acquired",
+            "unavailable on this machine" if lease is None else bool(lease),
         )
-        held = solo.acquire()
-        show("preflight_mutex", "unavailable" if held is None else solo.name or "")
-        show("another_preflight_running", held is False)
-        if app_running is not False or held is not True:
+        if lease is not True:
             show(
                 "verdict",
-                "STOP - close the application and any other copy of this tool, "
-                "then run it again",
+                "STOP - something else holds the credential; close the "
+                "application and any other copy of this tool"
+                if lease is False else
+                "STOP - the machine-wide credential lock is unavailable",
             )
             print()
-            solo.release()
             return 1
+        holds_credential = True
         print()
 
     try:
@@ -803,7 +724,10 @@ def main():
         if args.application_handshake:
             status = run_application_handshake(database, only_project)
     finally:
-        solo.release()
+        if holds_credential:
+            from sync_manager import SyncManager as _SyncManager
+
+            _SyncManager.release_auth_lease()
 
     after = file_sha256(database)
     print("[database file]")

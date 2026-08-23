@@ -479,6 +479,101 @@ class ServerActionWorker(QThread):
         except Exception as error:
             self.resultReady.emit(False, error)
 
+class SupabaseAuthLease:
+    """The exclusive right to exchange this machine's stored session.
+
+    The application and the preflight are both clients of one credential, and
+    an exchange retires whatever the other is holding. Checking that the other
+    is not running is a guess that goes stale the moment it is made; holding one
+    lock for as long as the work lasts does not.
+
+    One namespace, and no falling back to another. A fallback would put the two
+    holders in different rooms, each certain it was alone.
+    """
+
+    NAME = "Global\\AntigravityWriterSupabaseAuth"
+    _ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, name=None):
+        self.name = name or self.NAME
+        self._handle = None
+
+    @property
+    def held(self):
+        return bool(self._handle)
+
+    def acquire(self):
+        """True when held, False when somebody else holds it, None when the
+        lock itself is unavailable on this machine."""
+        if self._handle:
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CreateMutexW.argtypes = [
+                wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR
+            ]
+        except Exception:
+            return None
+        handle = kernel32.CreateMutexW(None, True, self.name)
+        error = ctypes.get_last_error()
+        if not handle:
+            return None
+        if error == self._ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self._handle = handle
+        return True
+
+    def release(self):
+        if not self._handle:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.ReleaseMutex(self._handle)
+            kernel32.CloseHandle(self._handle)
+        except Exception:
+            pass
+        self._handle = None
+
+
+def auth_error_facts(error, classified):
+    """The safe shape of an auth failure: what kind, from what, with what status.
+
+    Enough to tell a refused credential from a bad minute without recording the
+    message, the address it came from, or anything the token said.
+    """
+    chain = []
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
+    status = next(
+        (
+            value
+            for item in chain
+            for attribute in ("status_code", "status")
+            for value in [getattr(item, attribute, None)]
+            if isinstance(value, int) and not isinstance(value, bool)
+        ),
+        None,
+    )
+    return {
+        "exception_class": type(error).__name__,
+        "auth_error_status": "" if status is None else status,
+        "classified_kind": getattr(classified, "kind", ""),
+    }
+
+
 class SyncManager(QObject):
     syncStateChanged = pyqtSignal(str, str, int)  # state, detail, pending retry count
     conflictDetected = pyqtSignal(object)
@@ -501,6 +596,9 @@ class SyncManager(QObject):
     # server retires the old token the moment it answers, and the write that
     # records the new one starts afterwards. Closing in that gap leaves a spent
     # token behind, so shutdown waits on the count, not on the lock.
+    # One holder at a time may exchange the stored session, across processes.
+    # Held for as long as this process might do so, not merely checked.
+    _auth_lease = SupabaseAuthLease()
     _session_exchanges = 0
     # Starts set. Nothing is in flight before anything has run, and a
     # shutdown that never saw an exchange must not wait out its budget.
@@ -2134,6 +2232,20 @@ class SyncManager(QObject):
             # the one that loses is told its token is invalid -- which looks
             # exactly like the account's token having been revoked.
             with SyncManager._session_restore_lock:
+                lease = SyncManager.acquire_auth_lease()
+                if lease is not True:
+                    # Somebody else on this machine is exchanging the same
+                    # credential. Doing it anyway is what retires their token.
+                    client._antigravity_restore_error_kind = (
+                        "auth_lease_unavailable" if lease is None
+                        else "auth_lease_held_elsewhere"
+                    )
+                    client._antigravity_authenticated = False
+                    print(
+                        "Supabase session left alone: another process holds "
+                        "the credential."
+                    )
+                    return client
                 try:
                     from security_manager import SecurityManager
                     access_token, refresh_token = SecurityManager.get_supabase_session()
@@ -2163,17 +2275,26 @@ class SyncManager(QObject):
                         client._antigravity_email = getattr(user, "email", "") or ""
                 except Exception as auth_error:
                     classified = classify_cloud_error(auth_error)
+                    facts = auth_error_facts(auth_error, classified)
                     client._antigravity_restore_error_kind = classified.kind
-                    if not SyncManager._discard_rejected_session(
+                    client._antigravity_restore_error_facts = facts
+                    detail = (
+                        f"{facts['exception_class']}"
+                        f"/{facts['auth_error_status'] or 'no-status'}"
+                        f"/{facts['classified_kind']}"
+                    )
+                    if SyncManager._discard_rejected_session(
                         classified, access_token, refresh_token
                     ):
+                        print(f"Supabase session discarded: {detail}.")
+                    else:
                         # Keeping the session is the right answer, but a silent
                         # failed restore leaves somebody staring at a signed-out
-                        # app with nothing to read. The kind is safe to print;
-                        # the tokens never appear.
+                        # app with nothing to read. These three say what happened
+                        # without recording the message, the address or the token.
                         print(
-                            "Supabase session restore failed "
-                            f"({classified.kind}); the stored session was kept."
+                            f"Supabase session restore failed: {detail}; "
+                            "the stored session was kept."
                         )
 
             client._antigravity_authenticated = authenticated
@@ -2247,12 +2368,16 @@ class SyncManager(QObject):
             SecurityManager.clear_supabase_session()
         except Exception:
             return False
-        # The one place a stored session is thrown away without the writer
-        # asking. Saying so leaves something to read the next time somebody
-        # finds themselves signed out; the kind is safe to print, the tokens
-        # never appear.
-        print(f"Supabase session discarded after {classified.kind} refusal.")
         return True
+
+    @staticmethod
+    def acquire_auth_lease():
+        """Take the machine-wide right to exchange the stored session."""
+        return SyncManager._auth_lease.acquire()
+
+    @staticmethod
+    def release_auth_lease():
+        SyncManager._auth_lease.release()
 
     @staticmethod
     @contextmanager

@@ -6,11 +6,14 @@ import socket
 import threading
 import time
 import unittest
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import sync_manager
 from cloud_config import classify_cloud_error
-from sync_manager import SyncManager
+from sync_manager import SupabaseAuthLease, SyncManager, auth_error_facts
 from writing_controller import WritingController
 
 
@@ -53,12 +56,33 @@ def _access_token(tag):
     return f"header.{payload}.{tag}"
 
 
+def _b64url(value):
+    return base64.urlsafe_b64encode(
+        json.dumps(value).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
 def _expiring_token(seconds_left):
     """A token that lapses in the given number of seconds."""
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": int(time.time()) + int(seconds_left)}).encode("utf-8")
-    ).decode("ascii").rstrip("=")
+    payload = _b64url({"exp": int(time.time()) + int(seconds_left)})
     return f"header.{payload}.signature"
+
+
+def _library_shaped_token(seconds_left):
+    """The same, but carrying the claims the real library insists on parsing."""
+    expires_at = int(time.time()) + int(seconds_left)
+    header = _b64url({"alg": "HS256", "typ": "JWT", "kid": "test"})
+    payload = _b64url({
+        "sub": "00000000-0000-4000-8000-000000000001",
+        "exp": expires_at,
+        "iat": expires_at - 3600,
+        "aud": "authenticated",
+        "role": "authenticated",
+        "iss": "https://unreachable.invalid/auth/v1",
+        "email": "writer@example.com",
+    })
+    signature = base64.urlsafe_b64encode(b"signature").decode("ascii").rstrip("=")
+    return f"{header}.{payload}.{signature}"
 
 
 def _session(tag):
@@ -490,9 +514,10 @@ class SingleRefreshAuthorityTestCase(unittest.TestCase):
     def test_the_installed_library_really_has_its_timer_off(self):
         """Checking the option we passed only proves we passed it.
 
-        This builds the actual client the application builds, against an
-        address nothing answers on, and asks the auth object it produced. No
-        request is made: construction is local.
+        This builds the actual client the application builds, against an address
+        nothing answers on, and asks the auth object it produced -- at
+        construction, and again after a session has been set, which is where a
+        timer would be armed. Both steps are local; no request is made.
         """
         try:
             import httpx
@@ -511,7 +536,17 @@ class SingleRefreshAuthorityTestCase(unittest.TestCase):
             )
             auth = client.auth
             self.assertFalse(getattr(auth, "_auto_refresh_token", True))
-            # And nothing was scheduled to fire behind our back.
+            self.assertIsNone(getattr(auth, "_refresh_token_timer", None))
+
+            # Adopting a session is the moment the library would arm a timer.
+            # The address is a reserved name that never resolves, so the attempt
+            # ends in the transport rather than anywhere real; what matters is
+            # what it left behind.
+            with contextlib.suppress(Exception):
+                auth.set_session(
+                    _library_shaped_token(3600), "refresh-adopted"
+                )
+            self.assertFalse(getattr(auth, "_auto_refresh_token", True))
             self.assertIsNone(getattr(auth, "_refresh_token_timer", None))
         finally:
             transport.close()
@@ -540,6 +575,160 @@ class SingleRefreshAuthorityTestCase(unittest.TestCase):
             SyncManager.create_supabase_client(config)
 
         self.assertIs(captured.get("auto_refresh_token"), False)
+
+
+class AuthLeaseTestCase(unittest.TestCase):
+    """One credential, one holder, and the holder keeps it while it works.
+
+    The application and the preflight both exchange the stored session. Asking
+    whether the other is running answers a question about the past; taking the
+    same lock and keeping it answers the one that matters.
+    """
+
+    def setUp(self):
+        self.leases = []
+
+    def tearDown(self):
+        for lease in self.leases:
+            lease.release()
+
+    def _lease(self, name):
+        lease = SupabaseAuthLease(name)
+        self.leases.append(lease)
+        return lease
+
+    def test_only_one_holder_at_a_time(self):
+        name = f"Local\\AntigravityTest-{uuid.uuid4().hex}"
+        first, second = self._lease(name), self._lease(name)
+
+        self.assertIs(first.acquire(), True)
+        self.assertIs(second.acquire(), False)
+        self.assertTrue(first.held)
+        self.assertFalse(second.held)
+
+    def test_releasing_hands_it_on(self):
+        name = f"Local\\AntigravityTest-{uuid.uuid4().hex}"
+        first, second = self._lease(name), self._lease(name)
+
+        first.acquire()
+        first.release()
+        self.assertIs(second.acquire(), True)
+
+    def test_asking_twice_in_one_process_is_idempotent(self):
+        name = f"Local\\AntigravityTest-{uuid.uuid4().hex}"
+        lease = self._lease(name)
+
+        self.assertIs(lease.acquire(), True)
+        self.assertIs(lease.acquire(), True)
+
+    def test_there_is_one_namespace_and_no_falling_back(self):
+        """Two namespaces would put the holders in separate rooms."""
+        self.assertTrue(SupabaseAuthLease.NAME.startswith("Global\\"))
+        source = Path(sync_manager.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("Local\\Antigravity", source)
+
+    def test_a_client_built_without_the_lease_does_not_exchange(self):
+        """Exchanging anyway is exactly what retires the other holder's token."""
+        keyring = _Keyring()
+        set_session = MagicMock()
+        supabase = SimpleNamespace(
+            create_client=lambda *a, **k: SimpleNamespace(
+                auth=SimpleNamespace(
+                    set_session=set_session, on_auth_state_change=MagicMock()
+                )
+            ),
+            ClientOptions=lambda **k: None,
+        )
+        config = SimpleNamespace(
+            is_ready=True, url="https://example.invalid", publishable_key="pk"
+        )
+        printed = io.StringIO()
+        with patch("security_manager.SecurityManager", keyring), \
+                patch.dict("sys.modules", {"supabase": supabase}), \
+                patch.object(SyncManager, "acquire_auth_lease", staticmethod(lambda: False)):
+            with contextlib.redirect_stdout(printed):
+                client = SyncManager.create_supabase_client(config)
+
+        set_session.assert_not_called()
+        self.assertFalse(client._antigravity_authenticated)
+        self.assertEqual(
+            client._antigravity_restore_error_kind, "auth_lease_held_elsewhere"
+        )
+        self.assertEqual(keyring.clears, 0)
+        self.assertTrue(keyring.present)
+        self.assertIn("another process holds", printed.getvalue())
+
+
+class AuthErrorFactsTestCase(unittest.TestCase):
+    """What a failed exchange is allowed to leave behind."""
+
+    def test_the_three_fields_are_recorded(self):
+        error = _http_error(400, "Invalid Refresh Token: Already Used")
+        facts = auth_error_facts(error, classify_cloud_error(error))
+
+        self.assertEqual(facts["exception_class"], "RuntimeError")
+        self.assertEqual(facts["auth_error_status"], 400)
+        self.assertEqual(facts["classified_kind"], "authentication")
+
+    def test_a_status_on_status_rather_than_status_code_is_found(self):
+        error = RuntimeError("Unauthorized")
+        error.status = 401
+        facts = auth_error_facts(error, classify_cloud_error(error))
+
+        self.assertEqual(facts["auth_error_status"], 401)
+        self.assertEqual(facts["classified_kind"], "authentication")
+
+    def test_no_status_is_recorded_as_empty_not_guessed(self):
+        error = TimeoutError("timed out")
+        facts = auth_error_facts(error, classify_cloud_error(error))
+
+        self.assertEqual(facts["exception_class"], "TimeoutError")
+        self.assertEqual(facts["auth_error_status"], "")
+        self.assertEqual(facts["classified_kind"], "timeout")
+
+    def test_nothing_from_the_message_survives(self):
+        error = _http_error(
+            400, "refresh token 'abc.def.ghi' rejected by https://host.invalid"
+        )
+        facts = auth_error_facts(error, classify_cloud_error(error))
+        rendered = json.dumps(facts)
+
+        for secret in ("abc.def.ghi", "host.invalid", "https://", "refresh token"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, rendered)
+
+    def test_a_failed_restore_reports_the_three_fields_and_nothing_else(self):
+        keyring = _Keyring()
+        error = _http_error(503, "service unavailable at https://host.invalid")
+        supabase = SimpleNamespace(
+            create_client=lambda *a, **k: SimpleNamespace(
+                auth=SimpleNamespace(
+                    set_session=MagicMock(side_effect=error),
+                    on_auth_state_change=MagicMock(),
+                )
+            ),
+            ClientOptions=lambda **k: None,
+        )
+        config = SimpleNamespace(
+            is_ready=True, url="https://example.invalid", publishable_key="pk"
+        )
+        printed = io.StringIO()
+        with patch("security_manager.SecurityManager", keyring), \
+                patch.dict("sys.modules", {"supabase": supabase}), \
+                patch.object(SyncManager, "acquire_auth_lease", staticmethod(lambda: True)):
+            with contextlib.redirect_stdout(printed):
+                client = SyncManager.create_supabase_client(config)
+
+        facts = client._antigravity_restore_error_facts
+        self.assertEqual(facts["auth_error_status"], 503)
+        self.assertEqual(facts["classified_kind"], "server_rejection")
+        output = printed.getvalue()
+        self.assertIn("503", output)
+        self.assertIn("server_rejection", output)
+        self.assertNotIn("host.invalid", output)
+        self.assertNotIn("service unavailable", output)
+        # A server fault is not a refusal, so the session stays.
+        self.assertEqual(keyring.clears, 0)
 
 
 class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
