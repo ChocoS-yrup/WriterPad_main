@@ -182,24 +182,62 @@ class StoredSessionLineageTestCase(unittest.TestCase):
                 self.assertFalse(written)
                 self.assertEqual(keyring.refresh, "refresh-keep")
 
-    def test_shutdown_waits_for_a_write_that_is_mid_flight(self):
-        """Closing while a rotation is between exchange and store loses it."""
-        released = threading.Event()
-        observed = []
+    def test_shutdown_waits_between_the_server_answering_and_the_write(self):
+        """The gap the store lock cannot see, and the one that loses tokens.
 
-        def hold():
-            with SyncManager._session_restore_lock:
-                released.wait(1.0)
+        The server retires the old token the moment it answers. Everything up to
+        the new one being written down is a window where closing leaves a spent
+        token behind, so shutdown has to wait on the exchange, not on the write.
+        """
+        answered = threading.Event()
+        release = threading.Event()
+        observed = {}
 
-        holder = threading.Thread(target=hold)
-        holder.start()
-        time.sleep(0.05)
-        observed.append(SyncManager.await_session_writes(timeout_ms=50))
-        released.set()
-        holder.join()
-        observed.append(SyncManager.await_session_writes(timeout_ms=500))
+        def exchange():
+            with SyncManager._session_exchange_in_flight():
+                # The server has answered and retired the previous token here.
+                answered.set()
+                release.wait(2.0)
+                # The write would happen here.
 
-        self.assertEqual(observed, [False, True])
+        worker = threading.Thread(target=exchange)
+        worker.start()
+        self.assertTrue(answered.wait(1.0))
+        observed["while_in_flight"] = SyncManager.await_session_writes(
+            timeout_ms=100
+        )
+        release.set()
+        worker.join()
+        observed["after_it_landed"] = SyncManager.await_session_writes(
+            timeout_ms=500
+        )
+
+        self.assertEqual(observed["while_in_flight"], False)
+        self.assertEqual(observed["after_it_landed"], True)
+
+    def test_shutdown_returns_at_once_when_nothing_is_in_flight(self):
+        self.assertTrue(SyncManager.await_session_writes(timeout_ms=50))
+
+    def test_overlapping_exchanges_all_have_to_finish(self):
+        release = threading.Event()
+        started = threading.Semaphore(0)
+
+        def exchange():
+            with SyncManager._session_exchange_in_flight():
+                started.release()
+                release.wait(2.0)
+
+        workers = [threading.Thread(target=exchange) for _ in range(3)]
+        for worker in workers:
+            worker.start()
+        for _ in workers:
+            self.assertTrue(started.acquire(timeout=1.0))
+
+        self.assertFalse(SyncManager.await_session_writes(timeout_ms=100))
+        release.set()
+        for worker in workers:
+            worker.join()
+        self.assertTrue(SyncManager.await_session_writes(timeout_ms=500))
 
     def test_persisting_from_inside_a_restore_does_not_deadlock(self):
         """The restore holds the lock while the session it produced is stored."""
@@ -317,6 +355,99 @@ class SessionRestoreTestCase(unittest.TestCase):
         self.keyring = _Unreadable()
         self.assertFalse(self._discard(_http_error(401, "invalid credentials")))
         self.assertEqual(self.keyring.clears, 0)
+
+
+class SingleRefreshAuthorityTestCase(unittest.TestCase):
+    """One credential, several clients, and only one of them may rotate it.
+
+    Five clients refreshing on five schedules against one credential means every
+    rotation retires the token the other four are holding, and each of them then
+    discovers it is signed out. Ordering the writes keeps the store correct; it
+    does not stop the clients from invalidating each other.
+    """
+
+    def setUp(self):
+        self.manager = SyncManager()
+        self.manager._auth_retry_blocked = False
+        self.rotations = []
+
+    def _client(self, held, stored_access="access-current"):
+        rotations = self.rotations
+
+        def refresh_session():
+            rotations.append("refresh")
+            return SimpleNamespace(session=SimpleNamespace(
+                access_token="access-rotated", refresh_token="refresh-rotated",
+                user=SimpleNamespace(email="writer@example.com"),
+            ))
+
+        def set_session(access, refresh):
+            rotations.append("adopt")
+            return SimpleNamespace(session=SimpleNamespace(
+                access_token=access, refresh_token=refresh,
+                user=SimpleNamespace(email="writer@example.com"),
+            ))
+
+        client = SimpleNamespace(
+            auth=SimpleNamespace(
+                refresh_session=refresh_session,
+                set_session=set_session,
+                get_session=lambda: SimpleNamespace(session=None),
+            ),
+            _antigravity_authenticated=False,
+            _antigravity_refresh_token=held,
+            _antigravity_session_generation=SyncManager._session_generation,
+        )
+        return client
+
+    def test_a_worker_takes_the_session_somebody_else_refreshed(self):
+        """Adopting costs one local exchange; refreshing costs everyone else."""
+        keyring = _Keyring(access="access-newer", refresh="refresh-newer")
+        client = self._client(held="refresh-mine")
+        with patch("security_manager.SecurityManager", keyring):
+            self.manager.ensure_session_valid(client, force_refresh=True)
+
+        self.assertEqual(self.rotations, ["adopt"])
+        self.assertTrue(client._antigravity_authenticated)
+        self.assertEqual(client._antigravity_refresh_token, "refresh-newer")
+        # Nothing was rotated, so the store still holds what it held.
+        self.assertEqual(keyring.refresh, "refresh-newer")
+
+    def test_a_worker_already_holding_the_stored_session_refreshes(self):
+        """Nothing to adopt means this really is the client that has to rotate."""
+        keyring = _Keyring(access="access-current", refresh="refresh-mine")
+        client = self._client(held="refresh-mine")
+        with patch("security_manager.SecurityManager", keyring):
+            self.manager.ensure_session_valid(client, force_refresh=True)
+
+        self.assertEqual(self.rotations, ["refresh"])
+        self.assertEqual(keyring.refresh, "refresh-rotated")
+        self.assertEqual(client._antigravity_refresh_token, "refresh-rotated")
+
+    def test_no_client_refreshes_on_a_timer_of_its_own(self):
+        """A timer inside the library is neither serialized nor waited for."""
+        captured = {}
+
+        def client_options(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        supabase = SimpleNamespace(
+            create_client=lambda *a, **k: SimpleNamespace(
+                auth=SimpleNamespace(
+                    set_session=MagicMock(side_effect=TimeoutError("timed out")),
+                    on_auth_state_change=MagicMock(),
+                )
+            ),
+            ClientOptions=client_options,
+        )
+        config = SimpleNamespace(
+            is_ready=True, url="https://example.invalid", publishable_key="pk"
+        )
+        with patch("security_manager.SecurityManager", _Keyring()),                 patch.dict("sys.modules", {"supabase": supabase}):
+            SyncManager.create_supabase_client(config)
+
+        self.assertIs(captured.get("auto_refresh_token"), False)
 
 
 class SessionRestoreThroughTheClientTestCase(unittest.TestCase):

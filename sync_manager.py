@@ -495,6 +495,16 @@ class SyncManager(QObject):
     # generation it was built in, so a callback from a client that belongs to a
     # session the writer has already ended cannot write to the store.
     _session_generation = 0
+    # How many token exchanges are somewhere between asking the server and
+    # writing the answer down. The store lock alone does not cover this: the
+    # server retires the old token the moment it answers, and the write that
+    # records the new one starts afterwards. Closing in that gap leaves a spent
+    # token behind, so shutdown waits on the count, not on the lock.
+    _session_exchanges = 0
+    # Starts set. Nothing is in flight before anything has run, and a
+    # shutdown that never saw an exchange must not wait out its budget.
+    _session_exchanges_idle = threading.Event()
+    _session_exchanges_idle.set()
 
     def __new__(cls, *args, **kwargs):
         with QMutexLocker(cls._mutex):
@@ -2100,7 +2110,14 @@ class SyncManager(QObject):
                 timeout=5.0,
                 limits=httpx.Limits(max_keepalive_connections=5),
             )
-            options = ClientOptions(httpx_client=custom_httpx_client)
+            # No client refreshes on a timer of its own. Five of them do it on
+            # five schedules against one credential, and each rotation retires
+            # the token the other four are holding. Refreshes go through
+            # ensure_session_valid instead, which serializes them and which
+            # shutdown can wait for; a timer inside the library is neither.
+            options = ClientOptions(
+                httpx_client=custom_httpx_client, auto_refresh_token=False
+            )
             client = create_client(
                 config.url,
                 config.publishable_key,
@@ -2125,9 +2142,10 @@ class SyncManager(QObject):
                 try:
                     auth_response = None
                     if access_token and refresh_token:
-                        auth_response = client.auth.set_session(
-                            access_token, refresh_token
-                        )
+                        with SyncManager._session_exchange_in_flight():
+                            auth_response = client.auth.set_session(
+                                access_token, refresh_token
+                            )
                     session = (
                         getattr(auth_response, "session", None)
                         if auth_response else None
@@ -2236,21 +2254,80 @@ class SyncManager(QObject):
         return True
 
     @staticmethod
-    def await_session_writes(timeout_ms=None):
-        """Wait for any rotation that is mid-flight to finish being stored.
+    @contextmanager
+    def _session_exchange_in_flight():
+        """Mark a token exchange as running, from the ask to the write.
 
-        The client library refreshes on a timer of its own, on a thread no
-        worker drain knows about. Closing while one is between exchanging a
-        token and writing it down leaves the spent one in the store, and the
-        next launch is refused for a session nobody ended.
+        Everything between is a window where the server has already retired the
+        old token and nothing has recorded the new one yet.
+        """
+        with SyncManager._session_restore_lock:
+            SyncManager._session_exchanges += 1
+            SyncManager._session_exchanges_idle.clear()
+        try:
+            yield
+        finally:
+            with SyncManager._session_restore_lock:
+                SyncManager._session_exchanges = max(
+                    0, SyncManager._session_exchanges - 1
+                )
+                if not SyncManager._session_exchanges:
+                    SyncManager._session_exchanges_idle.set()
+
+    @staticmethod
+    def await_session_writes(timeout_ms=None):
+        """Wait for every exchange in flight to finish being written down.
+
+        Workers are drained by the time this runs, but a token exchange is not
+        one of them. Closing between the server answering and the answer being
+        stored leaves the spent token in place, and the next launch is refused
+        for a session nobody ended.
         """
         timeout = (
             SHUTDOWN_GRACE_MS if timeout_ms is None else timeout_ms
         ) / 1000.0
+        if not SyncManager._session_exchanges_idle.wait(timeout):
+            return False
         if not SyncManager._session_restore_lock.acquire(timeout=timeout):
             return False
         SyncManager._session_restore_lock.release()
         return True
+
+    def _adopt_stored_session(self, client):
+        """Take the session somebody else already refreshed, instead of racing.
+
+        There is one credential and several clients. A worker holding a stale
+        token usually needs no rotation of its own -- another client has done it
+        and written the result down. Refreshing anyway would retire that result
+        and leave every other client stale in turn.
+        """
+        auth = getattr(client, "auth", None)
+        if auth is None:
+            return None
+        try:
+            from security_manager import SecurityManager
+            with SyncManager._session_restore_lock:
+                access, refresh = SecurityManager.get_supabase_session()
+            if not (access and refresh):
+                return None
+            if refresh == getattr(client, "_antigravity_refresh_token", ""):
+                return None
+            with SyncManager._session_exchange_in_flight():
+                response = auth.set_session(access, refresh)
+                session = self._session_from_response(response)
+                if not getattr(session, "refresh_token", ""):
+                    return None
+                self._persist_supabase_session(
+                    session,
+                    expected_previous=refresh,
+                    generation=getattr(
+                        client, "_antigravity_session_generation", None
+                    ),
+                )
+                self._remember_client_session(client, session)
+                return session
+        except Exception:
+            return None
 
     @staticmethod
     def _remember_client_session(client, session):
@@ -2350,26 +2427,52 @@ class SyncManager(QObject):
         observed_generation = self._auth_refresh_generation
         with self._session_refresh_lock:
             try:
+                session = None
                 if force_refresh and observed_generation == self._auth_refresh_generation:
-                    response = auth.refresh_session()
+                    # Somebody else may already have done this. Taking their
+                    # result costs one local exchange; refreshing anyway costs
+                    # every other client its token.
+                    session = self._adopt_stored_session(client)
+                    if session is None:
+                        with SyncManager._session_exchange_in_flight():
+                            response = auth.refresh_session()
+                            session = self._session_from_response(response)
+                            if not getattr(session, "access_token", "") or not getattr(
+                                session, "refresh_token", ""
+                            ):
+                                raise RuntimeError("AUTH_REQUIRED")
+                            self._persist_supabase_session(
+                                session,
+                                expected_previous=getattr(
+                                    client, "_antigravity_refresh_token", ""
+                                ),
+                                generation=getattr(
+                                    client, "_antigravity_session_generation", None
+                                ),
+                            )
+                            self._remember_client_session(client, session)
                     self._auth_refresh_generation += 1
                 else:
                     response = auth.get_session()
-                session = self._session_from_response(response)
+                    session = self._session_from_response(response)
+                    if not getattr(session, "access_token", "") or not getattr(
+                        session, "refresh_token", ""
+                    ):
+                        raise RuntimeError("AUTH_REQUIRED")
+                    self._persist_supabase_session(
+                        session,
+                        expected_previous=getattr(
+                            client, "_antigravity_refresh_token", ""
+                        ),
+                        generation=getattr(
+                            client, "_antigravity_session_generation", None
+                        ),
+                    )
+                    self._remember_client_session(client, session)
                 if not getattr(session, "access_token", "") or not getattr(
                     session, "refresh_token", ""
                 ):
                     raise RuntimeError("AUTH_REQUIRED")
-                self._persist_supabase_session(
-                    session,
-                    expected_previous=getattr(
-                        client, "_antigravity_refresh_token", ""
-                    ),
-                    generation=getattr(
-                        client, "_antigravity_session_generation", None
-                    ),
-                )
-                self._remember_client_session(client, session)
                 client._antigravity_authenticated = True
                 self._auth_retry_blocked = False
                 return True
