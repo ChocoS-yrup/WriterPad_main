@@ -104,7 +104,11 @@ def print_client_pin():
 
 def read_projects(database: Path):
     """Open the live database read-only and take the contract columns out."""
-    uri = database.as_uri() + "?mode=ro&immutable=1"
+    # mode=ro and not immutable=1: immutable tells SQLite the file cannot
+    # change and to skip the write-ahead log entirely. A gate that was closed
+    # in a WAL frame would read as whatever the main file still said, which is
+    # the one thing this must not get wrong.
+    uri = database.as_uri() + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -147,12 +151,16 @@ def stored_compatibility(project):
     return "PASS"
 
 
-def print_projects(user_version, present, projects):
+def print_projects(user_version, present, projects, gate_column=True):
     print("[local database]")
     show("user_version", user_version)
     show("projects", len(projects))
-    if "contract_path_enabled" not in present:
-        show("gate_column", "ABSENT -- this build predates the local gate")
+    if not gate_column:
+        show(
+            "gate_column",
+            "ABSENT -- this database has not been opened by a build that has "
+            "the gate; it is added, closed, on first open",
+        )
     else:
         show(
             "projects_with_gate_open",
@@ -164,8 +172,17 @@ def print_projects(user_version, present, projects):
         print(f"[project {index}]")
         show("project_id", project["project_id"])
         gate_open = bool(project.get("contract_path_enabled"))
-        show("contract_path_enabled", gate_open)
-        show("contract_path_enabled_at", project.get("contract_path_enabled_at"))
+        # An absent column is not a column reading false. Saying false would
+        # claim this database has a gate and it is shut, which is a stronger
+        # thing than is known.
+        show(
+            "contract_path_enabled",
+            gate_open if gate_column else "ABSENT (treated as closed)",
+        )
+        show(
+            "contract_path_enabled_at",
+            project.get("contract_path_enabled_at") if gate_column else "ABSENT",
+        )
         show("project_sync_mode", project.get("project_sync_mode"))
         show("migration_epoch", project.get("migration_epoch"))
         show("server_protocol_version", project.get("server_protocol_version"))
@@ -638,7 +655,10 @@ def main():
     show("path", database)
     show("sha256_before", before)
     print()
-    print_projects(user_version, present, projects)
+    print_projects(
+        user_version, present, projects,
+        gate_column="contract_path_enabled" in present,
+    )
 
     status = 0
     if args.rpc_handshake:
