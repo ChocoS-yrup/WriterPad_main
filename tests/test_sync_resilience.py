@@ -6,6 +6,7 @@ import json
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -17,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import sync_manager
 from cloud_config import classify_cloud_error
 from sync_manager import SupabaseAuthLease, SyncManager, auth_error_facts
+from sync_v2_store import SyncV2Store
 from writing_controller import WritingController
 
 
@@ -630,8 +632,9 @@ class AuthLeaseTestCase(unittest.TestCase):
         source = Path(sync_manager.__file__).read_text(encoding="utf-8")
         self.assertNotIn("Local\\Antigravity", source)
 
-    def test_a_client_built_without_the_lease_does_not_exchange(self):
-        """Exchanging anyway is exactly what retires the other holder's token."""
+    def test_a_client_is_not_built_at_all_without_the_lease(self):
+        """Handing back a signed-out client is not fail-closed. The paths that
+        reach for one ask whether it exists, not whether it may be used."""
         keyring = _Keyring()
         set_session = MagicMock()
         supabase = SimpleNamespace(
@@ -652,11 +655,8 @@ class AuthLeaseTestCase(unittest.TestCase):
             with contextlib.redirect_stdout(printed):
                 client = SyncManager.create_supabase_client(config)
 
+        self.assertIsNone(client)
         set_session.assert_not_called()
-        self.assertFalse(client._antigravity_authenticated)
-        self.assertEqual(
-            client._antigravity_restore_error_kind, "auth_lease_held_elsewhere"
-        )
         self.assertEqual(keyring.clears, 0)
         self.assertTrue(keyring.present)
         self.assertIn("another process holds", printed.getvalue())
@@ -745,61 +745,194 @@ class CredentialClaimedAtStartupTestCase(unittest.TestCase):
         )
 
 
-class CredentialLockoutDisablesSyncTestCase(unittest.TestCase):
-    """Losing the claim closes every server path, not only the signed-in ones."""
+class _CredentialHolder:
+    """Another process, holding the real machine-wide credential lock."""
+
+    def __init__(self):
+        self.process = None
+
+    def __enter__(self):
+        # Constructing SyncManager takes the lock, so this process is usually
+        # already holding it by the time a test asks somebody else to.
+        SyncManager.release_auth_lease()
+        source = (
+            "import os, sys\n"
+            "os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')\n"
+            f"sys.path.insert(0, {str(Path(sync_manager.__file__).parent)!r})\n"
+            "from sync_manager import SyncManager\n"
+            "print('held', SyncManager.acquire_auth_lease(), flush=True)\n"
+            "sys.stdin.readline()\n"
+        )
+        self.process = subprocess.Popen(
+            [sys.executable, "-c", source],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        line = self.process.stdout.readline().strip()
+        if line != "held True":
+            self.__exit__(None, None, None)
+            raise AssertionError(f"holder did not take the lock: {line!r}")
+        return self
+
+    def __exit__(self, *_exc):
+        if self.process is None:
+            return False
+        try:
+            self.process.stdin.write("go\n")
+            self.process.stdin.flush()
+            self.process.wait(timeout=30)
+        except Exception:
+            self.process.kill()
+        finally:
+            for pipe in (self.process.stdin, self.process.stdout):
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        self.process = None
+        return False
+
+
+class CredentialHeldElsewhereTestCase(unittest.TestCase):
+    """With the credential held by another process, this one reaches no server.
+
+    A client that merely knows it is signed out is still a client, and the paths
+    that reach for one ask whether it exists rather than whether it may be used.
+    So the proof cannot be a property: it has to be that nothing capable of
+    opening a connection is built at all.
+    """
 
     def setUp(self):
+        SyncManager.release_auth_lease()
         self.manager = SyncManager()
-        self.original = self.manager.supabase
-        self.original_state = self.manager.cloud_config_state
+        self.previous = {
+            "supabase": self.manager.supabase,
+            "state": self.manager.cloud_config_state,
+            "store": self.manager._v2_store,
+            "context": self.manager._v2_context,
+            "device": self.manager._v2_device_id,
+        }
+        # One manager serves the whole process, and an earlier case may have
+        # left it attached to a temporary database that no longer exists.
+        # Retrying against that is a different failure than the one under test.
+        self.manager.release_v2()
+        self.manager._v2_store = None
+        self.manager._v2_device_id = None
+        self.built = []
+        self.transports = []
 
     def tearDown(self):
-        self.manager.supabase = self.original
-        self.manager.cloud_config_state = self.original_state
+        self.manager.supabase = self.previous["supabase"]
+        self.manager.cloud_config_state = self.previous["state"]
+        self.manager._v2_store = self.previous["store"]
+        self.manager._v2_context = self.previous["context"]
+        self.manager._v2_device_id = self.previous["device"]
+        SyncManager.release_auth_lease()
 
-    def _client(self, locked_out):
-        client = SimpleNamespace(auth=None, _antigravity_authenticated=False)
-        if locked_out:
-            client._antigravity_credential_locked_out = True
-        return client
+    @contextlib.contextmanager
+    def _watching_the_network(self):
+        """Anything that could open a connection is recorded and refused."""
+        built, transports = self.built, self.transports
 
-    def test_a_locked_out_client_reports_no_network(self):
-        self.manager.cloud_config_state = "ready"
-        self.manager.supabase = self._client(locked_out=True)
-        self.assertFalse(self.manager.cloud_network_enabled)
+        def create_client(*args, **kwargs):
+            built.append(args)
+            raise AssertionError("a client was built without the credential")
 
-    def test_an_ordinary_signed_out_client_is_not_treated_the_same(self):
-        """Signed out is recoverable here; locked out is not this process's to
-        recover, and conflating them would let it keep trying."""
-        self.manager.cloud_config_state = "ready"
-        self.manager.supabase = self._client(locked_out=False)
-        self.assertTrue(self.manager.cloud_network_enabled)
+        class _Transport:
+            def __init__(self, *args, **kwargs):
+                transports.append(kwargs)
+                raise AssertionError("a transport was opened without the credential")
 
-    def test_building_a_client_without_the_claim_marks_it_locked_out(self):
-        keyring = _Keyring()
-        set_session = MagicMock()
         supabase = SimpleNamespace(
-            create_client=lambda *a, **k: SimpleNamespace(
-                auth=SimpleNamespace(
-                    set_session=set_session, on_auth_state_change=MagicMock()
-                )
-            ),
-            ClientOptions=lambda **k: None,
+            create_client=create_client, ClientOptions=lambda **k: None
         )
-        config = SimpleNamespace(
-            is_ready=True, url="https://example.invalid", publishable_key="pk"
-        )
-        with patch("security_manager.SecurityManager", keyring), \
-                patch.dict("sys.modules", {"supabase": supabase}), \
-                patch.object(
-                    SyncManager, "acquire_auth_lease", staticmethod(lambda: False)
-                ):
-            with contextlib.redirect_stdout(io.StringIO()):
-                client = SyncManager.create_supabase_client(config)
+        httpx = SimpleNamespace(Client=_Transport, Limits=lambda **k: None)
+        with patch.dict("sys.modules", {"supabase": supabase, "httpx": httpx}):
+            yield
 
-        self.assertTrue(client._antigravity_credential_locked_out)
-        set_session.assert_not_called()
-        self.assertEqual(keyring.clears, 0)
+    def _config(self):
+        return SimpleNamespace(
+            is_ready=True, state="ready", user_message="",
+            url="https://example.invalid", publishable_key="pk",
+        )
+
+    @contextlib.contextmanager
+    def _held_and_watched(self):
+        with _CredentialHolder(), self._watching_the_network(), patch.object(
+            sync_manager, "load_cloud_client_config", lambda _dir: self._config()
+        ), contextlib.redirect_stdout(io.StringIO()):
+            yield
+
+    def _assert_nothing_was_built(self):
+        self.assertEqual(self.built, [])
+        self.assertEqual(self.transports, [])
+
+    def test_no_client_and_no_transport_is_built(self):
+        with self._held_and_watched():
+            client = SyncManager.create_supabase_client(self._config())
+
+        self.assertIsNone(client)
+        self._assert_nothing_was_built()
+
+    def test_initialising_leaves_the_manager_with_no_connection(self):
+        with self._held_and_watched():
+            self.manager.init_supabase()
+
+        self.assertIsNone(self.manager.supabase)
+        self.assertFalse(self.manager.cloud_network_enabled)
+        state, message = self.manager.cloud_configuration_status()
+        self.assertEqual(state, "credential_busy")
+        self.assertIn("사용 중", message)
+        self._assert_nothing_was_built()
+
+    def test_pull_retry_and_handshake_all_decline_to_start(self):
+        attempts = {}
+        with self._held_and_watched():
+            self.manager.init_supabase()
+            attempts["pull"] = self.manager.pull_remote_changes_async()
+            attempts["retry"] = self.manager.retry_pending_syncs()
+            try:
+                attempts["handshake"] = self.manager.perform_contract_handshake()
+            except RuntimeError as error:
+                attempts["handshake"] = str(error)
+
+        self.assertFalse(attempts["pull"])
+        self.assertFalse(attempts["retry"])
+        self.assertIn(
+            attempts["handshake"], (None, "v2 project is not configured")
+        )
+        self._assert_nothing_was_built()
+
+    def test_every_worker_that_builds_its_own_client_gets_none(self):
+        """Five call sites build their own. None of them may get one."""
+        with self._held_and_watched():
+            results = [SyncManager.create_supabase_client() for _ in range(5)]
+
+        self.assertEqual(results, [None] * 5)
+        self._assert_nothing_was_built()
+
+    def test_local_editing_is_untouched(self):
+        """Losing the server is not losing the writing."""
+        with tempfile.TemporaryDirectory() as temp:
+            store = SyncV2Store(str(Path(temp) / "sync.sqlite3"))
+            context = store.configure_project(
+                str(Path(temp) / "writing"), "Offline",
+                "00000000-0000-4000-8000-000000000901",
+            )
+            with self._held_and_watched():
+                SyncManager.create_supabase_client(self._config())
+                operation = store.enqueue(
+                    context, "1화.txt", "본문", relative_path="1화.txt"
+                )
+                document = store.get_document(context["local_key"], "1화.txt")
+
+            self.assertEqual(operation["status"], "pending")
+            self.assertEqual(document["local_path"], "1화.txt")
+            self._assert_nothing_was_built()
+
+    def test_the_claim_is_available_again_once_the_holder_goes(self):
+        with _CredentialHolder():
+            self.assertIs(SyncManager.acquire_auth_lease(), False)
+        self.assertIs(SyncManager.acquire_auth_lease(), True)
 
 
 class CredentialLockReleaseTestCase(unittest.TestCase):

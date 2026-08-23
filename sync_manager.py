@@ -20,6 +20,7 @@ from PyQt6.QtCore import (
 from datetime import datetime, timezone
 
 from cloud_config import (
+    CLOUD_CREDENTIAL_BUSY_MESSAGE,
     CLOUD_INVALID_MESSAGE,
     classify_cloud_error,
     load_cloud_client_config,
@@ -599,6 +600,9 @@ class SyncManager(QObject):
     # One holder at a time may exchange the stored session, across processes.
     # Held for as long as this process might do so, not merely checked.
     _auth_lease = SupabaseAuthLease()
+    # Why the last attempt to build a client came back empty, when the reason
+    # was something other than the configuration being unusable.
+    _client_refusal = ""
     _session_exchanges = 0
     # Starts set. Nothing is in flight before anything has run, and a
     # shutdown that never saw an exchange must not wait out its budget.
@@ -2200,6 +2204,24 @@ class SyncManager(QObject):
         config = config or load_cloud_client_config(supabase_config_dir())
         if not config.is_ready:
             return None
+        lease = SyncManager.acquire_auth_lease()
+        if lease is not True:
+            # Nothing is handed back. A client that merely knows it is signed
+            # out is still a client, and the paths that reach for one check
+            # whether it exists rather than whether it may be used -- so it
+            # would open connections anyway. Without the credential there is
+            # nothing safe to return, so nothing is returned, and it is decided
+            # before a transport is built rather than after.
+            SyncManager._client_refusal = (
+                "auth_lease_unavailable" if lease is None
+                else "auth_lease_held_elsewhere"
+            )
+            print(
+                "Supabase client not built: another process holds the "
+                "credential."
+            )
+            return None
+        SyncManager._client_refusal = ""
         custom_httpx_client = None
         try:
             from supabase import create_client, ClientOptions
@@ -2232,25 +2254,6 @@ class SyncManager(QObject):
             # the one that loses is told its token is invalid -- which looks
             # exactly like the account's token having been revoked.
             with SyncManager._session_restore_lock:
-                lease = SyncManager.acquire_auth_lease()
-                if lease is not True:
-                    # Somebody else on this machine is exchanging the same
-                    # credential. Doing it anyway is what retires their token.
-                    client._antigravity_restore_error_kind = (
-                        "auth_lease_unavailable" if lease is None
-                        else "auth_lease_held_elsewhere"
-                    )
-                    client._antigravity_authenticated = False
-                    # Not merely unauthenticated. Without the credential this
-                    # process has no business talking to the server at all, and
-                    # a client that is merely signed out would still be treated
-                    # as a working connection.
-                    client._antigravity_credential_locked_out = True
-                    print(
-                        "Supabase session left alone: another process holds "
-                        "the credential."
-                    )
-                    return client
                 try:
                     from security_manager import SecurityManager
                     access_token, refresh_token = SecurityManager.get_supabase_session()
@@ -2717,15 +2720,16 @@ class SyncManager(QObject):
         if old_client is not None and old_client is not self.supabase:
             self._close_supabase_client(old_client)
         if self._cloud_config.is_ready and not self.supabase:
-            self.cloud_config_state = "invalid"
-            self.cloud_config_message = CLOUD_INVALID_MESSAGE
+            if SyncManager._client_refusal:
+                # The configuration is fine. Somebody else is using the login.
+                self.cloud_config_state = "credential_busy"
+                self.cloud_config_message = CLOUD_CREDENTIAL_BUSY_MESSAGE
+            else:
+                self.cloud_config_state = "invalid"
+                self.cloud_config_message = CLOUD_INVALID_MESSAGE
 
     @property
     def cloud_network_enabled(self):
-        if getattr(self.supabase, "_antigravity_credential_locked_out", False):
-            # Another process holds the stored session. Every server path is
-            # closed for this one, not just the authenticated ones.
-            return False
         return self.cloud_config_state == "ready" and self.supabase is not None
 
     def cloud_configuration_status(self):

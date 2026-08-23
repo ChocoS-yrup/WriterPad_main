@@ -744,7 +744,9 @@ class SettingsPanel(QWidget):
             self.edit_supabase_password.clear()
             self.lbl_supabase_status.setText(config_message)
             self._style_cloud_status(
-                "disconnected" if config_state == "disabled" else "error"
+                "disconnected"
+                if config_state in ("disabled", "credential_busy")
+                else "error"
             )
             self.btn_supabase_login.setEnabled(False)
             self.btn_supabase_logout.setEnabled(False)
@@ -822,7 +824,9 @@ class SettingsPanel(QWidget):
                     self.lbl_supabase_status.setText(config_message)
                     SettingsPanel._style_cloud_status(
                         self,
-                        "disconnected" if config_state == "disabled" else "error",
+                        "disconnected"
+                if config_state in ("disabled", "credential_busy")
+                else "error",
                     )
                     self.btn_supabase_login.setText("동기화 로그인")
                     self.btn_supabase_login.setEnabled(False)

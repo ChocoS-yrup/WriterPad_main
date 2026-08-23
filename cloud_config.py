@@ -18,6 +18,10 @@ ALLOWED_RELEASE_CONFIG_KEYS = frozenset({
 
 CLOUD_DISABLED_MESSAGE = "이 빌드는 클라우드 동기화가 구성되지 않았습니다."
 CLOUD_INVALID_MESSAGE = "클라우드 서버 설정을 확인할 수 없습니다."
+CLOUD_CREDENTIAL_BUSY_MESSAGE = (
+    "다른 프로그램이 클라우드 로그인 정보를 사용 중입니다. "
+    "그 프로그램을 닫은 뒤 다시 시도해주세요."
+)
 CLOUD_DNS_MESSAGE = "클라우드 서버 설정을 확인할 수 없습니다."
 CLOUD_TIMEOUT_MESSAGE = "클라우드 서버 응답 시간이 초과되었습니다."
 CLOUD_AUTH_MESSAGE = "이메일 또는 비밀번호를 확인해주세요."
