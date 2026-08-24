@@ -1,4 +1,4 @@
-"""Preflight for the contract write path. Three modes, in widening scope.
+"""Preflight for the contract write path. Six modes, in widening scope.
 
   (no flag)                the client pin, plus the local gate and the server
                            state stored beside it, read out of the live
@@ -33,10 +33,25 @@
                            write that still comes out legacy. Exits non-zero if
                            any of that is false.
 
-Nothing here opens the gate or promotes a project, and nothing writes to the
-live database: the application mode works on a copy. No project names, no
-paths, no document content and no credentials are printed; project ids and
-metadata only.
+  --structure-write        the other half of that question, once a gate is
+                           open. Makes one folder in one project whose gate is
+                           open and follows it all the way out: builds the
+                           contract batch through the real client path, checks
+                           it field by field against the pin, then dispatches
+                           it twice -- once with the network refused, because a
+                           batch that cannot be sent has to wait rather than
+                           tear anything up, and once for real, to find out
+                           whether the server takes it. Without --apply it
+                           works on a throwaway copy of the database and a
+                           throwaway writing root, and sends nothing at all.
+
+Nothing here opens the gate or promotes a project. Two modes write to the live
+database, and only with --apply: --activate-contract-path, which writes one
+column of one row, and --structure-write, which makes one folder in one
+project and queues the batch that carries it. Every other mode works on a copy.
+No project names, no document paths, no document content and no credentials
+are printed; project ids, row metadata, and the folder this run was told to
+make.
 
 Read-only does not extend to the stored session. Both handshake modes build a
 real client, which spends the saved refresh token and is issued a new one, and
@@ -74,6 +89,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -81,6 +97,7 @@ import unicodedata
 import tempfile
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +113,8 @@ from sync_contract import (  # noqa: E402
     SERVER_CAPABILITIES,
     SYNC_PROTOCOL_VERSION,
     SyncContractError,
+    json_sha256,
+    normalize_storage_name,
     read_handshake_compatibility,
     require_server_compatibility,
 )
@@ -158,10 +177,35 @@ def _one_line(value):
     control, a format character, or a line or paragraph separator becomes a
     visible escape. Everything legible survives, Korean paths included, because
     an unreadable record is its own kind of useless.
+
+    A character this console cannot encode is escaped too. Some of what is
+    printed here is named on the command line, and a name the output codepage
+    has no room for would otherwise raise partway through a line and end the
+    run holding a record that stops mid-sentence. An escape says what the
+    character was; a half-written record says nothing at all.
+
+    Only a stream that declares an encoding is held to one. A stream that does
+    not -- anything capturing this in memory rather than writing it to a
+    console -- has no codepage to exceed, and escaping against a guessed one
+    would mangle the Korean paths this is meant to keep readable.
     """
+    encoding = getattr(sys.stdout, "encoding", None)
+
+    def unrenderable(character):
+        if not encoding:
+            return False
+        try:
+            character.encode(encoding)
+        except (UnicodeError, LookupError):
+            return True
+        return False
+
     escaped = []
     for character in str(value):
-        if unicodedata.category(character) in _UNPRINTABLE_CATEGORIES:
+        if (
+            unicodedata.category(character) in _UNPRINTABLE_CATEGORIES
+            or unrenderable(character)
+        ):
             point = ord(character)
             escaped.append(
                 "\\x%02x" % point if point < 0x100 else "\\u%04x" % point
@@ -491,11 +535,26 @@ class Checks:
         print()
 
 
-def build_manager(store, project, device_id):
+def build_manager(store, project, device_id, *, allow_client=True):
     """A manager attached to the copy, holding one project, and nothing else."""
     from sync_manager import SyncManager
 
-    manager = SyncManager()
+    if allow_client:
+        manager = SyncManager()
+    else:
+        # SyncManager.__init__ normally restores the stored session. A dry run
+        # must not even build that client, so suppress initialization around
+        # construction rather than creating a client and discarding it later.
+        original_init_supabase = SyncManager.init_supabase
+        SyncManager.init_supabase = lambda _manager: None
+        try:
+            manager = SyncManager()
+        finally:
+            SyncManager.init_supabase = original_init_supabase
+        old_client = getattr(manager, "supabase", None)
+        manager.supabase = None
+        if old_client is not None:
+            SyncManager._close_supabase_client(old_client)
     manager.release_v2()
     manager._v2_store = store
     manager._v2_context = {
@@ -1043,6 +1102,987 @@ def run_application_handshake(live: Path, only_project: str):
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def writing_root_fingerprint(root: Path):
+    """The manuscript as it stands on disk: every folder, every .txt byte.
+
+    A dispatch that fails has to leave this exactly as it found it, and a
+    successful one has to change it by exactly the folder that was made and
+    nothing else. Counting files would not show one that was rewritten in
+    place, so each is hashed rather than tallied.
+    """
+    folders = []
+    documents = {}
+    unreadable = []
+    if not root.is_dir():
+        return {
+            "folders": folders,
+            "documents": documents,
+            "unreadable": unreadable,
+        }
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root)).replace("\\", "/")
+        if path.is_dir():
+            folders.append(relative)
+        elif path.suffix == ".txt":
+            try:
+                documents[relative] = file_sha256(path)
+            except OSError:
+                # A fixed placeholder would compare equal to itself and let a
+                # changed manuscript pass as untouched. Keep the failure
+                # explicit so every caller can fail closed instead.
+                unreadable.append(relative)
+    return {
+        "folders": folders,
+        "documents": documents,
+        "unreadable": unreadable,
+    }
+
+
+def manuscript_bytes_unchanged(before, after):
+    """True only when every manuscript was readable and every byte matches."""
+    return (
+        not before.get("unreadable")
+        and not after.get("unreadable")
+        and before.get("documents") == after.get("documents")
+    )
+
+
+def manuscript_evidence_available(snapshot):
+    """Whether a snapshot can prove something about real manuscript bytes."""
+    return bool(snapshot.get("documents")) and not snapshot.get("unreadable")
+
+
+def structure_target_directory(root: Path, parent_path: str, folder_name: str):
+    """Resolve one safe child directory and prove it stays under ``root``.
+
+    The name is operator input and reaches mkdir before the application sees
+    the logical path. It therefore has to satisfy the contract name rule and
+    the host path rule here, before any filesystem call. Resolving both sides
+    also catches an existing junction beneath the writing root. A different
+    drive or UNC share raises ValueError from relative_to and is simply outside.
+    """
+    try:
+        normalize_storage_name(folder_name)
+    except SyncContractError as error:
+        raise ValueError(getattr(error, "code", "STORAGE_NAME_INVALID")) from error
+
+    candidate = Path(folder_name)
+    if (
+        not folder_name
+        or candidate.anchor
+        or candidate.drive
+        or candidate.parts != (folder_name,)
+        or "/" in folder_name
+        or "\\" in folder_name
+    ):
+        raise ValueError("FOLDER_NAME_NOT_ONE_SEGMENT")
+
+    logical_parent = str(parent_path or "").replace("\\", "/").strip("/")
+    parent_parts = logical_parent.split("/") if logical_parent else []
+    if (
+        not parent_parts
+        or "\\" in str(parent_path or "")
+        or str(parent_path or "") != logical_parent
+        or any(part in {"", ".", ".."} for part in parent_parts)
+    ):
+        raise ValueError("PARENT_PATH_INVALID")
+
+    root_resolved = root.resolve(strict=False)
+    target_resolved = root.joinpath(*parent_parts, folder_name).resolve(
+        strict=False
+    )
+    try:
+        target_resolved.relative_to(root_resolved)
+    except ValueError as error:
+        raise ValueError("TARGET_OUTSIDE_WRITING_ROOT") from error
+    return target_resolved
+
+
+def arm_manager_from_stored_contract(manager, project):
+    """Arm a throwaway manager without a client, credential, or RPC."""
+    require_server_compatibility(
+        project_sync_mode=project["project_sync_mode"],
+        migration_epoch=int(project["migration_epoch"] or 0),
+        server_protocol_version=int(project["server_protocol_version"] or 0),
+        server_contract_sha256=project["active_contract_sha256"] or "",
+        server_capabilities=json.loads(project["server_capabilities_json"] or "[]"),
+    )
+    reading = {
+        "generation": manager._v2_context_generation,
+        "project_id": manager._v2_context["project_id"],
+        "identity": manager._contract_identity(),
+        "contract_sha256": CANONICAL_CONTRACT_SHA256,
+        "observed_at": project.get("contract_validated_at") or "",
+        "outcome": "supported",
+        "project_sync_mode": project["project_sync_mode"],
+        "migration_epoch": int(project["migration_epoch"] or 0),
+    }
+    manager._contract_handshake_error = ""
+    manager._contract_handshake = reading
+    return reading
+
+
+def project_structure_snapshot(database: Path, local_key: str):
+    """Every row on one project that a contract batch can move."""
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+        def rows(table, where):
+            if table not in tables:
+                return []
+            return [
+                dict(row) for row in connection.execute(
+                    f"SELECT * FROM {table} WHERE {where}", (local_key,)
+                )
+            ]
+
+        return {
+            "folders": rows("sync_folders", "local_key = ?"),
+            "documents": rows("sync_documents", "local_key = ?"),
+            "tree_orders": rows("sync_tree_orders", "local_key = ?"),
+            "operations": rows("sync_operations", "local_key = ?"),
+            "batches": rows("sync_contract_batches", "local_key = ?"),
+            "structure_operations": rows(
+                "sync_structure_operations", "local_key = ?"
+            ),
+            "results": rows(
+                "sync_contract_batch_results",
+                "batch_id IN (SELECT batch_id FROM sync_contract_batches "
+                "WHERE local_key = ?)",
+            ),
+        }
+    finally:
+        connection.close()
+
+
+def unanswered_contract_batches(database: Path, local_key: str):
+    """Batches this project has queued and never had an answer for."""
+    snapshot = project_structure_snapshot(database, local_key)
+    answered = {row["batch_id"] for row in snapshot["results"]}
+    return sum(
+        1 for row in snapshot["batches"] if row["batch_id"] not in answered
+    )
+
+
+def unanswered_batch_for_folder(database: Path, local_key: str, folder_id: str):
+    """The batch queued to create one folder that was never answered.
+
+    A batch the server never answered is not litter to clear away. The
+    application resends it under its own id when it next runs, because a
+    second id for the same work is the one thing the contract forbids. So a
+    run that finds one resumes it rather than building another.
+    """
+    snapshot = project_structure_snapshot(database, local_key)
+    answered = {row["batch_id"] for row in snapshot["results"]}
+    for row in snapshot["batches"]:
+        if row["batch_id"] in answered:
+            continue
+        request = json.loads(row["request_json"])
+        if any(
+            intent["entity_kind"] == "folder"
+            and intent["intent_kind"] == "create"
+            and intent["entity_id"] == folder_id
+            for intent in request.get("ordered_intents") or []
+        ):
+            return row
+    return None
+
+
+def folder_revision(store, local_key, path):
+    """One folder's revision, or None when no folder stands at that path.
+
+    Separated out because revision zero is the interesting value here and it is
+    falsy: an ``or`` default reads a folder the server has never seen as no
+    folder at all.
+    """
+    folder = store.get_folder_by_path(local_key, path)
+    return None if folder is None else int(folder["revision"] or 0)
+
+
+def binder_children(store, local_key, parent_path, extra=""):
+    """One parent's children by name, in the order the binder already holds.
+
+    The application sends a parent's whole child list, not just the part that
+    changed, so a probe that named only its own folder would reorder the parent
+    down to that one child and drop every sibling on the way out. Children the
+    order does not mention yet go last, which is where a newly made one goes.
+    """
+    prefix = f"{parent_path}/"
+
+    def direct_children(rows, key):
+        found = {}
+        for row in rows:
+            path = row["local_path"]
+            if (
+                row["is_deleted"]
+                or not path.startswith(prefix)
+                or "/" in path[len(prefix):]
+            ):
+                continue
+            found[row[key]] = path[len(prefix):]
+        return found
+
+    names = direct_children(store.list_folders(local_key), "folder_id")
+    names.update(
+        direct_children(store.list_documents(local_key), "document_id")
+    )
+    order = store.get_tree_order(local_key, parent_path) or {}
+    children = [
+        names.pop(child) for child in order.get("children", []) if child in names
+    ]
+    children.extend(names[key] for key in sorted(names))
+    if extra and extra not in children:
+        children.append(extra)
+    return children
+
+
+def batch_operation_states(store, snapshot, batch_id):
+    """The derived state of every operation in one batch, deduplicated."""
+    return sorted({
+        store.operation(row["operation_id"])["status"]
+        for row in snapshot["structure_operations"]
+        if row["batch_id"] == batch_id
+    })
+
+
+def run_structure_write(
+    live: Path,
+    project_id: str,
+    confirm_id: str,
+    writing_root: str,
+    parent_path: str,
+    folder_name: str,
+    apply_change: bool,
+):
+    """Make one folder on the contract path and report what the server did.
+
+    Without --apply nothing leaves this machine and nothing on it is written:
+    the batch is built against a throwaway copy of the database and a throwaway
+    writing root, checked field by field, and destroyed along with them.
+
+    With --apply the same folder is made for real, in the live database and in
+    the project's own writing root, and then dispatched twice. The first
+    dispatch is made to fail, because a batch that cannot be sent has to wait
+    instead of tearing anything up, and that is only worth believing if it has
+    been watched happen on real rows. The second is the real one.
+    """
+    from sync_manager import SyncManager, load_or_create_device_id
+    from sync_v2_store import SyncV2Store
+
+    checks = Checks()
+    workspace = Path(tempfile.mkdtemp(prefix="contract-structure-"))
+    managers = []
+
+    def stop(reason):
+        checks.report()
+        show("verdict", f"STOP - {reason}")
+        return 1
+
+    def stop_on_failed_checks():
+        return stop(", ".join(name for name, _p, _d in checks.failed))
+
+    try:
+        print("[structure write]")
+        show(
+            "mode",
+            "apply - the live database and the project's own writing root"
+            if apply_change else
+            "dry run - a throwaway copy of both; nothing is sent",
+        )
+        show("target_project_id", project_id)
+        show("parent_path", parent_path)
+        show("folder_name", folder_name)
+        # The same two-hands rule activation uses. Fifteen other projects are
+        # one character away, and this one queues a write.
+        checks.require(
+            "the project id was given twice and matched",
+            bool(project_id) and project_id == confirm_id,
+            "--project-id and --confirm-project-id differ",
+        )
+        name_error = ""
+        try:
+            # The workspace is only a harmless root for validating the logical
+            # path before the live project or its database is even opened.
+            structure_target_directory(workspace, parent_path, folder_name)
+        except (OSError, ValueError) as error:
+            name_error = str(error) or type(error).__name__
+        checks.require(
+            "the parent and folder name form one safe path below the root",
+            not name_error,
+            name_error or "invalid path",
+        )
+        if checks.failed:
+            return stop_on_failed_checks()
+        target_path = f"{parent_path}/{folder_name}"
+
+        connection = sqlite3.connect(live.as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            live_row = connection.execute(
+                "SELECT local_key FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if live_row is None:
+            return stop("no such project here")
+        local_key = live_row["local_key"]
+
+        if apply_change:
+            database = live
+            checks.require(
+                "a writing root was named",
+                bool(str(writing_root or "").strip()),
+                "--writing-root is required with --apply",
+            )
+            root = Path(writing_root) if writing_root else workspace / "writing"
+            if str(writing_root or "").strip():
+                # The root and the row have to be the same project. Making the
+                # folder under one project's root while queueing the batch on
+                # another's is the one mistake this mode could make silently.
+                try:
+                    named_key = SyncV2Store.local_key_for(str(root))
+                except Exception:
+                    named_key = ""
+                checks.require(
+                    "the writing root is this project's own",
+                    named_key == local_key,
+                    "--writing-root belongs to a different project",
+                )
+        else:
+            database = workspace / "sync_v2.sqlite3"
+            copy_database(live, database)
+            root = workspace / "writing"
+            root.mkdir(parents=True, exist_ok=True)
+        if checks.failed:
+            return stop_on_failed_checks()
+
+        try:
+            target_directory = structure_target_directory(
+                root, parent_path, folder_name
+            )
+        except (OSError, ValueError) as error:
+            checks.require(
+                "the resolved target stays inside the writing root",
+                False,
+                str(error) or type(error).__name__,
+            )
+            return stop_on_failed_checks()
+        checks.require(
+            "the resolved target stays inside the writing root", True
+        )
+
+        disk_probe = writing_root_fingerprint(root)
+        show("manuscript_documents", len(disk_probe["documents"]))
+        show("unreadable_manuscripts", len(disk_probe["unreadable"]))
+        checks.require(
+            "every manuscript can be hashed before any write",
+            not disk_probe["unreadable"],
+            f'{len(disk_probe["unreadable"])} unreadable manuscript(s)',
+        )
+        if apply_change:
+            checks.require(
+                "a manuscript exists for the no-damage check",
+                manuscript_evidence_available(disk_probe),
+                "the project has no readable .txt manuscript to compare",
+            )
+        if checks.failed:
+            return stop_on_failed_checks()
+        show(
+            "database",
+            "the live file" if apply_change else "a throwaway snapshot",
+        )
+        show(
+            "writing_root",
+            "the project's own" if apply_change else "a throwaway directory",
+        )
+        print()
+
+        store = SyncV2Store(str(database))
+        project = store.get_project_by_id(project_id)
+        print("[before]")
+        checks.require(
+            "its gate is open",
+            bool(project["contract_path_enabled"]),
+            "the gate is shut, so there is nothing here to test",
+        )
+        work = project_work_counts(database, local_key)
+        for name, value in work.items():
+            show(name, value)
+        unanswered = unanswered_contract_batches(database, local_key)
+        show("contract_batches_without_an_answer", unanswered)
+        checks.require(
+            "nothing else is owed on it",
+            not work["queued_operations"]
+            and not work["operations_with_errors"]
+            and not work["documents_in_conflict"],
+            "queued work, errors or conflicts are present",
+        )
+
+        parent = store.get_folder_by_path(local_key, parent_path)
+        show("parent_revision", (parent or {}).get("revision"))
+        checks.require(
+            "the parent folder is one the server has proven",
+            bool(parent)
+            and not parent["is_deleted"]
+            and int(parent["revision"] or 0) >= 1,
+            "the parent has no server-proven revision to hang a child from",
+        )
+
+        standing = store.get_folder_by_path(local_key, target_path)
+        resume = (
+            unanswered_batch_for_folder(
+                database, local_key, standing["folder_id"]
+            ) if standing else None
+        )
+        show("resuming_an_unanswered_batch", bool(resume))
+        if resume is not None:
+            # What the application does when it starts with a batch that was
+            # queued and never answered: send it again under its own id rather
+            # than build a second one for the same work.
+            checks.require(
+                "the folder it was queued for is still locally unproven",
+                folder_revision(store, local_key, target_path) == 0,
+                f'revision {standing["revision"]}',
+            )
+            checks.require(
+                "the directory it names is still on disk",
+                target_directory.is_dir(),
+                "it is gone",
+            )
+            checks.require(
+                "it is the only batch still waiting",
+                unanswered == 1,
+                f"{unanswered} waiting",
+            )
+        else:
+            # Unlike activation this does not demand a zero batch count: a
+            # project that has been through this keeps its answered batch rows.
+            # What it demands is that none is still waiting, because a second
+            # batch would then be built on a revision the server has not
+            # agreed to yet.
+            checks.require(
+                "no earlier batch is still unanswered",
+                unanswered == 0,
+                f"{unanswered} waiting",
+            )
+            checks.require(
+                "no folder stands at that path yet",
+                standing is None,
+                "a folder row is already there",
+            )
+            checks.require(
+                "nothing stands at that path on disk",
+                not target_directory.exists(),
+                "the directory is already there",
+            )
+
+        # The device id the application itself writes under. A throwaway one
+        # belongs in a real batch. A dry run deliberately uses an ephemeral id
+        # so it cannot create a device-id file while rehearsing on copies.
+        device_id = (
+            load_or_create_device_id() if apply_change else str(uuid.uuid4())
+        )
+        manager = build_manager(
+            store, project, device_id, allow_client=apply_change
+        )
+        manager._v2_wpm = SimpleNamespace(
+            writing_root_path=str(root),
+            read_text_file=lambda _path: None,
+            project_settings={},
+            save_settings=lambda: True,
+        )
+        managers.append(manager)
+
+        if apply_change:
+            client = manager.supabase or SyncManager.create_supabase_client()
+            if client is None or not getattr(
+                client, "_antigravity_authenticated", False
+            ):
+                show(
+                    "client",
+                    "RESTORE FAILED - the stored session was kept"
+                    if client is not None else "NO CLIENT",
+                )
+                show(
+                    "restore_error_kind",
+                    getattr(client, "_antigravity_restore_error_kind", "")
+                    or "(none)",
+                )
+                checks.require(
+                    "a signed-in client is available", False,
+                    "not authenticated",
+                )
+            else:
+                checks.require("a signed-in client is available", True)
+            if checks.failed:
+                return stop_on_failed_checks()
+            manager.supabase = client
+            print()
+
+            print("[fresh handshake]")
+            try:
+                reading = manager.perform_contract_handshake(
+                    require_connection=True
+                )
+            except Exception as error:
+                code = getattr(error, "code", "") or type(error).__name__
+                show("perform_contract_handshake", f"RAISED {code}")
+                checks.require("the handshake completed", False, code)
+                reading = None
+        else:
+            print("[stored contract state; no client and no request]")
+            try:
+                reading = arm_manager_from_stored_contract(manager, project)
+            except Exception as error:
+                code = getattr(error, "code", "") or type(error).__name__
+                show("stored_contract_state", f"REJECTED {code}")
+                checks.require("the stored contract state is usable", False, code)
+                reading = None
+        if reading is not None:
+            show("outcome", reading.get("outcome"))
+            show("observed_project_sync_mode", reading.get("project_sync_mode"))
+            show("observed_migration_epoch", reading.get("migration_epoch"))
+            checks.require(
+                "the handshake completed" if apply_change
+                else "the stored contract state is usable",
+                True,
+            )
+            checks.require(
+                "the server supports this client" if apply_change
+                else "the stored server state supports this client",
+                reading.get("outcome") == "supported",
+                str(reading.get("outcome")),
+            )
+            checks.require(
+                "it answered LEGACY at epoch 0" if apply_change
+                else "the stored server state is LEGACY at epoch 0",
+                (reading.get("project_sync_mode"), reading.get("migration_epoch"))
+                == ("LEGACY", 0),
+                f'{reading.get("project_sync_mode")}'
+                f'/{reading.get("migration_epoch")}',
+            )
+        uses_contract = manager._uses_contract_structure()
+        show("uses_contract_structure", uses_contract)
+        # The mirror image of what --application-handshake proves. There the
+        # gate is shut and this has to be false. Here it is open and this has
+        # to be true, or the folder would go out legacy and the run would say
+        # nothing at all about the contract path.
+        checks.require(
+            "the contract path is armed for this project",
+            uses_contract,
+            "structure work would still go out legacy",
+        )
+        if checks.failed:
+            return stop_on_failed_checks()
+        print()
+
+        before_rows = project_structure_snapshot(database, local_key)
+        before_disk = writing_root_fingerprint(root)
+
+        if resume is None:
+            print("[making the folder]")
+            target_directory.mkdir(parents=True)
+            operations = manager.record_path_change(
+                target_path, target_path, retry=False
+            )
+            intents = [
+                intent
+                for operation in operations or []
+                if isinstance(operation, dict)
+                for intent in (operation.get("contract_structure_intents") or [])
+            ]
+            show("path_operations", len(operations or []))
+            show("planned_intents", len(intents))
+            checks.require(
+                "the folder was planned as contract intents",
+                bool(intents),
+                "record_path_change came back with legacy operations",
+            )
+            if not intents:
+                return stop("no contract intent was planned")
+
+            children = binder_children(
+                store, local_key, parent_path, extra=folder_name
+            )
+            show("parent_children", len(children))
+            request = manager.queue_contract_path_change_with_order(
+                operations, {parent_path: children}, retry=False
+            )
+            checks.require(
+                "queueing it produced a contract request",
+                isinstance(request, dict)
+                and request.get("kind") == "atomic_structure_commit_request",
+                str((request or {}).get("kind")),
+            )
+            if not isinstance(request, dict):
+                return stop("no contract batch was queued")
+
+            queued_rows = project_structure_snapshot(database, local_key)
+            known = {row["batch_id"] for row in before_rows["batches"]}
+            fresh = [
+                row for row in queued_rows["batches"]
+                if row["batch_id"] not in known
+            ]
+            checks.require(
+                "exactly one contract batch appeared",
+                len(fresh) == 1,
+                f"{len(fresh)} appeared",
+            )
+            checks.require(
+                "no legacy operation was queued alongside it",
+                len(queued_rows["operations"])
+                == len(before_rows["operations"]),
+                f'{len(before_rows["operations"])} -> '
+                f'{len(queued_rows["operations"])}',
+            )
+            if len(fresh) != 1:
+                return stop_on_failed_checks()
+            batch = fresh[0]
+        else:
+            print("[the batch that was already waiting]")
+            batch = resume
+            request = json.loads(batch["request_json"])
+            show("planned_intents", len(request.get("ordered_intents") or []))
+            checks.require(
+                "the waiting batch is a contract request",
+                request.get("kind") == "atomic_structure_commit_request",
+                str(request.get("kind")),
+            )
+        batch_id = batch["batch_id"]
+        queued_rows = project_structure_snapshot(database, local_key)
+        print()
+
+        print("[the batch]")
+        show("batch_id", batch_id)
+        show("sync_protocol_version", batch["sync_protocol_version"])
+        show("contract_version", batch["contract_version"])
+        show("canonical_contract_sha256", batch["canonical_contract_sha256"])
+        show("client_build_id", batch["client_build_id"])
+        show("project_sync_mode", batch["project_sync_mode"])
+        show("migration_epoch", batch["migration_epoch"])
+        show("batch_payload_sha256", batch["batch_payload_sha256"])
+        show("request_sha256", batch["request_sha256"])
+        show("intents", " ".join(
+            f'{intent["sequence"]}:{intent["entity_kind"]}'
+            f'/{intent["intent_kind"]}@{intent["base_revision"]}'
+            for intent in request["ordered_intents"]
+        ))
+        checks.require(
+            "it goes out at protocol 3",
+            int(batch["sync_protocol_version"] or 0) == SYNC_PROTOCOL_VERSION,
+            f'protocol {batch["sync_protocol_version"]}',
+        )
+        checks.require(
+            "it names contract version 0.2.0",
+            batch["contract_version"] == CONTRACT_VERSION,
+            str(batch["contract_version"]),
+        )
+        checks.require(
+            "it carries the canonical digest this client is pinned to",
+            batch["canonical_contract_sha256"] == CANONICAL_CONTRACT_SHA256,
+            "the digest differs from the pin",
+        )
+        # Recomputed rather than compared to itself: a digest that is only ever
+        # read back from the row it was written to proves nothing about what
+        # the row actually holds.
+        checks.require(
+            "the batch digest is over the intents that are in it",
+            batch["batch_payload_sha256"]
+            == json_sha256(request["ordered_intents"]),
+            "recomputing it gives something else",
+        )
+        checks.require(
+            "the stored request digest is over the stored request",
+            batch["request_sha256"] == json_sha256(request),
+            "recomputing it gives something else",
+        )
+        checks.require(
+            "the batch still names LEGACY at epoch 0",
+            (batch["project_sync_mode"], int(batch["migration_epoch"] or 0))
+            == ("LEGACY", 0),
+            f'{batch["project_sync_mode"]}/{batch["migration_epoch"]}',
+        )
+        checks.require(
+            "it is one folder create and one reorder",
+            [
+                f'{intent["entity_kind"]}/{intent["intent_kind"]}'
+                for intent in request["ordered_intents"]
+            ] == ["folder/create", "tree_order/reorder"],
+            "the batch holds something else",
+        )
+        checks.require(
+            "every operation in it is a contract operation",
+            all(
+                row["provenance_kind"] == "CONTRACT_BATCH"
+                for row in queued_rows["structure_operations"]
+                if row["batch_id"] == batch_id
+            ),
+            "a legacy operation is sitting in a contract batch",
+        )
+
+        if not apply_change:
+            print()
+            if checks.failed:
+                return stop_on_failed_checks()
+            checks.report()
+            show(
+                "verdict",
+                "the batch is well formed and nothing was sent; re-run with "
+                "--apply against the real project to ask the server",
+            )
+            return 0
+        if checks.failed:
+            print()
+            return stop_on_failed_checks()
+        print()
+
+        print("[dispatch 1: the network refused]")
+        # Forced offline is refused inside the dispatch, before a request is
+        # built, so this is the shallowest failure there is. That is the point:
+        # every dispatch failure reaches the same handler, and what is under
+        # test is what that handler leaves behind.
+        marker = workspace / "offline"
+        marker.write_text("", encoding="utf-8")
+        previous = os.environ.get("ANTIGRAVITY_SYNC_OFFLINE_FILE")
+        refused = ""
+        try:
+            os.environ["ANTIGRAVITY_SYNC_OFFLINE_FILE"] = str(marker)
+            store.mark_structure_batch_attempt(batch_id)
+            try:
+                manager._process_contract_structure_batch(batch_id)
+            except Exception as error:
+                refused = getattr(error, "code", "") or type(error).__name__
+            if refused:
+                # Exactly what the worker's result handler does with a dispatch
+                # that threw.
+                store.mark_structure_batch_retry(batch_id, refused)
+        finally:
+            if previous is None:
+                os.environ.pop("ANTIGRAVITY_SYNC_OFFLINE_FILE", None)
+            else:
+                os.environ["ANTIGRAVITY_SYNC_OFFLINE_FILE"] = previous
+            marker.unlink(missing_ok=True)
+        show("dispatch_raised", refused or "(nothing)")
+        checks.require(
+            "a dispatch that cannot go through fails instead of pretending",
+            bool(refused),
+            "it came back as though it had been sent",
+        )
+        refused_rows = project_structure_snapshot(database, local_key)
+        refused_disk = writing_root_fingerprint(root)
+        refused_states = batch_operation_states(store, refused_rows, batch_id)
+        show("operation_states", " ".join(refused_states) or "(none)")
+        show("results_recorded", len(refused_rows["results"]))
+        show("unreadable_manuscripts", len(refused_disk["unreadable"]))
+        checks.require(
+            "the batch is waiting, not lost and not finished",
+            refused_states == ["retry_wait"],
+            " ".join(refused_states) or "(none)",
+        )
+        checks.require(
+            "nothing was written down as an answer",
+            len(refused_rows["results"]) == len(before_rows["results"]),
+            f'{len(before_rows["results"])} -> {len(refused_rows["results"])}',
+        )
+        checks.require(
+            "the folder is still locally unproven",
+            folder_revision(store, local_key, target_path) == 0,
+            "its revision moved without a server answer",
+        )
+        checks.require(
+            "no document row moved",
+            refused_rows["documents"] == before_rows["documents"],
+            "a document row changed under a refused dispatch",
+        )
+        checks.require(
+            "the manuscript on disk is untouched",
+            manuscript_bytes_unchanged(before_disk, refused_disk),
+            "a manuscript changed or could not be read under a refused dispatch",
+        )
+        if checks.failed:
+            print()
+            return stop_on_failed_checks()
+        print()
+
+        print("[dispatch 2: the real one]")
+        result = None
+        try:
+            store.mark_structure_batch_attempt(batch_id)
+            result = manager._process_contract_structure_batch(batch_id)
+        except Exception as error:
+            code = getattr(error, "code", "") or type(error).__name__
+            try:
+                store.mark_structure_batch_retry(batch_id, code)
+            except Exception:
+                pass
+            # Never the exception text: a transport error can carry a URL or a
+            # token fragment.
+            show("dispatch", f"RAISED {code}")
+            checks.require("the server answered", False, code)
+        if result is not None:
+            show("dispatch", "ANSWERED")
+            show("kind", result.get("kind"))
+            show("status", result.get("status"))
+            show("applied", result.get("applied") is True)
+            error = result.get("error") or {}
+            if error:
+                show("error_code", error.get("code"))
+                show("failed_sequence", error.get("failed_sequence"))
+            for item in result.get("results") or []:
+                show(
+                    f'result.{item["sequence"]}.result_revision',
+                    item["result_revision"],
+                )
+            checks.require("the server answered", True)
+            checks.require(
+                "the server took the batch",
+                result.get("kind") == "atomic_structure_commit_success"
+                and result.get("applied") is True,
+                str(error.get("code") or result.get("kind")),
+            )
+        print()
+
+        print("[local state against the server's answer]")
+        after_rows = project_structure_snapshot(database, local_key)
+        after_disk = writing_root_fingerprint(root)
+        show("unreadable_manuscripts_after", len(after_disk["unreadable"]))
+        returned = {
+            item["sequence"]: item
+            for item in (result or {}).get("results") or []
+        }
+        # By entity kind rather than by position: the sequence a kind lands on
+        # is a property of how the batch was planned, and reading a revision
+        # off the wrong row would let a mismatch pass as a match.
+        planned = {
+            intent["entity_kind"]: intent
+            for intent in request["ordered_intents"]
+        }
+
+        def server_revision(entity_kind):
+            intent = planned.get(entity_kind)
+            item = returned.get((intent or {}).get("sequence"))
+            return None if item is None else int(item["result_revision"])
+
+        folder = store.get_folder_by_path(local_key, target_path)
+        order = store.get_tree_order(local_key, parent_path)
+        show("folder_revision_local", (folder or {}).get("revision"))
+        show("folder_revision_server", server_revision("folder"))
+        show("tree_order_revision_local", (order or {}).get("revision"))
+        show("tree_order_revision_server", server_revision("tree_order"))
+        show("parent_children_local", len((order or {}).get("children") or []))
+        states = batch_operation_states(store, after_rows, batch_id)
+        show("operation_states", " ".join(states) or "(none)")
+        checks.require(
+            "the folder carries the revision the server gave it",
+            folder_revision(store, local_key, target_path) is not None
+            and folder_revision(store, local_key, target_path)
+            == server_revision("folder"),
+            "the local revision is not the one that came back",
+        )
+        checks.require(
+            "the order carries the revision the server gave it",
+            bool(order)
+            and int(order["revision"]) == server_revision("tree_order"),
+            "the local revision is not the one that came back",
+        )
+        checks.require(
+            "the order holds exactly the children the batch named",
+            bool(order)
+            and order["children"]
+            == planned.get("tree_order", {}).get("payload", {}).get("children"),
+            "the order and the batch disagree",
+        )
+        checks.require(
+            "the order names the folder the server created",
+            bool(folder) and bool(order)
+            and folder["folder_id"] in order["children"],
+            "the folder is not in its parent's order",
+        )
+        checks.require(
+            "every operation in the batch is finished",
+            states == ["completed"],
+            " ".join(states) or "(none)",
+        )
+        checks.require(
+            "the answer is written down as applied",
+            any(
+                row["batch_id"] == batch_id and row["applied"]
+                for row in after_rows["results"]
+            ),
+            "no applied result row",
+        )
+        checks.require(
+            "no legacy operation was queued at any point",
+            len(after_rows["operations"]) == len(before_rows["operations"]),
+            f'{len(before_rows["operations"])} -> '
+            f'{len(after_rows["operations"])}',
+        )
+        checks.require(
+            "no document row moved",
+            after_rows["documents"] == before_rows["documents"],
+            "a document row changed",
+        )
+        checks.require(
+            "the manuscript on disk is untouched",
+            manuscript_bytes_unchanged(before_disk, after_disk),
+            "a manuscript changed or could not be read",
+        )
+        # On a resumed run the folder was already on disk before this run took
+        # its first reading, so what has to hold is that nothing appeared at
+        # all -- committing a batch must not make directories.
+        checks.require(
+            "the only thing that appeared on disk is the folder that was made",
+            sorted(set(after_disk["folders"]) - set(before_disk["folders"]))
+            == ([] if resume is not None else [target_path])
+            and not set(before_disk["folders"]) - set(after_disk["folders"]),
+            "the writing root moved in some other way",
+        )
+        stored_after = store.get_project_by_id(project_id)
+        show("gate_after", bool(stored_after["contract_path_enabled"]))
+        show("project_sync_mode_after", stored_after["project_sync_mode"])
+        show("migration_epoch_after", stored_after["migration_epoch"])
+        checks.require(
+            "the gate is still open and nothing was promoted",
+            bool(stored_after["contract_path_enabled"])
+            and (
+                stored_after["project_sync_mode"],
+                int(stored_after["migration_epoch"] or 0),
+            ) == ("LEGACY", 0),
+            f'{stored_after["project_sync_mode"]}'
+            f'/{stored_after["migration_epoch"]}',
+        )
+        print()
+        if checks.failed:
+            return stop_on_failed_checks()
+        checks.report()
+        show(
+            "verdict",
+            "the server took one contract batch at protocol 3 and the local "
+            "rows carry the revisions it gave back",
+        )
+        return 0
+    finally:
+        # One manager serves the whole process. Leaving it holding a store on a
+        # directory that is about to be deleted is how the next thing to ask it
+        # for a project gets a database that is no longer there.
+        for manager in managers:
+            try:
+                manager.release_v2()
+                manager.supabase = None
+                manager._v2_store = None
+                manager._v2_device_id = None
+            except Exception:
+                pass
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1082,8 +2122,33 @@ def main():
         help="the same id again; they must match",
     )
     parser.add_argument(
+        "--structure-write", action="store_true",
+        help="make one folder on the contract path in a project whose gate is "
+             "open, and report what the server did with the batch. Works on a "
+             "throwaway copy and sends nothing unless --apply is given",
+    )
+    parser.add_argument(
+        "--writing-root", default="",
+        help="the project's own writing root, required with "
+             "--structure-write --apply. It must be the root this project id "
+             "is registered under",
+    )
+    # No defaults, and deliberately not: a folder name this tool chose for
+    # itself would be a folder somebody has to explain later. The operator
+    # names it, and the name is echoed back into the record.
+    parser.add_argument(
+        "--parent-path", default="",
+        help="the folder to make the new one inside, required with "
+             "--structure-write. It must already have a server-proven revision",
+    )
+    parser.add_argument(
+        "--folder-name", default="",
+        help="the name of the folder to make, required with --structure-write",
+    )
+    parser.add_argument(
         "--apply", action="store_true",
-        help="actually open the gate. Without it nothing is written",
+        help="actually open the gate, or actually make the folder and send "
+             "its batch. Without it nothing is written and nothing is sent",
     )
     args = parser.parse_args()
 
@@ -1130,7 +2195,12 @@ def main():
 
     status = 0
     holds_credential = False
-    if args.rpc_handshake or args.application_handshake or args.activate_contract_path:
+    if (
+        args.rpc_handshake
+        or args.application_handshake
+        or args.activate_contract_path
+        or (args.structure_write and args.apply)
+    ):
         # Both of these build a real client and spend the stored refresh token.
         # Taking the same lock the application takes is what makes that safe;
         # asking whether the application is running would be a question whose
@@ -1169,16 +2239,30 @@ def main():
                 args.confirm_project_id.strip(),
                 args.apply,
             )
+        if args.structure_write:
+            status = run_structure_write(
+                database,
+                args.project_id.strip(),
+                args.confirm_project_id.strip(),
+                args.writing_root.strip(),
+                args.parent_path.strip(),
+                args.folder_name.strip(),
+                args.apply,
+            )
     finally:
         if holds_credential:
             from sync_manager import SyncManager as _SyncManager
 
             _SyncManager.release_auth_lease()
 
-    if not args.activate_contract_path:
+    if not args.activate_contract_path and not (
+        args.structure_write and args.apply
+    ):
         # Every other mode promises not to write. This is where that promise is
         # checked rather than asserted. Activation writes deliberately and
-        # accounts for its own changes, field by field, above.
+        # accounts for its own changes, field by field, above, and so does a
+        # structure write that was told to apply. A structure write that was
+        # not works on a copy, so it is held to the promise like the rest.
         after = file_sha256(database)
         print("[database file]")
         show("sha256_after", after)

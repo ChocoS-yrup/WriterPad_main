@@ -2512,6 +2512,17 @@ class ContractPathActivationTests(unittest.TestCase):
         self.assertFalse(self._gate(CANARY_ID))
         self.assertFalse(self._gate(BYSTANDER_ID))
 
+    def test_activation_dry_run_labels_the_fresh_server_answer(self):
+        status, output, client = self._run(apply_change=False)
+
+        self.assertEqual(status, 0, output)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("[fresh handshake]", output)
+        self.assertIn("the server supports this client=PASS", output)
+        self.assertIn("it answered LEGACY at epoch 0=PASS", output)
+        self.assertNotIn("the stored server state supports this client", output)
+        self.assertNotIn("the stored server state is LEGACY at epoch 0", output)
+
     def test_applying_opens_that_gate_and_only_that_gate(self):
         status, output, _client = self._run(apply_change=True)
 
@@ -2942,6 +2953,462 @@ class ContractApplicationHandshakeTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, lowered)
+
+
+class StructureWritePreflightReadingTests(unittest.TestCase):
+    """The readings the structure-write mode decides on.
+
+    Each of these stands for a way the mode got a real run wrong before it was
+    written this way: a revision of zero read as no folder at all, a parent
+    reordered down to the one child the probe had just made, and a batch
+    already sent counted as one still waiting.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp.name) / "sync.sqlite3"
+        self.store = SyncV2Store(str(self.db_path))
+        self.context = self.store.configure_project(
+            str(Path(self.temp.name) / "writing"), "Structure", PROJECT_ID
+        )
+        self.local_key = self.context["local_key"]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _snapshot(self, path, folder_id, *, parent_id=None, revision=1):
+        return {
+            "folder_id": folder_id,
+            "parent_folder_id": parent_id,
+            "local_path": path,
+            "name": path.rsplit("/", 1)[-1],
+            "revision": revision,
+            "is_deleted": False,
+        }
+
+    def test_a_folder_the_server_has_never_seen_reads_as_revision_zero(self):
+        """Revision zero is falsy, and it is the value that matters here.
+
+        Read with an ``or`` default it comes back as absence, and a run that
+        cannot tell an unproven folder from a missing one refuses to dispatch
+        the batch it just built.
+        """
+        parent_id = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(
+            self.local_key, [self._snapshot("메인/메모장", parent_id)]
+        )
+        self.store.ensure_local_folder(
+            self.local_key, "메인/메모장/새 폴더", parent_folder_id=parent_id
+        )
+
+        self.assertEqual(
+            self.preflight.folder_revision(
+                self.store, self.local_key, "메인/메모장/새 폴더"
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.preflight.folder_revision(
+                self.store, self.local_key, "메인/메모장"
+            ),
+            1,
+        )
+        self.assertIsNone(
+            self.preflight.folder_revision(
+                self.store, self.local_key, "메인/메모장/없는 폴더"
+            )
+        )
+
+    def test_the_child_list_keeps_the_siblings_the_order_already_held(self):
+        """The application sends a parent's whole child list, not the delta.
+
+        Naming only the folder just made reorders the parent down to that one
+        child, which is a silent delete of every sibling in the binder.
+        """
+        parent_id = str(uuid.uuid4())
+        first = str(uuid.uuid4())
+        second = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(self.local_key, [
+            self._snapshot("메인/메모장", parent_id),
+            self._snapshot("메인/메모장/먼저", first, parent_id=parent_id),
+            self._snapshot("메인/메모장/나중", second, parent_id=parent_id),
+        ])
+        self.store.replace_tree_order_snapshots(self.local_key, [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent_id,
+            "parent_path": "메인/메모장",
+            "children": [second, first],
+            "revision": 1,
+        }])
+
+        children = self.preflight.binder_children(
+            self.store, self.local_key, "메인/메모장", extra="새 폴더"
+        )
+
+        # The order the binder already holds, then what it does not mention.
+        self.assertEqual(children, ["나중", "먼저", "새 폴더"])
+
+    def test_a_child_list_asked_for_twice_does_not_grow(self):
+        parent_id = str(uuid.uuid4())
+        existing = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(self.local_key, [
+            self._snapshot("메인/메모장", parent_id),
+            self._snapshot("메인/메모장/있던 것", existing, parent_id=parent_id),
+        ])
+
+        self.assertEqual(
+            self.preflight.binder_children(
+                self.store, self.local_key, "메인/메모장", extra="있던 것"
+            ),
+            ["있던 것"],
+        )
+
+    def test_a_batch_counts_as_waiting_only_until_it_has_an_answer(self):
+        """A batch already sent is not one to resume, and one never sent is."""
+        parent_id = str(uuid.uuid4())
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.store.replace_folder_snapshots(
+            self.local_key, [self._snapshot("메인/메모장", parent_id)]
+        )
+        folder = self.store.ensure_local_folder(
+            self.local_key, "메인/메모장/새 폴더", parent_folder_id=parent_id
+        )
+        request = self.store.create_structure_batch(
+            self.context, DEVICE_ID, [{
+                "entity_kind": "folder",
+                "entity_id": folder["folder_id"],
+                "intent_kind": "create",
+                "base_revision": 0,
+                "payload": {
+                    "name": "새 폴더", "parent_folder_id": parent_id,
+                },
+            }],
+            batch_id=BATCH_ID,
+        )
+
+        waiting = self.preflight.unanswered_batch_for_folder(
+            self.db_path, self.local_key, folder["folder_id"]
+        )
+        self.assertIsNotNone(waiting)
+        self.assertEqual(waiting["batch_id"], BATCH_ID)
+        self.assertEqual(
+            self.preflight.unanswered_contract_batches(
+                self.db_path, self.local_key
+            ),
+            1,
+        )
+
+        intent = request["ordered_intents"][0]
+        self.store.mark_structure_batch_attempt(BATCH_ID)
+        self.store.record_structure_batch_response(BATCH_ID, {
+            "kind": "atomic_structure_commit_success",
+            "batch_id": BATCH_ID,
+            "batch_payload_sha256": request["batch"]["batch_payload_sha256"],
+            "status": "committed",
+            "applied": True,
+            "results": [{
+                "sequence": intent["sequence"],
+                "operation_id": intent["operation_id"],
+                "entity_id": intent["entity_id"],
+                "result_revision": 1,
+            }],
+        })
+
+        self.assertIsNone(
+            self.preflight.unanswered_batch_for_folder(
+                self.db_path, self.local_key, folder["folder_id"]
+            )
+        )
+        self.assertEqual(
+            self.preflight.unanswered_contract_batches(
+                self.db_path, self.local_key
+            ),
+            0,
+        )
+
+    def test_a_manuscript_rewritten_in_place_is_not_read_as_untouched(self):
+        """The whole point of the reading is that a refused batch changed
+        nothing, and a file count cannot see a file rewritten at the same
+        length under the same name."""
+        root = Path(self.temp.name) / "writing"
+        (root / "메인" / "원고").mkdir(parents=True)
+        page = root / "메인" / "원고" / "001화.txt"
+        page.write_text("before", encoding="utf-8")
+
+        before = self.preflight.writing_root_fingerprint(root)
+        self.assertEqual(
+            self.preflight.writing_root_fingerprint(root), before
+        )
+
+        page.write_text("after!", encoding="utf-8")
+        after = self.preflight.writing_root_fingerprint(root)
+
+        self.assertEqual(after["folders"], before["folders"])
+        self.assertNotEqual(after["documents"], before["documents"])
+
+    def test_an_unreadable_manuscript_fails_closed_even_if_both_reads_match(self):
+        root = Path(self.temp.name) / "writing"
+        (root / "메인" / "원고").mkdir(parents=True)
+        page = root / "메인" / "원고" / "001화.txt"
+        page.write_text("before", encoding="utf-8")
+
+        with patch.object(
+            self.preflight, "file_sha256", side_effect=OSError("locked")
+        ):
+            before = self.preflight.writing_root_fingerprint(root)
+            page.write_text("the whole manuscript changed", encoding="utf-8")
+            after = self.preflight.writing_root_fingerprint(root)
+
+        self.assertEqual(before["documents"], {})
+        self.assertEqual(before["unreadable"], ["메인/원고/001화.txt"])
+        self.assertEqual(after, before)
+        self.assertFalse(
+            self.preflight.manuscript_bytes_unchanged(before, after)
+        )
+        self.assertFalse(
+            self.preflight.manuscript_evidence_available(before)
+        )
+
+    def test_an_empty_writing_root_is_not_manuscript_evidence(self):
+        root = Path(self.temp.name) / "empty-writing"
+        root.mkdir()
+
+        snapshot = self.preflight.writing_root_fingerprint(root)
+
+        self.assertEqual(snapshot["documents"], {})
+        self.assertEqual(snapshot["unreadable"], [])
+        self.assertFalse(
+            self.preflight.manuscript_evidence_available(snapshot)
+        )
+
+    def test_structure_target_rejects_traversal_drive_and_real_unc_names(self):
+        root = Path(self.temp.name) / "writing"
+        root.mkdir()
+        unc_name = "\\\\" + "server\\share\\escape"
+        self.assertEqual(unc_name[:2], "\\\\")
+
+        hostile = (
+            "..",
+            "..\\..\\..\\escape",
+            "C:\\Windows\\Temp\\escape",
+            "C:drive-relative",
+            unc_name,
+            "folder/child",
+        )
+        for name in hostile:
+            with self.subTest(name=repr(name)), self.assertRaises(ValueError):
+                self.preflight.structure_target_directory(
+                    root, "메인/메모장", name
+                )
+
+        self.assertEqual(list(root.iterdir()), [])
+        target = self.preflight.structure_target_directory(
+            root, "메인/메모장", "안전한 폴더"
+        )
+        self.assertEqual(
+            target, (root / "메인" / "메모장" / "안전한 폴더").resolve()
+        )
+
+    def test_dry_run_manager_is_armed_without_a_client_or_rpc(self):
+        self.store.set_contract_path_enabled(self.local_key, True)
+        project = self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        manager = self.preflight.build_manager(
+            self.store, project, DEVICE_ID, allow_client=False
+        )
+        self.assertIsNone(manager.supabase)
+
+        with patch.object(
+            manager,
+            "perform_contract_handshake",
+            side_effect=AssertionError("dry run made an RPC"),
+        ):
+            reading = self.preflight.arm_manager_from_stored_contract(
+                manager, project
+            )
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertTrue(manager.contract_handshake_is_fresh())
+        self.assertTrue(manager._uses_contract_structure())
+
+    def test_structure_dry_run_builds_a_batch_without_client_or_live_write(self):
+        parent_id = str(uuid.uuid4())
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.store.replace_folder_snapshots(
+            self.local_key,
+            [self._snapshot("메인/메모장", parent_id)],
+        )
+        before = self.preflight.file_sha256(self.db_path)
+        output = io.StringIO()
+
+        with patch.object(
+            SyncManager,
+            "create_supabase_client",
+            side_effect=AssertionError("dry run built a client"),
+        ), patch.object(
+            SyncManager,
+            "perform_contract_handshake",
+            side_effect=AssertionError("dry run made an RPC"),
+        ), redirect_stdout(output):
+            status = self.preflight.run_structure_write(
+                self.db_path,
+                PROJECT_ID,
+                PROJECT_ID,
+                "",
+                "메인/메모장",
+                "dry-run-folder",
+                False,
+            )
+
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertEqual(self.preflight.file_sha256(self.db_path), before)
+        self.assertIn(
+            "[stored contract state; no client and no request]",
+            output.getvalue(),
+        )
+        self.assertNotIn("[fresh handshake]", output.getvalue())
+        self.assertIn(
+            "the stored server state supports this client=PASS",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "the stored server state is LEGACY at epoch 0=PASS",
+            output.getvalue(),
+        )
+        self.assertNotIn(
+            "the server supports this client=PASS", output.getvalue()
+        )
+        self.assertNotIn(
+            "it answered LEGACY at epoch 0=PASS", output.getvalue()
+        )
+        self.assertIsNone(
+            self.store.get_folder_by_path(
+                self.local_key, "메인/메모장/dry-run-folder"
+            )
+        )
+
+    def test_apply_stops_before_client_or_mkdir_when_no_manuscript_exists(self):
+        writing_root = Path(self.temp.name) / "writing"
+        writing_root.mkdir()
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        before = self.preflight.file_sha256(self.db_path)
+        output = io.StringIO()
+
+        with patch.object(
+            SyncManager,
+            "create_supabase_client",
+            side_effect=AssertionError("empty evidence built a client"),
+        ), redirect_stdout(output):
+            status = self.preflight.run_structure_write(
+                self.db_path,
+                PROJECT_ID,
+                PROJECT_ID,
+                str(writing_root),
+                "메인/메모장",
+                "must-not-appear",
+                True,
+            )
+
+        self.assertEqual(status, 1, output.getvalue())
+        self.assertIn(
+            "a manuscript exists for the no-damage check=FAIL",
+            output.getvalue(),
+        )
+        self.assertEqual(self.preflight.file_sha256(self.db_path), before)
+        self.assertFalse((writing_root / "메인").exists())
+
+    def test_structure_dry_run_main_takes_no_credential_lock(self):
+        parent_id = str(uuid.uuid4())
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.store.replace_folder_snapshots(
+            self.local_key,
+            [self._snapshot("메인/메모장", parent_id)],
+        )
+        argv = [
+            "contract_path_preflight.py",
+            "--database", str(self.db_path),
+            "--structure-write",
+            "--project-id", PROJECT_ID,
+            "--confirm-project-id", PROJECT_ID,
+            "--parent-path", "메인/메모장",
+            "--folder-name", "main-dry-run-folder",
+        ]
+        output = io.StringIO()
+
+        with patch.object(sys, "argv", argv), patch.object(
+            SyncManager,
+            "acquire_auth_lease",
+            side_effect=AssertionError("dry run took the credential lock"),
+        ), patch.object(
+            SyncManager,
+            "create_supabase_client",
+            side_effect=AssertionError("dry run built a client"),
+        ), redirect_stdout(output):
+            status = self.preflight.main()
+
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertNotIn("[credential lock]", output.getvalue())
+        self.assertIn("unchanged=true", output.getvalue())
+
+    def test_a_name_this_console_cannot_encode_is_escaped_not_raised(self):
+        """The folder name is named on the command line and echoed back.
+
+        A console whose codepage has no room for it would otherwise raise
+        partway through the line, ending the run holding a record that stops
+        mid-sentence.
+        """
+        with patch.object(sys, "stdout", SimpleNamespace(encoding="cp949")):
+            rendered = self.preflight._one_line("메모\U0001f600장")
+
+        self.assertEqual(rendered, "메모\\u1f600장")
+
+    def test_a_name_the_console_can_encode_is_left_alone(self):
+        with patch.object(sys, "stdout", SimpleNamespace(encoding="utf-8")):
+            self.assertEqual(
+                self.preflight._one_line("메인/메모장"), "메인/메모장"
+            )
 
 
 if __name__ == "__main__":
