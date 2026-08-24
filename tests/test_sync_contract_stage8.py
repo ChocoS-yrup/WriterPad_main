@@ -1997,6 +1997,72 @@ class ContractHandshakeGateTests(unittest.TestCase):
         self.assertIsNone(self.manager._contract_handshake)
         self.assertFalse(self.manager.contract_handshake_is_fresh())
 
+    def _rewrite_stored_state(self, column, value):
+        """Move one column of the row the third condition reads.
+
+        Deliberately not through the manager. The point being tested is that
+        the store is a separate source of truth from the reading held in
+        memory, so the change has to arrive the way a real divergence would --
+        from outside this session.
+        """
+        with closing(sqlite3.connect(
+            str(Path(self.temp.name) / "sync.sqlite3")
+        )) as connection:
+            connection.execute(
+                f"UPDATE sync_projects SET {column} = ? WHERE local_key = ?",
+                (value, self.context["local_key"]),
+            )
+            connection.commit()
+
+    def test_a_stored_server_state_that_stops_matching_closes_the_path(self):
+        """The third condition, watched closing the path on its own.
+
+        An open gate and a fresh reading are the first two conditions and both
+        stay true throughout. The row beside the gate is read from the store on
+        every use, so it is the only thing left that can close the path. Every
+        other test here closes it by dropping the reading or shutting the gate,
+        which means this condition could be deleted and they would all still
+        pass.
+
+        Restoring each column afterwards and watching the path reopen is what
+        says the closure came from that column and not from something else
+        drifting along the way.
+        """
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+        healthy = dict(self.store.get_project(self.context["local_key"]))
+
+        cases = (
+            ("active_contract_sha256", "0" * 64),
+            ("server_protocol_version", 2),
+            (
+                "server_capabilities_json",
+                json.dumps(sorted(SERVER_CAPABILITIES)[1:]),
+            ),
+            # No mode or epoch case, and not by oversight: a trigger on
+            # sync_projects allows only an unchanged pair, LEGACY/0 ->
+            # MIGRATING/1, or MIGRATING/>=1 -> ID_BASED. Every other move
+            # aborts with INVALID_PROJECT_MODE_TRANSITION, so that axis cannot
+            # be made to diverge through the store at all. The third
+            # condition's STALE_MIGRATION_EPOCH branch guards a row that
+            # arrived some other way.
+            # Not a contract error at all: json.loads raises ValueError, and
+            # closing on that is what keeps one fail-closed answer instead of
+            # an interpreter error reaching the caller.
+            ("server_capabilities_json", "{"),
+        )
+        for column, value in cases:
+            with self.subTest(column=column, value=repr(value)[:32]):
+                self._rewrite_stored_state(column, value)
+
+                self.assertTrue(self.manager.contract_path_enabled())
+                self.assertTrue(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+
+                self._rewrite_stored_state(column, healthy[column])
+                self.assertTrue(self.manager._uses_contract_structure())
+
     def test_the_handshake_is_asked_once_per_opened_project(self):
         client = self._attach(supported_handshake())
         for _ in range(4):
