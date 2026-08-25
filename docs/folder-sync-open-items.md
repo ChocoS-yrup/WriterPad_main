@@ -44,11 +44,23 @@ afb96bee0773d4961f9bad1fea76321eeb71a2bf  폴더 tombstone 순서, 최초 휴지
 
 ## 지금 서 있는 자리
 
-서버에 배포된 RPC는 `ensure_project`, `commit_document`, `commit_folder`,
-편집 리스 계열, 프로젝트 휴지통 계열뿐이다. `atomic_structure_commit` 과
-`document_commit` 은 **서버에 없다.** 양쪽 클라이언트 모두 호출하지 않는다는
-것을 확인했다. 호출하는 코드가 Windows 에 남아 있지만 제품 경로에서 도달하지
-않는다.
+**아래 문단은 2026-08-23 이전의 자리였고 더 이상 사실이 아니다.** 남겨 두는
+이유는 그 사이에 무엇이 바뀌었는지가 이 문서를 읽는 사람에게 필요하기 때문이다.
+
+> 서버에 배포된 RPC는 `ensure_project`, `commit_document`, `commit_folder`,
+> 편집 리스 계열, 프로젝트 휴지통 계열뿐이다. `atomic_structure_commit` 과
+> `document_commit` 은 **서버에 없다.** 양쪽 클라이언트 모두 호출하지 않는다는
+> 것을 확인했다.
+
+지금은 이렇다. `atomic_structure_commit` 은 **배포돼 있고 실제로 응답한다.**
+Windows 가 canary 하나의 관문을 열고 네 번 불렀다 — 폴더 생성 세 번이 수락됐고,
+낡은 revision 을 실은 네 번째가 `REVISION_CONFLICT` 로 거절됐다. `get_sync_handshake`
+도 배포돼 있고 양쪽 클라이언트가 같은 답을 받는다.
+
+바뀌지 않은 것은 **범위**다. 관문이 열린 프로젝트는 canary 하나뿐이고 나머지
+열다섯은 닫혀 있다. 관문이 닫힌 프로젝트의 구조 쓰기는 여전히 `commit_folder`
+와 `__antigravity__/tree-order.json` 으로 나간다. iPad 는 관문을 아직 열지
+않았으므로 전부 레거시 경로다.
 
 폴더는 `folder_id` + `parent_folder_id` 로 서버에 있고, 문서는 `document_id` 와
 `relative_path` 로 있다. 문서에는 부모나 순서 컬럼이 없다. 형제 순서는
@@ -478,7 +490,7 @@ staging 에서 확인이 필요하다. 이 항목을 적을 당시 Windows 는 �
 이 병합돼 있지 않고, 그러면 `becbf42` 의 서버 쪽 산출물을 어떻게 가져올지의
 문제로 되돌아간다.
 
-**tree_order 의 base revision 대조 — 소스 확인됨, 살아 있는 서버에서는 미관측**
+**tree_order 의 base revision 대조 — 소스 확인됨, 살아 있는 서버에서 관측됨**
 
 tree_order 는 부모의 **자식 목록 전체**를 보낸다. 일부만 아는 클라이언트가 쓰면
 그 목록이 그대로 새 목록이 되므로, 다른 기기가 만든 형제가 목록에서 빠진다.
@@ -500,18 +512,24 @@ if v_tree.revision <> v_base_revision then
 의도에서 행이 없으면 `TREE_REFERENCE_NOT_FOUND` 로 막힌다. 행 없는 부모는
 create 분기로만 만들어진다.
 
-**그래도 관측은 별개다.** Windows 라이브 DB 에 실패 응답 배치 0,
-`conflict_detected` 0, `blocked` 0 — 계약 경로에서 서버 거부를 한 번도 받아 본
-적이 없다. 배포된 함수가 이 소스와 같다는 것도 확인된 적 없다. 소스를 읽는 것이
-관측을 대신하지 않는다.
+**그리고 2026-08-25, 배포된 서버가 실제로 그렇게 답하는 것을 보았다.** canary
+`메인/메모장` 이 order rev 3 일 때 base 2 로 reorder 를 하나 보냈다. 자식 목록은
+이미 거기 있는 셋 그대로라, 서버가 받아 줬더라도 움직일 것이 없는 배치였다.
 
-확인 방법이 하나 있고 값이 싸다. canary 의 `메인/메모장` 에 **일부러 낡은
-base revision** 으로 reorder 를 하나 보내면 예상 결과는 `REVISION_CONFLICT`
-하나뿐이다. 실패하도록 만든 배치라 성공해도 바뀌는 것이 없고, 클라이언트의 처리
-경로(`conflict` 기록, `applied=0`)는 이미 코드에 있으나 한 번도 돌지 않았다.
-이것으로 오래 열려 있던 "서버 거부 경로 미실증" 도 함께 닫힌다.
-**iPad 가 canary 에 연결하기 전에 하는 것이 맞다** — iPad 가 안전의 근거로
-삼으려는 방어가 바로 이것이기 때문이다.
+```
+batch    6836c778-60f9-44c1-a3be-e1f53c1bc573
+answer   atomic_structure_commit_failure / rejected / applied=false
+error    REVISION_CONFLICT   failed_sequence 1
+남은 것  order rev 3 그대로 · 폴더·문서·원고 전부 불변
+         연산은 conflict 로 붙잡히고 스스로 다시 나가지 않는다
+```
+
+이것으로 **계약 경로의 서버 거부 경로가 처음으로 관측됐다.** 그전까지 세 배치가
+전부 수락돼서, 클라이언트의 거부 처리 코드는 있으나 한 번도 돌지 않은 상태였다.
+지금은 conflict 이벤트 1 건이 남아 있다.
+
+iPad 가 canary 에 연결하기 전의 전제 조건이었고, 충족됐다. iPad 가 안전의
+근거로 삼으려는 방어가 바로 이것이다.
 
 ---
 
@@ -575,21 +593,35 @@ base revision** 으로 reorder 를 하나 보내면 예상 결과는 `REVISION_C
 drift 가 아니라 계약 경로 구조 쓰기 실증이 남긴 것이다. 대조할 때 설명되지 않는
 폴더로 읽지 마라.
 
+**두 종류가 섞여 있으니 구분해서 읽어라.** iPad 가 pull 한 뒤 대조할 대상은 위
+네 줄뿐이다. 아래 두 줄은 서버에 간 적이 없으므로, 구분 없이 대조하면 "없어진
+것" 으로 오탐된다.
+
 ```
-메인/메모장/계약경로검증    폴더 rev 1
-메인/메모장/계약경로검증2   폴더 rev 1
-메인/메모장/계약경로검증3   폴더 rev 1
-메인/메모장                order rev 3, children 3
-메인/원고/합성원고-01.txt   합성 원고, 서버 미전송
-메인/원고/합성원고-02.txt   합성 원고, 서버 미전송
+서버에 있다 — iPad 가 pull 하면 보인다. 대조 대상은 이 넷뿐이다
+  메인/메모장/계약경로검증    폴더 rev 1
+  메인/메모장/계약경로검증2   폴더 rev 1
+  메인/메모장/계약경로검증3   폴더 rev 1
+  메인/메모장                order rev 3, children 3
+
+Windows 로컬 디스크에만 있다 — pull 해도 보이지 않는다. 대조 대상이 아니다
+  메인/원고/합성원고-01.txt   합성 원고, 서버 미전송
+  메인/원고/합성원고-02.txt   합성 원고, 서버 미전송
 ```
 
-출처는 계약 배치 셋이고 전부 `applied=1` 이다.
+서버 쪽 네 줄의 출처는 계약 배치 셋이고 전부 `applied=1` 이다.
 
 ```
 4f6f2a51-e296-4c2b-b5fa-76fb347b39c4   folder create rev 1 + reorder rev 1
 0434134c-41a4-40af-b210-86965446ff10   folder create rev 1 + reorder rev 2
 b06cc68f-fdc0-488e-b42b-e2f6d4c4d135   folder create rev 1 + reorder rev 3
+```
+
+네 번째 배치는 **일부러 거절당하도록 만든 것**이고 `applied=0` 이다. 서버가
+base revision 을 대조하는지 보려고 보냈다. 실패 1 건은 drift 가 아니다.
+
+```
+6836c778-60f9-44c1-a3be-e1f53c1bc573   reorder@2 -> REVISION_CONFLICT
 ```
 
 **합성 원고 두 개는 사람이 쓴 원고가 아니다.** 원고 무손상 실증의 비교 대상으로

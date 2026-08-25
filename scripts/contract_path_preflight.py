@@ -2083,6 +2083,384 @@ def run_structure_write(
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def run_stale_reorder_probe(
+    live: Path,
+    project_id: str,
+    confirm_id: str,
+    writing_root: str,
+    parent_path: str,
+    apply_change: bool,
+):
+    """Send one reorder the server has to refuse, and watch it refuse.
+
+    Everything the contract path has been shown doing so far, the server took.
+    The refusal side is written into the client -- a rejected batch is recorded
+    as conflicted, applied zero, and its intents stop being sendable -- and none
+    of it has ever run. This asks for exactly one refusal.
+
+    The batch is built to be harmless twice over. Its children are the children
+    the order already holds, so a server that took it anyway would move nothing;
+    and its base revision is one behind, so a server that compares revisions has
+    no choice but to refuse. Either answer is safe. Only one of them is
+    informative.
+    """
+    from sync_manager import SyncManager, load_or_create_device_id
+    from sync_v2_store import SyncV2Store
+
+    checks = Checks()
+    workspace = Path(tempfile.mkdtemp(prefix="contract-stale-"))
+    managers = []
+
+    def stop(reason):
+        checks.report()
+        show("verdict", f"STOP - {reason}")
+        return 1
+
+    def stop_on_failed_checks():
+        return stop(", ".join(name for name, _p, _d in checks.failed))
+
+    try:
+        print("[stale reorder probe]")
+        show(
+            "mode",
+            "apply - the live database, one batch the server should refuse"
+            if apply_change else
+            "dry run - a throwaway copy; nothing is sent",
+        )
+        show("target_project_id", project_id)
+        show("parent_path", parent_path)
+        checks.require(
+            "the project id was given twice and matched",
+            bool(project_id) and project_id == confirm_id,
+            "--project-id and --confirm-project-id differ",
+        )
+        checks.require(
+            "a parent path was given",
+            bool(parent_path),
+            "--parent-path is required",
+        )
+        if checks.failed:
+            return stop_on_failed_checks()
+
+        connection = sqlite3.connect(live.as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                "SELECT local_key FROM sync_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return stop("no such project here")
+        local_key = row["local_key"]
+
+        if apply_change:
+            database = live
+            checks.require(
+                "a writing root was named",
+                bool(str(writing_root or "").strip()),
+                "--writing-root is required with --apply",
+            )
+            root = Path(writing_root) if writing_root else workspace / "writing"
+            if str(writing_root or "").strip():
+                try:
+                    named_key = SyncV2Store.local_key_for(str(root))
+                except Exception:
+                    named_key = ""
+                checks.require(
+                    "the writing root is this project's own",
+                    named_key == local_key,
+                    "--writing-root belongs to a different project",
+                )
+        else:
+            database = workspace / "sync_v2.sqlite3"
+            copy_database(live, database)
+            root = workspace / "writing"
+            root.mkdir(parents=True, exist_ok=True)
+        if checks.failed:
+            return stop_on_failed_checks()
+
+        store = SyncV2Store(str(database))
+        project = store.get_project_by_id(project_id)
+        checks.require(
+            "its gate is open",
+            bool(project["contract_path_enabled"]),
+            "the gate is shut, so no contract batch can be built",
+        )
+        unanswered = unanswered_contract_batches(database, local_key)
+        show("contract_batches_without_an_answer", unanswered)
+        checks.require(
+            "no earlier batch is still unanswered",
+            unanswered == 0,
+            f"{unanswered} waiting",
+        )
+
+        order = store.get_tree_order(local_key, parent_path)
+        checks.require(
+            "the parent already holds a server-proven order",
+            bool(order) and int(order["revision"] or 0) >= 2,
+            "there is no order row, or its revision is too low to go one back",
+        )
+        if checks.failed:
+            return stop_on_failed_checks()
+
+        standing = int(order["revision"])
+        stale = standing - 1
+        children = list(order["children"])
+        show("order_revision_on_the_server", standing)
+        show("base_revision_this_batch_will_claim", stale)
+        show("children_named", len(children))
+        # The children are the ones already there. Even a server that ignored
+        # the revision entirely would write back what it already holds.
+        show("children_differ_from_what_is_there", False)
+
+        disk_before = writing_root_fingerprint(root)
+        show("manuscript_documents", len(disk_before["documents"]))
+        show("unreadable_manuscripts", len(disk_before["unreadable"]))
+        checks.require(
+            "every manuscript can be hashed before any request",
+            not disk_before["unreadable"],
+            f'{len(disk_before["unreadable"])} unreadable manuscript(s)',
+        )
+        if apply_change:
+            checks.require(
+                "a manuscript exists for the no-damage check",
+                manuscript_evidence_available(disk_before),
+                "the project has no readable .txt manuscript to compare",
+            )
+        if checks.failed:
+            return stop_on_failed_checks()
+        print()
+
+        client = None
+        if apply_change:
+            client = SyncManager.create_supabase_client()
+            if client is None or not getattr(
+                client, "_antigravity_authenticated", False
+            ):
+                show(
+                    "client",
+                    "RESTORE FAILED - the stored session was kept"
+                    if client is not None else "NO CLIENT",
+                )
+                checks.require(
+                    "a signed-in client is available", False, "not authenticated"
+                )
+                return stop_on_failed_checks()
+            checks.require("a signed-in client is available", True)
+
+        device_id = (
+            load_or_create_device_id() if apply_change else str(uuid.uuid4())
+        )
+        manager = build_manager(
+            store, project, device_id, allow_client=apply_change
+        )
+        managers.append(manager)
+        if apply_change:
+            manager.supabase = client
+            print("[fresh handshake]")
+            try:
+                reading = manager.perform_contract_handshake(
+                    require_connection=True
+                )
+            except Exception as error:
+                code = getattr(error, "code", "") or type(error).__name__
+                show("perform_contract_handshake", f"RAISED {code}")
+                checks.require("the handshake completed", False, code)
+                return stop_on_failed_checks()
+            show("outcome", (reading or {}).get("outcome"))
+            checks.require(
+                "the server supports this client",
+                (reading or {}).get("outcome") == "supported",
+                str((reading or {}).get("outcome")),
+            )
+        else:
+            print("[stored contract state; no client and no request]")
+            try:
+                arm_manager_from_stored_contract(manager, project)
+            except Exception as error:
+                code = getattr(error, "code", "") or type(error).__name__
+                checks.require("the stored contract state is usable", False, code)
+                return stop_on_failed_checks()
+            checks.require("the stored contract state is usable", True)
+        checks.require(
+            "the contract path is armed for this project",
+            manager._uses_contract_structure(),
+            "structure work would go out legacy",
+        )
+        if checks.failed:
+            return stop_on_failed_checks()
+        print()
+
+        before = project_structure_snapshot(database, local_key)
+        print("[the batch]")
+        intent = {
+            "entity_kind": "tree_order",
+            "entity_id": order["tree_order_id"],
+            "intent_kind": "reorder",
+            "base_revision": stale,
+            "payload": {
+                "parent_folder_id": order["parent_folder_id"],
+                "children": children,
+            },
+        }
+        request = manager.queue_atomic_structure_batch([intent], retry=False)
+        batch_id = request["batch"]["batch_id"]
+        show("batch_id", batch_id)
+        show("sync_protocol_version", request["batch"]["sync_protocol_version"])
+        show("contract_version", request["batch"]["contract_version"])
+        show(
+            "intents",
+            " ".join(
+                f'{item["sequence"]}:{item["entity_kind"]}'
+                f'/{item["intent_kind"]}@{item["base_revision"]}'
+                for item in request["ordered_intents"]
+            ),
+        )
+        checks.require(
+            "it is one reorder at a revision the server has moved past",
+            [
+                (item["entity_kind"], item["intent_kind"], item["base_revision"])
+                for item in request["ordered_intents"]
+            ] == [("tree_order", "reorder", stale)],
+            "the batch holds something else",
+        )
+
+        if not apply_change:
+            print()
+            if checks.failed:
+                return stop_on_failed_checks()
+            checks.report()
+            show(
+                "verdict",
+                "the batch is built and nothing was sent; re-run with --apply "
+                "to ask the server for the refusal",
+            )
+            return 0
+        if checks.failed:
+            return stop_on_failed_checks()
+        print()
+
+        print("[dispatch]")
+        result = None
+        try:
+            store.mark_structure_batch_attempt(batch_id)
+            result = manager._process_contract_structure_batch(batch_id)
+        except Exception as error:
+            code = getattr(error, "code", "") or type(error).__name__
+            try:
+                store.mark_structure_batch_retry(batch_id, code)
+            except Exception:
+                pass
+            show("dispatch", f"RAISED {code}")
+            checks.require("the server answered", False, code)
+        if result is not None:
+            error = result.get("error") or {}
+            show("dispatch", "ANSWERED")
+            show("kind", result.get("kind"))
+            show("status", result.get("status"))
+            show("applied", result.get("applied") is True)
+            show("error_code", error.get("code") or "(none)")
+            show("failed_sequence", error.get("failed_sequence"))
+            checks.require("the server answered", True)
+            # The whole point. A server that took this would be one that does
+            # not compare the revision it was handed.
+            checks.require(
+                "the server refused the batch",
+                result.get("kind") == "atomic_structure_commit_failure"
+                and result.get("applied") is False,
+                f'it answered {result.get("kind")}',
+            )
+            checks.require(
+                "it refused with REVISION_CONFLICT",
+                error.get("code") == "REVISION_CONFLICT",
+                str(error.get("code")),
+            )
+        print()
+
+        print("[what the refusal left behind]")
+        after = project_structure_snapshot(database, local_key)
+        after_disk = writing_root_fingerprint(root)
+        order_after = store.get_tree_order(local_key, parent_path)
+        states = batch_operation_states(store, after, batch_id)
+        show("order_revision_after", (order_after or {}).get("revision"))
+        show("children_after", len((order_after or {}).get("children") or []))
+        show("operation_states", " ".join(states) or "(none)")
+        show(
+            "result_rows_applied",
+            sum(1 for item in after["results"] if item["applied"]),
+        )
+        checks.require(
+            "the order did not move",
+            bool(order_after)
+            and int(order_after["revision"]) == standing
+            and order_after["children"] == children,
+            "a refused batch changed the order",
+        )
+        checks.require(
+            "the batch is recorded as not applied",
+            any(
+                item["batch_id"] == batch_id and not item["applied"]
+                for item in after["results"]
+            ),
+            "no unapplied result row",
+        )
+        # Conflicted, not retried. A refusal no wait can change must not go
+        # back on the wire by itself.
+        checks.require(
+            "its operation is held in conflict, not queued again",
+            states == ["conflict"],
+            " ".join(states) or "(none)",
+        )
+        checks.require(
+            "no folder moved",
+            after["folders"] == before["folders"],
+            "a folder row changed under a refused batch",
+        )
+        checks.require(
+            "no document row moved",
+            after["documents"] == before["documents"],
+            "a document row changed under a refused batch",
+        )
+        checks.require(
+            "the manuscript on disk is untouched",
+            manuscript_bytes_unchanged(disk_before, after_disk),
+            "a manuscript changed or could not be read",
+        )
+        stored_after = store.get_project_by_id(project_id)
+        checks.require(
+            "the gate is still open and nothing was promoted",
+            bool(stored_after["contract_path_enabled"])
+            and (
+                stored_after["project_sync_mode"],
+                int(stored_after["migration_epoch"] or 0),
+            ) == ("LEGACY", 0),
+            f'{stored_after["project_sync_mode"]}'
+            f'/{stored_after["migration_epoch"]}',
+        )
+        print()
+        if checks.failed:
+            return stop_on_failed_checks()
+        checks.report()
+        show(
+            "verdict",
+            "the server compares the revision it is handed and refuses when it "
+            "has moved past it; the refusal changed nothing here",
+        )
+        return 0
+    finally:
+        for manager in managers:
+            try:
+                manager.release_v2()
+                manager.supabase = None
+                manager._v2_store = None
+                manager._v2_device_id = None
+            except Exception:
+                pass
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2146,6 +2524,12 @@ def main():
         help="the name of the folder to make, required with --structure-write",
     )
     parser.add_argument(
+        "--stale-reorder-probe", action="store_true",
+        help="send one reorder against a revision the server has moved past, "
+             "to find out whether it refuses. Its children are the ones "
+             "already there, so even being taken would move nothing",
+    )
+    parser.add_argument(
         "--apply", action="store_true",
         help="actually open the gate, or actually make the folder and send "
              "its batch. Without it nothing is written and nothing is sent",
@@ -2200,6 +2584,7 @@ def main():
         or args.application_handshake
         or args.activate_contract_path
         or (args.structure_write and args.apply)
+        or (args.stale_reorder_probe and args.apply)
     ):
         # Both of these build a real client and spend the stored refresh token.
         # Taking the same lock the application takes is what makes that safe;
@@ -2239,6 +2624,15 @@ def main():
                 args.confirm_project_id.strip(),
                 args.apply,
             )
+        if args.stale_reorder_probe:
+            status = run_stale_reorder_probe(
+                database,
+                args.project_id.strip(),
+                args.confirm_project_id.strip(),
+                args.writing_root.strip(),
+                args.parent_path.strip(),
+                args.apply,
+            )
         if args.structure_write:
             status = run_structure_write(
                 database,
@@ -2256,7 +2650,7 @@ def main():
             _SyncManager.release_auth_lease()
 
     if not args.activate_contract_path and not (
-        args.structure_write and args.apply
+        (args.structure_write or args.stale_reorder_probe) and args.apply
     ):
         # Every other mode promises not to write. This is where that promise is
         # checked rather than asserted. Activation writes deliberately and
