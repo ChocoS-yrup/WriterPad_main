@@ -580,11 +580,24 @@ iPad 가 canary 에 연결하기 전의 전제 조건이었고, 충족됐다. iP
 
 **Windows — 제품 코드 (이어서)**
 
-- `supported_protocol_versions` 부재를 fail-closed 로.
-  `sync_contract.py:362` 가 `if supported_versions is not None:` 이라 필드가
-  없으면 검사를 건너뛴다. protocol 판정의 실질 근거인데 근거 없이 통과시키는
-  것이고, iPad 는 같은 필드를 비옵셔널로 두어 없으면 닫는다. 지금 서버가 항상
-  보내므로 동작 차이는 0. **서버 응답 모양이 바뀌기 전에는 반드시.**
+- **핸드셰이크 응답의 선택적 세 키를 fail-closed 로.** 하나가 아니라 셋이다.
+
+  ```
+  키가 없을 때            iPad    Windows
+  contract_version         거절    통과
+  canonical_contract_sha256 거절   통과
+  supported_protocol_versions 거절 통과
+  ```
+
+  셋 다 `sync_contract.py` 에서 "있는데 틀리면 거절, 아예 없으면 통과" 다
+  (`if x is not None:` 뒤에서만 검사한다). 판정 근거가 없을 때 통과시키는
+  모양이고, 이 저장소에서 여섯 번 나온 그 유형이다. 지금 서버가 셋을 항상
+  보내므로 동작 차이는 0. **서버 응답 모양이 바뀌기 전에는 반드시.** 한 커밋에서
+  같이 고친다.
+
+  셋이라는 것은 코드 대조가 아니라 **봉투 문서를 정확히 쓰려다** 드러났다.
+  문서가 처음에 "양쪽 다 넷을 요구한다" 고 적었고, Windows 코드에 실제로 물어
+  보니 둘만 요구했다.
 
 **Windows — 스테이징에 쓰는 것**
 
@@ -616,6 +629,25 @@ iPad 가 canary 에 연결하기 전의 전제 조건이었고, 충족됐다. iP
 - `becbf42` 병합 — 무효. iPad 의 `4033edc` 가 독립 작성이고 기능이 더 넓으며,
   `becbf42` 판본은 핸드셰이크를 SQLite 에 영속하고 재시작 후 복원해 설계상
   기각되었다. 그 브랜치의 서버 쪽 산출물은 위 "storage-name-v2" 항목이 붙잡는다.
+
+## 양쪽에 같은 파일로 두는 것
+
+`sync-contract/handshake-envelope.md` 는 두 저장소에 **바이트까지 같은 사본**으로
+있다. `get_sync_handshake` 의 응답 봉투를 적어 둔 문서이고, 2026-08-25 까지 그
+봉투는 배포된 함수 몸통에만 존재했다.
+
+**원본은 iPad 저장소다.** 여기 것은 미러다. 고칠 일이 생기면 iPad 쪽을 고치고
+여기로 받아 넣는다. **양쪽에서 각자 고치면 미러가 아니라 사본 둘이 되고**,
+이 문서의 "계약 pin — iPad 0.3.0" 오기가 정확히 그 증상이었다.
+
+계약 pin 에는 영향이 없다. 다이제스트는 `protocol.json` 한 파일의 RFC 8785
+바이트에만 걸리므로(`contract-lock.json` 의 `protocol_path`) 이 디렉터리에
+파일을 더해도 `416c1b99…` 는 움직이지 않는다. `verify_contract.py` 가 훑는 것도
+`*.schema.json` 과 `test_vectors/*.json` 뿐이다.
+
+**이 저장소의 CI 는 이 미러를 보지 않는다.** 워크플로가 `sync-contract/` 를
+`ChocoS-yrup/Writerpad@7bcb5d25` 에서 가져오도록 고정돼 있어서, 그 커밋 뒤에
+더해진 파일은 CI 에 딸려오지 않는다. 미러가 필요한 이유가 그것이다.
 
 ## 서버 인스턴스를 옮길 때
 
