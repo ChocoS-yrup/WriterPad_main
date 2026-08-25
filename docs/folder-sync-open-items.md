@@ -478,24 +478,32 @@ staging 에서 확인이 필요하다. 이 항목을 적을 당시 Windows 는 �
 이 병합돼 있지 않고, 그러면 `becbf42` 의 서버 쪽 산출물을 어떻게 가져올지의
 문제로 되돌아간다.
 
-**`atomic_structure_commit` 이 tree_order 의 base revision 을 대조하는가 — 미관측**
+**tree_order 의 base revision 대조 — 소스 확인됨, 살아 있는 서버에서는 미관측**
 
 tree_order 는 부모의 **자식 목록 전체**를 보낸다. 일부만 아는 클라이언트가 쓰면
 그 목록이 그대로 새 목록이 되므로, 다른 기기가 만든 형제가 목록에서 빠진다.
 
-막아 주는 것은 배치에 함께 실리는 base revision 이고, 레거시 `commit_document`
-는 실제로 대조한다 — 어긋나면 `REVISION_CONFLICT` 로 거절한다. 계약 경로는
-다른 함수(`atomic_structure_commit`)를 쓰고, **그 함수가 같은 대조를 하는지는
-아직 관측되지 않았다.** Windows 라이브 DB 에 실패 응답 배치 0, `conflict_detected`
-0, `blocked` 0 — 계약 경로에서 서버 거부를 한 번도 받아 본 적이 없다.
+막아 주는 것은 배치에 함께 실리는 base revision 이다. 대조는 계약 경로 본체인
+`private.apply_structure_intent` 안에 있고 `atomic_structure_commit` 이 그것을
+부른다 — 레거시 `commit_document` 를 보고 유추한 것이 아니라 **계약 경로 자신의
+코드다.** (2026-08-25, iPad 가 서버 마이그레이션 소스에서 확인.)
 
-그러니 지금 아는 것의 크기는 이렇다. **거절될 것으로 기대되지만 확인되지
-않았다.** "지워진다" 로 적으면 실제보다 무섭고, "막힌다" 로 단정하면 근거 없이
-안심시킨다.
+```sql
+if not found or v_tree.project_id <> p_project_id then
+  raise ... 'TREE_REFERENCE_NOT_FOUND';
+end if;
+if v_tree.revision <> v_base_revision then
+  raise ... 'REVISION_CONFLICT';
+```
 
-대조가 있더라도 막아 주는 범위는 **서버에 tree_order 행이 이미 있는 부모**뿐이다.
-행이 없는 부모는 base 0 이 그냥 맞으므로 아무것도 걸러내지 못한다. 지금은 그런
-부모들이 서버에서도 비어 있어 잃을 것이 없을 뿐이다.
+**"행이 없는 부모는 base 0 이 그냥 통과한다" 는 우려도 여기서 닫힌다.** reorder
+의도에서 행이 없으면 `TREE_REFERENCE_NOT_FOUND` 로 막힌다. 행 없는 부모는
+create 분기로만 만들어진다.
+
+**그래도 관측은 별개다.** Windows 라이브 DB 에 실패 응답 배치 0,
+`conflict_detected` 0, `blocked` 0 — 계약 경로에서 서버 거부를 한 번도 받아 본
+적이 없다. 배포된 함수가 이 소스와 같다는 것도 확인된 적 없다. 소스를 읽는 것이
+관측을 대신하지 않는다.
 
 확인 방법이 하나 있고 값이 싸다. canary 의 `메인/메모장` 에 **일부러 낡은
 base revision** 으로 reorder 를 하나 보내면 예상 결과는 `REVISION_CONFLICT`
@@ -504,9 +512,6 @@ base revision** 으로 reorder 를 하나 보내면 예상 결과는 `REVISION_C
 이것으로 오래 열려 있던 "서버 거부 경로 미실증" 도 함께 닫힌다.
 **iPad 가 canary 에 연결하기 전에 하는 것이 맞다** — iPad 가 안전의 근거로
 삼으려는 방어가 바로 이것이기 때문이다.
-
-iPad 는 서버 마이그레이션 소스를 갖고 있으므로 함수를 읽어 한 줄로 답할 수도
-있다. 그 답이 오면 위 "미관측" 을 갱신한다.
 
 ---
 
