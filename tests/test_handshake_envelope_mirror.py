@@ -35,9 +35,21 @@ SOURCE_BLOB_ID = "cb39119a7a5087ebb9beab63d9c924a7f599fc8b"
 
 
 def git_blob_id(raw: bytes) -> str:
-    """What `git hash-object` would print for these bytes."""
-    header = b"blob %d\0" % len(raw)
-    return hashlib.sha1(header + raw).hexdigest()
+    """The id git stores this content under, from the bytes on disk.
+
+    Line endings are normalized first, and that is the whole subtlety. Git
+    keeps a text file with LF and hands the working tree whatever the platform
+    asked for; this repository is cloned on Windows with core.autocrlf on, so
+    the same committed file reads back as CRLF there and LF elsewhere. Hashing
+    what is on disk therefore answers a different question on each machine.
+
+    The identity being compared is the stored content, so the presentation is
+    undone before hashing. This was found by the check failing on CI while
+    passing locally -- loudly, which is the direction a check should fail.
+    """
+    stored = raw.replace(b"\r\n", b"\n")
+    header = b"blob %d\0" % len(stored)
+    return hashlib.sha1(header + stored).hexdigest()
 
 
 class HandshakeEnvelopeMirrorTests(unittest.TestCase):
