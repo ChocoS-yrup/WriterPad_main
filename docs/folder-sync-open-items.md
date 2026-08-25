@@ -446,9 +446,39 @@ storage_name_tables.py             v2 경로에만 물려 있어 함께 잠들�
 이유는 이것을 근거로 삼은 판단이 이미 나왔기 때문이다. 0.3.0 CHANGELOG 의
 실물을 찾기 전까지 배포 경계에 대해 아는 것은 없다.
 
-**아직 모르는 것.** 계약 트랙(`sync_contract_0_1_0_*`, `0_3_0_storage_name_v2`
-마이그레이션 줄기)이 실제 서버에 적용된 적이 있는지 이 저장소에서는 판정할 수
-없다. 활성 `supabase/migrations/` 는 그와 겹치지 않는 다른 줄기다.
+**2026-08-25 갱신 — 위 "아직 모르는 것" 은 답이 나왔다.** 계약 트랙은 실제
+서버에 적용돼 있다. 그리고 두 저장소의 관계도 처음 보이던 것과 다르다.
+
+```
+Windows  supabase/migrations/  6개, 0714~0803   레거시 RPC 만 정의
+iPad     supabase/migrations/  3개, 0811        baseline snapshot + 계약 0.1.0
+becbf42  미병합                3개, 0813~0820   handshake, corrective, 0.3.0
+```
+
+파일은 하나도 겹치지 않는다. 그런데 **내용은 iPad 쪽이 상위집합이다.**
+`operational_v2_schema_baseline_snapshot` 이라는 이름 그대로, Windows 6개를
+적용한 **결과 상태를 스냅샷으로 떠 둔 것**이다. `repair_v2_rpc_permissions` 의
+grant 교정까지 그 안에 반영돼 있어 적용 순서 문제도 없다.
+
+2026-08-25 에 빈 인스턴스(`writerpad-prod`, ap-northeast-2)를 iPad 저장소
+마이그레이션과 `becbf42` 의 두 개(handshake, corrective)만으로 세웠고, 함수
+44 개가 섰다. 스테이징 48 개와의 차이는 `storage_name_v2` 계열 다섯뿐이며 그것은
+0.3.0 이라 일부러 넣지 않았다.
+
+**그러므로 Windows 6개를 옮길 필요가 없다.** 한때 필수라고 기록됐던 것은 잘못된
+측정이었다 — RPC 를 빈 인자로 불러 `PGRST202` 가 난 것을 함수 부재로 읽었다.
+Windows 의 6개는 역사 기록으로 남는다.
+
+**아직 재지 않은 것 — 존재와 동일성은 다르다.** 위 비교는 함수 **이름**이 같다는
+것이지 **몸통**이 같다는 것이 아니다. 확인할 것 셋:
+
+- 이름이 같은 44 개의 정의가 실제로 같은가
+- prod 44 개가 staging 48 개의 부분집합인가. 개수만으로는 prod 에만 있는 것을
+  걸러내지 못한다
+- grant 가 같은가. 함수가 있어도 못 부를 수 있다. `anon` 거부는 확인됐으나 앱은
+  `authenticated` 로 붙는다
+
+두 덤프가 이미 있으므로 diff 로 답할 수 있다.
 
 **출처 주의.** 0.3.0 산출물이 `_사용안함_과거테스트흔적_20260815/` 안에도 있지만
 그 폴더는 시험하다 늘어난 작업 폴더를 치워둔 잔재이고, `_forbidden` 이 붙은 것은
@@ -605,8 +635,9 @@ release_cloud_config.json   supabase_url + supabase_publishable_key
 
 - 레거시 트랙 — `supabase/migrations/` 여섯 개. 이 저장소에 있다.
 - 계약 트랙 — `get_sync_handshake`, `atomic_structure_commit`, `document_commit`,
-  `private.apply_structure_intent`. **이 저장소에 없다.** iPad 가 갖고 있고,
-  거기서 읽어 revision 대조를 확인했다.
+  `private.apply_structure_intent`. **이 저장소에 없다.** iPad 가 갖고 있다.
+  2026-08-25 확인: iPad 저장소 마이그레이션과 `becbf42` 의 handshake·corrective
+  둘만으로 빈 인스턴스에 계약 서버가 선다. 위 "계약 pin" 절의 갱신을 보라.
 - **0.2.0 allowlist 행** (digest `416c1b99…`). 없으면 핸드셰이크가 전부
   `supported=false` 로 답하고 계약 경로는 어디서도 열리지 않는다. 안전한
   실패이지만, 안 되는 이유가 그것이라는 것은 알고 있어야 한다.
