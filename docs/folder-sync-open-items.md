@@ -587,6 +587,66 @@ iPad 가 canary 에 연결하기 전의 전제 조건이었고, 충족됐다. iP
   `becbf42` 판본은 핸드셰이크를 SQLite 에 영속하고 재시작 후 복원해 설계상
   기각되었다. 그 브랜치의 서버 쪽 산출물은 위 "storage-name-v2" 항목이 붙잡는다.
 
+## 서버 인스턴스를 옮길 때
+
+2026-08-25, 스테이징을 다른 국가의 새 Supabase 프로젝트로 옮기기로 했다. 지금까지
+관측한 것은 전부 `mhpnszcorfzrvhyondxr` 한 인스턴스에 대한 것이므로, 여기 적어
+둔다.
+
+**런타임에서 인스턴스를 정하는 곳은 한 곳뿐이다.**
+
+```
+release_cloud_config.json   supabase_url + supabase_publishable_key
+```
+
+저장소의 다른 `mhpnszcorfzrvhyondxr` 언급은 전부 문서다.
+
+**새 인스턴스가 갖춰야 하는 것**
+
+- 레거시 트랙 — `supabase/migrations/` 여섯 개. 이 저장소에 있다.
+- 계약 트랙 — `get_sync_handshake`, `atomic_structure_commit`, `document_commit`,
+  `private.apply_structure_intent`. **이 저장소에 없다.** iPad 가 갖고 있고,
+  거기서 읽어 revision 대조를 확인했다.
+- **0.2.0 allowlist 행** (digest `416c1b99…`). 없으면 핸드셰이크가 전부
+  `supported=false` 로 답하고 계약 경로는 어디서도 열리지 않는다. 안전한
+  실패이지만, 안 되는 이유가 그것이라는 것은 알고 있어야 한다.
+
+**로컬 상태에 무슨 일이 생기는가**
+
+- 프로젝트 열여섯의 `project_id` 는 옛 인스턴스의 것이다. 새 인스턴스에는 없다.
+- **폴더가 통째로 휴지통으로 가지는 않는다.** 빈 폴더 투영은
+  `_apply_remote_folder_identities` 의 `if not folder_rows: return` 이 무시한다.
+  확인했다. 비어 있지 않으면서 불완전한 투영은 여전히 빠진 것을 은퇴시킨다.
+- canary 행은 옛 서버의 digest·protocol·capabilities 와 폴더 rev 1, order rev 3
+  을 들고 있다. 새 서버에 그 revision 이 없으므로 계약 배치는 거절된다 —
+  fail-closed 지만 소음이다.
+- 인증은 다시 해야 한다. 새 인스턴스는 새 auth 사용자다.
+
+**옮기기 전에 할 것**
+
+canary 관문을 닫는다.
+
+```
+scripts/contract_path_preflight.py --deactivate-contract-path --apply
+  --project-id <canary> --confirm-project-id <canary>
+```
+
+열린 채로 두어도 실제로 열리지는 않는다 — 새 인스턴스에서 신선한 답을 받지
+못하므로 세 다리 중 둘째가 실패한다. 그래도 닫는 이유는 **기록이 거짓말을 하지
+않게** 하기 위해서다. 관문이 열려 있다는 행은 그 서버가 아직 거기 있다는 뜻으로
+읽힌다.
+
+**옮긴 뒤 다시 세워야 하는 것**
+
+아래 "canary 기대 기준선" 은 옛 인스턴스에 대한 것이고 전부 무의미해진다.
+
+그리고 더 큰 것 하나. **7번에서 실증한 다섯 가지는 배포된 한 인스턴스를 관측한
+결과다** — 서버가 계약 배치를 받는다, 로컬 revision 이 서버 응답과 맞는다,
+전송 불가 시 대기한다, 원고가 손상되지 않는다, 낡은 revision 은
+`REVISION_CONFLICT` 로 거절된다. 새 인스턴스가 같은 함수를 같은 모양으로
+배포했다는 것이 확인되기 전까지 이 다섯은 **이월되지 않는다.** 옮긴 뒤 같은
+순서로 다시 관측해야 한다. 도구는 그대로 쓸 수 있다.
+
 ## canary 기대 기준선
 
 `SYNC-V2-CANARY-20260823` (`4df996c8-6443-4429-9dad-8fe3573af3d1`) 의 아래 상태는

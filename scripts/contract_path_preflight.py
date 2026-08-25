@@ -2083,6 +2083,146 @@ def run_structure_write(
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def run_deactivation(
+    live: Path, project_id: str, confirm_id: str, apply_change: bool
+):
+    """Shut one project's gate. The way back, and the only one there is.
+
+    Opening needed the server's answer. Shutting does not, and must not: the
+    reason to shut a gate is usually that something about the server is wrong
+    or about to change, and a rollback that first has to ask the thing it is
+    rolling back from is no rollback. So this builds no client, takes no
+    credential lock and sends nothing.
+
+    What the row keeps is deliberate. The digest, protocol and capabilities the
+    last handshake recorded stay where they are, as the last observation. They
+    open nothing on their own -- a shut gate is the first of three conditions
+    and it fails alone.
+    """
+    from sync_v2_store import SyncV2Store
+
+    checks = Checks()
+    print("[deactivation]")
+    show(
+        "mode",
+        "apply" if apply_change else "dry run - nothing will be written",
+    )
+    show("target_project_id", project_id)
+    show("network_used", False)
+    checks.require(
+        "the project id was given twice and matched",
+        bool(project_id) and project_id == confirm_id,
+        "--project-id and --confirm-project-id differ",
+    )
+    if checks.failed:
+        checks.report()
+        show("verdict", "STOP - the two project ids do not match")
+        return 1
+
+    gates_before = gate_snapshot(live)
+    if project_id not in gates_before:
+        checks.report()
+        show("verdict", "STOP - no such project here")
+        return 1
+    show("other_projects", len(gates_before) - 1)
+    show("gate_before", gates_before[project_id][0])
+    checks.require(
+        "its gate is open to begin with",
+        gates_before[project_id][0] is True,
+        "it is already shut, so there is nothing to close",
+    )
+
+    # Read-only until there is something to write. Opening the store moves the
+    # file even when no row changes, and a dry run that does that cannot be
+    # held to the promise every other reporting mode is held to.
+    connection = sqlite3.connect(live.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        local_key = connection.execute(
+            "SELECT local_key FROM sync_projects WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["local_key"]
+    finally:
+        connection.close()
+    unanswered = unanswered_contract_batches(live, local_key)
+    show("contract_batches_without_an_answer", unanswered)
+    # A batch already queued goes out whether or not the gate is still open --
+    # the gate is checked when a batch is built, not when it is sent. Shutting
+    # over one would send it anyway, from a project that no longer means to.
+    checks.require(
+        "no batch is still waiting for an answer",
+        unanswered == 0,
+        f"{unanswered} waiting",
+    )
+    if checks.failed:
+        checks.report()
+        show(
+            "verdict", "STOP - " + ", ".join(n for n, _p, _d in checks.failed)
+        )
+        return 1
+
+    if not apply_change:
+        checks.report()
+        show(
+            "verdict", "every check passed; re-run with --apply to shut the gate"
+        )
+        return 0
+
+    work_before = project_work_counts(live, local_key)
+    store = SyncV2Store(str(live))
+    store.set_contract_path_enabled(local_key, False)
+    gates_after = gate_snapshot(live)
+    work_after = project_work_counts(live, local_key)
+    stored = store.get_project_by_id(project_id)
+
+    print()
+    print("[what changed]")
+    moved = [
+        other for other in gates_after
+        if gates_after[other] != gates_before[other]
+    ]
+    show("gate_rows_changed", len(moved))
+    show("gate_after", gates_after[project_id][0])
+    show("recorded_contract_sha256_kept", bool(stored["active_contract_sha256"]))
+    show("project_sync_mode", stored["project_sync_mode"])
+    show("migration_epoch", stored["migration_epoch"])
+    checks.require(
+        "exactly one gate moved", moved == [project_id], f"{len(moved)} moved"
+    )
+    checks.require(
+        "it is shut now", gates_after[project_id][0] is False, "still open"
+    )
+    checks.require(
+        "the other gates are where they were",
+        all(
+            gates_after[other] == gates_before[other]
+            for other in gates_after if other != project_id
+        ),
+        "another project's gate moved",
+    )
+    checks.require(
+        "shutting it queued nothing", work_after == work_before,
+        "the queue or the batch table moved",
+    )
+    checks.require(
+        "mode and epoch are untouched",
+        (stored["project_sync_mode"], int(stored["migration_epoch"] or 0))
+        == ("LEGACY", 0),
+        f'{stored["project_sync_mode"]}/{stored["migration_epoch"]}',
+    )
+    print()
+    checks.report()
+    if checks.failed:
+        show("verdict", "STOP - " + ", ".join(n for n, _p, _d in checks.failed))
+        return 1
+    show(
+        "verdict",
+        "the gate is shut for this project and no other; structure work goes "
+        "out legacy again from here",
+    )
+    return 0
+
+
 def run_stale_reorder_probe(
     live: Path,
     project_id: str,
@@ -2524,6 +2664,11 @@ def main():
         help="the name of the folder to make, required with --structure-write",
     )
     parser.add_argument(
+        "--deactivate-contract-path", action="store_true",
+        help="shut one project's contract gate. Builds no client, takes no "
+             "credential lock and sends nothing. Reports only unless --apply",
+    )
+    parser.add_argument(
         "--stale-reorder-probe", action="store_true",
         help="send one reorder against a revision the server has moved past, "
              "to find out whether it refuses. Its children are the ones "
@@ -2624,6 +2769,13 @@ def main():
                 args.confirm_project_id.strip(),
                 args.apply,
             )
+        if args.deactivate_contract_path:
+            status = run_deactivation(
+                database,
+                args.project_id.strip(),
+                args.confirm_project_id.strip(),
+                args.apply,
+            )
         if args.stale_reorder_probe:
             status = run_stale_reorder_probe(
                 database,
@@ -2650,6 +2802,8 @@ def main():
             _SyncManager.release_auth_lease()
 
     if not args.activate_contract_path and not (
+        args.deactivate_contract_path and args.apply
+    ) and not (
         (args.structure_write or args.stale_reorder_probe) and args.apply
     ):
         # Every other mode promises not to write. This is where that promise is
