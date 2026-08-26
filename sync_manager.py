@@ -60,6 +60,10 @@ PERMANENT_FOLDER_ERROR_CODES = frozenset({
     "INVALID_ARGUMENT",
 })
 TREE_ORDER_DOCUMENT_PATH = "__antigravity__/tree-order.json"
+STRUCTURE_AUTHORITY_UNKNOWN = "unknown"
+STRUCTURE_AUTHORITY_CONTRACT = "contract"
+STRUCTURE_AUTHORITY_LEGACY = "legacy"
+STRUCTURE_AUTHORITY_BLOCKED = "blocked"
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
 LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
 NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
@@ -448,18 +452,25 @@ class V2PullWorker(QThread):
                 if self.sync_manager._needs_folder_history(folders)
                 else []
             )
-            tree_orders = (
-                self.sync_manager._fetch_v2_project_tree_orders(
-                    self.sync_manager.supabase, project_id=project_id
+            # Zero rows only means "contract absent" after this query itself
+            # succeeded. Gate/handshake state controls writes, not whether an
+            # existing contract projection is allowed to disappear from view.
+            tree_orders = self.sync_manager._fetch_v2_project_tree_orders(
+                self.sync_manager.supabase, project_id=project_id
+            )
+            structure_authority = (
+                self.sync_manager._select_remote_structure_authority(
+                    documents,
+                    folders,
+                    tree_orders,
                 )
-                if self.sync_manager._uses_contract_structure()
-                else []
             )
             self.resultReady.emit(True, {
                 "documents": documents,
                 "folders": folders,
                 "folder_versions": folder_versions,
                 "tree_orders": tree_orders,
+                "structure_authority": structure_authority,
             })
         except Exception as error:
             self.resultReady.emit(False, str(error))
@@ -695,6 +706,12 @@ class SyncManager(QObject):
         self._structure_mutation_gate = threading.RLock()
         self._local_structure_generation = 0
         self._v2_untracked_recovery_paths = set()
+        # ``None`` means no configured v2 project. configure_v2() changes it
+        # to unknown, and no server write may start until one complete pull has
+        # selected exactly one structure authority for that project generation.
+        self._v2_structure_authority = None
+        self._v2_structure_authority_error = ""
+        self._v2_structure_authority_identity = None
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
@@ -746,6 +763,9 @@ class SyncManager(QObject):
         self._forget_contract_handshake()
         self._v2_wpm = None
         self._v2_untracked_recovery_paths = set()
+        self._v2_structure_authority = None
+        self._v2_structure_authority_error = ""
+        self._v2_structure_authority_identity = None
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
@@ -789,6 +809,9 @@ class SyncManager(QObject):
         # A new project is a new generation, even when the one before it was
         # released first: a reply from the old one must not pass for this one.
         self._v2_context_generation += 1
+        self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+        self._v2_structure_authority_error = ""
+        self._v2_structure_authority_identity = self._v2_pull_identity()
         deterministic_ids = bool(forced_project_id() and not project_id)
         root = getattr(wpm, "writing_root_path", None)
         self._v2_untracked_recovery_paths = set()
@@ -1279,6 +1302,204 @@ class SyncManager(QObject):
         except (SyncContractError, TypeError, ValueError):
             return False
         return True
+
+    def _begin_structure_authority_selection(self):
+        """Close every server-write exit while one pull chooses its source."""
+        if self.is_v2_enabled:
+            self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = self._v2_pull_identity()
+
+    def _accept_structure_authority(self, authority):
+        if authority not in {
+            STRUCTURE_AUTHORITY_CONTRACT,
+            STRUCTURE_AUTHORITY_LEGACY,
+        }:
+            raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+        self._v2_structure_authority = authority
+        self._v2_structure_authority_error = ""
+        self._v2_structure_authority_identity = self._v2_pull_identity()
+
+    def _block_structure_authority(self, error):
+        """Keep pull apply and every queued upload closed after a bad choice."""
+        code = self._stable_error_code(error) or "STRUCTURE_AUTHORITY_UNRESOLVED"
+        self._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+        self._v2_structure_authority_error = code
+        self._v2_structure_authority_identity = self._v2_pull_identity()
+        self._v2_last_pull_apply_blocked = True
+        self._set_sync_state(
+            "conflict",
+            "서버 구조 기준을 하나로 확정하지 못해 적용과 업로드를 "
+            "중단했습니다. 로컬 파일은 변경하지 않았습니다.",
+        )
+        return code
+
+    def _structure_authority_allows_dispatch(self):
+        # ``None`` is kept for old isolated tests and for a manager with no
+        # attached project. Every production configure_v2() starts at unknown.
+        if self._v2_structure_authority_identity != self._v2_pull_identity():
+            return True
+        return self._v2_structure_authority in {
+            None,
+            STRUCTURE_AUTHORITY_CONTRACT,
+            STRUCTURE_AUTHORITY_LEGACY,
+        }
+
+    @classmethod
+    def _validated_contract_structure_folder_paths(
+        cls, remote_documents, folder_rows, tree_order_rows
+    ):
+        """Validate one complete ID-based folder projection without writing.
+
+        Contract rows are authoritative once any row exists.  They may not be
+        repaired by the legacy name document. Fixed application roots predate
+        contract ordering and are the only live folders allowed outside an ID
+        order row; every user folder must be named exactly under its proven
+        parent.
+        """
+        if not isinstance(tree_order_rows, list) or not tree_order_rows:
+            raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+
+        live_folder_rows = [
+            row for row in (folder_rows or [])
+            if isinstance(row, dict) and not row.get("is_deleted")
+        ]
+        folders_by_id = {}
+        for row in live_folder_rows:
+            try:
+                folder_id = str(uuid.UUID(str(row.get("folder_id"))))
+                parent_id = row.get("parent_folder_id")
+                parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+                if int(row.get("revision") or 0) < 1:
+                    raise ValueError("invalid folder revision")
+            except (TypeError, ValueError, AttributeError):
+                raise SyncContractError("INVALID_FOLDER_RESPONSE")
+            if folder_id in folders_by_id:
+                raise SyncContractError("INVALID_FOLDER_RESPONSE")
+            folders_by_id[folder_id] = {**row, "parent_folder_id": parent_id}
+
+        resolved = cls._folder_rows_with_tree_paths(list(folders_by_id.values()))
+        if len(resolved) != len(folders_by_id):
+            raise SyncContractError("INVALID_FOLDER_RESPONSE")
+
+        documents_by_id = {}
+        for row in remote_documents or []:
+            if not isinstance(row, dict) or row.get("is_deleted"):
+                continue
+            try:
+                document_id = str(uuid.UUID(str(row.get("document_id"))))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            documents_by_id[document_id] = row
+
+        seen_order_ids = set()
+        children_by_parent = {}
+        seen_children = set()
+        for snapshot in tree_order_rows:
+            if not isinstance(snapshot, dict):
+                raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+            try:
+                order_id = str(uuid.UUID(str(snapshot.get("tree_order_id"))))
+                parent_id = snapshot.get("parent_folder_id")
+                parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+                revision = int(snapshot.get("revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+            children = snapshot.get("children")
+            if (
+                order_id in seen_order_ids
+                or parent_id in children_by_parent
+                or revision < 1
+                or not isinstance(children, list)
+                or (parent_id is not None and parent_id not in folders_by_id)
+            ):
+                raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+            seen_order_ids.add(order_id)
+
+            normalized_children = []
+            for value in children:
+                try:
+                    child_id = str(uuid.UUID(str(value)))
+                except (TypeError, ValueError, AttributeError):
+                    raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+                if child_id in seen_children:
+                    raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+                folder = folders_by_id.get(child_id)
+                document = documents_by_id.get(child_id)
+                if folder is None and document is None:
+                    raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+                actual_parent = (
+                    folder.get("parent_folder_id")
+                    if folder is not None
+                    else document.get("parent_folder_id")
+                )
+                if actual_parent:
+                    try:
+                        actual_parent = str(uuid.UUID(str(actual_parent)))
+                    except (TypeError, ValueError, AttributeError):
+                        raise SyncContractError("TREE_PARENT_MISMATCH")
+                else:
+                    actual_parent = None
+                if actual_parent != parent_id:
+                    raise SyncContractError("TREE_PARENT_MISMATCH")
+                normalized_children.append(child_id)
+                seen_children.add(child_id)
+            children_by_parent[parent_id] = normalized_children
+
+        fixed_root_keys = {
+            cls._tree_path_comparison_key(f"메인/{storage_name}")
+            for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+        }
+        for folder_id, item in resolved.items():
+            path = item["local_path"]
+            if (
+                path == "메인"
+                or cls._tree_path_comparison_key(path) in fixed_root_keys
+            ):
+                continue
+            parent_id = folders_by_id[folder_id].get("parent_folder_id")
+            if folder_id not in children_by_parent.get(parent_id, ()):
+                raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+
+        return {item["local_path"] for item in resolved.values()}
+
+    def _select_remote_structure_authority(
+        self,
+        remote_documents,
+        folder_rows,
+        tree_order_rows,
+    ):
+        """Choose contract or legacy once; never combine them or guess."""
+        if tree_order_rows:
+            folder_paths = self._validated_contract_structure_folder_paths(
+                remote_documents, folder_rows, tree_order_rows
+            )
+            return {
+                "kind": STRUCTURE_AUTHORITY_CONTRACT,
+                "folder_paths": sorted(folder_paths),
+            }
+
+        live_document_paths = set()
+        for item in remote_documents or []:
+            if not isinstance(item, dict) or item.get("is_deleted"):
+                continue
+            try:
+                path = self._safe_relative_path(item.get("relative_path"))
+            except ValueError:
+                continue
+            if is_live_document_path(path):
+                live_document_paths.add(path)
+        legacy_paths = self._remote_tree_folder_paths(
+            remote_documents, live_document_paths
+        )
+        if legacy_paths is None:
+            # A successful zero-row contract query permits legacy selection;
+            # a missing or malformed legacy snapshot does not.
+            raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+        return {
+            "kind": STRUCTURE_AUTHORITY_LEGACY,
+            "folder_paths": sorted(legacy_paths),
+        }
 
     @staticmethod
     def _path_before_local_change(path, aliases):
@@ -2012,6 +2233,9 @@ class SyncManager(QObject):
                 return False
             self._cancel_scheduled_v2_retry(reset_backoff=False)
         if self.is_v2_enabled:
+            if not self._structure_authority_allows_dispatch():
+                self._publish_sync_state()
+                return False
             if self._current_project_server_state() != "active":
                 self._publish_sync_state()
                 return False
@@ -4951,6 +5175,7 @@ class SyncManager(QObject):
         folder_versions,
         remote_documents,
         protected_paths,
+        authoritative_folder_paths=None,
     ):
         """Apply exact folder_id renames before any child document is moved.
 
@@ -4971,9 +5196,13 @@ class SyncManager(QObject):
                 continue
             if is_live_document_path(path):
                 live_document_paths.add(path)
-        remote_folders = self._remote_tree_folder_paths(
-            remote_documents,
-            live_document_paths,
+        remote_folders = (
+            set(authoritative_folder_paths)
+            if authoritative_folder_paths is not None
+            else self._remote_tree_folder_paths(
+                remote_documents,
+                live_document_paths,
+            )
         )
         if remote_folders is None:
             return {"blocked": True, "changes": []}
@@ -5373,6 +5602,7 @@ class SyncManager(QObject):
         remote_documents,
         remote_live_document_paths,
         protected_paths,
+        authoritative_folder_paths=None,
     ):
         """Move a complete clean folder once before applying its document rows.
 
@@ -5385,8 +5615,12 @@ class SyncManager(QObject):
         from project_creation_v1 import CreationError
         from project_identity_v1 import IdentityError
 
-        remote_folders = self._remote_tree_folder_paths(
-            remote_documents, remote_live_document_paths
+        remote_folders = (
+            set(authoritative_folder_paths)
+            if authoritative_folder_paths is not None
+            else self._remote_tree_folder_paths(
+                remote_documents, remote_live_document_paths
+            )
         )
         if remote_folders is None:
             return []
@@ -5533,20 +5767,98 @@ class SyncManager(QObject):
     def _apply_contract_tree_order_snapshots(self, snapshots):
         if not snapshots:
             return None
-        remote_order = self._contract_tree_order_from_snapshots(snapshots)
-        local_order = getattr(self._v2_wpm, "project_settings", {}).get(
-            "tree_order", {}
-        )
-        merged_order = copy.deepcopy(remote_order)
-        if isinstance(local_order, dict):
-            merged_order.update({
-                key: copy.deepcopy(value)
-                for key, value in local_order.items()
-                if key == "메인/휴지통" or key.startswith("메인/휴지통/")
-            })
-        if local_order == merged_order:
-            return None
-        self._save_remote_tree_order_settings(merged_order)
+        with self._structure_mutation_gate:
+            remote_order = self._contract_tree_order_from_snapshots(snapshots)
+            local_order = getattr(self._v2_wpm, "project_settings", {}).get(
+                "tree_order", {}
+            )
+            merged_order = copy.deepcopy(remote_order)
+            if isinstance(local_order, dict):
+                merged_order.update({
+                    key: copy.deepcopy(value)
+                    for key, value in local_order.items()
+                    if key == "메인/휴지통" or key.startswith("메인/휴지통/")
+                })
+
+            local_key = self._v2_context["local_key"]
+            folder_rows = [
+                item for item in self._v2_store.list_folders(local_key)
+                if not item.get("is_deleted")
+            ]
+            remote_folder_paths = {
+                item["local_path"] for item in folder_rows
+            }
+            remote_folder_ids = {
+                self._tree_path_comparison_key(item["local_path"]): item["folder_id"]
+                for item in folder_rows
+            }
+            remote_live_document_paths = {
+                item["local_path"]
+                for item in self._v2_store.list_documents(local_key)
+                if not item.get("is_deleted")
+                and is_live_document_path(item.get("local_path"))
+            }
+            folder_plan = self._build_remote_tree_folder_plan(
+                self._v2_wpm.writing_root_path,
+                remote_order,
+                remote_live_document_paths,
+                remote_folder_paths=remote_folder_paths,
+                has_remote_folder_projection=True,
+            )
+            if local_order == merged_order and all(
+                item["exists"] for item in folder_plan
+            ):
+                return None
+
+            had_tree_order = "tree_order" in self._v2_wpm.project_settings
+            previous_tree_order = copy.deepcopy(local_order)
+            adopted_nodes = []
+            created_paths = []
+            settings_save_attempted = False
+            try:
+                adopted_nodes = self._adopt_remote_tree_folders(
+                    folder_plan, [], remote_folder_ids
+                )
+                adopted_paths = {
+                    node["legacy_path"] for node in adopted_nodes
+                }
+                created_paths.extend(
+                    item["full_path"]
+                    for item in folder_plan
+                    if not item["exists"]
+                    and item["relative_path"] in adopted_paths
+                )
+                for item in folder_plan:
+                    if item["exists"]:
+                        continue
+                    try:
+                        os.mkdir(item["full_path"])
+                        created_paths.append(item["full_path"])
+                    except FileExistsError:
+                        if not self._safe_existing_tree_directory(
+                            self._v2_wpm.writing_root_path,
+                            item["relative_path"],
+                        ):
+                            raise
+                settings_save_attempted = True
+                self._save_remote_tree_order_settings(merged_order)
+            except Exception:
+                if had_tree_order:
+                    self._v2_wpm.project_settings["tree_order"] = previous_tree_order
+                else:
+                    self._v2_wpm.project_settings.pop("tree_order", None)
+                if settings_save_attempted:
+                    try:
+                        self._v2_wpm.save_settings()
+                    except Exception:
+                        pass
+                self._release_adopted_identity(
+                    adopted_nodes,
+                    lambda: self._rollback_remote_tree_folders(
+                        self._v2_wpm.writing_root_path, created_paths
+                    ),
+                )
+                raise
         return {
             "kind": "tree_order",
             "revision": max(int(item.get("revision") or 0) for item in snapshots),
@@ -5560,6 +5872,8 @@ class SyncManager(QObject):
         folder_rows=None,
         folder_versions=None,
         tree_order_rows=None,
+        structure_authority=None,
+        authoritative_folder_paths=None,
     ):
         if (
             not self.is_v2_enabled
@@ -5594,7 +5908,8 @@ class SyncManager(QObject):
         changes = []
         root = os.path.abspath(self._v2_wpm.writing_root_path)
         defer_contract_tree_order = bool(
-            tree_order_rows is not None
+            structure_authority != STRUCTURE_AUTHORITY_LEGACY
+            and tree_order_rows is not None
             and self._v2_store.has_active_structure_kind(
                 self._v2_context["local_key"], "tree_order"
             )
@@ -5616,6 +5931,7 @@ class SyncManager(QObject):
                     folder_versions,
                     remote_documents,
                     protected,
+                    authoritative_folder_paths=authoritative_folder_paths,
                 )
                 if (
                     not identity_result.get("blocked")
@@ -5671,6 +5987,7 @@ class SyncManager(QObject):
             remote_documents,
             remote_live_document_paths,
             protected,
+            authoritative_folder_paths=authoritative_folder_paths,
         )
 
         def full_path(relative_path):
@@ -5714,6 +6031,11 @@ class SyncManager(QObject):
                 is_deleted = bool(remote.get("is_deleted"))
                 deleted_at = remote.get("deleted_at") or remote.get("updated_at")
                 if remote_path == TREE_ORDER_DOCUMENT_PATH:
+                    if structure_authority == STRUCTURE_AUTHORITY_CONTRACT:
+                        # Contract ID rows are the one chosen source. The stale
+                        # legacy document is retained on the server for old
+                        # clients but is neither applied nor used as evidence.
+                        continue
                     if defer_tree_order:
                         # A tree snapshot may lead one folder row during a rapid
                         # multi-rename batch. Never materialize that unconfirmed
@@ -6148,7 +6470,11 @@ class SyncManager(QObject):
                     # stored has to say so instead of reporting nothing.
                     self._block_pull_with_conflict(error)
                 print(f"Failed to apply remote v2 document: {error}")
-        if tree_order_rows is not None and not defer_contract_tree_order:
+        if (
+            structure_authority != STRUCTURE_AUTHORITY_LEGACY
+            and tree_order_rows is not None
+            and not defer_contract_tree_order
+        ):
             try:
                 contract_tree_change = self._apply_contract_tree_order_snapshots(
                     tree_order_rows
@@ -6841,6 +7167,14 @@ class SyncManager(QObject):
     def pull_remote_changes_async(self):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             return False
+        if (
+            self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
+            and self._v2_structure_authority_identity == self._v2_pull_identity()
+        ):
+            # The five-second timer must not turn a fail-closed snapshot into
+            # an automatic retry loop. Reopening/reconfiguring starts one new
+            # selection generation deliberately.
+            return False
         if self._v2_pull_worker is not None:
             try:
                 if self._v2_pull_worker.isRunning():
@@ -6849,6 +7183,7 @@ class SyncManager(QObject):
                 self._v2_pull_worker = None
 
         started_for = self._v2_pull_identity()
+        self._begin_structure_authority_selection()
         worker = V2PullWorker(self, project_id=started_for[1])
         self._v2_pull_worker = worker
 
@@ -6865,19 +7200,48 @@ class SyncManager(QObject):
                     folder_rows = payload.get("folders") or []
                     folder_versions = payload.get("folder_versions") or []
                     tree_order_rows = payload.get("tree_orders") or []
+                    structure_decision = payload.get("structure_authority")
                 else:
-                    # Compatibility with an already-running/legacy worker.
+                    # A payload without a decision predates the authority gate
+                    # and cannot prove that a zero-row contract query happened.
                     documents = payload
                     folder_rows = []
                     folder_versions = []
                     tree_order_rows = []
-                changes = self._apply_v2_remote_documents(
-                    documents,
-                    folder_rows=folder_rows,
-                    folder_versions=folder_versions,
-                    tree_order_rows=tree_order_rows,
+                    structure_decision = None
+                if not isinstance(structure_decision, dict):
+                    self._block_structure_authority(
+                        "STRUCTURE_AUTHORITY_UNRESOLVED"
+                    )
+                    return
+                authority = structure_decision.get("kind")
+                authoritative_folder_paths = structure_decision.get(
+                    "folder_paths"
                 )
+                if authority not in {
+                    STRUCTURE_AUTHORITY_CONTRACT,
+                    STRUCTURE_AUTHORITY_LEGACY,
+                }:
+                    self._block_structure_authority(
+                        "INVALID_TREE_ORDER_RESPONSE"
+                    )
+                    return
+                try:
+                    changes = self._apply_v2_remote_documents(
+                        documents,
+                        folder_rows=folder_rows,
+                        folder_versions=folder_versions,
+                        tree_order_rows=tree_order_rows,
+                        structure_authority=authority,
+                        authoritative_folder_paths=authoritative_folder_paths,
+                    )
+                except Exception as error:
+                    self._block_structure_authority(error)
+                    return
                 if self._v2_last_pull_apply_blocked:
+                    self._block_structure_authority(
+                        "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                    )
                     return
                 # A structure pull is audited whether or not it reported a
                 # change: the apply that quietly skipped its identity work is
@@ -6888,13 +7252,17 @@ class SyncManager(QObject):
                     # pull as applied would hide that until the next launch
                     # refuses to open the project.
                     self._v2_last_pull_apply_blocked = True
-                    self._set_sync_state(
-                        "conflict", self._identity_conflict_detail()
+                    self._block_structure_authority(
+                        "STRUCTURE_IDENTITY_AUDIT_BLOCKED"
                     )
                     return
                 recovered_count = self._recover_untracked_local_files_after_pull(
                     documents
                 )
+                # Local structure, document snapshots and the identity audit
+                # have all landed. Only now may the 250 ms retry path or any
+                # later autosave dispatch queued server writes.
+                self._accept_structure_authority(authority)
                 self._record_sync_success()
                 if changes:
                     self.remoteDocumentsApplied.emit(changes)
@@ -6902,6 +7270,9 @@ class SyncManager(QObject):
                     self._schedule_v2_retry(0)
             else:
                 code = self._stable_error_code(payload)
+                self._block_structure_authority(
+                    code or "STRUCTURE_AUTHORITY_UNRESOLVED"
+                )
                 if code == "PROJECT_TRASHED":
                     self.mark_project_server_state(
                         self._v2_context["project_id"], "trashed"

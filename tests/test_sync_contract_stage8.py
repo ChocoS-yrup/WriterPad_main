@@ -30,7 +30,14 @@ from sync_contract import (
     validate_atomic_structure_response,
     validate_document_commit_response,
 )
-from sync_manager import SyncManager
+from sync_manager import (
+    STRUCTURE_AUTHORITY_BLOCKED,
+    STRUCTURE_AUTHORITY_CONTRACT,
+    STRUCTURE_AUTHORITY_LEGACY,
+    STRUCTURE_AUTHORITY_UNKNOWN,
+    SyncManager,
+    V2PullWorker,
+)
 from sync_v2_store import STAGE8_USER_VERSION, SyncV2Store
 from unicode15_casefold import (
     MAPPING_COUNT,
@@ -449,6 +456,8 @@ class ContractStoreTests(unittest.TestCase):
         manager._v2_store = self.store
         manager._v2_context = {**self.context, **project}
         manager._v2_device_id = DEVICE_ID
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_CONTRACT
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
         arm_contract_handshake(manager)
         manager._v2_wpm = SimpleNamespace(
             writing_root_path=str(Path(self.temp.name) / "writing"),
@@ -1215,6 +1224,294 @@ class ContractStoreTests(unittest.TestCase):
                 "메인/휴지통": ["로컬 보관본.txt"],
             },
         )
+
+    def test_contract_tree_order_is_the_only_source_when_legacy_is_stale(self):
+        manager = self._contract_manager()
+        root = self._folder_snapshot("메인")
+        parent = self._folder_snapshot(
+            "메인/메모장", parent_id=root["folder_id"]
+        )
+        children = [
+            self._folder_snapshot(
+                f"메인/메모장/계약경로검증{suffix}",
+                parent_id=parent["folder_id"],
+            )
+            for suffix in ("", "2", "3", "4")
+        ]
+        previous_rows = [root, parent, *children[:3]]
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], previous_rows
+        )
+        for item in previous_rows:
+            Path(manager._v2_wpm.writing_root_path, item["local_path"]).mkdir(
+                parents=True, exist_ok=True
+            )
+        manager._v2_wpm.project_settings["tree_order"] = {
+            "메인/메모장": [item["name"] for item in children[:3]]
+        }
+        legacy_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/메모장": []},
+            }),
+            "revision": 1,
+            "is_deleted": False,
+        }
+        contract_rows = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [item["folder_id"] for item in children],
+            "revision": 4,
+        }]
+        folder_rows = [root, parent, *children]
+
+        decision = manager._select_remote_structure_authority(
+            [legacy_document],
+            folder_rows,
+            contract_rows,
+        )
+        changes = manager._apply_v2_remote_documents(
+            [legacy_document],
+            strict=True,
+            folder_rows=folder_rows,
+            folder_versions=[],
+            tree_order_rows=contract_rows,
+            structure_authority=decision["kind"],
+            authoritative_folder_paths=decision["folder_paths"],
+        )
+
+        self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_CONTRACT)
+        self.assertTrue(
+            Path(
+                manager._v2_wpm.writing_root_path,
+                "메인/메모장/계약경로검증4",
+            ).is_dir()
+        )
+        self.assertEqual(
+            manager._v2_wpm.project_settings["tree_order"]["메인/메모장"],
+            [item["name"] for item in children],
+        )
+        self.assertEqual(
+            self.store.get_tree_order(
+                self.context["local_key"], "메인/메모장"
+            )["revision"],
+            4,
+        )
+        self.assertIsNone(
+            self.store.get_document(
+                self.context["local_key"],
+                "__antigravity__/tree-order.json",
+            ),
+            "the selected contract pull applied the stale legacy document",
+        )
+        self.assertTrue(any(item.get("kind") == "tree_order" for item in changes))
+
+    def test_zero_contract_rows_selects_a_valid_legacy_snapshot(self):
+        manager = self._contract_manager()
+        legacy_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/메모장": []},
+            }),
+            "revision": 1,
+            "is_deleted": False,
+        }
+
+        decision = manager._select_remote_structure_authority(
+            [legacy_document], [], []
+        )
+
+        self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_LEGACY)
+        self.assertEqual(decision["folder_paths"], ["메인/메모장"])
+
+    def test_valid_empty_contract_row_is_not_mistaken_for_absence(self):
+        manager = self._contract_manager()
+        root = self._folder_snapshot("메인")
+        parent = self._folder_snapshot(
+            "메인/메모장", parent_id=root["folder_id"]
+        )
+        contract_rows = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [],
+            "revision": 1,
+        }]
+
+        decision = manager._select_remote_structure_authority(
+            [], [root, parent], contract_rows
+        )
+
+        self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_CONTRACT)
+
+    def test_pull_worker_proves_contract_absence_even_with_write_gate_closed(self):
+        calls = []
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: calls.append("handshake"),
+            _fetch_v2_project_documents=lambda project_id=None: [],
+            _fetch_v2_project_folders=lambda _client, project_id=None: [],
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: (
+                calls.append("tree_orders") or []
+            ),
+            _select_remote_structure_authority=lambda _documents, _folders, rows: {
+                "kind": STRUCTURE_AUTHORITY_LEGACY,
+                "folder_paths": [],
+                "observed_rows": len(rows),
+            },
+            _uses_contract_structure=lambda: (_ for _ in ()).throw(
+                AssertionError("the local write gate suppressed the read")
+            ),
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(lambda success, payload: results.append(
+            (success, payload)
+        ))
+
+        worker.run()
+
+        self.assertEqual(calls, ["handshake", "tree_orders"])
+        self.assertTrue(results[0][0])
+        self.assertEqual(
+            results[0][1]["structure_authority"]["observed_rows"], 0
+        )
+
+    def test_invalid_contract_never_falls_back_to_valid_legacy(self):
+        manager = self._contract_manager()
+        root = self._folder_snapshot("메인")
+        parent = self._folder_snapshot(
+            "메인/메모장", parent_id=root["folder_id"]
+        )
+        child = self._folder_snapshot(
+            "메인/메모장/계약경로검증4",
+            parent_id=parent["folder_id"],
+        )
+        legacy_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/메모장": ["계약경로검증4"]},
+            }),
+            "revision": 99,
+            "is_deleted": False,
+        }
+        invalid_contract = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [child["folder_id"]],
+            "revision": 0,
+        }]
+
+        with self.assertRaises(SyncContractError) as raised:
+            manager._select_remote_structure_authority(
+                [legacy_document],
+                [root, parent, child],
+                invalid_contract,
+            )
+
+        self.assertEqual(raised.exception.code, "INVALID_TREE_ORDER_RESPONSE")
+        self.assertEqual(
+            manager._v2_wpm.project_settings["tree_order"], {}
+        )
+        self.assertIsNone(
+            self.store.get_folder_by_id(child["folder_id"])
+        )
+
+    def test_unknown_or_blocked_authority_stops_upload_dispatch_with_teeth(self):
+        legacy_context = self.store.configure_project(
+            str(Path(self.temp.name) / "legacy-writing"),
+            "Legacy dispatch gate",
+            OTHER_PROJECT_ID,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = legacy_context
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._active_server_syncs = 0
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        operation = self.store.enqueue(
+            legacy_context,
+            "메인/원고/대기.txt",
+            "본문",
+            relative_path="메인/원고/대기.txt",
+        )
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+
+        with patch.object(manager, "_launch_v2_operation") as launch:
+            self.assertFalse(manager.retry_pending_syncs())
+            launch.assert_not_called()
+
+            # This is the tooth check: disabling only the authority guard lets
+            # the exact same queued document reach the dispatcher.
+            manager._v2_structure_authority = STRUCTURE_AUTHORITY_LEGACY
+            self.assertTrue(manager.retry_pending_syncs())
+            launch.assert_called_once()
+        self.assertEqual(
+            self.store.operation(operation["operation_id"])["status"],
+            "pending",
+        )
+
+    def test_blocked_authority_stops_the_five_second_pull_entrypoint(self):
+        manager = self._contract_manager()
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker",
+            side_effect=AssertionError("blocked timer built a new pull worker"),
+        ) as worker:
+            self.assertFalse(manager.pull_remote_changes_async())
+        worker.assert_not_called()
+
+    def test_failed_contract_selection_blocks_apply_upload_and_timer_reentry(self):
+        manager = self._contract_manager()
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_LEGACY
+        callbacks = {}
+
+        class _Worker:
+            resultReady = SimpleNamespace(
+                connect=lambda callback: callbacks.setdefault("result", callback)
+            )
+            finished = SimpleNamespace(connect=lambda _callback: None)
+
+            def __init__(self, _manager, project_id=None):
+                self.project_id = project_id
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker", _Worker
+        ), patch.object(manager, "_start_worker"):
+            self.assertTrue(manager.pull_remote_changes_async())
+            self.assertEqual(
+                manager._v2_structure_authority,
+                STRUCTURE_AUTHORITY_UNKNOWN,
+            )
+            callbacks["result"](False, "INVALID_TREE_ORDER_RESPONSE")
+
+        self.assertEqual(
+            manager._v2_structure_authority, STRUCTURE_AUTHORITY_BLOCKED
+        )
+        with patch.object(manager, "_apply_v2_remote_documents") as apply, patch.object(
+            manager, "_launch_v2_operation"
+        ) as upload:
+            self.assertFalse(manager.retry_pending_syncs())
+            self.assertFalse(manager.pull_remote_changes_async())
+        apply.assert_not_called()
+        upload.assert_not_called()
 
     def test_pending_contract_tree_order_is_detected_before_remote_projection(self):
         manager = self._contract_manager()

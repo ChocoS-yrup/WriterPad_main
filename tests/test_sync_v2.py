@@ -7251,6 +7251,10 @@ class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
             "folders": [],
             "folder_versions": [],
             "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy",
+                "folder_paths": None,
+            },
         }
 
     def _pull_handler(self):
