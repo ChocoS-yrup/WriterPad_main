@@ -46,18 +46,24 @@ class _DocumentQuery:
         if self.client.block_started is not None:
             self.client.block_started.set()
             self.client.block_release.wait(timeout=5)
-        if self.client.document_error is not None:
+        if self.table_name == "documents" and self.client.document_error is not None:
             raise self.client.document_error
+        source = (
+            self.client.folders
+            if self.table_name == "folders"
+            else self.client.documents
+        )
         rows = [
-            dict(row) for row in self.client.documents
+            dict(row) for row in source
             if row.get("project_id", self.project_id) == self.project_id
         ]
         return SimpleNamespace(data=rows)
 
 
 class _FakeSupabase:
-    def __init__(self, documents=None):
+    def __init__(self, documents=None, folders=None):
         self.documents = list(documents or [])
+        self.folders = list(folders or [])
         self.document_error = None
         self._antigravity_authenticated = True
         self.selects = []
@@ -89,6 +95,18 @@ def _remote_document(
         "revision": revision,
         "is_deleted": is_deleted,
         "deleted_at": "2026-07-28T09:00:00Z" if is_deleted else None,
+        "updated_at": "2026-07-28T10:00:00Z",
+    }
+
+
+def _remote_folder(project_id, folder_id, parent_folder_id, name):
+    return {
+        "project_id": project_id,
+        "folder_id": folder_id,
+        "parent_folder_id": parent_folder_id,
+        "name": name,
+        "revision": 1,
+        "is_deleted": False,
         "updated_at": "2026-07-28T10:00:00Z",
     }
 
@@ -414,6 +432,116 @@ class ServerProjectImportTestCase(unittest.TestCase):
         self.assertTrue(Path(result.writing_root_path, "메인", "원고").is_dir())
         self.assertEqual(self.store.get_project_import(project_id)["state"], "complete")
         self.assertEqual(self.client.rpc_calls, [])
+
+    def test_folder_projection_adopts_server_ids_without_queueing_or_projection_rows(self):
+        """Import keeps the fielded folder-ID contract and repeat pull semantics."""
+        project_id = str(uuid.uuid4())
+        tree_document_id = str(uuid.uuid4())
+        root_names = [
+            "원고", "캐릭터", "설정집", "메모장", "스토리 플롯",
+            "흐름정리", "복선", "장소", "휴지통",
+        ]
+        folder_ids = {"메인": str(uuid.uuid4())}
+        folder_ids.update({
+            f"메인/{name}": str(uuid.uuid4()) for name in root_names
+        })
+        main_id = folder_ids["메인"]
+        self.client.folders = [
+            _remote_folder(project_id, main_id, None, "메인"),
+            *[
+                _remote_folder(
+                    project_id, folder_ids[f"메인/{name}"], main_id, name
+                )
+                for name in root_names
+            ],
+        ]
+        tree_order = {"<root>": root_names}
+        tree_remote = _remote_document(
+            project_id,
+            document_id=tree_document_id,
+            path="__antigravity__/tree-order.json",
+            content=SyncManager._tree_order_content(tree_order),
+            revision=1,
+        )
+        self.client.documents = [tree_remote]
+
+        result = self._service().import_project(
+            project_id, "iPad E2E 폴더 작품"
+        )
+
+        project_root = Path(result.writing_root_path).parent
+        identity_path = project_root / ".writerpad" / "identity-v1.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity_folders = {
+            node["legacy_path"]: node["uuid"]
+            for node in identity["nodes"]
+            if node["kind"] == "folder"
+        }
+        self.assertEqual(identity_folders, folder_ids)
+        for relative_path in folder_ids:
+            self.assertTrue(
+                Path(result.writing_root_path, *relative_path.split("/")).is_dir(),
+                relative_path,
+            )
+
+        binding = self.store.get_project_by_id(project_id)
+        def operation_row_counts():
+            connection = sqlite3.connect(self.store.db_path)
+            try:
+                return tuple(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE local_key = ?",
+                        (binding["local_key"],),
+                    ).fetchone()[0]
+                    for table in (
+                        "sync_operations", "sync_structure_operations"
+                    )
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(self.store.list_folders(binding["local_key"]), [])
+        self.assertEqual(operation_row_counts(), (0, 0))
+        self.assertEqual(self.store.counts(binding["local_key"])["total"], 0)
+        self.assertEqual(self.client.rpc_calls, [])
+
+        first_identity = identity_path.read_bytes()
+        first_settings = Path(
+            result.writing_root_path, "설정.json"
+        ).read_bytes()
+        wpm = WritingProjectManager.create_detached(
+            str(self.workspace),
+            result.local_project_name,
+            result.writing_root_path,
+        )
+        self.manager.configure_v2(
+            wpm,
+            result.local_project_name,
+            self.device_id,
+            store=self.store,
+            project_id=project_id,
+            recover_local_changes=False,
+        )
+
+        repeated_changes = self.manager._apply_v2_remote_documents(
+            [dict(tree_remote)], strict=True
+        )
+
+        self.assertEqual(repeated_changes, [])
+        self.assertEqual(identity_path.read_bytes(), first_identity)
+        self.assertEqual(
+            Path(result.writing_root_path, "설정.json").read_bytes(),
+            first_settings,
+        )
+        self.assertEqual(self.store.list_folders(binding["local_key"]), [])
+        self.assertEqual(operation_row_counts(), (0, 0))
+        self.assertEqual(self.store.counts(binding["local_key"])["total"], 0)
+        self.assertEqual(self.manager.pending_retry_count, 0)
+        self.assertEqual(self.client.rpc_calls, [])
+        self.assertEqual(
+            [table_name for table_name, _fields in self.client.selects],
+            ["documents", "folders"],
+        )
 
     def test_missing_completed_local_folder_can_be_imported_again(self):
         project_id = str(uuid.uuid4())
