@@ -1,3 +1,4 @@
+import base64
 import copy
 import io
 import json
@@ -55,6 +56,7 @@ PROJECT_ID = "00000000-0000-4000-8000-000000000201"
 DEVICE_ID = "60000000-0000-4000-8000-000000000201"
 BATCH_ID = "10000000-0000-4000-8000-000000000201"
 OTHER_PROJECT_ID = "00000000-0000-4000-8000-000000000202"
+DEFAULT_SUBJECT = "00000000-0000-4000-8000-000000000203"
 
 
 LIVE_PROJECT_ID = "01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2"
@@ -104,12 +106,27 @@ def unsupported_handshake(project_id=PROJECT_ID, **overrides):
     return live_reply(LIVE_INACTIVE_REPLY, project_id, **overrides)
 
 
-def arm_contract_handshake(manager, outcome="supported"):
-    """Leave behind the reading a fresh handshake would have recorded."""
+def access_token_with_subject(subject=DEFAULT_SUBJECT):
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"sub": subject}, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def arm_contract_handshake(
+    manager, outcome="supported", subject=DEFAULT_SUBJECT
+):
+    """Leave behind an explicitly synthetic fresh handshake reading."""
+    if manager.supabase is None:
+        manager.supabase = SimpleNamespace()
+    manager.supabase._antigravity_access_token = (
+        access_token_with_subject(subject) if subject is not None else "not-a-jwt"
+    )
+    identity = manager._contract_identity()
     manager._contract_handshake = {
         "generation": manager._v2_context_generation,
         "project_id": manager._v2_context["project_id"],
-        "identity": manager._contract_identity(),
+        "identity": identity,
         "contract_sha256": CANONICAL_CONTRACT_SHA256,
         "observed_at": "",
         "outcome": outcome,
@@ -120,13 +137,16 @@ def arm_contract_handshake(manager, outcome="supported"):
 class _HandshakeClient:
     """A Supabase stand-in that answers get_sync_handshake and counts calls."""
 
-    def __init__(self, reply, email="writer@example.invalid"):
+    def __init__(
+        self, reply, email="writer@example.invalid", subject=DEFAULT_SUBJECT
+    ):
         self.reply = reply
         self.calls = []
         # ``ensure_session_valid`` leaves a client with no auth alone, which is
         # what keeps these cases off the token refresh path entirely.
         self.auth = None
         self._antigravity_email = email
+        self._antigravity_access_token = access_token_with_subject(subject)
         self._antigravity_authenticated = True
 
     def rpc(self, name, params):
@@ -2281,7 +2301,34 @@ class ContractHandshakeGateTests(unittest.TestCase):
         self.manager.enable_contract_path()
         self.assertTrue(self.manager._uses_contract_structure())
 
-        self.manager.supabase._antigravity_email = "other@example.invalid"
+        # Keep the email unchanged: the stable account subject, not a private
+        # supabase-py address attribute, owns cache invalidation.
+        self.manager.supabase._antigravity_access_token = (
+            access_token_with_subject(
+                "00000000-0000-4000-8000-000000000204"
+            )
+        )
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_an_unreadable_subject_cannot_arm_the_contract_path(self):
+        client = self._attach(supported_handshake())
+        client._antigravity_access_token = "not-a-jwt"
+
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.enable_contract_path()
+
+        self.assertEqual(raised.exception.code, "AUTH_REQUIRED")
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_two_empty_identity_markers_never_make_a_reading_fresh(self):
+        client = self._attach(supported_handshake())
+        client._antigravity_access_token = "not-a-jwt"
+        arm_contract_handshake(self.manager, subject=None)
+
+        self.assertEqual(self.manager._contract_handshake["identity"], "")
         self.assertFalse(self.manager.contract_handshake_is_fresh())
         self.assertFalse(self.manager._uses_contract_structure())
 
@@ -2484,14 +2531,23 @@ class ContractHandshakeGateTests(unittest.TestCase):
                     self._project()["project_sync_mode"], "LEGACY"
                 )
 
-    def test_an_absent_protocol_set_falls_back_to_the_scalar_alone(self):
-        """The field is not in the contract's required five; missing is allowed."""
-        reply = supported_handshake()
-        reply.pop("supported_protocol_versions")
-        self._attach(reply)
-        self.assertEqual(
-            self.manager.perform_contract_handshake()["outcome"], "supported"
-        )
+    def test_each_absent_coherence_field_is_refused(self):
+        """No missing fact may silently become agreement with the client pin."""
+        for field in (
+            "contract_version",
+            "canonical_contract_sha256",
+            "supported_protocol_versions",
+        ):
+            with self.subTest(field=field):
+                self.manager._forget_contract_handshake()
+                reply = supported_handshake()
+                reply.pop(field)
+                self._attach(reply)
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
 
     def _server_moved_the_project_to_migrating(self):
         """Exactly what a handshake records once the server promotes a project.

@@ -87,6 +87,7 @@ whether it does.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -1207,10 +1208,22 @@ def arm_manager_from_stored_contract(manager, project):
         server_contract_sha256=project["active_contract_sha256"] or "",
         server_capabilities=json.loads(project["server_capabilities_json"] or "[]"),
     )
+    # This manager exists only inside an offline dry run. Give it a token-shaped
+    # holder with a plainly synthetic subject instead of relying on the
+    # runtime's old empty-marker equality. It has no auth or RPC methods and no
+    # real credential, so it cannot send or authorize anything.
+    payload = base64.urlsafe_b64encode(json.dumps(
+        {"sub": "offline-stored-contract-dry-run"},
+        separators=(",", ":"),
+    ).encode("utf-8")).decode("ascii").rstrip("=")
+    manager.supabase = SimpleNamespace(
+        _antigravity_access_token=f"header.{payload}.signature"
+    )
+    offline_identity = manager._contract_identity()
     reading = {
         "generation": manager._v2_context_generation,
         "project_id": manager._v2_context["project_id"],
-        "identity": manager._contract_identity(),
+        "identity": offline_identity,
         "contract_sha256": CANONICAL_CONTRACT_SHA256,
         "observed_at": project.get("contract_validated_at") or "",
         "outcome": "supported",

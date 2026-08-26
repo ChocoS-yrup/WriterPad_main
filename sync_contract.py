@@ -359,35 +359,44 @@ def read_handshake_compatibility(handshake):
 
 def _require_coherent_handshake(handshake, digest, protocol_version):
     """Refuse a reply whose extra fields contradict the ones acted on."""
-    supported_versions = handshake.get("supported_protocol_versions")
-    if supported_versions is not None:
-        if not isinstance(supported_versions, (list, tuple)) or not all(
-            isinstance(item, int) and not isinstance(item, bool)
-            for item in supported_versions
-        ):
-            raise SyncContractError(
-                "INVALID_ARGUMENT", "invalid supported_protocol_versions"
-            )
-        if supported_versions and SYNC_PROTOCOL_VERSION not in supported_versions:
-            # server_protocol_version on its own is only a ceiling, so a server
-            # that has dropped protocol 3 and answers 4 clears the >= check
-            # while refusing everything this client can actually say. The set is
-            # the field that says which versions are still accepted.
-            raise SyncContractError("PROTOCOL_TOO_OLD")
-        if protocol_version not in supported_versions and supported_versions:
-            raise SyncContractError(
-                "INVALID_ARGUMENT", "server_protocol_version outside its own set"
-            )
+    if "supported_protocol_versions" not in handshake:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "missing supported_protocol_versions"
+        )
+    supported_versions = handshake["supported_protocol_versions"]
+    if not isinstance(supported_versions, (list, tuple)) or not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in supported_versions
+    ):
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "invalid supported_protocol_versions"
+        )
+    if SYNC_PROTOCOL_VERSION not in supported_versions:
+        # server_protocol_version on its own is only a ceiling, so a server
+        # that has dropped protocol 3 and answers 4 clears the >= check while
+        # refusing everything this client can actually say. The set is the
+        # field that says which versions are still accepted.
+        raise SyncContractError("PROTOCOL_TOO_OLD")
+    if protocol_version not in supported_versions:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "server_protocol_version outside its own set"
+        )
 
-    canonical = handshake.get("canonical_contract_sha256")
-    if canonical is not None and canonical != digest:
+    if "canonical_contract_sha256" not in handshake:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "missing canonical_contract_sha256"
+        )
+    canonical = handshake["canonical_contract_sha256"]
+    if canonical != digest:
         # The digest the server allowlists and the digest it reports serving
         # are one identity. A server that gives two different answers has not
         # told this client which contract it is on.
         raise SyncContractError("CONTRACT_DIGEST_MISMATCH")
 
-    contract_version = handshake.get("contract_version")
-    if contract_version is not None and contract_version != CONTRACT_VERSION:
+    if "contract_version" not in handshake:
+        raise SyncContractError("INVALID_ARGUMENT", "missing contract_version")
+    contract_version = handshake["contract_version"]
+    if contract_version != CONTRACT_VERSION:
         # A digest that matches the pin while the version does not means the
         # allowlist row disagrees with itself about what 0.2.0 is.
         raise SyncContractError("CONTRACT_DIGEST_MISMATCH")

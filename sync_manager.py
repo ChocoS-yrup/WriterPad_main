@@ -1103,16 +1103,26 @@ class SyncManager(QObject):
         """A short, one-way marker for whoever is signed in.
 
         A handshake answers for one account's membership, so a reading has to
-        stop counting when somebody else signs in. The address itself is never
-        kept anywhere - only this digest of it.
+        stop counting when somebody else signs in. ``sub`` is decoded from the
+        access token without verifying the token and is therefore only a cache
+        invalidation marker. It is never identity proof or an authorization
+        decision; the server still owns both of those.
         """
         try:
-            email = str(getattr(self.supabase, "_antigravity_email", "") or "")
+            token = str(
+                getattr(self.supabase, "_antigravity_access_token", "") or ""
+            )
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(
+                base64.urlsafe_b64decode(payload).decode("utf-8")
+            )
+            subject = claims.get("sub")
         except Exception:
-            email = ""
-        if not email:
             return ""
-        return hashlib.sha256(email.encode("utf-8")).hexdigest()[:16]
+        if not isinstance(subject, str) or not subject:
+            return ""
+        return hashlib.sha256(subject.encode("utf-8")).hexdigest()[:16]
 
     def _forget_contract_handshake(self):
         """Drop the reading so nothing downstream can act on it any more."""
@@ -1135,7 +1145,12 @@ class SyncManager(QObject):
             return None
         if reading.get("contract_sha256") != CANONICAL_CONTRACT_SHA256:
             return None
-        if reading.get("identity") != self._contract_identity():
+        current_identity = self._contract_identity()
+        if (
+            not current_identity
+            or not reading.get("identity")
+            or reading.get("identity") != current_identity
+        ):
             return None
         return reading
 
@@ -1173,7 +1188,6 @@ class SyncManager(QObject):
 
         generation = self._v2_context_generation
         project_id = self._v2_context["project_id"]
-        identity = self._contract_identity()
         response = self._call_with_session(
             lambda: self.supabase.rpc("get_sync_handshake", {
                 "p_project_id": project_id,
@@ -1181,6 +1195,12 @@ class SyncManager(QObject):
             }).execute(),
             self.supabase,
         )
+        # Session validation above may have refreshed the token. Bind the
+        # reading to the subject of the token that actually made the request,
+        # and refuse to cache it when no non-empty marker can be derived.
+        identity = self._contract_identity()
+        if not identity:
+            raise SyncContractError("AUTH_REQUIRED")
         handshake = self._response_data(response)
         if not isinstance(handshake, dict):
             raise SyncContractError("INVALID_ARGUMENT", "invalid handshake")
