@@ -1455,6 +1455,7 @@ class ContractStoreTests(unittest.TestCase):
         manager._v2_context = legacy_context
         manager._v2_worker = None
         manager._v2_structure_worker = None
+        manager._v2_pull_worker = None
         manager._active_server_syncs = 0
         manager._v2_structure_authority_identity = manager._v2_pull_identity()
         operation = self.store.enqueue(
@@ -1491,6 +1492,156 @@ class ContractStoreTests(unittest.TestCase):
             self.assertFalse(manager.pull_remote_changes_async())
         worker.assert_not_called()
 
+    def test_manual_retry_reselects_authority_before_dispatching_pending_write(self):
+        context = self.store.configure_project(
+            str(Path(self.temp.name) / "manual-retry-writing"),
+            "Manual retry",
+            OTHER_PROJECT_ID,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = context
+        manager._v2_device_id = DEVICE_ID
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._active_server_syncs = 0
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
+        manager._v2_last_pull_apply_blocked = False
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        operation = self.store.enqueue(
+            context,
+            "메인/원고/수동재시도.txt",
+            "로컬 본문",
+            relative_path="메인/원고/수동재시도.txt",
+        )
+        callbacks = {"finished": []}
+
+        class _Worker:
+            resultReady = SimpleNamespace(
+                connect=lambda callback: callbacks.setdefault("result", callback)
+            )
+            finished = SimpleNamespace(
+                connect=lambda callback: callbacks["finished"].append(callback)
+            )
+
+            def __init__(self, _manager, project_id=None):
+                self.project_id = project_id
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker", _Worker
+        ), patch.object(manager, "_start_worker"), patch.object(
+            manager, "_apply_v2_remote_documents", return_value=[]
+        ) as apply, patch.object(
+            manager, "_identity_audit_is_clean", return_value=True
+        ), patch.object(
+            manager, "_recover_untracked_local_files_after_pull", return_value=0
+        ), patch.object(
+            manager, "_launch_contract_structure_batch"
+        ) as structure_launch, patch.object(
+            manager, "_launch_v2_operation"
+        ) as launch:
+            self.assertTrue(manager.retry_pending_syncs(manual=True))
+            self.assertEqual(
+                manager._v2_structure_authority,
+                STRUCTURE_AUTHORITY_UNKNOWN,
+            )
+            launch.assert_not_called()
+
+            callbacks["result"](
+                True,
+                {
+                    "documents": [],
+                    "folders": [],
+                    "folder_versions": [],
+                    "tree_orders": [],
+                    "structure_authority": {
+                        "kind": STRUCTURE_AUTHORITY_LEGACY,
+                        "folder_paths": [],
+                    },
+                },
+            )
+            apply.assert_called_once()
+            launch.assert_not_called()
+            self.assertIsNotNone(
+                self.store.next_ready_operation(context["local_key"])
+            )
+            for callback in callbacks["finished"]:
+                callback()
+
+        structure_launch.assert_not_called()
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[0]["operation_id"], operation["operation_id"])
+
+    def test_manual_retry_that_cannot_reselect_authority_never_dispatches(self):
+        context = self.store.configure_project(
+            str(Path(self.temp.name) / "failed-manual-retry-writing"),
+            "Failed manual retry",
+            OTHER_PROJECT_ID,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = context
+        manager._v2_device_id = DEVICE_ID
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._v2_pull_worker = None
+        manager._active_server_syncs = 0
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
+        manager._v2_last_pull_apply_blocked = False
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        self.store.enqueue(
+            context,
+            "메인/원고/계속대기.txt",
+            "로컬 본문",
+            relative_path="메인/원고/계속대기.txt",
+        )
+        callbacks = {"finished": []}
+
+        class _Worker:
+            resultReady = SimpleNamespace(
+                connect=lambda callback: callbacks.setdefault("result", callback)
+            )
+            finished = SimpleNamespace(
+                connect=lambda callback: callbacks["finished"].append(callback)
+            )
+
+            def __init__(self, _manager, project_id=None):
+                self.project_id = project_id
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker", _Worker
+        ), patch.object(manager, "_start_worker"), patch.object(
+            manager, "_launch_v2_operation"
+        ) as launch:
+            self.assertTrue(manager.retry_pending_syncs(manual=True))
+            callbacks["result"](False, "INVALID_TREE_ORDER_RESPONSE")
+            for callback in callbacks["finished"]:
+                callback()
+
+        self.assertEqual(
+            manager._v2_structure_authority,
+            STRUCTURE_AUTHORITY_BLOCKED,
+        )
+        launch.assert_not_called()
+
     def test_failed_contract_selection_blocks_apply_upload_and_timer_reentry(self):
         manager = self._contract_manager()
         manager.supabase = SimpleNamespace()
@@ -1505,6 +1656,7 @@ class ContractStoreTests(unittest.TestCase):
 
             def __init__(self, _manager, project_id=None):
                 self.project_id = project_id
+                callbacks["worker"] = self
 
             def isRunning(self):
                 return False

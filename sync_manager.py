@@ -2254,6 +2254,23 @@ class SyncManager(QObject):
             self._cancel_scheduled_v2_retry(reset_backoff=False)
         if self.is_v2_enabled:
             if not self._structure_authority_allows_dispatch():
+                # A blocked pull is deliberately sticky for every automatic
+                # entrypoint.  The status dialog's explicit retry is the one
+                # place where the user can ask for a fresh, read-first
+                # authority decision.  The queued write remains untouched and
+                # cannot dispatch unless that pull validates and applies one
+                # complete structure projection.
+                if (
+                    manual
+                    and self._v2_structure_authority
+                    == STRUCTURE_AUTHORITY_BLOCKED
+                    and self._v2_structure_authority_identity
+                    == self._v2_pull_identity()
+                ):
+                    return self.pull_remote_changes_async(
+                        manual=True,
+                        retry_pending_after_pull=True,
+                    )
                 self._publish_sync_state()
                 return False
             if self._current_project_server_state() != "active":
@@ -6695,6 +6712,33 @@ class SyncManager(QObject):
         by_uuid = {node["uuid"]: node for node in nodes}
 
         local_key = self._v2_context["local_key"]
+        pending_renames = self._v2_store.pending_folder_rename_intents(local_key)
+        rename_aliases = [
+            (item["new_path"], item["old_path"])
+            for item in pending_renames
+            if item.get("old_path") and item.get("new_path")
+        ]
+
+        def path_before_pending_renames(path):
+            """Rewind an identity path through durable local rename intents.
+
+            The server projection correctly keeps the old path until its
+            folder commit lands, while identity correctly follows the local
+            filesystem immediately.  That temporary split is not a UUID
+            divergence when an append-only pending intent proves every rename.
+            Chained renames are rewound newest first and bounded by the number
+            of durable intents, so malformed cycles cannot loop.
+            """
+            previous = str(path or "")
+            for _unused in rename_aliases:
+                current = previous
+                for alias in reversed(rename_aliases):
+                    current = self._path_before_local_change(current, [alias])
+                if current == previous:
+                    break
+                previous = current
+            return previous
+
         rows = [
             (str(row.get("folder_id")), row)
             for row in self._v2_store.list_folders(local_key)
@@ -6719,6 +6763,12 @@ class SyncManager(QObject):
                 continue
             at_uuid = by_uuid.get(entity_id)
             if at_uuid is not None and at_uuid["legacy_path"] != local_path:
+                if (
+                    at_path is None
+                    and path_before_pending_renames(at_uuid["legacy_path"])
+                    == local_path
+                ):
+                    continue
                 divergences.append(local_path)
         return sorted(set(divergences))
 
@@ -7184,12 +7234,15 @@ class SyncManager(QObject):
                 break
             current = os.path.dirname(current)
 
-    def pull_remote_changes_async(self):
+    def pull_remote_changes_async(
+        self, *, manual=False, retry_pending_after_pull=False
+    ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             return False
         if (
             self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
             and self._v2_structure_authority_identity == self._v2_pull_identity()
+            and not manual
         ):
             # The five-second timer must not turn a fail-closed snapshot into
             # an automatic retry loop. Reopening/reconfiguring starts one new
@@ -7206,6 +7259,12 @@ class SyncManager(QObject):
         self._begin_structure_authority_selection()
         worker = V2PullWorker(self, project_id=started_for[1])
         self._v2_pull_worker = worker
+        retry_after_success = {"value": False}
+        if manual:
+            self._set_sync_state(
+                "syncing",
+                "서버 구조 기준을 다시 확인한 뒤 대기 작업을 전송합니다.",
+            )
 
         def handle_result(success, payload):
             if not self.is_v2_enabled or self._v2_pull_identity() != started_for:
@@ -7284,6 +7343,7 @@ class SyncManager(QObject):
                 # later autosave dispatch queued server writes.
                 self._accept_structure_authority(authority)
                 self._record_sync_success()
+                retry_after_success["value"] = bool(retry_pending_after_pull)
                 if changes:
                     self.remoteDocumentsApplied.emit(changes)
                 if recovered_count:
@@ -7314,6 +7374,12 @@ class SyncManager(QObject):
         def handle_finished():
             if self._v2_pull_worker is worker:
                 self._v2_pull_worker = None
+                if retry_after_success["value"]:
+                    # resultReady runs before QThread.finished.  Waiting until
+                    # this slot has cleared the pull worker keeps dispatch from
+                    # being rejected as concurrent work, while the accepted
+                    # authority still gates the write itself.
+                    self.retry_pending_syncs(manual=True)
 
         worker.resultReady.connect(handle_result)
         worker.finished.connect(handle_finished)

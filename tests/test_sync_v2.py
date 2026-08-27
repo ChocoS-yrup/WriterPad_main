@@ -6846,6 +6846,44 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             },
         )
 
+    def test_pending_local_folder_rename_is_not_uuid_divergence(self):
+        """서버 old path와 로컬 new path는 전송 전의 정상적인 한 상태다."""
+        old_name = "공용-검증06"
+        new_name = "공용-검증06-윈도우"
+        old_path = f"메인/메모장/{old_name}"
+        new_path = f"메인/메모장/{new_name}"
+        folder_id, rows = self._new_folder_rows(old_name)
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote({
+                "<root>": ["메모장"],
+                "메인/메모장": [old_name],
+                old_path: [],
+            })],
+            strict=True,
+            folder_rows=rows,
+        )
+        self.assertEqual(self._identity_node(old_path)["uuid"], folder_id)
+
+        self.assertTrue(self.wpm.rename_item(old_path, new_path))
+        intent = self.manager.record_folder_rename_intent(old_path, new_path)
+        self.assertEqual(self._identity_node(new_path)["uuid"], folder_id)
+        self.assertEqual(
+            self.store.get_folder_by_id(folder_id)["local_path"], old_path
+        )
+
+        # The pending intent is the durable proof that both paths describe the
+        # same UUID before commit_folder advances the server projection.
+        self.assertEqual(self.manager._identity_uuid_divergences(), [])
+        self.assertTrue(self.manager._identity_audit_is_clean())
+
+        # Tooth: once that proof is terminal, the same split is a real
+        # divergence again and must close the pull.
+        self.store.complete_folder_rename_intent(intent["intent_id"])
+        self.assertEqual(
+            self.manager._identity_uuid_divergences(), [old_path]
+        )
+        self.assertFalse(self.manager._identity_audit_is_clean())
+
     def test_a_failed_identity_adoption_never_finishes_the_pull(self):
         """채택이 실패하면 sync_folders 만 앞서간 채 성공으로 끝나면 안 된다."""
         name = "채택 실패 폴더"
