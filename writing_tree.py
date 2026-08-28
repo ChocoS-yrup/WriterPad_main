@@ -1798,9 +1798,10 @@ class WritingTreeMixin:
                 return
 
             # Rebuild first so the new volume and all 25 chapters are present in
-            # the binder. Queue document UUIDs before publishing tree-order so
-            # another device never materializes the same paths with temporary
-            # local UUIDs first.
+            # the binder. Publish a folder-only binder skeleton before the
+            # chapter documents, then publish the complete order after all
+            # document UUIDs have reached the server. A peer can therefore add
+            # its next volumes without basing that edit on an older tree.
             self.load_tree_data()
             document_operations = []
             if sync_manager is not None:
@@ -1815,6 +1816,34 @@ class WritingTreeMixin:
                     )
                 ]
                 volume_path = f"메인/원고/{new_vol_name}"
+                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                manuscript_path = os.path.join(
+                    self.wpm.writing_root_path, "메인", "원고"
+                )
+                disk_volumes = [
+                    name for name in os.listdir(manuscript_path)
+                    if os.path.isdir(os.path.join(manuscript_path, name))
+                ]
+                saved_volumes = tree_order.get("메인/원고", [])
+                volume_order = [
+                    name for name in saved_volumes if name in disk_volumes
+                ]
+                volume_order.extend(sorted(
+                    (name for name in disk_volumes if name not in volume_order),
+                    key=lambda name: WritingTreeMixin._natural_sort_key(
+                        self, name
+                    ),
+                ))
+                tree_order["메인/원고"] = volume_order
+                tree_order[volume_path] = chapter_names
+                if not sync_manager._uses_contract_structure():
+                    folder_only_order = copy.deepcopy(tree_order)
+                    for parent_path in list(folder_only_order):
+                        if re.fullmatch(r"메인/원고/\d+권", parent_path):
+                            folder_only_order[parent_path] = []
+                    sync_manager.record_tree_order(
+                        folder_only_order, retry=False
+                    )
                 folder_operations = sync_manager.record_path_change(
                     volume_path, volume_path, retry=False
                 )
@@ -1837,26 +1866,6 @@ class WritingTreeMixin:
                 # Do not depend on lazy Qt child materialization for the durable
                 # barrier.  The new volume identity and its exact 25 chapters
                 # are known from the filesystem transaction above.
-                tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
-                manuscript_path = os.path.join(
-                    self.wpm.writing_root_path, "메인", "원고"
-                )
-                disk_volumes = [
-                    name for name in os.listdir(manuscript_path)
-                    if os.path.isdir(os.path.join(manuscript_path, name))
-                ]
-                saved_volumes = tree_order.get("메인/원고", [])
-                volume_order = [
-                    name for name in saved_volumes if name in disk_volumes
-                ]
-                volume_order.extend(sorted(
-                    (name for name in disk_volumes if name not in volume_order),
-                    key=lambda name: WritingTreeMixin._natural_sort_key(
-                        self, name
-                    ),
-                ))
-                tree_order["메인/원고"] = volume_order
-                tree_order[f"메인/원고/{new_vol_name}"] = chapter_names
                 self.defer_tree_order_until_operations(
                     document_operations, tree_order
                 )

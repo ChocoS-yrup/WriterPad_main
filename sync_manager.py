@@ -64,6 +64,11 @@ STRUCTURE_AUTHORITY_UNKNOWN = "unknown"
 STRUCTURE_AUTHORITY_CONTRACT = "contract"
 STRUCTURE_AUTHORITY_LEGACY = "legacy"
 STRUCTURE_AUTHORITY_BLOCKED = "blocked"
+# Legacy folder/document commits and the final tree-order document are separate
+# requests.  A peer can therefore be healthy while a pull briefly sees the
+# first two ahead of the last one.  Re-read only that proven transition; every
+# other malformed structure response keeps the ordinary fail-closed path.
+LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
 LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
 NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
@@ -439,24 +444,44 @@ class V2PullWorker(QThread):
             # once per opened project is the whole policy. The reading has to be
             # in hand before the structure branch below consults it.
             self.sync_manager._ensure_contract_handshake()
-            documents = self.sync_manager._fetch_v2_project_documents(
-                project_id=project_id
-            )
-            folders = self.sync_manager._fetch_v2_project_folders(
-                self.sync_manager.supabase, project_id=project_id
-            )
+            documents = []
+            folders = []
+            tree_orders = []
+            for settle_attempt in range(
+                len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS) + 1
+            ):
+                documents = self.sync_manager._fetch_v2_project_documents(
+                    project_id=project_id
+                )
+                folders = self.sync_manager._fetch_v2_project_folders(
+                    self.sync_manager.supabase, project_id=project_id
+                )
+                # Zero rows only means "contract absent" after this query
+                # itself succeeded. Gate/handshake state controls writes, not
+                # whether an existing contract projection may disappear.
+                tree_orders = self.sync_manager._fetch_v2_project_tree_orders(
+                    self.sync_manager.supabase, project_id=project_id
+                )
+                if not self.sync_manager._legacy_structure_snapshot_in_flight(
+                    documents, folders, tree_orders
+                ):
+                    break
+                if settle_attempt >= len(
+                    LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS
+                ):
+                    raise SyncContractError(
+                        "LEGACY_STRUCTURE_SNAPSHOT_UNSTABLE"
+                    )
+                self.sync_manager._report_legacy_structure_settle_wait()
+                time.sleep(
+                    LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS[settle_attempt]
+                )
             folder_versions = (
                 self.sync_manager._fetch_v2_project_folder_versions(
                     self.sync_manager.supabase, project_id=project_id
                 )
                 if self.sync_manager._needs_folder_history(folders)
                 else []
-            )
-            # Zero rows only means "contract absent" after this query itself
-            # succeeded. Gate/handshake state controls writes, not whether an
-            # existing contract projection is allowed to disappear from view.
-            tree_orders = self.sync_manager._fetch_v2_project_tree_orders(
-                self.sync_manager.supabase, project_id=project_id
             )
             structure_authority = (
                 self.sync_manager._select_remote_structure_authority(
@@ -680,6 +705,13 @@ class SyncManager(QObject):
         self._v2_conflict_callbacks = {}
         self._v2_leases = {}
         self._v2_pull_worker = None
+        self._v2_pull_worker_identity = None
+        # Pull requests are coordinated per durable project key.  The manager
+        # is process-wide and can be rebound while an old worker is finishing,
+        # so a single global "pending" bit would let project A stall project B.
+        # These flags are intentionally memory-only: every bind creates a new
+        # generation whose baseline must be read again.
+        self._v2_pull_coordinators = {}
         self._v2_protected_paths_provider = None
         self._v2_active_paths_provider = None
         self._v2_retry_timer = QTimer(self)
@@ -715,6 +747,12 @@ class SyncManager(QObject):
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
+        # LEGACY / epoch 0 publishes folder rows through commit_folder before
+        # any live child document.  This cache is only an optimization: it is
+        # reset on every project attachment, so a restart always proves the
+        # server projection again from durable identity before sending text.
+        self._legacy_live_folder_fingerprint = None
+        self._legacy_confirmed_live_folder_paths = frozenset()
         self._auth_refresh_generation = 0
         self._auth_retry_blocked = False
         self._shutting_down = False
@@ -746,6 +784,83 @@ class SyncManager(QObject):
             str(context.get("local_key") or ""),
         )
 
+    def _current_pull_coordinator(self, create=True):
+        """Return the coordinator for the currently bound project generation."""
+        identity = self._v2_pull_identity()
+        local_key = identity[2]
+        if not local_key:
+            return None
+        coordinator = self._v2_pull_coordinators.get(local_key)
+        if coordinator is None or coordinator.get("identity") != identity:
+            if not create:
+                return None
+            coordinator = {
+                "identity": identity,
+                "baseline_validated": False,
+                "pull_pending": True,
+                "pulling": False,
+            }
+            self._v2_pull_coordinators[local_key] = coordinator
+        return coordinator
+
+    def _v2_activity_counts(self, local_key=None):
+        """Classify durable work without calling a queued write a conflict."""
+        counts = {
+            "pending": 0,
+            "inflight": 0,
+            "retry_wait": 0,
+            "blocked": 0,
+            "conflict": 0,
+        }
+        if self._v2_store is not None:
+            key = local_key or (self._v2_context or {}).get("local_key")
+            if key:
+                stored = self._v2_store.counts(key)
+                for name in counts:
+                    counts[name] = max(0, int(stored.get(name, 0) or 0))
+        return counts
+
+    def sync_activity_snapshot(self):
+        """User-facing, mutually named sources of outstanding sync work."""
+        counts = self._v2_activity_counts() if self.is_v2_enabled else {
+            "pending": 0, "inflight": 0, "retry_wait": 0,
+            "blocked": 0, "conflict": 0,
+        }
+        coordinator = self._current_pull_coordinator(create=False)
+        return {
+            "transfer_pending": counts["pending"],
+            "transferring": counts["inflight"],
+            "retry_wait": counts["retry_wait"],
+            "conflict": counts["conflict"],
+            "blocked": counts["blocked"],
+            "pull_pending": int(bool(coordinator and coordinator["pull_pending"])),
+            "pulling": int(bool(coordinator and coordinator["pulling"])),
+        }
+
+    @staticmethod
+    def _outbound_work_count(counts):
+        return sum(int(counts.get(name, 0) or 0) for name in (
+            "pending", "inflight", "retry_wait"
+        ))
+
+    def _ordinary_pull_gate_is_open(self, coordinator):
+        """Evaluate queue-empty and pull-start as one main-thread transition."""
+        if coordinator is None or not coordinator["baseline_validated"]:
+            return False
+        counts = self._v2_activity_counts(coordinator["identity"][2])
+        return (
+            self._outbound_work_count(counts) == 0
+            and counts["conflict"] == 0
+            and counts["blocked"] == 0
+            and self._structure_authority_allows_dispatch()
+        )
+
+    def _maybe_start_deferred_pull(self):
+        coordinator = self._current_pull_coordinator(create=False)
+        if not coordinator or not coordinator["pull_pending"]:
+            return False
+        return self.pull_remote_changes_async(reason="general")
+
     def release_v2(self):
         """Serve no project at all until something valid is attached.
 
@@ -769,6 +884,8 @@ class SyncManager(QObject):
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
+        self._legacy_live_folder_fingerprint = None
+        self._legacy_confirmed_live_folder_paths = frozenset()
 
     def configure_v2(
         self,
@@ -812,6 +929,12 @@ class SyncManager(QObject):
         self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
         self._v2_structure_authority_error = ""
         self._v2_structure_authority_identity = self._v2_pull_identity()
+        self._v2_last_pull_apply_blocked = False
+        self._v2_identity_apply_failed = False
+        self._v2_identity_uuid_conflicts = []
+        self._legacy_live_folder_fingerprint = None
+        self._legacy_confirmed_live_folder_paths = frozenset()
+        self._current_pull_coordinator()
         deterministic_ids = bool(forced_project_id() and not project_id)
         root = getattr(wpm, "writing_root_path", None)
         self._v2_untracked_recovery_paths = set()
@@ -1195,6 +1318,7 @@ class SyncManager(QObject):
             }).execute(),
             self.supabase,
         )
+
         # Session validation above may have refreshed the token. Bind the
         # reading to the subject of the token that actually made the request,
         # and refuse to cache it when no non-empty marker can be derived.
@@ -1348,7 +1472,7 @@ class SyncManager(QObject):
         self._v2_structure_authority_identity = self._v2_pull_identity()
         self._v2_last_pull_apply_blocked = True
         self._set_sync_state(
-            "conflict",
+            "blocked",
             "서버 구조 기준을 하나로 확정하지 못해 적용과 업로드를 "
             "중단했습니다. 로컬 파일은 변경하지 않았습니다.",
         )
@@ -1520,6 +1644,109 @@ class SyncManager(QObject):
             "kind": STRUCTURE_AUTHORITY_LEGACY,
             "folder_paths": sorted(legacy_paths),
         }
+
+    @staticmethod
+    def _server_timestamp(value):
+        try:
+            parsed = datetime.fromisoformat(
+                str(value or "").replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _legacy_structure_snapshot_in_flight(
+        cls, remote_documents, folder_rows, tree_order_rows
+    ):
+        """True only for a valid legacy tree visibly older than peer writes.
+
+        Legacy structure publication is deliberately folder/document first and
+        tree-order last.  During that bounded interval, a pull may see live
+        folder rows or live document rows that the newest valid tree document
+        does not name yet.  The timestamps prove which projection is behind;
+        missing/malformed timestamps, malformed trees, and contract rows are
+        never treated as transient.
+        """
+        if tree_order_rows:
+            return False
+        tree_rows = [
+            item for item in (remote_documents or [])
+            if isinstance(item, dict)
+            and not item.get("is_deleted")
+            and str(item.get("relative_path") or "").replace("\\", "/")
+            == TREE_ORDER_DOCUMENT_PATH
+        ]
+        if not tree_rows:
+            return False
+        try:
+            tree_row = max(
+                tree_rows, key=lambda item: int(item.get("revision") or 0)
+            )
+            payload = json.loads(tree_row.get("content") or "{}")
+            if payload.get("version") != 1:
+                return False
+            tree_order = cls._validated_remote_tree_order(
+                payload.get("tree_order")
+            )
+        except (TypeError, ValueError, OSError, json.JSONDecodeError):
+            return False
+        tree_updated_at = cls._server_timestamp(tree_row.get("updated_at"))
+        if tree_updated_at is None:
+            return False
+
+        named_paths = set()
+        for parent_path, child_names in tree_order.items():
+            if parent_path != "<root>":
+                named_paths.add(cls._tree_path_comparison_key(parent_path))
+            for child_name in child_names:
+                named_paths.add(cls._tree_path_comparison_key(
+                    cls._tree_order_child_path(parent_path, child_name)
+                ))
+
+        fixed_root_keys = {
+            cls._tree_path_comparison_key(f"메인/{storage_name}")
+            for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+        }
+        resolved_folders = cls._folder_rows_with_tree_paths(folder_rows or [])
+        for item in resolved_folders.values():
+            if item.get("is_deleted"):
+                continue
+            path = item.get("local_path") or ""
+            path_key = cls._tree_path_comparison_key(path)
+            if (
+                path == "메인"
+                or path_key in fixed_root_keys
+                or path_key in named_paths
+            ):
+                continue
+            updated_at = cls._server_timestamp(item.get("updated_at"))
+            if updated_at is not None and updated_at > tree_updated_at:
+                return True
+
+        for item in remote_documents or []:
+            if not isinstance(item, dict) or item.get("is_deleted"):
+                continue
+            try:
+                path = cls._safe_relative_path(item.get("relative_path"))
+            except ValueError:
+                continue
+            if not is_live_document_path(path):
+                continue
+            if cls._tree_path_comparison_key(path) in named_paths:
+                continue
+            updated_at = cls._server_timestamp(item.get("updated_at"))
+            if updated_at is not None and updated_at > tree_updated_at:
+                return True
+        return False
+
+    def _report_legacy_structure_settle_wait(self):
+        self._set_sync_state(
+            "syncing",
+            "다른 기기의 구조 갱신이 끝나기를 기다리는 중입니다.",
+        )
 
     @staticmethod
     def _path_before_local_change(path, aliases):
@@ -1957,11 +2184,10 @@ class SyncManager(QObject):
 
     @property
     def pending_retry_count(self):
-        persistent = 0
-        if self.is_v2_enabled:
-            counts = self._v2_store.counts(self._v2_context["local_key"])
-            persistent = counts.get("documents", counts["total"])
-        return len(self._retry_queue) + persistent
+        activity = self.sync_activity_snapshot()
+        return len(self._retry_queue) + sum(activity[name] for name in (
+            "transfer_pending", "transferring", "retry_wait"
+        ))
 
     def _absent_project_state(self):
         """Decide what a missing server row means for this project.
@@ -2057,22 +2283,17 @@ class SyncManager(QObject):
             "login_state": login_state,
             "pending_count": self.pending_retry_count,
             "sync_state": self.current_sync_state,
+            "activity": self.sync_activity_snapshot(),
         }
 
     def diagnostic_report(self):
         return format_diagnostic_report(self.diagnostic_snapshot())
 
     def _publish_sync_state(self):
-        v2_counts = None
-        if self.is_v2_enabled:
-            v2_counts = self._v2_store.counts(
-                self._v2_context["local_key"]
-            )
-        persistent_count = (
-            v2_counts.get("documents", v2_counts["total"])
-            if v2_counts is not None else 0
-        )
-        pending_count = len(self._retry_queue) + persistent_count
+        activity = self.sync_activity_snapshot()
+        pending_count = len(self._retry_queue) + sum(activity[name] for name in (
+            "transfer_pending", "transferring", "retry_wait"
+        ))
 
         def publish(state, detail):
             self._set_sync_state(
@@ -2098,12 +2319,36 @@ class SyncManager(QObject):
                     "다시 로그인하면 대기 작업이 이어서 전송됩니다."
                 ),
             )
-        elif self._active_server_syncs > 0:
+        elif (
+            self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
+            and self._v2_structure_authority_identity == self._v2_pull_identity()
+        ):
+            publish(
+                "blocked",
+                "서버 구조 기준을 확정하지 못해 원격 적용과 업로드가 차단됐습니다.",
+            )
+        elif self._active_server_syncs > 0 and not self.is_v2_enabled:
             publish("syncing", "서버에 변경 내용을 올리는 중입니다.")
-        elif v2_counts is not None and v2_counts["conflict"]:
-            count = v2_counts["conflict"]
+        elif activity["conflict"]:
+            count = activity["conflict"]
             publish("conflict", f"자동 병합할 수 없는 문서 충돌이 {count}건 있습니다.")
-        elif v2_counts is not None and v2_counts["total"]:
+        elif activity["blocked"]:
+            count = activity["blocked"]
+            publish("blocked", f"서버 적용이 거부되거나 차단된 작업이 {count}건 있습니다.")
+        elif activity["transferring"] or activity["pulling"]:
+            detail = (
+                "서버의 최신 변경 내용을 확인하는 중입니다."
+                if activity["pulling"] and not activity["transferring"]
+                else "서버에 변경 내용을 올리는 중입니다."
+            )
+            publish("syncing", detail)
+        elif activity["retry_wait"]:
+            detail = (
+                self._v2_store.latest_error(self._v2_context["local_key"])
+                if self.is_v2_enabled else self._last_sync_error
+            )
+            publish("retry_wait", detail or "서버 전송을 다시 시도할 때까지 기다리는 중입니다.")
+        elif activity["transfer_pending"]:
             detail = self._v2_store.latest_error(self._v2_context["local_key"])
             if "LEASE_CONFLICT" in detail:
                 publish(
@@ -2132,6 +2377,8 @@ class SyncManager(QObject):
             state = "offline" if any(item.get("_retry_offline", False) for item in pending) else "failed"
             detail = next((item.get("_retry_error") for item in pending if item.get("_retry_error")), self._last_sync_error)
             publish(state, detail)
+        elif activity["pull_pending"]:
+            publish("pull_pending", "업로드가 안정 지점에 도달하면 서버 변경을 확인합니다.")
         elif self._active_backups > 0:
             publish("backup", "로컬 자동백업을 만드는 중입니다.")
         else:
@@ -2308,6 +2555,11 @@ class SyncManager(QObject):
                     )
             if operation:
                 self._launch_v2_operation(operation)
+                return True
+            # This is the serialized drain boundary: no ready, claimed, retry
+            # or structure work remains for this local_key, and no event-loop
+            # turn occurs between that observation and the pull decision.
+            if self._maybe_start_deferred_pull():
                 return True
         if self._retry_active_key is not None or self._active_server_syncs > 0 or not self._retry_queue:
             return False
@@ -3251,6 +3503,15 @@ class SyncManager(QObject):
         rows = getattr(response, "data", None) or []
         return rows[0] if rows else None
 
+    def _revision_conflict_read_first(self, operation, client=None):
+        """The sole upload-drain exception: read the rejected document only.
+
+        This is deliberately narrower than a project snapshot pull. It cannot
+        apply unrelated remote structure between queued local uploads; it only
+        supplies the revision/base needed by the existing three-way merge.
+        """
+        return self._fetch_remote_document(operation["document_id"], client)
+
     def set_remote_protected_paths_provider(self, provider):
         self._v2_protected_paths_provider = provider
 
@@ -3539,6 +3800,132 @@ class SyncManager(QObject):
             return None
         return cls._normalized_tree_order(tree_order)
 
+    @staticmethod
+    def _is_ordered_subsequence(required, candidate):
+        """Whether every required child remains in its original order."""
+        cursor = iter(candidate)
+        return all(any(value == wanted for value in cursor) for wanted in required)
+
+    @classmethod
+    def _merge_additive_child_orders(cls, base, local, remote):
+        """Merge two insertion-only edits, preserving both ordering constraints.
+
+        Removing or reordering a base child is deliberately outside this helper.
+        Those operations can mean delete, move or rename and need explicit user
+        resolution when both peers touched the same parent.
+        """
+        if not (
+            cls._is_ordered_subsequence(base, local)
+            and cls._is_ordered_subsequence(base, remote)
+        ):
+            return None
+
+        nodes = []
+        for sequence in (remote, local):
+            for value in sequence:
+                if value not in nodes:
+                    nodes.append(value)
+        edges = {value: set() for value in nodes}
+        incoming = {value: 0 for value in nodes}
+        for sequence in (remote, local):
+            for before, after in zip(sequence, sequence[1:]):
+                if after in edges[before]:
+                    continue
+                edges[before].add(after)
+                incoming[after] += 1
+
+        preference = {value: index for index, value in enumerate(nodes)}
+        merged = []
+        ready = [value for value in nodes if incoming[value] == 0]
+        while ready:
+            ready.sort(key=preference.__getitem__)
+            value = ready.pop(0)
+            merged.append(value)
+            for after in edges[value]:
+                incoming[after] -= 1
+                if incoming[after] == 0:
+                    ready.append(after)
+        return merged if len(merged) == len(nodes) else None
+
+    @classmethod
+    def _merge_tree_order_conflict(cls, base_content, local_content, remote_content):
+        """Return a safe three-way tree-order merge, or ``None`` to fail closed.
+
+        A one-sided edit is safe. Concurrent edits to one parent are automatic
+        only when both are insertion-only relative to the shared base. This is
+        the rapid cross-device volume-creation case: neither peer's new volume
+        may disappear merely because the other peer committed first.
+        """
+        def parse(content):
+            try:
+                payload = json.loads(content or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return None
+            raw_order = payload.get("tree_order")
+            if not isinstance(raw_order, dict):
+                return None
+            try:
+                return cls._validated_remote_tree_order(raw_order)
+            except (FileExistsError, TypeError, ValueError):
+                return None
+
+        base_order = parse(base_content)
+        local_order = parse(local_content)
+        remote_order = parse(remote_content)
+        if base_order is None or local_order is None or remote_order is None:
+            return None
+
+        missing = object()
+        merged_order = {}
+        parent_paths = sorted(
+            set(base_order) | set(local_order) | set(remote_order),
+            key=cls._tree_path_comparison_key,
+        )
+        for parent_path in parent_paths:
+            base = base_order.get(parent_path, missing)
+            local = local_order.get(parent_path, missing)
+            remote = remote_order.get(parent_path, missing)
+            if local == remote:
+                chosen = local
+            elif local == base:
+                chosen = remote
+            elif remote == base:
+                chosen = local
+            else:
+                has_missing = any(
+                    value is missing for value in (base, local, remote)
+                )
+                if has_missing:
+                    # The base may lack a parent that both peers independently
+                    # introduced. A missing parent on only one changed side is
+                    # a concurrent removal/move, which is not additive.
+                    if base is not missing and (
+                        local is missing or remote is missing
+                    ):
+                        return None
+                    base_children = [] if base is missing else base
+                    local_children = [] if local is missing else local
+                    remote_children = [] if remote is missing else remote
+                else:
+                    base_children = base
+                    local_children = local
+                    remote_children = remote
+                chosen = cls._merge_additive_child_orders(
+                    base_children, local_children, remote_children
+                )
+                if chosen is None:
+                    return None
+            if chosen is not missing:
+                merged_order[parent_path] = chosen
+
+        try:
+            cls._validated_remote_tree_order(merged_order)
+        except (FileExistsError, TypeError, ValueError):
+            return None
+        return cls._tree_order_content(merged_order)
+
     @classmethod
     def _infer_outbound_empty_folder_rename(cls, base_content, content):
         """Return one exact same-position rename between adjacent tree snapshots."""
@@ -3737,7 +4124,9 @@ class SyncManager(QObject):
             rpc_name="commit_folder",
         )
 
-    def _commit_outbound_folder_lifecycle(self, operation, client):
+    def _commit_outbound_folder_lifecycle(
+        self, operation, client, *, publish_live_only=False, candidates=None
+    ):
         """Make the server's folder rows agree with identity before tree-order.
 
         Identity says where a folder is, so it also says what the server should
@@ -3756,10 +4145,15 @@ class SyncManager(QObject):
         empty = {"created": [], "restored": [], "deleted": [], "blocked": []}
         if not self.is_v2_enabled or self._v2_wpm is None:
             return empty
-        candidates = self._publishable_identity_folders()
+        candidates = list(
+            candidates
+            if candidates is not None
+            else self._publishable_identity_folders()
+        )
         if not candidates:
             return empty
 
+        local_key = self._v2_context["local_key"]
         live_by_id = {}
         deleted_by_id = {}
         live_by_slot = {}
@@ -3778,19 +4172,48 @@ class SyncManager(QObject):
             )] = folder_id
 
         result = {key: list(value) for key, value in empty.items()}
+        live_paths_by_id = self._folder_rows_with_tree_paths(
+            live_by_id.values()
+        )
+        active_document_paths = {
+            self._safe_relative_path(path)
+            for path in self._v2_store.active_document_server_paths(local_key)
+        }
 
-        # 휴지통 으로 간 폴더부터, 깊은 것에서 얕은 것 순으로 내린다.
-        for node in sorted(
-            (node for node in candidates if node["wants_deleted"]),
-            key=lambda node: node["legacy_path"].count("/"),
-            reverse=True,
-        ):
+        # A chapter preflight is allowed to publish live parents only. Folder
+        # deletions must keep their old ordering behind document tombstones and
+        # final tree-order, so they stay in the ordinary lifecycle pass.
+        delete_candidates = (
+            [] if publish_live_only else
+            sorted(
+                (node for node in candidates if node["wants_deleted"]),
+                key=lambda node: node["legacy_path"].count("/"),
+                reverse=True,
+            )
+        )
+        for node in delete_candidates:
             folder_id = str(node["uuid"])
             row = live_by_id.get(folder_id)
             if row is None:
                 # Never published, so there is nothing to tombstone. This is
                 # also what keeps a first upload from trying to create a folder
                 # that is already deleted, which the server refuses outright.
+                continue
+            server_folder = live_paths_by_id.get(folder_id)
+            server_path = (
+                self._safe_relative_path(server_folder.get("local_path"))
+                if server_folder else ""
+            )
+            if server_path and any(
+                path == server_path or path.startswith(server_path + "/")
+                for path in active_document_paths
+            ):
+                # An older tree-order operation can run after a later local
+                # delete has moved identity into trash.  Do not let that older
+                # operation overtake the descendant tombstones.  The tree
+                # snapshot recorded by the delete itself is already queued
+                # after those document operations and will finish the folder
+                # lifecycle once they are terminal.
                 continue
             still_live_child = any(
                 str(other.get("parent_folder_id") or "") == folder_id
@@ -3826,7 +4249,6 @@ class SyncManager(QObject):
             deleted_by_id[folder_id] = {**row, **committed, "is_deleted": True}
             result["deleted"].append(node["legacy_path"])
 
-        local_key = self._v2_context["local_key"]
         for node in (node for node in candidates if not node["wants_deleted"]):
             folder_id = str(node["uuid"])
             if folder_id in live_by_id:
@@ -3873,7 +4295,71 @@ class SyncManager(QObject):
                 node["legacy_path"]
             )
 
+        result["confirmed_live_paths"] = sorted(
+            node["legacy_path"]
+            for node in candidates
+            if not node["wants_deleted"]
+            and str(node["uuid"]) in live_by_id
+        )
         return result
+
+    @staticmethod
+    def _identified_document_parent_path(relative_path):
+        """Return the live parent path that must exist before a document."""
+        normalized = str(relative_path or "").replace("\\", "/").strip("/")
+        if not is_live_document_path(normalized):
+            return None
+        parent_path, separator, _name = normalized.rpartition("/")
+        return parent_path if separator else None
+
+    def _publish_live_parents_before_legacy_document(self, operation, client):
+        """Prove an identified live parent before sending its child document.
+
+        Creation and restore both write identity before their document work.
+        Identity is therefore the restart-safe source of the parent UUIDs.
+        Whenever that live folder set changes, publish every live folder first
+        and cache only what the server projection actually confirmed.  A
+        missing requested parent keeps the document in retry instead of
+        letting path-only commit_document overtake it.
+        """
+        parent_path = self._identified_document_parent_path(
+            operation.get("relative_path")
+        )
+        if parent_path is None:
+            return None
+        candidates = self._publishable_identity_folders()
+        if not candidates:
+            # Pre-identity legacy projects retain their historical behavior.
+            return None
+        candidate_paths = {
+            item["legacy_path"] for item in candidates
+            if not item["wants_deleted"]
+        }
+        if parent_path not in candidate_paths:
+            return None
+        fingerprint = tuple(sorted(
+            (
+                str(item["uuid"]),
+                str(item.get("parent_uuid") or ""),
+                item["legacy_path"],
+                bool(item["wants_deleted"]),
+            )
+            for item in candidates
+        ))
+        if fingerprint != self._legacy_live_folder_fingerprint:
+            result = self._commit_outbound_folder_lifecycle(
+                operation,
+                client,
+                publish_live_only=True,
+                candidates=candidates,
+            )
+            self._legacy_live_folder_fingerprint = fingerprint
+            self._legacy_confirmed_live_folder_paths = frozenset(
+                result["confirmed_live_paths"]
+            )
+        if parent_path not in self._legacy_confirmed_live_folder_paths:
+            raise RuntimeError("PARENT_FOLDER_NOT_PUBLISHED")
+        return parent_path
 
     @staticmethod
     def _folder_slot(parent_folder_id, name):
@@ -4803,6 +5289,152 @@ class SyncManager(QObject):
                     pending.add(child_path)
         return merged
 
+    def _preserve_active_local_creates_in_remote_order(
+        self, local_order, remote_order, remote_live_document_paths
+    ):
+        """Keep proven queued creates while a peer snapshot is caught up.
+
+        A legacy tree-order snapshot describes only server-visible children.
+        During a long add-volume upload it can therefore omit chapters that
+        already exist locally and have durable create operations.  Replacing a
+        present parent list with that partial server list makes identity audit
+        fail and closes both pull and the remaining uploads.
+
+        Two kinds of proven children are added: live server documents omitted
+        by a lagging legacy tree-order write, and outstanding local creates
+        absent from the server document set. Existing server order is never
+        rearranged, and a same-path server child that is not the local
+        operation's document is left for the normal UUID/path conflict guards
+        rather than guessed through here.
+        """
+        if not isinstance(local_order, dict):
+            return copy.deepcopy(remote_order)
+        try:
+            validated_local = self._validated_remote_tree_order(local_order)
+        except (TypeError, ValueError, OSError, FileExistsError):
+            return copy.deepcopy(remote_order)
+        merged = copy.deepcopy(remote_order)
+        remote_live_keys = {
+            self._tree_path_comparison_key(path)
+            for path in (remote_live_document_paths or set())
+            if path
+        }
+        root = os.path.abspath(self._v2_wpm.writing_root_path)
+        retained_by_parent = {}
+
+        # Legacy document commits and the hidden tree-order document are not
+        # atomic. A peer can therefore publish tree rev N while document
+        # commits that it had not yet observed land immediately afterward.
+        # The document rows are positive liveness evidence; retain their known
+        # local positions when that tree revision omits them.
+        for parent, local_children in validated_local.items():
+            if parent not in merged:
+                continue
+            remote_children = list(merged.get(parent) or [])
+            remote_keys = {
+                self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                )
+                for child in remote_children
+            }
+            for child in local_children:
+                path = self._tree_order_child_path(parent, child)
+                path_key = self._tree_path_comparison_key(path)
+                if path_key not in remote_live_keys or path_key in remote_keys:
+                    continue
+                try:
+                    full_path = os.path.abspath(os.path.join(root, path))
+                    if (
+                        os.path.commonpath([root, full_path]) != root
+                        or not os.path.isfile(full_path)
+                        or self._is_reparse_path(full_path)
+                    ):
+                        continue
+                except (OSError, ValueError):
+                    continue
+                retained_by_parent.setdefault(parent, {})[path_key] = child
+
+        for operation in self._v2_store.active_local_document_creates(
+            self._v2_context["local_key"]
+        ):
+            try:
+                path = self._safe_relative_path(operation.get("local_path"))
+            except ValueError:
+                continue
+            if not is_live_document_path(path):
+                continue
+            path_key = self._tree_path_comparison_key(path)
+            if path_key in remote_live_keys:
+                continue
+            parent, separator, name = path.rpartition("/")
+            if not separator or parent not in merged:
+                # A parent omitted wholesale is handled by the existing-order
+                # compatibility merge below this helper.
+                continue
+            try:
+                full_path = os.path.abspath(os.path.join(root, path))
+                if (
+                    os.path.commonpath([root, full_path]) != root
+                    or not os.path.isfile(full_path)
+                    or self._is_reparse_path(full_path)
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+            local_children = validated_local.get(parent)
+            if not isinstance(local_children, list):
+                continue
+            matching = [
+                child
+                for child in local_children
+                if self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                ) == path_key
+            ]
+            if len(matching) != 1:
+                continue
+            retained_by_parent.setdefault(parent, {})[path_key] = matching[0]
+
+        for parent, retained_names in retained_by_parent.items():
+            remote_children = list(merged.get(parent) or [])
+            remote_keys = {
+                self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                )
+                for child in remote_children
+            }
+            if remote_keys.intersection(retained_names):
+                raise SyncContractError("PATH_CONFLICT")
+            local_children = validated_local[parent]
+            candidate_keys = remote_keys.union(retained_names)
+            local_candidate = [
+                child
+                for child in local_children
+                if self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                ) in candidate_keys
+            ]
+            local_candidate_keys = {
+                self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                )
+                for child in local_candidate
+            }
+            base = [
+                child
+                for child in remote_children
+                if self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                ) in local_candidate_keys
+            ]
+            combined = self._merge_additive_child_orders(
+                base, local_candidate, remote_children
+            )
+            if combined is None:
+                raise SyncContractError("TREE_ORDER_CONFLICT")
+            merged[parent] = combined
+        return merged
+
     def _apply_remote_tree_order_document(
         self,
         document_id,
@@ -4915,6 +5547,9 @@ class SyncManager(QObject):
                 )
             except (TypeError, ValueError, OSError, FileExistsError):
                 effective_order = remote_order
+        effective_order = self._preserve_active_local_creates_in_remote_order(
+            local_order, effective_order, remote_live_document_paths
+        )
         effective_order = self._merge_existing_orders_omitted_by_remote(
             local_order, effective_order
         )
@@ -7235,10 +7870,23 @@ class SyncManager(QObject):
             current = os.path.dirname(current)
 
     def pull_remote_changes_async(
-        self, *, manual=False, retry_pending_after_pull=False
+        self, *, manual=False, retry_pending_after_pull=False, reason=None
     ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             return False
+        coordinator = self._current_pull_coordinator()
+        if reason is None:
+            reason = (
+                "baseline"
+                if not coordinator["baseline_validated"]
+                else "general"
+            )
+        if reason not in {"baseline", "general"}:
+            raise ValueError(f"unknown pull reason: {reason}")
+        # Realtime, timer, reconnect and UI requests all collapse into this one
+        # bit. It is consumed immediately before a worker starts, never when
+        # that worker happens to finish.
+        coordinator["pull_pending"] = True
         if (
             self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
             and self._v2_structure_authority_identity == self._v2_pull_identity()
@@ -7248,17 +7896,33 @@ class SyncManager(QObject):
             # an automatic retry loop. Reopening/reconfiguring starts one new
             # selection generation deliberately.
             return False
-        if self._v2_pull_worker is not None:
+        current_pull_worker = (
+            self._v2_pull_worker
+            if self._v2_pull_worker_identity == self._v2_pull_identity()
+            else None
+        )
+        if coordinator["pulling"] or current_pull_worker is not None:
             try:
-                if self._v2_pull_worker.isRunning():
+                if coordinator["pulling"] or current_pull_worker.isRunning():
                     return False
             except RuntimeError:
                 self._v2_pull_worker = None
+                self._v2_pull_worker_identity = None
+
+        if reason == "general" and not self._ordinary_pull_gate_is_open(
+            coordinator
+        ):
+            self._publish_sync_state()
+            return False
 
         started_for = self._v2_pull_identity()
+        started_coordinator = coordinator
+        coordinator["pull_pending"] = False
+        coordinator["pulling"] = True
         self._begin_structure_authority_selection()
         worker = V2PullWorker(self, project_id=started_for[1])
         self._v2_pull_worker = worker
+        self._v2_pull_worker_identity = started_for
         retry_after_success = {"value": False}
         if manual:
             self._set_sync_state(
@@ -7342,6 +8006,14 @@ class SyncManager(QObject):
                 # have all landed. Only now may the 250 ms retry path or any
                 # later autosave dispatch queued server writes.
                 self._accept_structure_authority(authority)
+                started_coordinator["baseline_validated"] = True
+                if self._outbound_work_count(
+                    self._v2_activity_counts(started_for[2])
+                ):
+                    # This snapshot protected local writes that arrived before
+                    # or during it. One final snapshot is still required after
+                    # all of them drain.
+                    started_coordinator["pull_pending"] = True
                 self._record_sync_success()
                 retry_after_success["value"] = bool(retry_pending_after_pull)
                 if changes:
@@ -7372,14 +8044,28 @@ class SyncManager(QObject):
                 print(f"Failed to pull v2 documents: {payload}")
 
         def handle_finished():
+            started_coordinator["pulling"] = False
             if self._v2_pull_worker is worker:
                 self._v2_pull_worker = None
-                if retry_after_success["value"]:
+                self._v2_pull_worker_identity = None
+                if (
+                    retry_after_success["value"]
+                    or (
+                        started_coordinator["baseline_validated"]
+                        and self._v2_pull_identity() == started_for
+                        and self._outbound_work_count(
+                            self._v2_activity_counts(started_for[2])
+                        )
+                    )
+                ):
                     # resultReady runs before QThread.finished.  Waiting until
                     # this slot has cleared the pull worker keeps dispatch from
                     # being rejected as concurrent work, while the accepted
                     # authority still gates the write itself.
                     self.retry_pending_syncs(manual=True)
+                elif self._v2_pull_identity() == started_for:
+                    self._maybe_start_deferred_pull()
+                self._publish_sync_state()
 
         worker.resultReady.connect(handle_result)
         worker.finished.connect(handle_finished)
@@ -7406,6 +8092,9 @@ class SyncManager(QObject):
         return self._v2_store.record_structure_batch_response(batch_id, result)
 
     def _launch_contract_structure_batch(self, batch_id):
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator and coordinator["baseline_validated"]:
+            coordinator["pull_pending"] = True
         operation_ids = self._v2_store.mark_structure_batch_attempt(batch_id)
         worker = V2StructureBatchWorker(self, batch_id)
         self._v2_structure_worker = worker
@@ -7511,6 +8200,10 @@ class SyncManager(QObject):
                         )
                         return contract_result(wire_response)
 
+                    if not operation["is_deleted"]:
+                        self._publish_live_parents_before_legacy_document(
+                            operation, client
+                        )
                     if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
                         # Folder state settles first: a rename needs its folder,
                         # and a child needs its parent, to already be there.
@@ -7578,25 +8271,47 @@ class SyncManager(QObject):
                     "operation": operation,
                 }
             if code in {"REVISION_CONFLICT", "DOCUMENT_ALREADY_EXISTS"}:
-                remote = self._fetch_remote_document(operation["document_id"], client)
+                remote = self._revision_conflict_read_first(operation, client)
                 if not remote:
                     message = "REVISION_CONFLICT: 서버 문서를 읽을 수 없습니다."
                     return {"kind": "retry", "error": message, "operation": operation}
                 if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
-                    # Binder order is one project preference snapshot. A later local
-                    # reorder rebases onto the newest server revision and becomes the
-                    # next atomic update instead of creating a manuscript conflict.
+                    merged_tree_content = self._merge_tree_order_conflict(
+                        operation.get("base_content", ""),
+                        operation.get("content", ""),
+                        remote.get("content", ""),
+                    )
+                    if merged_tree_content is None:
+                        self._v2_store.mark_conflict(
+                            operation_id,
+                            remote["revision"],
+                            remote.get("relative_path", TREE_ORDER_DOCUMENT_PATH),
+                            remote.get("content", ""),
+                            operation.get("content", ""),
+                            operation.get("content", ""),
+                            error_message="TREE_ORDER_CONFLICT",
+                        )
+                        return {
+                            "kind": "conflict",
+                            "operation": operation,
+                            "remote": remote,
+                            "base_content": operation.get("base_content", ""),
+                            "local_content": operation.get("content", ""),
+                            "merged_content": operation.get("content", ""),
+                            "conflict_count": 1,
+                            "error": "TREE_ORDER_CONFLICT",
+                        }
                     self._v2_store.rebase_clean_merge(
                         operation_id,
                         remote["revision"],
                         remote.get("content", ""),
-                        operation["content"],
+                        merged_tree_content,
                     )
                     return {
                         "kind": "auto_merged",
                         "operation": operation,
                         "remote": remote,
-                        "merged_content": operation["content"],
+                        "merged_content": merged_tree_content,
                         "old_local_path": TREE_ORDER_DOCUMENT_PATH,
                         "new_local_path": TREE_ORDER_DOCUMENT_PATH,
                     }
@@ -7710,6 +8425,9 @@ class SyncManager(QObject):
         # scheduled lease retry fires. Cancel that reservation so only one
         # retry chain can exist at a time.
         self._cancel_scheduled_v2_retry(reset_backoff=False)
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator and coordinator["baseline_validated"]:
+            coordinator["pull_pending"] = True
         self._v2_store.mark_attempt(operation["operation_id"])
         worker = V2QueueWorker(self, operation["operation_id"])
         self._v2_worker = worker

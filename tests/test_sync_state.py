@@ -683,6 +683,52 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             "● 로컬 저장 완료 · 서버 전송 중 1건",
         )
 
+    def test_conflict_status_never_labels_pending_queue_as_conflict_count(self):
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(authenticated_email=lambda: ""),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "conflict", "구조 기준 확인 필요", 30
+        )
+
+        self.assertEqual(
+            target.lbl_storage_status.text,
+            "● 로컬 저장 완료 · 충돌 확인 필요 · 대기 작업 30건",
+        )
+        self.assertNotIn("충돌 30건", target.lbl_storage_status.text)
+
+    def test_pending_34_and_conflict_zero_is_only_transfer_waiting(self):
+        activity = {
+            "transfer_pending": 34,
+            "transferring": 0,
+            "retry_wait": 0,
+            "conflict": 0,
+            "blocked": 0,
+            "pull_pending": 1,
+            "pulling": 0,
+        }
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                sync_activity_snapshot=lambda: activity,
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "failed", "서버 전송을 기다립니다.", 34
+        )
+
+        self.assertIn("서버 전송 대기 34건", target.lbl_storage_status.text)
+        self.assertNotIn("충돌", target.lbl_storage_status.text)
+        self.assertEqual(target._storage_sync_activity["conflict"], 0)
+
     def test_guidance_distinguishes_seven_primary_storage_states(self):
         cases = {
             "saved": ("동기화 완료", "모두 반영"),

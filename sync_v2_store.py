@@ -1941,6 +1941,63 @@ class SyncV2Store:
         with self._reader() as connection:
             return self._has_active_connection(connection, document_id)
 
+    def active_document_server_paths(self, local_key):
+        """Return server paths whose document work has not reached a terminal state.
+
+        Folder tombstones are a separate RPC from document tombstones.  A tree
+        snapshot queued for an earlier local edit must not retire a folder while
+        one of its descendants is still being deleted or restored.  The server
+        path is stable while the local copy moves through trash, so it is the
+        only path suitable for that ordering decision.
+        """
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT o.operation_id, d.server_path
+                FROM sync_operations AS o
+                JOIN sync_documents AS d ON d.document_id = o.document_id
+                WHERE o.local_key = ? AND d.server_path IS NOT NULL
+                """,
+                (local_key,),
+            ).fetchall()
+            return sorted({
+                row["server_path"]
+                for row in rows
+                if row["server_path"]
+                and self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+            })
+
+    def active_local_document_creates(self, local_key):
+        """Return distinct local creates that the server has not accepted yet."""
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT queue_id, operation_id, document_id, local_path,
+                       relative_path, base_revision, is_deleted, intent_kind
+                FROM sync_operations
+                WHERE local_key = ?
+                  AND entity_kind = 'document'
+                  AND intent_kind = 'create'
+                  AND is_deleted = 0
+                  AND COALESCE(base_revision, 0) = 0
+                ORDER BY queue_id
+                """,
+                (local_key,),
+            ).fetchall()
+            active = []
+            seen = set()
+            for row in rows:
+                if (
+                    row["document_id"] in seen
+                    or self._derived_state(connection, row["operation_id"])
+                    not in CONTRACT_ACTIVE_STATES
+                ):
+                    continue
+                seen.add(row["document_id"])
+                active.append(dict(row))
+            return active
+
     def has_nonempty_active_content(self, document_id):
         """Return whether the newest queued live snapshot contains text."""
         with self._reader() as connection:
@@ -2608,12 +2665,41 @@ class SyncV2Store:
                 f"SELECT * FROM sync_operations WHERE {where} ORDER BY queue_id",
                 params,
             ).fetchall()
+            ready = []
             for row in rows:
                 if self._derived_state(connection, row["operation_id"]) in {
                     "pending", "retry_wait"
                 }:
-                    return self._operation_dict(connection, row)
-            return None
+                    ready.append(row)
+            if not ready:
+                return None
+            selected = next(
+                (
+                    row for row in ready
+                    if self._is_volume_folder_skeleton(row)
+                ),
+                ready[0],
+            )
+            return self._operation_dict(connection, selected)
+
+    @staticmethod
+    def _is_volume_folder_skeleton(operation):
+        """Whether a hidden tree snapshot advertises volumes but no chapters."""
+        if operation["relative_path"] != "__antigravity__/tree-order.json":
+            return False
+        try:
+            payload = json.loads(operation["content"] or "{}")
+            tree_order = payload.get("tree_order")
+            volume_names = tree_order.get("메인/원고")
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(volume_names, list) or not volume_names:
+            return False
+        for volume_name in volume_names:
+            children = tree_order.get(f"메인/원고/{volume_name}")
+            if children != []:
+                return False
+        return True
 
     def mark_attempt(self, operation_id):
         with self._transaction() as connection:

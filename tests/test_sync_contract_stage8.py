@@ -12,7 +12,7 @@ import uuid
 from contextlib import closing, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sync_contract import (
     CANONICAL_CONTRACT_BYTES,
@@ -32,6 +32,7 @@ from sync_contract import (
     validate_document_commit_response,
 )
 from sync_manager import (
+    LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS,
     STRUCTURE_AUTHORITY_BLOCKED,
     STRUCTURE_AUTHORITY_CONTRACT,
     STRUCTURE_AUTHORITY_LEGACY,
@@ -1378,6 +1379,10 @@ class ContractStoreTests(unittest.TestCase):
             _fetch_v2_project_tree_orders=lambda _client, project_id=None: (
                 calls.append("tree_orders") or []
             ),
+            _legacy_structure_snapshot_in_flight=lambda *_args: False,
+            _report_legacy_structure_settle_wait=lambda: (_ for _ in ()).throw(
+                AssertionError("a coherent empty legacy snapshot waited")
+            ),
             _select_remote_structure_authority=lambda _documents, _folders, rows: {
                 "kind": STRUCTURE_AUTHORITY_LEGACY,
                 "folder_paths": [],
@@ -1401,6 +1406,238 @@ class ContractStoreTests(unittest.TestCase):
         self.assertEqual(
             results[0][1]["structure_authority"]["observed_rows"], 0
         )
+
+    def test_legacy_pull_waits_for_peer_tree_order_then_uses_one_coherent_read(self):
+        old_time = "2026-08-27T04:43:04+00:00"
+        new_time = "2026-08-27T04:43:07+00:00"
+        root_id = str(uuid.uuid4())
+        manuscript_id = str(uuid.uuid4())
+        volume_id = str(uuid.uuid4())
+        stale_tree = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/원고": []},
+            }),
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }
+        fresh_tree = {
+            **stale_tree,
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {
+                    "메인/원고": ["3권"],
+                    "메인/원고/3권": ["051화.txt"],
+                },
+            }),
+            "revision": 2,
+            "updated_at": new_time,
+        }
+        peer_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "메인/원고/3권/051화.txt",
+            "content": "peer content",
+            "revision": 1,
+            "updated_at": new_time,
+            "is_deleted": False,
+        }
+        folders = [{
+            "folder_id": root_id,
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": manuscript_id,
+            "parent_folder_id": root_id,
+            "name": "원고",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": volume_id,
+            "parent_folder_id": manuscript_id,
+            "name": "3권",
+            "revision": 1,
+            "updated_at": new_time,
+            "is_deleted": False,
+        }]
+        document_reads = [
+            [stale_tree, peer_document],
+            [fresh_tree, peer_document],
+        ]
+        calls = []
+        waits = []
+        decision_manager = self._contract_manager()
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: calls.append("handshake"),
+            _fetch_v2_project_documents=lambda project_id=None: (
+                calls.append("documents") or document_reads.pop(0)
+            ),
+            _fetch_v2_project_folders=lambda _client, project_id=None: (
+                calls.append("folders") or folders
+            ),
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: (
+                calls.append("tree_orders") or []
+            ),
+            _legacy_structure_snapshot_in_flight=(
+                SyncManager._legacy_structure_snapshot_in_flight
+            ),
+            _report_legacy_structure_settle_wait=lambda: waits.append("wait"),
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _select_remote_structure_authority=lambda documents, folders, rows: (
+                SyncManager._select_remote_structure_authority(
+                    decision_manager, documents, folders, rows
+                )
+            ),
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(
+            lambda success, payload: results.append((success, payload))
+        )
+
+        with patch("sync_manager.time.sleep") as sleep:
+            worker.run()
+
+        self.assertEqual(waits, ["wait"])
+        sleep.assert_called_once_with(
+            LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS[0]
+        )
+        self.assertEqual(calls.count("documents"), 2)
+        self.assertEqual(calls.count("folders"), 2)
+        self.assertEqual(calls.count("tree_orders"), 2)
+        self.assertTrue(results[0][0])
+        self.assertEqual(
+            results[0][1]["structure_authority"]["kind"],
+            STRUCTURE_AUTHORITY_LEGACY,
+        )
+        self.assertEqual(
+            results[0][1]["structure_authority"]["folder_paths"],
+            ["메인/원고", "메인/원고/3권"],
+        )
+
+    def test_legacy_pull_exhaustion_keeps_fail_closed_and_never_applies(self):
+        old_time = "2026-08-27T04:43:04+00:00"
+        new_time = "2026-08-27T04:43:07+00:00"
+        root_id = str(uuid.uuid4())
+        manuscript_id = str(uuid.uuid4())
+        stale_tree = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/원고": []},
+            }),
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }
+        folders = [{
+            "folder_id": root_id,
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": manuscript_id,
+            "parent_folder_id": root_id,
+            "name": "원고",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": manuscript_id,
+            "name": "3권",
+            "revision": 1,
+            "updated_at": new_time,
+            "is_deleted": False,
+        }]
+        select = Mock(side_effect=AssertionError(
+            "an unstable projection reached authority selection"
+        ))
+        waits = []
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: None,
+            _fetch_v2_project_documents=lambda project_id=None: [stale_tree],
+            _fetch_v2_project_folders=lambda _client, project_id=None: folders,
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: [],
+            _legacy_structure_snapshot_in_flight=(
+                SyncManager._legacy_structure_snapshot_in_flight
+            ),
+            _report_legacy_structure_settle_wait=lambda: waits.append("wait"),
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _select_remote_structure_authority=select,
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(
+            lambda success, payload: results.append((success, payload))
+        )
+
+        with patch("sync_manager.time.sleep") as sleep:
+            worker.run()
+
+        self.assertEqual(
+            waits, ["wait"] * len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS)
+        )
+        self.assertEqual(
+            sleep.call_count, len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS)
+        )
+        select.assert_not_called()
+        self.assertEqual(
+            results,
+            [(False, "LEGACY_STRUCTURE_SNAPSHOT_UNSTABLE")],
+        )
+
+    def test_contract_structure_error_is_not_retried_as_legacy_settle(self):
+        decision_manager = self._contract_manager()
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: None,
+            _fetch_v2_project_documents=lambda project_id=None: [],
+            _fetch_v2_project_folders=lambda _client, project_id=None: [],
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: [{
+                "tree_order_id": str(uuid.uuid4()),
+                "parent_folder_id": None,
+                "children": [],
+                "revision": 0,
+            }],
+            _legacy_structure_snapshot_in_flight=(
+                SyncManager._legacy_structure_snapshot_in_flight
+            ),
+            _report_legacy_structure_settle_wait=lambda: (_ for _ in ()).throw(
+                AssertionError("contract corruption entered legacy wait")
+            ),
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _select_remote_structure_authority=lambda documents, folders, rows: (
+                SyncManager._select_remote_structure_authority(
+                    decision_manager, documents, folders, rows
+                )
+            ),
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(
+            lambda success, payload: results.append((success, payload))
+        )
+
+        with patch("sync_manager.time.sleep") as sleep:
+            worker.run()
+
+        sleep.assert_not_called()
+        self.assertEqual(results, [(False, "INVALID_TREE_ORDER_RESPONSE")])
 
     def test_invalid_contract_never_falls_back_to_valid_legacy(self):
         manager = self._contract_manager()

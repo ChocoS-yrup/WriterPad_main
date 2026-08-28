@@ -1007,6 +1007,21 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "#fca5a5",
                 "#451f24",
             ),
+            "retry_wait": (
+                "● 로컬 저장 완료 · 재시도 대기",
+                "#fdba74",
+                "#422a18",
+            ),
+            "pull_pending": (
+                "● 로컬 저장 완료 · 서버 수신 대기",
+                "#7dd3fc",
+                "#173449",
+            ),
+            "blocked": (
+                "● 로컬 저장 완료 · 서버 적용 차단",
+                "#fca5a5",
+                "#451f24",
+            ),
             "empty_guard": (
                 "● 전체 삭제 확인 필요",
                 "#fcd34d",
@@ -1029,6 +1044,13 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             ),
         }
         text, color, background = labels.get(state, labels["saved"])
+        activity = {}
+        try:
+            snapshot = getattr(getattr(self, "sync_manager", None), "sync_activity_snapshot", None)
+            if callable(snapshot):
+                activity = snapshot()
+        except Exception:
+            activity = {}
         unsaved_editor_count = WritingModeWidget._unsaved_editor_count(self)
         editor_dirty = unsaved_editor_count > 0
         if editor_dirty and state != "empty_guard":
@@ -1037,6 +1059,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "auth_required": " · 로그인 필요",
                 "lease": " · 다른 기기 편집 중",
                 "failed": " · 서버 전송 대기",
+                "retry_wait": " · 재시도 대기",
+                "pull_pending": " · 서버 수신 대기",
+                "blocked": " · 서버 적용 차단",
                 "conflict": " · 충돌 확인 필요",
                 "project_trashed": " · 서버 휴지통",
                 "project_purged": " · 서버 영구 삭제",
@@ -1066,8 +1091,18 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                     f"● 로컬 저장 완료 · 서버 전송 대기 {pending_count}건"
                     " · 재시도 필요"
                 )
+            elif state == "retry_wait":
+                text = f"● 로컬 저장 완료 · 재시도 대기 {pending_count}건"
+            elif state == "blocked":
+                text = (
+                    "● 로컬 저장 완료 · 서버 적용 차단"
+                    f" · 전송 대기 {pending_count}건"
+                )
             elif state == "conflict":
-                text = f"● 로컬 저장 완료 · 충돌 {pending_count}건"
+                text = (
+                    "● 로컬 저장 완료 · 충돌 확인 필요"
+                    f" · 대기 작업 {pending_count}건"
+                )
             else:
                 text = f"{text} · {pending_count}건 대기"
         account_email = ""
@@ -1077,13 +1112,21 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 account_email = manager.authenticated_email()
         except Exception:
             account_email = ""
-        if account_email and state == "saved" and not editor_dirty and not pending_count:
+        activity_busy = any(int(activity.get(name, 0) or 0) for name in (
+            "transfer_pending", "transferring", "retry_wait", "conflict",
+            "blocked", "pull_pending", "pulling",
+        ))
+        if (
+            account_email and state == "saved" and not editor_dirty
+            and not pending_count and not activity_busy
+        ):
             text = "● 동기화 완료"
         self._storage_pending_count = pending_count
         self._storage_state = state
         self._storage_detail = detail
         self._storage_editor_dirty_count = unsaved_editor_count
         self._storage_account_email = account_email
+        self._storage_sync_activity = activity
         self.lbl_storage_status.setText(text)
         self.lbl_storage_status.setStyleSheet(
             f"QPushButton {{ color: {color}; background-color: {background}; border: 1px solid {color}; "
@@ -1191,6 +1234,30 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "cause": detail or "서버가 변경 내용을 처리하지 못했습니다.",
                 "action": "상세 원인을 확인한 뒤 지금 다시 시도할 수 있습니다.",
                 "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "retry_wait": {
+                "title": "서버 전송 재시도 대기",
+                "summary": f"원고는 로컬에 저장됐고 서버 전송{pending_text}을 다시 시도할 예정입니다.",
+                "cause": detail or "네트워크 또는 서버 응답을 기다리고 있습니다.",
+                "action": "자동 재시도를 기다리거나 지금 다시 시도할 수 있습니다.",
+                "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "pull_pending": {
+                "title": "서버 변경 확인 대기",
+                "summary": "로컬 업로드가 안정 지점에 도달하면 서버의 최신 상태를 확인합니다.",
+                "cause": detail or "업로드와 원격 적용이 서로 끼어들지 않도록 순서를 지키고 있습니다.",
+                "action": "현재 작업이 끝날 때까지 잠시 기다려주세요.",
+                "action_code": "",
+                "warning": False,
+            },
+            "blocked": {
+                "title": "서버 적용 차단",
+                "summary": "로컬 원고는 보존됐지만 서버 응답을 안전하게 적용할 수 없어 중지했습니다.",
+                "cause": detail or "구조 또는 식별자 검증이 안전 조건을 통과하지 못했습니다.",
+                "action": "상세 원인을 확인한 뒤 명시적으로 다시 시도해주세요.",
+                "action_code": "retry",
                 "warning": True,
             },
             "lease": {
@@ -1307,6 +1374,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             return
         if getattr(self, "_storage_state", "") == "empty_guard":
             self.manual_save()
+            return
+        if getattr(self, "_storage_state", "") == "blocked":
+            self.sync_manager.retry_pending_syncs(manual=True)
             return
         if getattr(self, "_storage_pending_count", 0):
             # 사용자가 누른 재시도는 예약된 자동 재시도 대기 시간을 건너뛴다.
