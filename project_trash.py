@@ -10,6 +10,7 @@ from project_paths import (
     LocalProjectPathError,
     resolve_local_project_destination,
 )
+from sync_diagnostics import sanitize_sensitive_text
 
 
 AUTH_REQUIRED = "auth_required"
@@ -24,6 +25,9 @@ LOCAL_STORAGE_ERROR = "local_storage_error"
 SERVER_OPERATION_FAILED = "server_operation_failed"
 SERVER_PROJECT_PURGED = "server_project_purged"
 SERVER_PROJECT_MISSING = "server_project_missing"
+SERVER_PROJECT_NOT_TRASHED = "server_project_not_trashed"
+SERVER_INVALID_ARGUMENT = "server_invalid_argument"
+SERVER_LEDGER_LOCKED = "server_ledger_locked"
 
 TRASH_METADATA_SUFFIX = ".project-trash.json"
 
@@ -40,15 +44,34 @@ _ERROR_MESSAGES = {
     SERVER_OPERATION_FAILED: "서버 작품 휴지통 작업을 완료하지 못했습니다.",
     SERVER_PROJECT_PURGED: "서버에서 이미 영구 삭제된 작품입니다.",
     SERVER_PROJECT_MISSING: "서버에서 이 작품을 찾을 수 없습니다.",
+    SERVER_PROJECT_NOT_TRASHED: (
+        "서버에서 아직 휴지통에 있지 않은 작품이라 영구 삭제할 수 없습니다."
+    ),
+    SERVER_INVALID_ARGUMENT: "서버가 이 요청의 값을 받아들이지 않았습니다.",
+    SERVER_LEDGER_LOCKED: (
+        "서버의 동기화 원장이 이 작품의 삭제를 거부했습니다. "
+        "서버 쪽 원장 설정을 갱신해야 합니다."
+    ),
 }
 
 
 class ProjectTrashError(RuntimeError):
-    def __init__(self, code):
+    """A trash failure and, when the server named one, the reason it gave.
+
+    The catch-all used to arrive with the original exception discarded, so a
+    failure nobody had anticipated read exactly like one that had been. The
+    detail travels with the error and into the dialog, because the person who
+    can act on it is the one reading that dialog.
+    """
+
+    def __init__(self, code, detail=""):
         if code not in _ERROR_MESSAGES:
             code = SERVER_OPERATION_FAILED
         self.code = code
+        self.detail = sanitize_sensitive_text(detail) if detail else ""
         self.user_message = _ERROR_MESSAGES[code]
+        if self.detail:
+            self.user_message += "\n\n서버 응답: " + self.detail
         super().__init__(self.user_message)
 
 
@@ -199,6 +222,12 @@ class ProjectTrashService:
             return SERVER_PROJECT_PURGED
         if "project_not_found" in combined:
             return SERVER_PROJECT_MISSING
+        if "project_not_trashed" in combined:
+            return SERVER_PROJECT_NOT_TRASHED
+        if "append_only_ledger" in combined:
+            return SERVER_LEDGER_LOCKED
+        if "invalid_argument" in combined:
+            return SERVER_INVALID_ARGUMENT
         if any(marker in combined for marker in (
             "network", "connection", "timeout", "timed out", "dns",
             "unreachable", "refused", "winerror", "temporarily unavailable",
@@ -216,9 +245,11 @@ class ProjectTrashService:
                 else action()
             )
         except Exception as error:
-            raise ProjectTrashError(
-                self._classify_server_error(error)
-            ) from None
+            code = self._classify_server_error(error)
+            # Only the catch-all needs the server's own words. The classified
+            # codes already say something truer than the raw text would.
+            detail = str(error) if code == SERVER_OPERATION_FAILED else ""
+            raise ProjectTrashError(code, detail) from None
         if response is None or not hasattr(response, "data"):
             raise ProjectTrashError(INVALID_RESPONSE)
         return response.data
