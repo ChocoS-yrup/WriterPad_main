@@ -136,6 +136,34 @@ Windows 는 폴더 투영을 live 행으로만 풀었기 때문에, 다른 기�
 남아 있으면 폴더를 건드리지 않는다. 복원 목적지가 이미 차 있으면
 `RESTORE_TARGET_TAKEN` 으로 보고하고 휴지통에 그대로 둔다.
 
+**빈 폴더 복원의 projection/tree-order 추월 — 해결됨**
+
+레거시 구조 경로에서는 `commit_folder` 와 tree-order 문서가 별도 커밋이다.
+tree-order 의 더 높은 revision 이 먼저 도착해 삭제된 빈 폴더 이름을 다시 가리키고,
+원본 `folder_id` 의 live 행은 아직 tombstone 인 중간 snapshot 이 실제 검증에서
+관측됐다. 예전 Windows 는 이름만 보고 빈 디렉터리를 만든 뒤 새 UUID 를 발급했다.
+그 결과 원본 UUID는 휴지통에, 대체 UUID는 바인더와 서버에 동시에 남았다.
+
+이제 폴더 projection 을 함께 받은 pull 은 다음 규칙을 지킨다.
+
+- 디스크에 없는 폴더는 같은 snapshot 의 live folder 행이 있어야만 만든다.
+- tree-order 및 그 `folder_paths` 표지만으로는 UUID를 발급하지 않고
+  `REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE` 로 다음 pull까지 보류한다.
+- 원본 UUID의 live 행이 오면 tree-order 적용보다 먼저 그 UUID를 휴지통에서 복원한다.
+- 부모부터 처리하므로 중첩 폴더도 같은 UUID 계보를 유지한다.
+- 같은 snapshot 을 다시 받아도 두 번째 복원이나 새 UUID 발급은 없다.
+
+이미 잘못된 대체 UUID가 생긴 프로젝트의 회수도 보존적으로 처리한다. 서버 snapshot 이
+**원본 UUID live + 대체 UUID tombstone + 동일 parent/name** 을 동시에 증명하고,
+대체 폴더가 실제로 비어 있으며 보호·전송 중인 하위 항목이 없을 때만 대체 폴더를
+휴지통으로 옮긴 뒤 원본을 복원한다. 대체 폴더를 영구 삭제하지 않는다. 내용이 있거나
+두 행이 같은 슬롯이라는 증명이 부족하면 기존처럼 `RESTORE_TARGET_TAKEN` 으로 멈춘다.
+
+기존 검증본은 바인더의 대체 빈 폴더를 먼저 휴지통으로 보내 서버에서 그 UUID의
+tombstone 을 확인한 다음, 휴지통 색인에서 원래 이름을 가진 원본 항목을 복원한다.
+최종 확인값은 바인더 경로 UUID가 원본 UUID이고, 대체 UUID는 휴지통/tombstone이며,
+같은 이름의 live 서버 행이 하나뿐인 상태다.
+
 **가져오기 프로젝트의 identity 정렬 — 해결됨**
 
 가져오기는 표준 폴더에 새 UUID 를 발급하고 pull 이 받아온 문서는 identity 에 아예

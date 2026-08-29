@@ -4686,6 +4686,7 @@ class SyncManager(QObject):
             cls._tree_path_comparison_key(f"메인/{storage_name}")
             for storage_name in TREE_ROOT_STORAGE_NAMES.values()
         }
+        fixed_root_path_keys.add(cls._tree_path_comparison_key("메인"))
         candidate_paths = {}
         document_paths = {}
 
@@ -4799,6 +4800,21 @@ class SyncManager(QObject):
             exists = existing_name is not None or os.path.lexists(full_path)
             if exists:
                 cls._safe_existing_tree_directory(root, relative_path)
+            elif (
+                has_remote_folder_projection
+                and cls._tree_path_comparison_key(relative_path)
+                not in folder_path_keys
+                and cls._tree_path_comparison_key(relative_path)
+                not in fixed_root_path_keys
+            ):
+                # A tree-order commit and the stable folder projection are
+                # separate server writes. The order can therefore name an
+                # empty folder before commit_folder has restored or created
+                # its UUID row. Materializing that name here would mint a new
+                # local UUID and turn one restored folder into two identities.
+                # Existing legacy directories are retained, but a missing
+                # directory needs the live folder row as its creation proof.
+                raise RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
             plan.append({
                 "relative_path": relative_path,
                 "full_path": full_path,
@@ -6644,6 +6660,15 @@ class SyncManager(QObject):
             for folder_id, item in resolved_folder_rows.items()
         }
 
+        # A live folder row is the stable proof that a tombstoned UUID was
+        # restored. Move that exact identity out of trash before documents or
+        # tree-order can materialize its destination. Doing this later makes
+        # the tree-created empty directory look like an occupied foreign slot,
+        # leaving the original in trash and a replacement UUID in the binder.
+        changes.extend(
+            self._apply_remote_folder_restores(folder_rows, protected, root)
+        )
+
         remote_live_document_paths = set()
         for remote in remote_documents or []:
             if bool(remote.get("is_deleted")):
@@ -7755,9 +7780,6 @@ class SyncManager(QObject):
                 "entity_id": folder_id,
             })
 
-        changes.extend(
-            self._apply_remote_folder_restores(folder_rows, protected, root)
-        )
         return changes
 
     def _folder_move_is_safe(self, local_path, protected, root):
@@ -7804,9 +7826,28 @@ class SyncManager(QObject):
         that is already occupied is left alone and reported.
         """
         restored = []
-        for row in folder_rows or []:
-            if not isinstance(row, dict) or row.get("is_deleted"):
-                continue
+        resolved = self._folder_rows_with_tree_paths(folder_rows)
+        rows_by_id = {
+            str(row.get("folder_id")): row
+            for row in (folder_rows or [])
+            if isinstance(row, dict) and row.get("folder_id")
+        }
+        # Parents have to leave trash before their descendants can resolve a
+        # live destination parent. Stable paths also make the order independent
+        # of the server query's row order.
+        ordered_rows = sorted(
+            (
+                row for row in (folder_rows or [])
+                if isinstance(row, dict)
+                and not row.get("is_deleted")
+                and str(row.get("folder_id") or "") in resolved
+            ),
+            key=lambda row: (
+                resolved[str(row["folder_id"])]["local_path"].count("/"),
+                resolved[str(row["folder_id"])]["local_path"].casefold(),
+            ),
+        )
+        for row in ordered_rows:
             folder_id = str(row.get("folder_id") or "")
             node = self._identity_folder_by_uuid(folder_id) if folder_id else None
             if node is None:
@@ -7830,9 +7871,74 @@ class SyncManager(QObject):
             target_path = f"{parent_path}/{name}"
             if not self._folder_move_is_safe(trash_path, protected, root):
                 continue
-            if os.path.exists(os.path.abspath(
+            target_full = os.path.abspath(
                 os.path.join(root, target_path.replace("/", os.sep))
-            )):
+            )
+            if os.path.exists(target_full):
+                # Recovery for the exact divergence produced by older builds:
+                # tree-order recreated an empty slot under a replacement UUID
+                # while the original UUID stayed in trash. A corrected server
+                # snapshot proves both halves at once — the original is live,
+                # the replacement is tombstoned in the same parent/name slot.
+                # Preserve the replacement in trash, then restore the original.
+                from project_creation_v1 import node_for_path
+
+                project_root = self._identity_project_root()
+                occupying = (
+                    node_for_path(project_root, target_path)
+                    if project_root else None
+                )
+                occupying_id = str((occupying or {}).get("uuid") or "")
+                occupying_row = rows_by_id.get(occupying_id)
+                same_slot_retired_replacement = bool(
+                    occupying
+                    and occupying.get("kind") == "folder"
+                    and occupying_id != folder_id
+                    and occupying_row
+                    and occupying_row.get("is_deleted")
+                    and str(occupying_row.get("parent_folder_id") or "")
+                    == str(row.get("parent_folder_id") or "")
+                    and self._folder_slot(
+                        occupying_row.get("parent_folder_id"),
+                        occupying_row.get("name"),
+                    )
+                    == self._folder_slot(
+                        row.get("parent_folder_id"), row.get("name")
+                    )
+                )
+                target_is_empty = False
+                if same_slot_retired_replacement and self._folder_move_is_safe(
+                    target_path, protected, root
+                ):
+                    try:
+                        with os.scandir(target_full) as entries:
+                            target_is_empty = next(entries, None) is None
+                    except OSError:
+                        target_is_empty = False
+                if target_is_empty:
+                    replacement_trash = self._v2_wpm.move_to_trash(target_path)
+                    self._v2_store.move_local_path(
+                        self._v2_context["local_key"],
+                        target_path,
+                        replacement_trash,
+                    )
+                    restored.append({
+                        "kind": "folder_tombstone",
+                        "old_local_path": target_path,
+                        "new_local_path": replacement_trash,
+                        "entity_id": occupying_id,
+                        "reason": "shadowed_restore_recovery",
+                    })
+                    self._v2_store.record_diagnostic(
+                        self._v2_context["local_key"],
+                        "folder_restore_shadow_recovered",
+                        dedupe=True,
+                        entity_id=folder_id,
+                        replacement_entity_id=occupying_id,
+                        project_id=self._v2_context["project_id"],
+                    )
+
+            if os.path.exists(target_full):
                 self._v2_store.record_diagnostic(
                     self._v2_context["local_key"],
                     "folder_restore_blocked",

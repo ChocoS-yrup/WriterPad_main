@@ -1752,7 +1752,9 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         ]
         self.assertEqual([row["folder_id"] for row in live], [replacement["uuid"]])
 
-    def _pull(self, folder_rows, remote_documents, tree_order):
+    def _pull(
+        self, folder_rows, remote_documents, tree_order, *, tree_revision=1
+    ):
         """Apply one pull the way _process_v2_pull hands it to the manager."""
         documents = [{
             "document_id": str(uuid.uuid5(
@@ -1760,7 +1762,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
             )),
             "relative_path": TREE_ORDER_DOCUMENT_PATH,
             "content": self.manager._tree_order_content(tree_order),
-            "revision": 1,
+            "revision": tree_revision,
             "is_deleted": False,
         }]
         documents.extend(remote_documents)
@@ -1938,6 +1940,100 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertEqual(moved["legacy_path"], "메인/설정집/구세계")
 
+    def test_tree_order_waits_for_the_original_live_folder_row_before_restore(self):
+        """A newer name-only snapshot must not mint a replacement folder UUID."""
+        folder = create_item_at_path(
+            self.project_root, "메인", "윈도우-빈폴더", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = True
+                row["revision"] = 2
+        self._pull(
+            client.folder_rows, [], {"<root>": []}, tree_revision=1
+        )
+        original_uuid = folder["uuid"]
+        trash_node = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == original_uuid
+        )
+        self.assertTrue(trash_node["legacy_path"].startswith("메인/휴지통/"))
+
+        # The tree-order commit can overtake commit_folder. It names the old
+        # slot again, but the only folder row for that slot is still the
+        # original UUID's tombstone.
+        first_changes = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=2,
+        )
+
+        target_path = "메인/윈도우-빈폴더"
+        target = Path(self.wpm.writing_root_path, target_path)
+        self.assertFalse(target.exists())
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, trash_node["legacy_path"]
+        ).is_dir())
+        self.assertEqual(
+            [node for node in read_identity(self.project_root)["nodes"]
+             if node["legacy_path"] == target_path],
+            [],
+        )
+        self.assertFalse(any(
+            change.get("kind") == "tree_order" for change in first_changes
+        ))
+
+        # Only the stable projection may prove a restore. The same UUID then
+        # moves out of trash exactly once; no replacement UUID is issued.
+        for row in client.folder_rows:
+            if row["folder_id"] == original_uuid:
+                row["is_deleted"] = False
+                row["revision"] = 3
+        second_changes = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=3,
+        )
+
+        self.assertTrue(target.is_dir())
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, trash_node["legacy_path"]
+        ).exists())
+        matching = [
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["legacy_path"] == target_path
+        ]
+        self.assertEqual([node["uuid"] for node in matching], [original_uuid])
+        self.assertEqual(
+            [change.get("kind") for change in second_changes
+             if change.get("kind") == "folder_restore"],
+            ["folder_restore"],
+        )
+        second_kinds = [change.get("kind") for change in second_changes]
+        self.assertLess(
+            second_kinds.index("folder_restore"),
+            second_kinds.index("tree_order"),
+        )
+
+        repeated = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=3,
+        )
+        self.assertFalse(any(
+            change.get("kind") == "folder_restore" for change in repeated
+        ))
+        self.assertEqual(
+            [node["uuid"] for node in read_identity(self.project_root)["nodes"]
+             if node["legacy_path"] == target_path],
+            [original_uuid],
+        )
+
     def test_following_a_remote_restore_does_not_start_a_delete_fight(self):
         """복원을 안 따라가면 바깥으로 내보내는 쪽이 상대의 복원을 되돌린다."""
         folder, client = self._publish_then_delete_remotely()
@@ -1963,6 +2059,91 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertFalse(row["is_deleted"])
         self.assertEqual(row["revision"], 3)
+
+    def test_corrected_snapshot_recovers_original_uuid_from_shadow_folder(self):
+        """Keep the bad replacement recoverable while returning the original."""
+        folder = create_item_at_path(
+            self.project_root, "메인", "윈도우-빈폴더", True
+        )["nodes"][-1]
+        original_uuid = folder["uuid"]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        for row in client.folder_rows:
+            if row["folder_id"] == original_uuid:
+                row["is_deleted"] = True
+                row["revision"] = 2
+        self._pull(client.folder_rows, [], {"<root>": []}, tree_revision=1)
+        original_trash = next(
+            node["legacy_path"]
+            for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == original_uuid
+        )
+
+        replacement = create_item_at_path(
+            self.project_root, "메인", "윈도우-빈폴더", True
+        )["nodes"][-1]
+        self.operation["operation_id"] = str(uuid.uuid4())
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        replacement_row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == replacement["uuid"]
+        )
+
+        # A repair commits the duplicate tombstone first and restores the
+        # original second. This is the first complete snapshot Windows sees.
+        replacement_row["is_deleted"] = True
+        replacement_row["revision"] = 2
+        original_row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == original_uuid
+        )
+        original_row["is_deleted"] = False
+        original_row["revision"] = 3
+
+        changes = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=2,
+        )
+
+        live_path = "메인/윈도우-빈폴더"
+        live = node_for_path(self.project_root, live_path)
+        self.assertEqual(live["uuid"], original_uuid)
+        original = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == original_uuid
+        )
+        self.assertEqual(original["legacy_path"], live_path)
+        retired_replacement = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == replacement["uuid"]
+        )
+        self.assertTrue(
+            retired_replacement["legacy_path"].startswith("메인/휴지통/")
+        )
+        self.assertNotEqual(retired_replacement["legacy_path"], original_trash)
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, retired_replacement["legacy_path"]
+        ).is_dir())
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, original_trash
+        ).exists())
+        self.assertEqual(
+            [change.get("reason") for change in changes
+             if change.get("reason") == "shadowed_restore_recovery"],
+            ["shadowed_restore_recovery"],
+        )
+        self.assertEqual(
+            [record["event"] for record in self.store.diagnostics(
+                self.context["local_key"]
+            ) if record["event"] == "folder_restore_shadow_recovered"],
+            ["folder_restore_shadow_recovered"],
+        )
+        self.assertEqual(prepare_open(self.project_root)["status"], OPEN_OK)
+        report = audit(self.project_root)
+        self.assertEqual(report["missing_in_identity"], [])
+        self.assertEqual(report["missing_on_disk"], [])
 
     def test_an_occupied_target_leaves_the_restored_folder_in_the_trash(self):
         folder, client = self._publish_then_delete_remotely()
@@ -5087,7 +5268,7 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.assertEqual(changes[-1]["kind"], "tree_order")
 
-    def test_ipad_partial_folder_projection_keeps_tree_parent_folders(self):
+    def test_ipad_partial_folder_projection_defers_unidentified_tree_folders(self):
         main_id = str(uuid.uuid4())
         manuscript_id = str(uuid.uuid4())
         third_volume_id = str(uuid.uuid4())
@@ -5115,9 +5296,9 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             "revision": 13,
             "is_deleted": False,
         }
-        # Older Windows-created volumes have no stable folder rows. Newer iPad
-        # folders do. The tree parent keys are still authoritative evidence that
-        # all four volume paths are directories.
+        # A partial projection cannot prove the identities of 1권 and 2권.
+        # Tree parent keys may order known folders, but may no longer create
+        # missing directories with locally minted replacement UUIDs.
         folder_rows = [
             {
                 "folder_id": main_id,
@@ -5165,19 +5346,21 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
 
         changes = self.manager._apply_v2_remote_documents(
             [remote_tree, self._live_remote(document_path)],
-            strict=True,
+            strict=False,
             folder_rows=folder_rows,
         )
 
         root = Path(self.wpm.writing_root_path)
         for volume in ("1권", "2권", "3권", "4권"):
-            self.assertTrue(Path(root, "메인", "원고", volume).is_dir())
-        self.assertTrue(Path(root, "메인", "팯-빈폴더").is_dir())
+            self.assertFalse(Path(root, "메인", "원고", volume).exists())
+        self.assertFalse(Path(root, "메인", "팯-빈폴더").exists())
         self.assertTrue(Path(root, document_path).is_file())
         self.assertFalse(Path(root, "메인", "팯-든폴더", "팯-문서").exists())
         stored_tree = self.store.get_document_by_id(self.tree_document_id)
-        self.assertEqual(stored_tree["revision"], 13)
-        self.assertEqual(changes[-1]["kind"], "tree_order")
+        self.assertIsNone(stored_tree)
+        self.assertFalse(any(
+            change.get("kind") == "tree_order" for change in changes
+        ))
 
     def test_ipad_document_alias_conflicting_with_stable_folder_is_rejected(self):
         main_id = str(uuid.uuid4())
@@ -5235,8 +5418,12 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertFalse(Path(root, parent_path, "팯-문서").exists())
         self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
 
-    def test_modern_tree_payload_marks_empty_folders_explicitly(self):
+    def test_folder_projection_does_not_materialize_tree_only_empty_folder(self):
         empty_folder = "메인/메모장/윈_빈폴더"
+        original = create_item_at_path(
+            self._project_root(), "메인/메모장", "윈_빈폴더", True
+        )["nodes"][-1]
+        trash_path = self.wpm.move_to_trash(empty_folder)
         tree_order = {
             "<root>": ["메모장"],
             "메인/메모장": ["윈_빈폴더"],
@@ -5247,17 +5434,28 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertIn("folder_paths", payload)
         self.assertIn(empty_folder, payload["folder_paths"])
 
-        change = self.manager._apply_remote_tree_order_document(
-            self.tree_document_id,
-            json.dumps(payload, ensure_ascii=False),
-            1,
-            remote_folder_paths=set(),
-            has_remote_folder_projection=True,
-        )
+        with self.assertRaisesRegex(
+            RuntimeError, "REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE"
+        ):
+            self.manager._apply_remote_tree_order_document(
+                self.tree_document_id,
+                json.dumps(payload, ensure_ascii=False),
+                1,
+                remote_folder_paths=set(),
+                has_remote_folder_projection=True,
+            )
 
-        self.assertEqual(change["kind"], "tree_order")
-        self.assertTrue(Path(
+        self.assertFalse(Path(
             self.wpm.writing_root_path, empty_folder
+        ).exists())
+        self.assertIsNone(node_for_path(self._project_root(), empty_folder))
+        preserved = next(
+            node for node in read_identity(self._project_root())["nodes"]
+            if node["uuid"] == original["uuid"]
+        )
+        self.assertEqual(preserved["legacy_path"], trash_path)
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, trash_path
         ).is_dir())
 
     def test_stable_folder_identity_can_materialize_folder_named_txt(self):
