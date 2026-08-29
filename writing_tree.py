@@ -1,6 +1,7 @@
 import copy
 import os
 import re
+import time
 import unicodedata
 from contextlib import nullcontext
 
@@ -36,6 +37,59 @@ class WritingTreeMixin:
         ("📌 장소", "메인/장소"),
         ("🗑️ 휴지통", "메인/휴지통"),
     )
+
+    def _run_or_queue_structure_action(
+        self, action_key, action, _queued_retry=False
+    ):
+        """Run at a safe boundary, or accept one deduplicated UI retry.
+
+        No Qt object is touched from a worker thread. The retry returns through
+        the event loop, while the filesystem/UUID journal remains the durable
+        boundary once execution starts.
+        """
+        sync_manager = getattr(self, "sync_manager", None)
+        if sync_manager is None:
+            action()
+            return True
+        pending = getattr(self, "_pending_structure_actions", {})
+        if action_key in pending and not _queued_retry:
+            return False
+        ready = False
+        with sync_manager.local_structure_mutation(
+            blocking=False, advance_generation=False
+        ) as generation:
+            if generation is not False:
+                pending = getattr(self, "_pending_structure_actions", {})
+                pending.pop(action_key, None)
+                self._pending_structure_actions = pending
+                sync_manager.notify_local_structure_queue(len(pending))
+                ready = True
+        if ready:
+            # The action owns its ordinary durable mutation context. Releasing
+            # this zero-work probe first keeps Qt refresh work out of the gate.
+            action()
+            return True
+
+        pending = getattr(self, "_pending_structure_actions", {})
+        if action_key in pending:
+            return False
+        pending[action_key] = action
+        self._pending_structure_actions = pending
+        sync_manager.notify_local_structure_queue(len(pending))
+
+        def retry():
+            queued = getattr(self, "_pending_structure_actions", {}).get(
+                action_key
+            )
+            if queued is None:
+                return
+            if not WritingTreeMixin._run_or_queue_structure_action(
+                self, action_key, queued, _queued_retry=True
+            ):
+                QTimer.singleShot(50, retry)
+
+        QTimer.singleShot(50, retry)
+        return False
 
     def _binder_project_root(self):
         root = getattr(self.wpm, "writing_root_path", None)
@@ -184,6 +238,10 @@ class WritingTreeMixin:
             return
         if getattr(self, "_tree_item_creation_active", False):
             return
+        if getattr(self, "_pending_structure_actions", {}):
+            self._remote_tree_refresh_scheduled = True
+            QTimer.singleShot(50, self._flush_remote_tree_refresh)
+            return
         try:
             from PyQt6.QtWidgets import QAbstractItemView
             if self.binder_tree.state() == QAbstractItemView.State.EditingState:
@@ -321,6 +379,19 @@ class WritingTreeMixin:
             QTimer.singleShot(50, finish_flags_after_editor_destruction)
 
     def load_tree_data(self):
+        started = time.perf_counter()
+        try:
+            return self._load_tree_data_impl()
+        finally:
+            sync_manager = getattr(self, "sync_manager", None)
+            recorder = getattr(sync_manager, "record_binder_timing", None)
+            if callable(recorder):
+                recorder(
+                    "load_tree_data",
+                    (time.perf_counter() - started) * 1000.0,
+                )
+
+    def _load_tree_data_impl(self):
         """로컬 폴더를 스캔하여 트리에 동적으로 노드를 생성합니다."""
         self.binder_tree.blockSignals(True)
         self.binder_tree.clear()
@@ -804,7 +875,7 @@ class WritingTreeMixin:
 
         QTimer.singleShot(50, _exec_menu)
 
-    def delete_tree_item(self, item):
+    def delete_tree_item(self, item, _structure_acquired=False):
         if not WritingTreeMixin._is_live_qt_object(item): return
         rel_path = item.data(0, Qt.ItemDataRole.UserRole)
         if not rel_path: return
@@ -814,45 +885,114 @@ class WritingTreeMixin:
             top_parent = top_parent.parent()
 
         if top_parent.text(0) == "🗑️ 휴지통":
-            reply = QMessageBox.question(self, "영구 삭제 확인", f"'{item.text(0)}'을(를) 영구적으로 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            reply = (
+                QMessageBox.StandardButton.Yes
+                if _structure_acquired
+                else QMessageBox.question(
+                    self,
+                    "영구 삭제 확인",
+                    f"'{item.text(0)}'을(를) 영구적으로 삭제하시겠습니까?\n"
+                    "이 작업은 되돌릴 수 없습니다.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+            )
             if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    trash_entry = next(
-                        (
-                            entry for entry in self.wpm.list_trash_items()
-                            if entry.get("trash_path") == rel_path
+                if not _structure_acquired:
+                    return WritingTreeMixin._run_or_queue_structure_action(
+                        self,
+                        f"purge:{rel_path}",
+                        lambda: WritingTreeMixin.delete_tree_item(
+                            self, item, _structure_acquired=True
                         ),
-                        {"trash_path": rel_path},
                     )
-                    self.wpm.delete_from_trash(rel_path)
-                    if hasattr(self, "sync_manager"):
-                        self.sync_manager.record_trash_purge([trash_entry])
+                try:
+                    mutation_gate = (
+                        self.sync_manager.local_structure_mutation()
+                        if hasattr(self, "sync_manager") else nullcontext()
+                    )
+                    with mutation_gate:
+                        trash_entry = next(
+                            (
+                                entry for entry in self.wpm.list_trash_items()
+                                if entry.get("trash_path") == rel_path
+                            ),
+                            {"trash_path": rel_path},
+                        )
+                        self.wpm.delete_from_trash(rel_path)
+                        if hasattr(self, "sync_manager"):
+                            self.sync_manager.record_trash_purge([trash_entry])
                     self._cleanup_after_delete(rel_path, item)
                 except Exception as e:
                     QMessageBox.warning(self, "오류", f"영구 삭제 실패: {e}")
             return
 
-        reply = QMessageBox.question(self, "삭제 확인", f"'{item.text(0)}'을(를) 휴지통으로 이동하시겠습니까?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = (
+            QMessageBox.StandardButton.Yes
+            if _structure_acquired
+            else QMessageBox.question(
+                self,
+                "삭제 확인",
+                f"'{item.text(0)}'을(를) 휴지통으로 이동하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+        )
         if reply == QMessageBox.StandardButton.Yes:
+            if not _structure_acquired:
+                action_key = f"delete:{rel_path}"
+                return WritingTreeMixin._run_or_queue_structure_action(
+                    self,
+                    action_key,
+                    lambda: WritingTreeMixin.delete_tree_item(
+                        self, item, _structure_acquired=True
+                    ),
+                )
+            trash_rel_path = None
             try:
                 sync_manager = getattr(self, "sync_manager", None)
                 mutation_gate = (
                     sync_manager.local_structure_mutation()
                     if sync_manager is not None else nullcontext()
                 )
+                tree_order = (
+                    WritingTreeMixin._current_tree_order_snapshot(self)
+                    if hasattr(getattr(self, "wpm", None), "project_settings")
+                    else None
+                )
+                order_parent, order_index = WritingTreeMixin._tree_order_position(
+                    tree_order or {}, rel_path
+                )
+                projected_order = WritingTreeMixin._tree_order_without_path(
+                    tree_order or {}, rel_path
+                )
                 with mutation_gate:
-                    trash_rel_path = self.wpm.move_to_trash(rel_path)
+                    trash_rel_path = self.wpm.move_to_trash(
+                        rel_path,
+                        tree_order_parent=order_parent,
+                        tree_order_index=order_index,
+                    )
                     if sync_manager is not None:
                         operations = sync_manager.record_tombstone(
                             rel_path, trash_rel_path, retry=False
                         )
                     else:
                         operations = []
-                    if hasattr(self, "controller"):
-                        self.controller.forget_path(rel_path)
-                    self._cleanup_after_delete(
-                        rel_path, item, operations=operations
-                    )
+                    if tree_order is not None:
+                        if operations and any(
+                            operation.get("contract_structure_intents")
+                            or operation.get("contract_document_changes")
+                            for operation in operations
+                            if isinstance(operation, dict)
+                        ):
+                            sync_manager.queue_contract_path_change_with_order(
+                                operations, projected_order, retry=False
+                            )
+                        else:
+                            WritingTreeMixin._persist_tree_order(
+                                self, projected_order, retry=False
+                            )
+                if hasattr(self, "controller"):
+                    self.controller.forget_path(rel_path)
+                self._cleanup_after_delete(rel_path, item, persist=False)
                 if sync_manager is not None:
                     sync_manager.retry_pending_syncs()
 
@@ -869,7 +1009,7 @@ class WritingTreeMixin:
                                 QTreeWidgetItem(trash_item, ["<dummy>"])
                         break
             except Exception as e:
-                if 'trash_rel_path' in locals():
+                if trash_rel_path:
                     sync_manager = getattr(self, "sync_manager", None)
                     rollback_gate = (
                         sync_manager.local_structure_mutation()
@@ -888,15 +1028,21 @@ class WritingTreeMixin:
                     self.load_tree_data()
                 QMessageBox.warning(self, "오류", f"삭제 실패: {e}")
 
-    def restore_trash_item(self, item, choose_location=False):
+    def restore_trash_item(
+        self,
+        item,
+        choose_location=False,
+        _structure_acquired=False,
+        _destination_parent=None,
+    ):
         if not WritingTreeMixin._is_live_qt_object(item):
             return
         rel_path = item.data(0, Qt.ItemDataRole.UserRole)
         if not rel_path:
             return
 
-        destination_parent = None
-        if choose_location:
+        destination_parent = _destination_parent
+        if choose_location and not _structure_acquired:
             main_root = os.path.abspath(os.path.join(self.wpm.writing_root_path, "메인"))
             selected = QFileDialog.getExistingDirectory(self, "복원할 위치 선택", main_root)
             if not selected:
@@ -909,6 +1055,20 @@ class WritingTreeMixin:
                 QMessageBox.warning(self, "복원 실패", "집필 모드의 메인 폴더 안에서 위치를 선택해주세요.")
                 return
             destination_parent = os.path.relpath(selected, self.wpm.writing_root_path).replace("\\", "/")
+
+        if not _structure_acquired:
+            action_key = f"restore:{rel_path}:{destination_parent or ''}"
+            return WritingTreeMixin._run_or_queue_structure_action(
+                self,
+                action_key,
+                lambda: WritingTreeMixin.restore_trash_item(
+                    self,
+                    item,
+                    choose_location=choose_location,
+                    _structure_acquired=True,
+                    _destination_parent=destination_parent,
+                ),
+            )
 
         try:
             sync_manager = getattr(self, "sync_manager", None)
@@ -924,6 +1084,7 @@ class WritingTreeMixin:
                 {},
             )
             original_rel_path = trash_entry.get("original_path")
+            tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
             with mutation_gate:
                 restored_path = self.wpm.restore_from_trash(
                     rel_path, destination_parent
@@ -937,11 +1098,15 @@ class WritingTreeMixin:
                     )
                 else:
                     operations = []
-                if hasattr(self, "controller"):
-                    self.controller.rename_path(rel_path, restored_path)
-                self.load_tree_data()
                 if sync_manager is not None:
-                    tree_order = WritingTreeMixin._current_tree_order_snapshot(self)
+                    tree_order = WritingTreeMixin._tree_order_with_restored_path(
+                        self,
+                        tree_order,
+                        rel_path,
+                        restored_path,
+                        original_parent=trash_entry.get("tree_order_parent"),
+                        original_index=trash_entry.get("tree_order_index"),
+                    )
                     if not operations:
                         # A folder with no documents in it restores without a
                         # single document operation to publish. The tree order
@@ -967,6 +1132,9 @@ class WritingTreeMixin:
                         self.defer_tree_order_until_operations(
                             operations, tree_order=tree_order
                         )
+            if hasattr(self, "controller"):
+                self.controller.rename_path(rel_path, restored_path)
+            self.load_tree_data()
             if sync_manager is not None:
                 sync_manager.retry_pending_syncs()
             QMessageBox.information(self, "복원 완료", f"다음 위치로 복원했습니다.\n{restored_path}")
@@ -990,7 +1158,9 @@ class WritingTreeMixin:
                 self.load_tree_data()
             QMessageBox.warning(self, "복원 실패", str(e))
 
-    def _cleanup_after_delete(self, rel_path, item, operations=None):
+    def _cleanup_after_delete(
+        self, rel_path, item, operations=None, persist=True
+    ):
         parent = item.parent()
         if parent:
             parent.removeChild(item)
@@ -1020,6 +1190,8 @@ class WritingTreeMixin:
             self.is_dirty_right = False
             self.right_editor.document().setModified(False)
 
+        if not persist:
+            return
         if not hasattr(getattr(self, "wpm", None), "project_settings"):
             self.save_tree_order()
             return
@@ -1258,6 +1430,98 @@ class WritingTreeMixin:
         return tree_order
 
     @staticmethod
+    def _tree_order_parent_key(rel_path):
+        parent_path = str(rel_path or "").replace("\\", "/").rpartition("/")[0]
+        return "<root>" if parent_path == "메인" else parent_path
+
+    @staticmethod
+    def _tree_order_position(tree_order, rel_path):
+        parent_key = WritingTreeMixin._tree_order_parent_key(rel_path)
+        name = os.path.basename(str(rel_path or "").replace("\\", "/"))
+        siblings = tree_order.get(parent_key, []) if isinstance(tree_order, dict) else []
+        if isinstance(siblings, list) and name in siblings:
+            return parent_key, siblings.index(name)
+        return parent_key, None
+
+    @staticmethod
+    def _tree_order_without_path(tree_order, rel_path):
+        """Project one delete without touching Qt widgets."""
+        projected = copy.deepcopy(tree_order) if isinstance(tree_order, dict) else {}
+        rel_path = str(rel_path or "").replace("\\", "/").rstrip("/")
+        parent_key = WritingTreeMixin._tree_order_parent_key(rel_path)
+        name = os.path.basename(rel_path)
+        siblings = projected.get(parent_key)
+        if isinstance(siblings, list):
+            projected[parent_key] = [child for child in siblings if child != name]
+        for key in list(projected):
+            normalized = str(key).replace("\\", "/")
+            if normalized == rel_path or normalized.startswith(rel_path + "/"):
+                projected.pop(key, None)
+        return projected
+
+    def _tree_order_with_restored_path(
+        self,
+        tree_order,
+        trash_rel_path,
+        restored_rel_path,
+        original_parent=None,
+        original_index=None,
+    ):
+        """Project one restore and scan only its restored subtree off-widget."""
+        projected = WritingTreeMixin._tree_order_without_path(
+            tree_order, trash_rel_path
+        )
+        restored_rel_path = str(restored_rel_path).replace("\\", "/").rstrip("/")
+        parent_key = WritingTreeMixin._tree_order_parent_key(restored_rel_path)
+        name = os.path.basename(restored_rel_path)
+        siblings = projected.get(parent_key)
+        if not isinstance(siblings, list):
+            siblings = []
+        else:
+            siblings = [child for child in siblings if child != name]
+        if original_parent == parent_key and original_index is not None:
+            insert_at = max(0, min(int(original_index), len(siblings)))
+        else:
+            insert_at = len(siblings)
+        siblings.insert(insert_at, name)
+        projected[parent_key] = siblings
+
+        writing_root = getattr(self.wpm, "writing_root_path", None)
+        restored_full = (
+            os.path.join(writing_root, restored_rel_path) if writing_root else ""
+        )
+        if os.path.isdir(restored_full):
+            for current_root, dirs, files in os.walk(restored_full):
+                rel_parent = os.path.relpath(current_root, writing_root).replace(
+                    "\\", "/"
+                )
+                entries = [
+                    entry for entry in os.listdir(current_root)
+                    if not entry.endswith(".tmp")
+                    and (
+                        os.path.isdir(os.path.join(current_root, entry))
+                        or entry.endswith(".txt")
+                    )
+                ]
+                fixed_order = canonical_manuscript_children(rel_parent, entries)
+                projected[rel_parent] = (
+                    fixed_order
+                    if fixed_order is not None
+                    else WritingTreeMixin._merge_additive_child_order(
+                        projected.get(rel_parent, []), entries
+                    )
+                )
+        return projected
+
+    @staticmethod
+    def _merge_additive_child_order(saved, entries):
+        saved = saved if isinstance(saved, list) else []
+        available = list(entries)
+        ordered = [name for name in saved if name in available]
+        ordered.extend(name for name in available if name not in ordered)
+        return ordered
+
+    @staticmethod
     def _rename_saved_tree_order(tree_order, old_rel_path, new_rel_path):
         """Rename one same-parent folder in a saved, possibly lazily loaded tree."""
         if not isinstance(tree_order, dict):
@@ -1351,11 +1615,27 @@ class WritingTreeMixin:
             tree_order, operations
         )
 
-    def start_create_root_item(self, is_folder):
+    def start_create_root_item(self, is_folder, _structure_acquired=False):
         # Rapid clicks can arrive before the first 150ms inline-editor timer.
         # Commit the previous default-named item so only one editor can open.
+        if not _structure_acquired and hasattr(self, "sync_manager"):
+            action_key = f"create-root:{'folder' if is_folder else 'document'}"
+            return WritingTreeMixin._run_or_queue_structure_action(
+                self,
+                action_key,
+                lambda: WritingTreeMixin.start_create_root_item(
+                    self, is_folder, _structure_acquired=True
+                ),
+            )
         self._finalize_current_tree_creation()
-        new_name = self._create_binder_item("메인", "새 폴더" if is_folder else "새_문서", is_folder)
+        mutation_gate = (
+            self.sync_manager.local_structure_mutation()
+            if hasattr(self, "sync_manager") else nullcontext()
+        )
+        with mutation_gate:
+            new_name = self._create_binder_item(
+                "메인", "새 폴더" if is_folder else "새_문서", is_folder
+            )
         if not new_name: return
 
         self.binder_tree.blockSignals(True)
@@ -1446,17 +1726,39 @@ class WritingTreeMixin:
                 self.apply_editor_margins()
                 QMessageBox.information(self, "복원 완료", "과거 버전으로 성공적으로 복원되었습니다.")
 
-    def start_create_item(self, parent_item, is_folder):
+    def start_create_item(
+        self, parent_item, is_folder, _structure_acquired=False
+    ):
         if not WritingTreeMixin._is_live_qt_object(parent_item): return
         if parent_item.data(0, Qt.ItemDataRole.UserRole + 1) is False:
             return
+        parent_rel_path = parent_item.data(0, Qt.ItemDataRole.UserRole)
+        if not _structure_acquired and hasattr(self, "sync_manager"):
+            action_key = (
+                f"create:{parent_rel_path}:"
+                f"{'folder' if is_folder else 'document'}"
+            )
+            return WritingTreeMixin._run_or_queue_structure_action(
+                self,
+                action_key,
+                lambda: WritingTreeMixin.start_create_item(
+                    self, parent_item, is_folder, _structure_acquired=True
+                ),
+            )
         self._finalize_current_tree_creation()
         if not parent_item.isExpanded():
             parent_item.setExpanded(True)
 
-        parent_rel_path = parent_item.data(0, Qt.ItemDataRole.UserRole)
-
-        new_name = self._create_binder_item(parent_rel_path, "새 폴더" if is_folder else "새_문서", is_folder)
+        mutation_gate = (
+            self.sync_manager.local_structure_mutation()
+            if hasattr(self, "sync_manager") else nullcontext()
+        )
+        with mutation_gate:
+            new_name = self._create_binder_item(
+                parent_rel_path,
+                "새 폴더" if is_folder else "새_문서",
+                is_folder,
+            )
         new_rel_path = os.path.join(parent_rel_path, new_name).replace("\\", "/") if parent_rel_path else new_name
 
         self.binder_tree.blockSignals(True)

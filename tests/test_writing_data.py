@@ -44,6 +44,55 @@ class WritingDataTestCase(unittest.TestCase):
     def path(self, relative_path):
         return Path(self.wpm.writing_root_path, relative_path)
 
+    def test_busy_structure_gate_accepts_first_click_and_retries_once(self):
+        manager = MagicMock()
+        manager.local_structure_mutation.side_effect = [
+            nullcontext(False),
+            nullcontext(7),
+        ]
+        panel = SimpleNamespace(sync_manager=manager)
+        action = MagicMock()
+        scheduled = []
+
+        with patch(
+            "writing_tree.QTimer.singleShot",
+            side_effect=lambda _delay, callback: scheduled.append(callback),
+        ):
+            accepted = WritingTreeMixin._run_or_queue_structure_action(
+                panel, "delete:one", action
+            )
+            duplicate = WritingTreeMixin._run_or_queue_structure_action(
+                panel, "delete:one", action
+            )
+            self.assertFalse(accepted)
+            self.assertFalse(duplicate)
+            action.assert_not_called()
+            self.assertEqual(len(scheduled), 1)
+
+            scheduled.pop()()
+
+        action.assert_called_once_with()
+        self.assertEqual(
+            manager.notify_local_structure_queue.call_args_list,
+            [call(1), call(0)],
+        )
+
+    def test_ui_heartbeat_reports_event_loop_lateness(self):
+        manager = SimpleNamespace(record_binder_timing=MagicMock())
+        panel = SimpleNamespace(
+            sync_manager=manager,
+            _ui_heartbeat_expected_at=10.0,
+            _ui_heartbeat_interval_ms=250,
+        )
+
+        with patch("mode_writing.time.perf_counter", return_value=10.125):
+            WritingModeWidget._record_ui_heartbeat(panel)
+
+        manager.record_binder_timing.assert_called_once_with(
+            "ui_heartbeat", 125.0
+        )
+        self.assertEqual(panel._ui_heartbeat_expected_at, 10.375)
+
     def test_fixed_binder_uses_story_plot_for_label_and_storage_path(self):
         roots = dict(WritingTreeMixin.FIXED_ROOT_NODES)
 
@@ -507,7 +556,8 @@ class WritingDataTestCase(unittest.TestCase):
         ):
             WritingTreeMixin.delete_tree_item(panel, item)
 
-        self.assertEqual(manager.local_structure_mutation.call_count, 2)
+        # One non-blocking UI admission probe plus commit and rollback gates.
+        self.assertEqual(manager.local_structure_mutation.call_count, 3)
         manager.record_tombstone.assert_called_once_with(
             live_path, trash_path, retry=False
         )
@@ -558,7 +608,8 @@ class WritingDataTestCase(unittest.TestCase):
         ):
             WritingTreeMixin.restore_trash_item(panel, item)
 
-        self.assertEqual(manager.local_structure_mutation.call_count, 2)
+        # One non-blocking UI admission probe plus commit and rollback gates.
+        self.assertEqual(manager.local_structure_mutation.call_count, 3)
         manager.record_restore.assert_called_once_with(
             trash_path,
             restored_path,
@@ -744,6 +795,47 @@ class WritingDataTestCase(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.wpm.restore_from_trash(collision_item["trash_path"])
         self.assertEqual(self.wpm.read_text_file("메인/메모장/충돌.txt"), "새 현재본")
+
+    def test_trash_metadata_preserves_original_tree_order_position(self):
+        original = "메인/메모장/가운데 폴더"
+        self.path(original).mkdir(parents=True)
+
+        trash_path = self.wpm.move_to_trash(
+            original,
+            tree_order_parent="메인/메모장",
+            tree_order_index=2,
+        )
+
+        trashed = next(
+            item for item in self.wpm.list_trash_items()
+            if item["trash_path"] == trash_path
+        )
+        self.assertEqual(trashed["tree_order_parent"], "메인/메모장")
+        self.assertEqual(trashed["tree_order_index"], 2)
+
+    def test_restore_projection_reuses_saved_sibling_position(self):
+        restored = "메인/메모장/가운데 폴더"
+        self.path(restored).mkdir(parents=True)
+        panel = SimpleNamespace(wpm=self.wpm)
+        before = {
+            "메인/메모장": ["앞 폴더", "뒤 폴더"],
+            "메인/휴지통": ["가운데 폴더"],
+        }
+
+        projected = WritingTreeMixin._tree_order_with_restored_path(
+            panel,
+            before,
+            "메인/휴지통/가운데 폴더",
+            restored,
+            original_parent="메인/메모장",
+            original_index=1,
+        )
+
+        self.assertEqual(
+            projected["메인/메모장"],
+            ["앞 폴더", "가운데 폴더", "뒤 폴더"],
+        )
+        self.assertNotIn("가운데 폴더", projected["메인/휴지통"])
 
     def test_full_and_partial_extraction_keep_sources_unchanged(self):
         volume = self.path("메인/원고/1권")

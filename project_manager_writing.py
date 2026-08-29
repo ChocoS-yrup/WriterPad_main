@@ -207,7 +207,14 @@ class WritingProjectManager:
         )
         return True
 
-    def move_to_trash(self, rel_path, deleted_at=None, document_id=None):
+    def move_to_trash(
+        self,
+        rel_path,
+        deleted_at=None,
+        document_id=None,
+        tree_order_parent=None,
+        tree_order_index=None,
+    ):
         """항목을 휴지통으로 이동하고 원래 위치를 기록합니다."""
         if not self.writing_root_path: return False
         full_path = self._resolve_inside_root(rel_path)
@@ -234,6 +241,10 @@ class WritingProjectManager:
             "original_path": rel_path.replace("\\", "/"),
             "deleted_at": deleted_at or datetime.now().isoformat(timespec="seconds"),
             "document_id": str(document_id) if document_id else None,
+            "tree_order_parent": tree_order_parent,
+            "tree_order_index": (
+                int(tree_order_index) if tree_order_index is not None else None
+            ),
         }
         self._save_trash_index(updated_index)
         target_rel = os.path.relpath(
@@ -265,6 +276,8 @@ class WritingProjectManager:
                 "original_path": info.get("original_path"),
                 "deleted_at": info.get("deleted_at"),
                 "document_id": info.get("document_id"),
+                "tree_order_parent": info.get("tree_order_parent"),
+                "tree_order_index": info.get("tree_order_index"),
             })
         return items
 

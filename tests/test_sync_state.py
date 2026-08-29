@@ -579,6 +579,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             "auth_required": "로그인 필요",
             "lease": "다른 기기 편집 중",
             "failed": "서버 전송 대기",
+            "local_waiting": "바인더 작업 대기",
             "conflict": "충돌",
             "project_trashed": "서버 휴지통 · 동기화 중지",
             "project_purged": "서버 영구 삭제 · 로컬 사본",
@@ -590,7 +591,8 @@ class StorageStatusLabelTestCase(unittest.TestCase):
                 state,
                 "상세 상태",
                 1 if state in {
-                    "offline", "auth_required", "lease", "failed", "conflict",
+                    "offline", "auth_required", "lease", "failed",
+                    "local_waiting", "conflict",
                     "project_trashed", "project_purged",
                 } else 0,
             )

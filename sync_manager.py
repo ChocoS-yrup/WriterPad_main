@@ -94,6 +94,66 @@ class RemoteRenameSkipped(Exception):
     """
 
 
+class _MeasuredReentrantLock:
+    """RLock wrapper that reports only outermost wait and hold durations.
+
+    Structure mutations deliberately remain one serial commit boundary. The
+    wrapper makes contention observable without retaining manuscript paths.
+    """
+
+    def __init__(self, observer):
+        self._lock = threading.RLock()
+        self._observer = observer
+        self._local = threading.local()
+
+    def acquire(self, blocking=True, timeout=-1):
+        depth = int(getattr(self._local, "depth", 0))
+        started = time.perf_counter()
+        if timeout == -1:
+            acquired = self._lock.acquire(blocking)
+        else:
+            acquired = self._lock.acquire(blocking, timeout)
+        waited_ms = (time.perf_counter() - started) * 1000.0
+        if not acquired:
+            return False
+        if depth == 0:
+            self._local.hold_started = time.perf_counter()
+            try:
+                self._observer("wait", waited_ms)
+            except Exception:
+                pass
+        self._local.depth = depth + 1
+        return True
+
+    def release(self):
+        depth = int(getattr(self._local, "depth", 0))
+        if depth <= 0:
+            raise RuntimeError("cannot release un-acquired structure lock")
+        report_ms = None
+        if depth == 1:
+            held_ms = (
+                time.perf_counter()
+                - float(getattr(self._local, "hold_started", time.perf_counter()))
+            ) * 1000.0
+            report_ms = held_ms
+            self._local.hold_started = None
+        self._local.depth = depth - 1
+        self._lock.release()
+        if report_ms is not None:
+            try:
+                self._observer("hold", report_ms)
+            except Exception:
+                pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+        return False
+
+
 def supabase_config_dir():
     """Return the directory that holds public Supabase client settings."""
     return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -735,7 +795,16 @@ class SyncManager(QObject):
         self._rename_workers = []
         self._retention_worker = None
         self._session_refresh_lock = threading.Lock()
-        self._structure_mutation_gate = threading.RLock()
+        self._structure_timing_lock = threading.Lock()
+        self._structure_timing = {
+            "wait_max_ms": 0.0,
+            "hold_max_ms": 0.0,
+            "slow_wait_count": 0,
+            "slow_hold_count": 0,
+        }
+        self._structure_mutation_gate = _MeasuredReentrantLock(
+            self._record_structure_timing
+        )
         self._local_structure_generation = 0
         self._v2_untracked_recovery_paths = set()
         # ``None`` means no configured v2 project. configure_v2() changes it
@@ -1189,15 +1258,77 @@ class SyncManager(QObject):
         with self._structure_mutation_gate:
             return self._local_structure_generation
 
+    def _record_structure_timing(self, phase, elapsed_ms):
+        """Keep bounded contention metrics and log only actionable stalls."""
+        elapsed_ms = max(0.0, float(elapsed_ms or 0.0))
+        key = f"{phase}_max_ms"
+        count_key = f"slow_{phase}_count"
+        threshold_ms = 16.0 if phase == "wait" else 50.0
+        with self._structure_timing_lock:
+            self._structure_timing[key] = max(
+                float(self._structure_timing.get(key, 0.0)), elapsed_ms
+            )
+            if elapsed_ms >= threshold_ms:
+                self._structure_timing[count_key] = (
+                    int(self._structure_timing.get(count_key, 0)) + 1
+                )
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None and elapsed_ms >= threshold_ms:
+            diagnostics.record(
+                "structure_timing",
+                state=f"{phase}:{elapsed_ms:.1f}ms",
+                pending_count=self.pending_retry_count,
+            )
+
+    def record_binder_timing(self, phase, elapsed_ms):
+        """Record slow UI-side binder work without retaining project paths."""
+        elapsed_ms = max(0.0, float(elapsed_ms or 0.0))
+        if elapsed_ms < 50.0:
+            return
+        self._diagnostics.record(
+            "binder_timing",
+            state=f"{str(phase)[:24]}:{elapsed_ms:.1f}ms",
+            pending_count=self.pending_retry_count,
+        )
+
+    def structure_timing_snapshot(self):
+        with self._structure_timing_lock:
+            return dict(self._structure_timing)
+
     @contextmanager
-    def local_structure_mutation(self):
+    def local_structure_mutation(self, blocking=True, advance_generation=True):
         """Serialize local filesystem/tree/queue changes with remote tree apply."""
-        with self._structure_mutation_gate:
-            self._local_structure_generation += 1
+        acquired = self._structure_mutation_gate.acquire(blocking=blocking)
+        if not acquired:
+            yield False
+            return
+        try:
+            if advance_generation:
+                self._local_structure_generation += 1
             try:
                 yield self._local_structure_generation
             finally:
-                self._local_structure_generation += 1
+                if advance_generation:
+                    self._local_structure_generation += 1
+        finally:
+            self._structure_mutation_gate.release()
+
+    def notify_local_structure_queue(self, pending_count):
+        """Expose accepted UI structure work without pretending it was lost."""
+        pending_count = max(0, int(pending_count or 0))
+        if pending_count:
+            self._set_sync_state(
+                "local_waiting",
+                "바인더 작업이 안전한 구조 커밋 경계를 기다리고 있습니다.",
+                pending_count,
+            )
+            self._diagnostics.record(
+                "local_structure_queued",
+                state=f"pending:{pending_count}",
+                pending_count=pending_count,
+            )
+        else:
+            self._publish_sync_state()
 
     def record_structure_recovery(
         self, old_rel_path, new_rel_path, error_code="RECOVERY_FAILED"
@@ -2284,6 +2415,7 @@ class SyncManager(QObject):
             "pending_count": self.pending_retry_count,
             "sync_state": self.current_sync_state,
             "activity": self.sync_activity_snapshot(),
+            "structure_timing": self.structure_timing_snapshot(),
         }
 
     def diagnostic_report(self):

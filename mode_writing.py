@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QTextEdit, QLabel,
@@ -351,6 +352,15 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             self.sync_manager.pending_retry_count,
         )
         self.load_tree_data()
+        self._ui_heartbeat_interval_ms = 250
+        self._ui_heartbeat_expected_at = time.perf_counter() + 0.25
+        self.ui_heartbeat_timer = QTimer(self)
+        self.ui_heartbeat_timer.setInterval(self._ui_heartbeat_interval_ms)
+        self.ui_heartbeat_timer.timeout.connect(self._record_ui_heartbeat)
+        self.ui_heartbeat_timer.start()
+        self.sync_manager.register_shutdown_timer_stopper(
+            self.ui_heartbeat_timer.stop
+        )
         QTimer.singleShot(250, self.sync_manager.retry_pending_syncs)
         self.remote_pull_timer = QTimer(self)
         self.remote_pull_timer.setInterval(5000)
@@ -363,6 +373,16 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         
         QTimer.singleShot(100, self.load_saved_files)
         
+    def _record_ui_heartbeat(self):
+        now = time.perf_counter()
+        expected = float(getattr(self, "_ui_heartbeat_expected_at", now))
+        late_ms = max(0.0, (now - expected) * 1000.0)
+        interval_ms = int(getattr(self, "_ui_heartbeat_interval_ms", 250))
+        self._ui_heartbeat_expected_at = now + interval_ms / 1000.0
+        recorder = getattr(self.sync_manager, "record_binder_timing", None)
+        if callable(recorder):
+            recorder("ui_heartbeat", late_ms)
+
     def get_active_paths(self):
         paths = []
         if self.current_loaded_file_left: paths.append(self.current_loaded_file_left)
@@ -1016,6 +1036,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "● 로컬 저장 완료 · 서버 수신 대기",
                 "#7dd3fc",
                 "#173449",
+            ),
+            "local_waiting": (
+                "● 바인더 작업 대기",
+                "#fcd34d",
+                "#3b3017",
             ),
             "blocked": (
                 "● 로컬 저장 완료 · 서버 적용 차단",
