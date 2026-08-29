@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import unicodedata
 import uuid
@@ -38,6 +39,7 @@ from sync_manager import (
     TRASH_PURGE_DOCUMENT_PATH,
     TREE_ORDER_DOCUMENT_PATH,
     SyncManager,
+    V2PullWorker,
     V2QueueWorker,
     is_live_document_path,
 )
@@ -45,6 +47,141 @@ from sync_v2_store import SyncV2Store
 from three_way_merge import build_conflict_report, three_way_merge
 from writing_controller import WritingController
 from writing_tree import WritingTreeMixin
+
+
+class BackgroundStructureExecutionTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_unchanged_pull_snapshot_skips_durable_projection(self):
+        manager = MagicMock()
+        manager._ensure_contract_handshake.return_value = None
+        manager._fetch_v2_project_documents.return_value = []
+        manager._fetch_v2_project_folders.return_value = []
+        manager._fetch_v2_project_tree_orders.return_value = []
+        manager._legacy_structure_snapshot_in_flight.return_value = False
+        manager._needs_folder_history.return_value = False
+        authority = {"kind": "legacy", "folder_paths": []}
+        manager._select_remote_structure_authority.return_value = authority
+        manager._remote_snapshot_fingerprint.side_effect = (
+            SyncManager._remote_snapshot_fingerprint
+        )
+        fingerprint = SyncManager._remote_snapshot_fingerprint(
+            [], [], [], [], authority
+        )
+        worker = V2PullWorker(manager, project_id="project-id")
+        worker.cached_snapshot_fingerprint = fingerprint
+        results = []
+        worker.resultReady.connect(lambda success, payload: results.append(
+            (success, payload)
+        ))
+
+        worker.run()
+
+        self.assertTrue(results[0][0])
+        self.assertEqual(
+            results[0][1]["background_apply"]["kind"], "unchanged"
+        )
+        manager._apply_v2_remote_documents.assert_not_called()
+
+    def test_snapshot_fingerprint_ignores_unordered_rpc_row_order(self):
+        documents = [
+            {"document_id": "b", "revision": 2, "content": "two"},
+            {"document_id": "a", "revision": 1, "content": "one"},
+        ]
+        tree_orders = [
+            {"tree_order_id": "second", "children": ["B", "A"]},
+            {"tree_order_id": "first", "children": ["A", "B"]},
+        ]
+        authority = {
+            "kind": "projection",
+            "folder_paths": ["메인/둘", "메인/하나"],
+        }
+
+        forward = SyncManager._remote_snapshot_fingerprint(
+            documents, [], [], tree_orders, authority
+        )
+        reversed_rows = SyncManager._remote_snapshot_fingerprint(
+            list(reversed(documents)),
+            [],
+            [],
+            list(reversed(tree_orders)),
+            {
+                "kind": "projection",
+                "folder_paths": list(reversed(authority["folder_paths"])),
+            },
+        )
+
+        self.assertEqual(forward, reversed_rows)
+        changed_children = copy.deepcopy(tree_orders)
+        changed_children[0]["children"] = ["A", "B"]
+        self.assertNotEqual(
+            forward,
+            SyncManager._remote_snapshot_fingerprint(
+                documents, [], [], changed_children, authority
+            ),
+        )
+
+    def test_changed_pull_defers_apply_for_fresh_editor_protection_check(self):
+        manager = MagicMock()
+        manager._ensure_contract_handshake.return_value = None
+        manager._fetch_v2_project_documents.return_value = []
+        manager._fetch_v2_project_folders.return_value = []
+        manager._fetch_v2_project_tree_orders.return_value = []
+        manager._legacy_structure_snapshot_in_flight.return_value = False
+        manager._needs_folder_history.return_value = False
+        authority = {"kind": "legacy", "folder_paths": []}
+        manager._select_remote_structure_authority.return_value = authority
+        manager._remote_snapshot_fingerprint.side_effect = (
+            SyncManager._remote_snapshot_fingerprint
+        )
+        worker = V2PullWorker(manager, project_id="project")
+        worker.pull_identity = (1, "project", "local")
+        worker.expected_structure_generation = 8
+        results = []
+        worker.resultReady.connect(lambda success, payload: results.append(
+            (success, payload)
+        ))
+
+        worker.run()
+
+        self.assertTrue(results[0][0])
+        self.assertNotIn("background_apply", results[0][1])
+        manager._apply_v2_remote_documents.assert_not_called()
+
+    def test_local_structure_executor_preserves_submission_order(self):
+        manager = SyncManager()
+        completed = []
+        execution = []
+
+        for number in range(5):
+            manager.submit_local_structure_action(
+                lambda value=number: execution.append(value) or value,
+                lambda success, result, error, value=number: completed.append(
+                    (value, success, result, error)
+                ),
+            )
+
+        deadline = time.monotonic() + 5.0
+        while len(completed) < 5 and time.monotonic() < deadline:
+            self.app.processEvents()
+            QTest.qWait(10)
+
+        manager.wait_all_workers(5000)
+        deadline = time.monotonic() + 2.0
+        while (
+            manager._local_structure_worker is not None
+            and time.monotonic() < deadline
+        ):
+            self.app.processEvents()
+            QTest.qWait(10)
+        self.app.processEvents()
+        self.assertEqual(execution, [0, 1, 2, 3, 4])
+        self.assertEqual(
+            completed,
+            [(number, True, number, "") for number in range(5)],
+        )
 
 
 class ThreeWayMergeTestCase(unittest.TestCase):
@@ -8581,6 +8718,47 @@ class UploadDrainPullCoordinatorTestCase(unittest.TestCase):
         self.assertEqual(len(self.workers), 2)
         self.assertFalse(self.coordinator["pull_pending"])
 
+    def test_successful_baseline_caches_snapshot_for_silent_noop_pull(self):
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        baseline = self.workers[0]
+        payload = {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy", "folder_paths": None
+            },
+            "snapshot_fingerprint": "stable-snapshot",
+        }
+        baseline.resultReady.emit(True, payload)
+        baseline.finished.emit()
+
+        self.assertEqual(
+            self.coordinator["applied_snapshot_fingerprint"],
+            "stable-snapshot",
+        )
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        noop = self.workers[1]
+        self.assertEqual(
+            noop.cached_snapshot_fingerprint, "stable-snapshot"
+        )
+        self.assertEqual(
+            self.manager.sync_activity_snapshot()["pull_visible"], 0
+        )
+        noop.resultReady.emit(True, {
+            **payload,
+            "background_apply": {
+                "kind": "unchanged",
+                "changes": [],
+                "recovered_count": 0,
+            },
+        })
+
+        self.assertEqual(
+            self.manager._apply_v2_remote_documents.call_count, 1
+        )
+
     def test_no_pull_fits_between_one_completion_and_the_next_claim(self):
         self._accept_current_authority()
         first = self._enqueue(1)
@@ -8609,6 +8787,55 @@ class UploadDrainPullCoordinatorTestCase(unittest.TestCase):
         self._finish_pull(first)
         self.assertEqual(len(self.workers), 2)
         self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_changed_generation_discards_fetched_plan_without_ui_wait(self):
+        self._accept_current_authority()
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        worker = self.workers[0]
+
+        with self.manager.local_structure_mutation():
+            pass
+        worker.resultReady.emit(True, {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy", "folder_paths": None
+            },
+            "snapshot_fingerprint": "newer-server-reading",
+        })
+
+        self.assertTrue(self.coordinator["pull_pending"])
+        self.manager._apply_v2_remote_documents.assert_not_called()
+
+    def test_unchanged_worker_result_cannot_cache_a_later_generation(self):
+        self._accept_current_authority()
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        worker = self.workers[0]
+
+        with self.manager.local_structure_mutation():
+            pass
+        worker.resultReady.emit(True, {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy", "folder_paths": None
+            },
+            "snapshot_fingerprint": "old-generation-snapshot",
+            "background_apply": {
+                "kind": "unchanged",
+                "changes": [],
+                "recovered_count": 0,
+            },
+        })
+
+        self.assertTrue(self.coordinator["pull_pending"])
+        self.assertIsNone(
+            self.coordinator["applied_snapshot_fingerprint"]
+        )
 
     def test_retry_wait_conflict_and_blocked_each_keep_the_general_gate_closed(self):
         self._accept_current_authority()

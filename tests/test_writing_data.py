@@ -1,5 +1,7 @@
 import os
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -7,17 +9,24 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from PyQt6.QtCore import QMutex, Qt
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import (
+    QApplication, QMessageBox, QTreeWidgetItem
+)
 
-from mode_writing import WritingModeWidget
+from mode_writing import BinderTreeWidget, WritingModeWidget
 from project_manager import ProjectManager
 from project_manager_writing import WritingProjectManager
-from sync_manager import AutoSaveWorker
+from sync_manager import AutoSaveWorker, SyncManager
 from writing_tree import WritingTreeMixin
 
 
 class WritingDataTestCase(unittest.TestCase):
     """실제 작품 폴더 대신 매 테스트마다 임시 작업공간만 사용한다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -43,6 +52,113 @@ class WritingDataTestCase(unittest.TestCase):
 
     def path(self, relative_path):
         return Path(self.wpm.writing_root_path, relative_path)
+
+    @staticmethod
+    def _wait_for(predicate, timeout_seconds=5.0):
+        app = QApplication.instance() or QApplication([])
+        deadline = time.monotonic() + timeout_seconds
+        while not predicate() and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+        return bool(predicate())
+
+    def test_slow_binder_create_returns_before_durable_io_finishes(self):
+        app = self.app
+        manager = SyncManager()
+        # SyncManager is process-wide.  A preceding test may have attached a
+        # temporary v2 project whose directory has already been removed; this
+        # fixture exercises local-only binder work and must not publish that
+        # stale project's state from the queued completion callback.
+        manager.release_v2()
+        panel = WritingTreeMixin()
+        panel.sync_manager = manager
+        panel.wpm = self.wpm
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        parent = QTreeWidgetItem(panel.binder_tree, ["📝 메모장"])
+        parent.setData(0, Qt.ItemDataRole.UserRole, "메인/메모장")
+        parent.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        release = threading.Event()
+
+        def slow_create(*_args):
+            release.wait(5.0)
+            return "새 폴더"
+
+        panel._create_binder_item = slow_create
+        started = time.perf_counter()
+        accepted = panel.start_create_item(parent, is_folder=True)
+        elapsed = time.perf_counter() - started
+
+        self.assertTrue(accepted)
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(parent.childCount(), 0)
+        release.set()
+        self.assertTrue(self._wait_for(lambda: parent.childCount() == 1))
+        self.assertEqual(parent.child(0).text(0), "새 폴더")
+        manager.wait_all_workers(5000)
+        self.assertTrue(self._wait_for(
+            lambda: manager._local_structure_worker is None
+        ))
+        app.processEvents()
+
+    def test_slow_binder_delete_returns_before_trash_io_finishes(self):
+        app = self.app
+        from project_creation_v1 import create_item_at_path
+
+        identity = create_item_at_path(
+            str(self.root / self.project_name),
+            "메인/메모장",
+            "삭제 대상",
+            True,
+        )
+        rel_path = identity["nodes"][-1]["legacy_path"]
+        manager = SyncManager()
+        manager.release_v2()
+        panel = WritingTreeMixin()
+        panel.sync_manager = manager
+        panel.wpm = self.wpm
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        parent = QTreeWidgetItem(panel.binder_tree, ["📝 메모장"])
+        parent.setData(0, Qt.ItemDataRole.UserRole, "메인/메모장")
+        parent.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        item = QTreeWidgetItem(parent, ["삭제 대상"])
+        item.setData(0, Qt.ItemDataRole.UserRole, rel_path)
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        panel._refresh_trash_binder_node = MagicMock()
+        release = threading.Event()
+        original_move = self.wpm.move_to_trash
+
+        def slow_move(*args, **kwargs):
+            release.wait(5.0)
+            return original_move(*args, **kwargs)
+
+        self.wpm.move_to_trash = slow_move
+        with patch(
+            "writing_tree.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            started = time.perf_counter()
+            accepted = panel.delete_tree_item(item)
+            elapsed = time.perf_counter() - started
+
+        self.assertTrue(accepted)
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(self.path(rel_path).is_dir())
+        release.set()
+        self.assertTrue(self._wait_for(lambda: parent.childCount() == 0))
+        self.assertFalse(self.path(rel_path).exists())
+        self.assertTrue(
+            any(
+                entry["original_path"] == rel_path
+                for entry in self.wpm.list_trash_items()
+            )
+        )
+        manager.wait_all_workers(5000)
+        self.assertTrue(self._wait_for(
+            lambda: manager._local_structure_worker is None
+        ))
+        app.processEvents()
 
     def test_busy_structure_gate_accepts_first_click_and_retries_once(self):
         manager = MagicMock()

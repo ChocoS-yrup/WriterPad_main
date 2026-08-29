@@ -72,6 +72,10 @@ LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
 LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
 NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
+# An unchanged server snapshot can bypass the expensive local projection for a
+# while.  A periodic full pass still repairs out-of-process filesystem changes
+# that do not advance this process's structure generation.
+REMOTE_SNAPSHOT_FULL_APPLY_SECONDS = 300.0
 # 종료는 하나의 예산 안에서만 원격 작업을 시도한다. 예산이 끝나면 새 요청을
 # 만들지 않고 다음 실행으로 미룬다.
 SHUTDOWN_BUDGET_MS = 5000
@@ -488,13 +492,24 @@ class V2StructureBatchWorker(QThread):
 class V2PullWorker(QThread):
     resultReady = pyqtSignal(bool, object)
 
-    def __init__(self, sync_manager, project_id=None):
+    def __init__(
+        self,
+        sync_manager,
+        project_id=None,
+        *,
+        pull_identity=None,
+        expected_structure_generation=None,
+        cached_snapshot_fingerprint=None,
+    ):
         super().__init__()
         self.sync_manager = sync_manager
         # The manager is shared and its context can be swapped while this
         # request is in the air. Ask about the project this pull was started
         # for, not whichever one is open when the reply is being built.
         self.project_id = project_id
+        self.pull_identity = pull_identity
+        self.expected_structure_generation = expected_structure_generation
+        self.cached_snapshot_fingerprint = cached_snapshot_fingerprint
 
     def run(self):
         try:
@@ -550,13 +565,70 @@ class V2PullWorker(QThread):
                     tree_orders,
                 )
             )
-            self.resultReady.emit(True, {
+            if (
+                self.pull_identity is None
+                and self.expected_structure_generation is None
+                and self.cached_snapshot_fingerprint is None
+            ):
+                # A directly constructed worker is the longstanding fetch-only
+                # seam used by contract tests and compatibility callers. The
+                # production coordinator always supplies identity/generation
+                # before start and therefore takes the fingerprint fast-path.
+                self.resultReady.emit(True, {
+                    "documents": documents,
+                    "folders": folders,
+                    "folder_versions": folder_versions,
+                    "tree_orders": tree_orders,
+                    "structure_authority": structure_authority,
+                })
+                return
+            snapshot_fingerprint = self.sync_manager._remote_snapshot_fingerprint(
+                documents,
+                folders,
+                folder_versions,
+                tree_orders,
+                structure_authority,
+            )
+            payload = {
                 "documents": documents,
                 "folders": folders,
                 "folder_versions": folder_versions,
                 "tree_orders": tree_orders,
                 "structure_authority": structure_authority,
-            })
+                "snapshot_fingerprint": snapshot_fingerprint,
+            }
+            if (
+                self.cached_snapshot_fingerprint
+                and snapshot_fingerprint == self.cached_snapshot_fingerprint
+            ):
+                with self.sync_manager._structure_mutation_gate:
+                    if (
+                        self.pull_identity is not None
+                        and self.sync_manager._v2_pull_identity()
+                        != self.pull_identity
+                    ):
+                        kind = "stale_project"
+                    elif (
+                        self.expected_structure_generation is not None
+                        and self.sync_manager.local_structure_generation
+                        != self.expected_structure_generation
+                    ):
+                        kind = "stale_generation"
+                    else:
+                        kind = "unchanged"
+                    payload["background_apply"] = {
+                        "kind": kind,
+                        "changes": [],
+                        "recovered_count": 0,
+                    }
+                self.resultReady.emit(True, payload)
+                return
+
+            # A changed response is intentionally handed back for foreground
+            # apply. The editor protection set must be sampled at the exact
+            # apply boundary; taking it before network I/O would allow a user
+            # who started typing during fetch to be overwritten.
+            self.resultReady.emit(True, payload)
         except Exception as error:
             self.resultReady.emit(False, str(error))
 
@@ -575,6 +647,30 @@ class ServerActionWorker(QThread):
             self.resultReady.emit(True, self.action())
         except Exception as error:
             self.resultReady.emit(False, error)
+
+
+class LocalStructureQueueWorker(QThread):
+    """Drain accepted local durable mutations on one serial worker."""
+
+    resultReady = pyqtSignal(str, bool, object, str)
+
+    def __init__(self, sync_manager):
+        super().__init__()
+        self.sync_manager = sync_manager
+
+    def run(self):
+        while True:
+            entry = self.sync_manager._take_local_structure_action()
+            if entry is None:
+                return
+            operation_id, action = entry
+            try:
+                result = action()
+                self.resultReady.emit(operation_id, True, result, "")
+            except Exception as error:
+                self.resultReady.emit(
+                    operation_id, False, None, str(error)
+                )
 
 class SupabaseAuthLease:
     """The exclusive right to exchange one profile's stored session.
@@ -806,6 +902,12 @@ class SyncManager(QObject):
             self._record_structure_timing
         )
         self._local_structure_generation = 0
+        self._local_structure_queue = []
+        self._local_structure_queue_lock = threading.Lock()
+        self._local_structure_worker = None
+        self._local_structure_callbacks = {}
+        self._local_structure_dedupe = {}
+        self.background_local_structure_enabled = True
         self._v2_untracked_recovery_paths = set()
         # ``None`` means no configured v2 project. configure_v2() changes it
         # to unknown, and no server write may start until one complete pull has
@@ -868,6 +970,10 @@ class SyncManager(QObject):
                 "baseline_validated": False,
                 "pull_pending": True,
                 "pulling": False,
+                "pull_visible": False,
+                "applied_snapshot_fingerprint": None,
+                "applied_structure_generation": None,
+                "last_full_apply_monotonic": 0.0,
             }
             self._v2_pull_coordinators[local_key] = coordinator
         return coordinator
@@ -896,6 +1002,8 @@ class SyncManager(QObject):
             "blocked": 0, "conflict": 0,
         }
         coordinator = self._current_pull_coordinator(create=False)
+        with self._local_structure_queue_lock:
+            local_structure = len(self._local_structure_callbacks)
         return {
             "transfer_pending": counts["pending"],
             "transferring": counts["inflight"],
@@ -904,7 +1012,57 @@ class SyncManager(QObject):
             "blocked": counts["blocked"],
             "pull_pending": int(bool(coordinator and coordinator["pull_pending"])),
             "pulling": int(bool(coordinator and coordinator["pulling"])),
+            "pull_visible": int(bool(
+                coordinator
+                and coordinator["pulling"]
+                and coordinator.get("pull_visible")
+            )),
+            "local_structure": local_structure,
         }
+
+    @staticmethod
+    def _remote_snapshot_fingerprint(
+        documents,
+        folders,
+        folder_versions,
+        tree_orders,
+        structure_authority,
+    ):
+        """Hash one fetched wire snapshot without touching the UI thread."""
+        def canonical_rows(rows):
+            # PostgREST does not promise row order without an explicit order()
+            # clause.  The rows are sets, while a tree-order row's ``children``
+            # list is semantic and therefore remains untouched inside the row.
+            return sorted(
+                list(rows or []),
+                key=lambda item: json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )
+
+        authority = dict(structure_authority or {})
+        if isinstance(authority.get("folder_paths"), list):
+            authority["folder_paths"] = sorted(
+                str(path) for path in authority["folder_paths"]
+            )
+        canonical = json.dumps(
+            {
+                "documents": canonical_rows(documents),
+                "folders": canonical_rows(folders),
+                "folder_versions": canonical_rows(folder_versions),
+                "tree_orders": canonical_rows(tree_orders),
+                "structure_authority": authority,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _outbound_work_count(counts):
@@ -1329,6 +1487,90 @@ class SyncManager(QObject):
             )
         else:
             self._publish_sync_state()
+
+    def submit_local_structure_action(
+        self, action, callback=None, *, dedupe_key=None
+    ):
+        """Accept one durable binder mutation on the project serial executor.
+
+        ``action`` must not touch Qt widgets.  Completion callbacks are invoked
+        on this manager's UI thread.  Distinct creates intentionally have no
+        dedupe key; delete/restore callers may name the entity so a double-click
+        cannot schedule the same destructive mutation twice.
+        """
+        if self._shutting_down:
+            return None
+        with self._local_structure_queue_lock:
+            if dedupe_key:
+                existing = self._local_structure_dedupe.get(str(dedupe_key))
+                if existing:
+                    return existing
+            operation_id = str(uuid.uuid4())
+            self._local_structure_queue.append((operation_id, action))
+            self._local_structure_callbacks[operation_id] = callback
+            if dedupe_key:
+                self._local_structure_dedupe[str(dedupe_key)] = operation_id
+            pending_count = len(self._local_structure_callbacks)
+        self.notify_local_structure_queue(pending_count)
+        self._start_local_structure_worker()
+        return operation_id
+
+    def _take_local_structure_action(self):
+        with self._local_structure_queue_lock:
+            if not self._local_structure_queue:
+                return None
+            return self._local_structure_queue.pop(0)
+
+    def _start_local_structure_worker(self):
+        worker = self._local_structure_worker
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    return worker
+            except RuntimeError:
+                pass
+        with self._local_structure_queue_lock:
+            if not self._local_structure_queue:
+                return None
+        worker = LocalStructureQueueWorker(self)
+        self._local_structure_worker = worker
+        worker.resultReady.connect(
+            self._handle_local_structure_result,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        def finished():
+            if self._local_structure_worker is worker:
+                self._local_structure_worker = None
+            worker.deleteLater()
+            self._start_local_structure_worker()
+
+        worker.finished.connect(finished, Qt.ConnectionType.QueuedConnection)
+        return self._start_worker(worker)
+
+    @pyqtSlot(str, bool, object, str)
+    def _handle_local_structure_result(
+        self, operation_id, success, result, error_message
+    ):
+        with self._local_structure_queue_lock:
+            callback = self._local_structure_callbacks.pop(operation_id, None)
+            for key, value in list(self._local_structure_dedupe.items()):
+                if value == operation_id:
+                    self._local_structure_dedupe.pop(key, None)
+            pending_count = len(self._local_structure_callbacks)
+        try:
+            if callback:
+                callback(bool(success), result, str(error_message or ""))
+        except Exception as callback_error:
+            self._diagnostics.record(
+                "local_structure_callback_failed",
+                state=type(callback_error).__name__,
+                pending_count=pending_count,
+            )
+        finally:
+            with self._local_structure_queue_lock:
+                pending_count = len(self._local_structure_callbacks)
+            self.notify_local_structure_queue(pending_count)
 
     def record_structure_recovery(
         self, old_rel_path, new_rel_path, error_code="RECOVERY_FAILED"
@@ -2388,17 +2630,18 @@ class SyncManager(QObject):
                 )
         self.syncStateChanged.emit(state, detail, pending_count)
 
-    def _record_sync_success(self):
+    def _record_sync_success(self, record_diagnostic=True):
         # 전송이 한 번이라도 성공했다면 직전 실패 사유는 더 이상 현재 상태가
         # 아니다. 남겨두면 큐가 다시 돌고 있는데도 옛 오류가 계속 표시된다.
         self._last_sync_error = ""
         self._last_failure_offline = False
         self._auth_retry_blocked = False
-        self._diagnostics.record(
-            "sync_success",
-            state="saved",
-            pending_count=self.pending_retry_count,
-        )
+        if record_diagnostic:
+            self._diagnostics.record(
+                "sync_success",
+                state="saved",
+                pending_count=self.pending_retry_count,
+            )
 
     def diagnostic_snapshot(self):
         """Return a local-only, non-sensitive snapshot for the settings panel."""
@@ -2459,6 +2702,11 @@ class SyncManager(QObject):
                 "blocked",
                 "서버 구조 기준을 확정하지 못해 원격 적용과 업로드가 차단됐습니다.",
             )
+        elif activity["local_structure"]:
+            publish(
+                "local_waiting",
+                "바인더 변경 사항을 안전하게 저장하는 중입니다.",
+            )
         elif self._active_server_syncs > 0 and not self.is_v2_enabled:
             publish("syncing", "서버에 변경 내용을 올리는 중입니다.")
         elif activity["conflict"]:
@@ -2467,10 +2715,10 @@ class SyncManager(QObject):
         elif activity["blocked"]:
             count = activity["blocked"]
             publish("blocked", f"서버 적용이 거부되거나 차단된 작업이 {count}건 있습니다.")
-        elif activity["transferring"] or activity["pulling"]:
+        elif activity["transferring"] or activity["pull_visible"]:
             detail = (
                 "서버의 최신 변경 내용을 확인하는 중입니다."
-                if activity["pulling"] and not activity["transferring"]
+                if activity["pull_visible"] and not activity["transferring"]
                 else "서버에 변경 내용을 올리는 중입니다."
             )
             publish("syncing", detail)
@@ -8157,11 +8405,43 @@ class SyncManager(QObject):
         started_coordinator = coordinator
         coordinator["pull_pending"] = False
         coordinator["pulling"] = True
+        coordinator["pull_visible"] = bool(manual or reason == "baseline")
         self._begin_structure_authority_selection()
+        try:
+            protected_paths = set(
+                (self._v2_protected_paths_provider or (lambda: set()))() or set()
+            )
+        except Exception:
+            protected_paths = set()
+        # This is an optimistic token only. Reading it must never make the UI
+        # timer wait behind an in-flight durable mutation; the worker validates
+        # it again after acquiring the structure gate.
+        expected_structure_generation = self._local_structure_generation
+        cache_is_fresh = bool(
+            started_coordinator.get("applied_snapshot_fingerprint")
+            and started_coordinator.get("applied_structure_generation")
+            == expected_structure_generation
+            and not protected_paths
+            and (
+                time.monotonic()
+                - float(started_coordinator.get("last_full_apply_monotonic") or 0.0)
+                < REMOTE_SNAPSHOT_FULL_APPLY_SECONDS
+            )
+        )
+        # Keep construction compatible with the deliberately tiny worker
+        # doubles used by contract tests; the production worker exposes these
+        # attributes with the same defaults.
         worker = V2PullWorker(self, project_id=started_for[1])
+        worker.pull_identity = started_for
+        worker.expected_structure_generation = expected_structure_generation
+        worker.cached_snapshot_fingerprint = (
+            started_coordinator.get("applied_snapshot_fingerprint")
+            if cache_is_fresh else None
+        )
         self._v2_pull_worker = worker
         self._v2_pull_worker_identity = started_for
         retry_after_success = {"value": False}
+        retry_pull_after_finish = {"value": False}
         if manual:
             self._set_sync_state(
                 "syncing",
@@ -8207,44 +8487,139 @@ class SyncManager(QObject):
                         "INVALID_TREE_ORDER_RESPONSE"
                     )
                     return
-                try:
-                    changes = self._apply_v2_remote_documents(
-                        documents,
-                        folder_rows=folder_rows,
-                        folder_versions=folder_versions,
-                        tree_order_rows=tree_order_rows,
-                        structure_authority=authority,
-                        authoritative_folder_paths=authoritative_folder_paths,
+                background_apply = payload.get("background_apply")
+                foreground_cacheable = False
+                if isinstance(background_apply, dict):
+                    apply_kind = background_apply.get("kind")
+                    if apply_kind == "stale_project":
+                        return
+                    if apply_kind == "stale_generation":
+                        started_coordinator["pull_pending"] = True
+                        retry_pull_after_finish["value"] = True
+                        return
+                    # The worker checked under the structure gate before it
+                    # emitted, but its queued signal can wait behind a local
+                    # completion. Do not let that later generation inherit an
+                    # older snapshot fingerprint merely because the wire rows
+                    # themselves were unchanged.
+                    if (
+                        apply_kind == "unchanged"
+                        and self._local_structure_generation
+                        != expected_structure_generation
+                    ):
+                        started_coordinator["pull_pending"] = True
+                        retry_pull_after_finish["value"] = True
+                        return
+                    if apply_kind == "blocked":
+                        self._v2_last_pull_apply_blocked = True
+                        self._block_structure_authority(
+                            background_apply.get("error")
+                            or "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                        )
+                        return
+                    if apply_kind not in {"applied", "unchanged"}:
+                        self._block_structure_authority(
+                            "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                        )
+                        return
+                    changes = background_apply.get("changes") or []
+                    recovered_count = int(
+                        background_apply.get("recovered_count") or 0
                     )
-                except Exception as error:
-                    self._block_structure_authority(error)
-                    return
-                if self._v2_last_pull_apply_blocked:
-                    self._block_structure_authority(
-                        "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                else:
+                    # A changed snapshot samples the editor protection set at
+                    # this exact foreground boundary. Only unchanged snapshots
+                    # take the worker fast-path above.
+                    with self.local_structure_mutation(
+                        blocking=False, advance_generation=False
+                    ) as current_generation:
+                        if (
+                            current_generation is False
+                            or current_generation
+                            != expected_structure_generation
+                        ):
+                            started_coordinator["pull_pending"] = True
+                            retry_pull_after_finish["value"] = True
+                            return
+                        try:
+                            changes = self._apply_v2_remote_documents(
+                                documents,
+                                folder_rows=folder_rows,
+                                folder_versions=folder_versions,
+                                tree_order_rows=tree_order_rows,
+                                structure_authority=authority,
+                                authoritative_folder_paths=(
+                                    authoritative_folder_paths
+                                ),
+                            )
+                        except Exception as error:
+                            self._block_structure_authority(error)
+                            return
+                    if self._v2_last_pull_apply_blocked:
+                        self._block_structure_authority(
+                            "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                        )
+                        return
+                    # A structure pull is audited whether or not it reported a
+                    # change: the apply that quietly skipped its identity work is
+                    # exactly the one that reports nothing.
+                    audited = bool(changes or folder_rows or tree_order_rows)
+                    if audited and not self._identity_audit_is_clean():
+                        self._v2_last_pull_apply_blocked = True
+                        self._block_structure_authority(
+                            "STRUCTURE_IDENTITY_AUDIT_BLOCKED"
+                        )
+                        return
+                    recovered_count = self._recover_untracked_local_files_after_pull(
+                        documents
                     )
-                    return
-                # A structure pull is audited whether or not it reported a
-                # change: the apply that quietly skipped its identity work is
-                # exactly the one that reports nothing.
-                audited = bool(changes or folder_rows or tree_order_rows)
-                if audited and not self._identity_audit_is_clean():
-                    # Something landed that identity cannot name. Reporting the
-                    # pull as applied would hide that until the next launch
-                    # refuses to open the project.
-                    self._v2_last_pull_apply_blocked = True
-                    self._block_structure_authority(
-                        "STRUCTURE_IDENTITY_AUDIT_BLOCKED"
-                    )
-                    return
-                recovered_count = self._recover_untracked_local_files_after_pull(
-                    documents
-                )
+                    try:
+                        foreground_cacheable = not bool(
+                            set(
+                                (
+                                    self._v2_protected_paths_provider
+                                    or (lambda: set())
+                                )() or set()
+                            )
+                        )
+                    except Exception:
+                        foreground_cacheable = False
                 # Local structure, document snapshots and the identity audit
                 # have all landed. Only now may the 250 ms retry path or any
                 # later autosave dispatch queued server writes.
                 self._accept_structure_authority(authority)
                 started_coordinator["baseline_validated"] = True
+                snapshot_fingerprint = payload.get("snapshot_fingerprint")
+                cache_from_background = bool(
+                    isinstance(background_apply, dict)
+                    and (
+                        background_apply.get("kind") == "unchanged"
+                        or background_apply.get("cacheable")
+                    )
+                )
+                if (
+                    snapshot_fingerprint
+                    and (cache_from_background or foreground_cacheable)
+                ):
+                    started_coordinator["applied_snapshot_fingerprint"] = (
+                        snapshot_fingerprint
+                    )
+                    started_coordinator["applied_structure_generation"] = (
+                        self._local_structure_generation
+                    )
+                    if (
+                        foreground_cacheable
+                        or (
+                            isinstance(background_apply, dict)
+                            and background_apply.get("kind") == "applied"
+                        )
+                    ):
+                        started_coordinator["last_full_apply_monotonic"] = (
+                            time.monotonic()
+                        )
+                elif isinstance(background_apply, dict):
+                    started_coordinator["applied_snapshot_fingerprint"] = None
+                    started_coordinator["applied_structure_generation"] = None
                 if self._outbound_work_count(
                     self._v2_activity_counts(started_for[2])
                 ):
@@ -8252,7 +8627,13 @@ class SyncManager(QObject):
                     # or during it. One final snapshot is still required after
                     # all of them drain.
                     started_coordinator["pull_pending"] = True
-                self._record_sync_success()
+                self._record_sync_success(
+                    record_diagnostic=not (
+                        isinstance(background_apply, dict)
+                        and background_apply.get("kind") == "unchanged"
+                        and not started_coordinator.get("pull_visible")
+                    )
+                )
                 retry_after_success["value"] = bool(retry_pending_after_pull)
                 if changes:
                     self.remoteDocumentsApplied.emit(changes)
@@ -8283,6 +8664,7 @@ class SyncManager(QObject):
 
         def handle_finished():
             started_coordinator["pulling"] = False
+            started_coordinator["pull_visible"] = False
             if self._v2_pull_worker is worker:
                 self._v2_pull_worker = None
                 self._v2_pull_worker_identity = None
@@ -8302,7 +8684,16 @@ class SyncManager(QObject):
                     # authority still gates the write itself.
                     self.retry_pending_syncs(manual=True)
                 elif self._v2_pull_identity() == started_for:
-                    self._maybe_start_deferred_pull()
+                    if retry_pull_after_finish["value"]:
+                        from PyQt6.QtCore import QTimer
+                        QTimer.singleShot(
+                            0,
+                            lambda: self.pull_remote_changes_async(
+                                reason="baseline"
+                            ),
+                        )
+                    else:
+                        self._maybe_start_deferred_pull()
                 self._publish_sync_state()
 
         worker.resultReady.connect(handle_result)
