@@ -410,6 +410,164 @@ class WritingProjectManager:
         self._save_trash_index(index)
         return os.path.relpath(target_path, self.writing_root_path).replace("\\", "/")
 
+    def restore_related_trash_documents(
+        self,
+        original_folder_path,
+        restored_folder_path,
+        expected_document_paths,
+    ):
+        """Reattach separately tombstoned children to a local folder restore.
+
+        A remote folder delete reaches Windows as document tombstones followed
+        by the folder tombstone. The documents therefore sit at the trash root
+        instead of inside the trashed folder. Restoring only that directory
+        would publish a live empty folder while every child UUID stayed
+        deleted. This method moves only children proven by all three durable
+        records: the trash index, identity, and the caller's SQLite UUID/path
+        map.
+
+        The whole set is validated before the first move. If a later move or
+        index write fails, every completed move is put back at its exact trash
+        path and the original index is restored.
+        """
+        if not self.writing_root_path:
+            raise RuntimeError("집필 프로젝트가 열려 있지 않습니다.")
+
+        original_folder_path = str(original_folder_path or "").replace(
+            "\\", "/"
+        ).rstrip("/")
+        restored_folder_path = str(restored_folder_path or "").replace(
+            "\\", "/"
+        ).rstrip("/")
+        expected_paths = {
+            str(document_id): str(original_path or "").replace("\\", "/")
+            for document_id, original_path in (
+                expected_document_paths or {}
+            ).items()
+            if document_id and original_path
+        }
+        expected_ids = set(expected_paths)
+        if not expected_ids:
+            return []
+
+        restored_full = self._resolve_inside_root(restored_folder_path)
+        if not os.path.isdir(restored_full):
+            raise NotADirectoryError("복원된 폴더를 찾을 수 없습니다.")
+
+        from project_creation_v1 import node_for_path
+
+        project_root = os.path.dirname(self.writing_root_path)
+        trash_root = os.path.abspath(
+            os.path.join(self.writing_root_path, "메인", "휴지통")
+        )
+        original_prefix = original_folder_path + "/"
+        index = self._load_trash_index()
+        original_index = dict(index)
+        candidates = []
+        found_ids = set()
+
+        for name, raw_info in index.items():
+            info = raw_info if isinstance(raw_info, dict) else {}
+            document_id = str(info.get("document_id") or "")
+            original_path = str(info.get("original_path") or "").replace(
+                "\\", "/"
+            )
+            if (
+                document_id not in expected_ids
+                or not original_path.startswith(original_prefix)
+            ):
+                continue
+            if original_path != expected_paths[document_id]:
+                raise ValueError("RESTORE_RELATED_PATH_MISMATCH")
+            if document_id in found_ids:
+                raise ValueError("RESTORE_RELATED_DOCUMENT_DUPLICATE")
+
+            suffix = original_path[len(original_folder_path):]
+            target_rel = restored_folder_path + suffix
+            source_rel = f"메인/휴지통/{name}"
+            source_full = self._resolve_inside_root(source_rel)
+            target_full = self._resolve_inside_root(target_rel)
+            try:
+                if (
+                    os.path.commonpath([trash_root, source_full]) != trash_root
+                    or os.path.commonpath([restored_full, target_full])
+                    != restored_full
+                    or source_full == trash_root
+                    or target_full == restored_full
+                ):
+                    raise ValueError("RESTORE_RELATED_PATH_OUTSIDE_FOLDER")
+            except ValueError:
+                raise ValueError("RESTORE_RELATED_PATH_OUTSIDE_FOLDER")
+            if not os.path.isfile(source_full) or os.path.islink(source_full):
+                raise FileNotFoundError("RESTORE_RELATED_SOURCE_MISSING")
+            if os.path.exists(target_full):
+                raise FileExistsError("RESTORE_RELATED_TARGET_TAKEN")
+
+            node = node_for_path(project_root, source_rel)
+            if (
+                node is None
+                or node.get("kind") != "document"
+                or str(node.get("uuid") or "") != document_id
+            ):
+                raise ValueError("RESTORE_RELATED_IDENTITY_MISMATCH")
+            self._refuse_unfollowable_restore(source_rel, target_rel)
+            candidates.append({
+                "document_id": document_id,
+                "trash_path": source_rel,
+                "restored_path": target_rel,
+                "original_path": original_path,
+                "source_full": source_full,
+                "target_full": target_full,
+                "index_name": name,
+            })
+            found_ids.add(document_id)
+
+        if found_ids != expected_ids:
+            raise FileNotFoundError("RESTORE_RELATED_SOURCE_MISSING")
+
+        candidates.sort(key=lambda item: (
+            item["restored_path"].count("/"),
+            item["restored_path"].casefold(),
+        ))
+        moved = []
+        try:
+            for candidate in candidates:
+                os.makedirs(os.path.dirname(candidate["target_full"]), exist_ok=True)
+                self._relocate_with_identity(
+                    candidate["trash_path"],
+                    candidate["restored_path"],
+                    lambda item=candidate: shutil.move(
+                        item["source_full"], item["target_full"]
+                    ),
+                )
+                moved.append(candidate)
+                index.pop(candidate["index_name"], None)
+            self._save_trash_index(index)
+        except Exception:
+            for candidate in reversed(moved):
+                try:
+                    self._relocate_with_identity(
+                        candidate["restored_path"],
+                        candidate["trash_path"],
+                        lambda item=candidate: shutil.move(
+                            item["target_full"], item["source_full"]
+                        ),
+                    )
+                except Exception:
+                    pass
+            try:
+                self._save_trash_index(original_index)
+            except Exception:
+                pass
+            raise
+
+        return [{
+            key: candidate[key]
+            for key in (
+                "document_id", "trash_path", "restored_path", "original_path"
+            )
+        } for candidate in candidates]
+
     def _refuse_unfollowable_restore(self, source_rel, target_rel):
         """Stop a restore identity could not follow, before anything is created."""
         from project_creation_v1 import (

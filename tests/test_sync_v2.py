@@ -1618,6 +1618,101 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertFalse(restored["is_deleted"])
 
+    def test_folder_restore_reattaches_remote_tombstoned_child_uuid(self):
+        """An iPad folder delete leaves its child at the Windows trash root."""
+        client, folder_path, document_path = self._published_nonempty_folder(
+            "아이패드-든폴더"
+        )
+        document = self.store.get_document(
+            self.context["local_key"], document_path
+        )
+        document_id = document["document_id"]
+        folder_id = self._uuid_of(folder_path)
+        for row in client.folder_rows:
+            if row["folder_id"] == folder_id:
+                row["is_deleted"] = True
+                row["revision"] = 2
+
+        self._pull(
+            client.folder_rows,
+            [{
+                "document_id": document_id,
+                "relative_path": document_path,
+                "content": "본문",
+                "revision": 2,
+                "is_deleted": True,
+            }],
+            {"<root>": ["설정집"], "메인/설정집": []},
+            tree_revision=2,
+        )
+
+        identity = read_identity(self.project_root)
+        folder_trash = next(
+            node["legacy_path"] for node in identity["nodes"]
+            if node["uuid"] == folder_id
+        )
+        document_trash = next(
+            node["legacy_path"] for node in identity["nodes"]
+            if node["uuid"] == document_id
+        )
+        self.assertTrue(folder_trash.startswith("메인/휴지통/"))
+        self.assertTrue(document_trash.startswith("메인/휴지통/"))
+        self.assertFalse(document_trash.startswith(folder_trash + "/"))
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, folder_trash
+        ).joinpath("문서.txt").exists())
+
+        restored_path = self.wpm.restore_from_trash(folder_trash)
+        operations = self.manager.record_restore(
+            folder_trash,
+            restored_path,
+            original_rel_path=folder_path,
+            retry=False,
+        )
+
+        self.assertEqual(restored_path, folder_path)
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, document_path
+        ).is_file())
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, document_trash
+        ).exists())
+        restored_document = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == document_id
+        )
+        self.assertEqual(restored_document["legacy_path"], document_path)
+        self.assertEqual(
+            [operation["document_id"] for operation in operations
+             if operation.get("operation_id")],
+            [document_id],
+        )
+
+        restore_operation = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.assertEqual(restore_operation["document_id"], document_id)
+        self.assertFalse(restore_operation["is_deleted"])
+        self.assertEqual(restore_operation["relative_path"], document_path)
+        client.calls.clear()
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(
+            restore_operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "committed")
+        self.assertLess(
+            self._rpc_index(
+                client, "commit_folder", folder_name="아이패드-든폴더"
+            ),
+            self._rpc_index(client, "commit_document"),
+        )
+        restored_row = next(
+            row for row in client.folder_rows if row["folder_id"] == folder_id
+        )
+        self.assertFalse(restored_row["is_deleted"])
+
     def _rows_by_name(self, client):
         return {row["name"]: row for row in client.folder_rows}
 

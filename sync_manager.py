@@ -9559,18 +9559,73 @@ class SyncManager(QObject):
                     "contract_structure_intents": [],
                     "contract_path_change": None,
                 }
+            all_documents = self._v2_store.list_documents(
+                self._v2_context["local_key"]
+            )
             source_documents = [
-                document for document in self._v2_store.list_documents(
-                    self._v2_context["local_key"]
-                )
+                document for document in all_documents
                 if document["local_path"] == trash_rel_path
                 or document["local_path"].startswith(trash_rel_path + "/")
             ]
+            detached_documents = []
+            restored_full = os.path.abspath(os.path.join(
+                self._v2_wpm.writing_root_path,
+                restored_rel_path.replace("/", os.sep),
+            ))
+            if original_rel_path and os.path.isdir(restored_full):
+                original_prefix = original_rel_path.rstrip("/") + "/"
+                for document in all_documents:
+                    try:
+                        server_path = self._safe_relative_path(
+                            document.get("server_path")
+                        )
+                        local_path = self._safe_relative_path(
+                            document.get("local_path")
+                        )
+                    except ValueError:
+                        continue
+                    if (
+                        not document.get("is_deleted")
+                        or not server_path.startswith(original_prefix)
+                        or not local_path.startswith("메인/휴지통/")
+                        or local_path == trash_rel_path
+                        or local_path.startswith(trash_rel_path + "/")
+                    ):
+                        continue
+                    if self._v2_store.has_active_operations(
+                        document["document_id"]
+                    ):
+                        raise RuntimeError(
+                            "RESTORE_RELATED_DOCUMENT_HAS_LOCAL_OPERATIONS"
+                        )
+                    detached_documents.append(document)
+
+            detached_restores = self._v2_wpm.restore_related_trash_documents(
+                original_rel_path,
+                restored_rel_path,
+                {
+                    document["document_id"]: document["server_path"]
+                    for document in detached_documents
+                },
+            ) if detached_documents else []
+            detached_by_id = {
+                str(document["document_id"]): document
+                for document in detached_documents
+            }
+            document_moves = [(
+                document,
+                restored_rel_path
+                + document["local_path"][len(trash_rel_path):],
+            ) for document in source_documents]
+            for restored in detached_restores:
+                document = detached_by_id.get(str(restored["document_id"]))
+                if document is None:
+                    raise RuntimeError("RESTORE_RELATED_DOCUMENT_NOT_FOUND")
+                document_moves.append((document, restored["restored_path"]))
+
             if contract_structure and folder_operation is not None:
                 document_changes = []
-                for document in source_documents:
-                    suffix = document["local_path"][len(trash_rel_path):]
-                    new_local_path = restored_rel_path + suffix
+                for document, new_local_path in document_moves:
                     content = self._v2_wpm.read_text_file(new_local_path)
                     if content is None:
                         continue
@@ -9586,13 +9641,18 @@ class SyncManager(QObject):
                 moved = [{
                     **document,
                     "old_local_path": document["local_path"],
-                    "local_path": restored_rel_path
-                    + document["local_path"][len(trash_rel_path):],
-                } for document in source_documents]
+                    "local_path": new_local_path,
+                } for document, new_local_path in document_moves]
             else:
                 moved = self._v2_store.move_local_path(
                     self._v2_context["local_key"], trash_rel_path, restored_rel_path
                 )
+                for restored in detached_restores:
+                    moved.extend(self._v2_store.move_local_path(
+                        self._v2_context["local_key"],
+                        restored["trash_path"],
+                        restored["restored_path"],
+                    ))
                 for document in moved:
                     content = self._v2_wpm.read_text_file(document["local_path"])
                     if content is not None:
