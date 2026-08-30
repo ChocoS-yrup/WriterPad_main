@@ -735,6 +735,56 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(promoted["base_content"], "첫 저장")
         self.assertEqual(self.store.operation_state_divergences(), [])
 
+    def test_recovery_promotes_only_one_of_many_chained_snapshots(self):
+        path = "__antigravity__/tree-order.json"
+        first = self.store.enqueue(self.context, path, "order-1")
+        dependents = [
+            self.store.enqueue(self.context, path, f"order-{number}")
+            for number in range(2, 5)
+        ]
+        self.assertTrue(all(
+            operation["base_revision"] is None for operation in dependents
+        ))
+
+        self.store.cancel_operation(first["operation_id"], str(uuid.uuid4()))
+
+        self.assertEqual(
+            self.store.recover_stranded_operations(self.context["local_key"]),
+            1,
+        )
+        reopened = SyncV2Store(self.db_path)
+        promoted = reopened.next_ready_operation(self.context["local_key"])
+        self.assertEqual(promoted["content"], "order-2")
+
+        # Restart recovery before the promoted operation commits must not
+        # create another ready operation against the same base revision.
+        self.assertEqual(
+            reopened.recover_stranded_operations(self.context["local_key"]),
+            0,
+        )
+        self.assertEqual(
+            reopened.next_ready_operation(self.context["local_key"])[
+                "operation_id"
+            ],
+            promoted["operation_id"],
+        )
+
+        for expected_revision, expected_content in ((1, "order-3"), (2, "order-4")):
+            reopened.mark_success(promoted["operation_id"], {
+                "revision": expected_revision,
+            })
+            promoted = reopened.next_ready_operation(
+                self.context["local_key"]
+            )
+            self.assertEqual(promoted["content"], expected_content)
+            self.assertEqual(promoted["base_revision"], expected_revision)
+
+        reopened.mark_success(promoted["operation_id"], {"revision": 3})
+        self.assertIsNone(
+            reopened.next_ready_operation(self.context["local_key"])
+        )
+        self.assertEqual(reopened.operation_state_divergences(), [])
+
     def test_unsent_saves_for_one_document_keep_immutable_intents(self):
         first = self.store.enqueue(
             self.context, "메인/원고/001화.txt", "서버 전송 중"

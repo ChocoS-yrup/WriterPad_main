@@ -2613,6 +2613,25 @@ class SyncV2Store:
                     "pending", "retry_wait"
                 }:
                     continue
+                ready_operations = connection.execute(
+                    """
+                    SELECT operation_id FROM sync_operations
+                    WHERE document_id = ? AND base_revision IS NOT NULL
+                    ORDER BY queue_id
+                    """,
+                    (row["document_id"],),
+                ).fetchall()
+                if any(
+                    self._derived_state(connection, item["operation_id"])
+                    in {"pending", "inflight", "retry_wait"}
+                    for item in ready_operations
+                ):
+                    # A successor inserted during this pass has a later queue
+                    # id than the immutable dependent it replaces.  Looking
+                    # only at earlier rows would therefore promote every
+                    # dependent onto the same revision.  Keep exactly one
+                    # dispatchable operation per document until it commits.
+                    continue
                 predecessors = connection.execute(
                     """
                     SELECT operation_id FROM sync_operations
@@ -2844,17 +2863,19 @@ class SyncV2Store:
                     operation["document_id"],
                 ),
             )
-            dependent = connection.execute(
+            dependent = next((
+                row for row in connection.execute(
                 """
                 SELECT * FROM sync_operations
                 WHERE document_id = ? AND base_revision IS NULL
-                ORDER BY queue_id LIMIT 1
+                ORDER BY queue_id
                 """,
                 (operation["document_id"],),
-            ).fetchone()
-            if dependent and self._derived_state(
-                connection, dependent["operation_id"]
-            ) in {"pending", "retry_wait"}:
+                ).fetchall()
+                if self._derived_state(connection, row["operation_id"])
+                in {"pending", "retry_wait"}
+            ), None)
+            if dependent:
                 context = {
                     "local_key": dependent["local_key"],
                     "project_id": dependent["project_id"],
