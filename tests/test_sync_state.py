@@ -167,14 +167,20 @@ class SyncManagerStateTestCase(unittest.TestCase):
         self.assertIn("로그인", guidance["action"])
         self.assertNotIn("인터넷", guidance["action"])
 
-    def test_queued_work_without_an_error_is_not_reported_as_offline(self):
-        state, _detail, _pending = self._publish_with_v2_error("")
+    def test_queued_work_without_an_error_is_normal_sync_progress(self):
+        with patch.object(self.manager._diagnostics, "record") as record:
+            state, detail, _pending = self._publish_with_v2_error("")
 
-        self.assertEqual(state, "failed")
+        self.assertEqual(state, "syncing")
+        self.assertIn("전송 순서", detail)
+        self.assertFalse(any(
+            call.args and call.args[0] == "sync_failure"
+            for call in record.call_args_list
+        ))
         guidance = WritingModeWidget._storage_status_guidance(
-            state, "", 1, 0, False
+            state, detail, 1, 0, False
         )
-        self.assertEqual(guidance["action_code"], "retry")
+        self.assertNotEqual(guidance["action_code"], "retry")
         self.assertNotIn("인터넷", guidance["action"])
 
     def test_connectivity_error_still_reports_offline(self):

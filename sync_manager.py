@@ -2775,12 +2775,16 @@ class SyncManager(QObject):
                     "대기 작업이 이어서 전송됩니다.",
                 )
                 return
-            # 오류 근거가 없으면 연결 문제라고 단정하지 않는다. 전송을 기다리는
-            # 상태이므로 재시도 버튼이 있는 failed 로 알린다.
+            if not detail:
+                # A chained snapshot can be durably queued while its
+                # predecessor is in flight.  That is ordinary progress, not a
+                # failed attempt, and must not emit sync_failure diagnostics.
+                publish("syncing", "서버 전송 순서를 기다리는 중입니다.")
+                return
             offline = bool(detail) and self._is_connectivity_error(detail)
             publish(
                 "offline" if offline else "failed",
-                detail or "서버 전송을 기다리는 로컬 변경 사항이 있습니다.",
+                detail,
             )
         elif self._retry_queue:
             pending = list(self._retry_queue.values())
