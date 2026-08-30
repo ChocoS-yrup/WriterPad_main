@@ -1996,6 +1996,19 @@ class SyncManager(QObject):
                 "folder_paths": sorted(folder_paths),
             }
 
+        if self._can_bootstrap_empty_legacy_structure(
+            remote_documents, folder_rows, tree_order_rows
+        ):
+            # A new project has no server row until its first dispatch.  The
+            # empty snapshot is therefore a complete LEGACY baseline, not a
+            # missing tree-order document.  This exception stays closed after
+            # any server-acknowledged revision so a vanished projection can
+            # never be mistaken for a fresh project.
+            return {
+                "kind": STRUCTURE_AUTHORITY_LEGACY,
+                "folder_paths": [],
+            }
+
         live_document_paths = set()
         for item in remote_documents or []:
             if not isinstance(item, dict) or item.get("is_deleted"):
@@ -2017,6 +2030,23 @@ class SyncManager(QObject):
             "kind": STRUCTURE_AUTHORITY_LEGACY,
             "folder_paths": sorted(legacy_paths),
         }
+
+    def _can_bootstrap_empty_legacy_structure(
+        self, remote_documents, folder_rows, tree_order_rows
+    ):
+        if remote_documents or folder_rows or tree_order_rows:
+            return False
+        store = getattr(self, "_v2_store", None)
+        context = getattr(self, "_v2_context", None)
+        if not store or not context:
+            return False
+        checker = getattr(store, "has_server_acknowledged_commit", None)
+        if not callable(checker):
+            return False
+        try:
+            return not checker(context["local_key"])
+        except (KeyError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _server_timestamp(value):

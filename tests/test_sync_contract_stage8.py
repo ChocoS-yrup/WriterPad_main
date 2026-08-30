@@ -1349,6 +1349,59 @@ class ContractStoreTests(unittest.TestCase):
         self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_LEGACY)
         self.assertEqual(decision["folder_paths"], ["메인/메모장"])
 
+    def test_new_project_selects_empty_legacy_baseline_before_first_commit(self):
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = self.context
+
+        decision = manager._select_remote_structure_authority([], [], [])
+
+        self.assertEqual(decision, {
+            "kind": STRUCTURE_AUTHORITY_LEGACY,
+            "folder_paths": [],
+        })
+
+    def test_empty_projection_after_acknowledged_commit_stays_blocked(self):
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = self.context
+        self.store.apply_remote_snapshot(
+            self.context,
+            str(uuid.uuid4()),
+            "메인/메모장/서버승인.txt",
+            "server body",
+            revision=1,
+        )
+
+        with self.assertRaises(SyncContractError) as raised:
+            manager._select_remote_structure_authority([], [], [])
+
+        self.assertEqual(raised.exception.code, "INVALID_TREE_ORDER_RESPONSE")
+
+    def test_tree_order_revision_counts_as_acknowledged_commit(self):
+        tree_order_id = str(uuid.uuid4())
+        with self.store._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sync_tree_orders (
+                    tree_order_id, local_key, parent_folder_id, parent_path,
+                    children_json, revision, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?)
+                """,
+                (
+                    tree_order_id,
+                    self.context["local_key"],
+                    "<root>",
+                    "[]",
+                    "2026-08-30T00:00:00+00:00",
+                    "2026-08-30T00:00:00+00:00",
+                ),
+            )
+
+        self.assertTrue(
+            self.store.has_server_acknowledged_commit(self.context["local_key"])
+        )
+
     def test_valid_empty_contract_row_is_not_mistaken_for_absence(self):
         manager = self._contract_manager()
         root = self._folder_snapshot("메인")

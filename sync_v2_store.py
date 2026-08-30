@@ -1430,9 +1430,12 @@ class SyncV2Store:
                 UNION ALL
                 SELECT 1 FROM sync_folders
                 WHERE local_key = ? AND revision > 0
+                UNION ALL
+                SELECT 1 FROM sync_tree_orders
+                WHERE local_key = ? AND revision > 0
                 LIMIT 1
                 """,
-                (local_key, local_key),
+                (local_key, local_key, local_key),
             ).fetchone()
             return row is not None
 
