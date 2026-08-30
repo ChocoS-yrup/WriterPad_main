@@ -863,47 +863,72 @@ class WritingTreeMixin:
                 super().__init__()
                 self.menu = menu
                 self._processing = False
+                self.selected_shortcut = None
+                self.release_callback = None
+
+            @staticmethod
+            def shortcut_for_event(event):
+                if event.type() == QEvent.Type.KeyPress:
+                    key = event.key()
+                    text = event.text().lower()
+                    try:
+                        vk = event.nativeVirtualKey()
+                    except Exception:
+                        vk = 0
+                    if key == Qt.Key.Key_F or text in ['f', 'ㄹ'] or vk == 0x46:
+                        return 'F'
+                    if key == Qt.Key.Key_N or text in ['n', 'ㅜ'] or vk == 0x4E:
+                        return 'N'
+                    if key == Qt.Key.Key_D or text in ['d', 'ㅇ'] or vk == 0x44:
+                        return 'D'
+                    if key == Qt.Key.Key_E or text in ['e', 'ㄷ'] or vk == 0x45:
+                        return 'E'
+                if event.type() == QEvent.Type.KeyRelease:
+                    key = event.key()
+                    try:
+                        vk = event.nativeVirtualKey()
+                    except Exception:
+                        vk = 0
+                    if key == Qt.Key.Key_F or vk == 0x46:
+                        return 'F'
+                    if key == Qt.Key.Key_N or vk == 0x4E:
+                        return 'N'
+                    if key == Qt.Key.Key_D or vk == 0x44:
+                        return 'D'
+                    if key == Qt.Key.Key_E or vk == 0x45:
+                        return 'E'
+                if event.type() == QEvent.Type.InputMethod:
+                    text = event.commitString() or event.preeditString()
+                    text = text.lower()
+                    return {
+                        'f': 'F', 'ㄹ': 'F',
+                        'n': 'N', 'ㅜ': 'N',
+                        'd': 'D', 'ㅇ': 'D',
+                        'e': 'E', 'ㄷ': 'E',
+                    }.get(text)
+                return None
 
             def eventFilter(self, obj, event):
                 if self._processing:
                     return False
                 self._processing = True
                 try:
-                    target_shortcut = None
+                    target_shortcut = self.shortcut_for_event(event)
 
-                    if event.type() == QEvent.Type.KeyPress:
-                        key = event.key()
-                        text = event.text().lower()
-                        try:
-                            vk = event.nativeVirtualKey()
-                        except:
-                            vk = 0
-
-                        if key == Qt.Key.Key_F or text in ['f', 'ㄹ'] or vk == 0x46:
-                            target_shortcut = 'F'
-                        elif key == Qt.Key.Key_N or text in ['n', 'ㅜ'] or vk == 0x4E:
-                            target_shortcut = 'N'
-                        elif key == Qt.Key.Key_D or text in ['d', 'ㅇ'] or vk == 0x44:
-                            target_shortcut = 'D'
-                        elif key == Qt.Key.Key_E or text in ['e', 'ㄷ'] or vk == 0x45:
-                            target_shortcut = 'E'
-
-                    elif event.type() == QEvent.Type.InputMethod:
-                        text = event.commitString()
-                        if not text:
-                            text = event.preeditString()
-                        if text:
-                            text = text.lower()
-                            if text in ['f', 'ㄹ']:
-                                target_shortcut = 'F'
-                            elif text in ['n', 'ㅜ']:
-                                target_shortcut = 'N'
-                            elif text in ['d', 'ㅇ']:
-                                target_shortcut = 'D'
-                            elif text in ['e', 'ㄷ']:
-                                target_shortcut = 'E'
+                    if self.selected_shortcut is not None:
+                        if target_shortcut != self.selected_shortcut:
+                            return False
+                        # The activation key and its Korean IME composition
+                        # belong to the menu command, never to the inline name
+                        # editor that is about to be created.
+                        if event.type() == QEvent.Type.KeyRelease:
+                            callback = self.release_callback
+                            if callback is not None:
+                                QTimer.singleShot(0, callback)
+                        return True
 
                     if target_shortcut and target_shortcut in callbacks:
+                        self.selected_shortcut = target_shortcut
                         custom_triggered_shortcut[0] = target_shortcut
                         self.menu.close()
                         return True
@@ -1015,7 +1040,6 @@ class WritingTreeMixin:
             finally:
                 if pull_timer_was_active and WritingTreeMixin._is_live_qt_object(pull_timer):
                     pull_timer.start()
-                QApplication.instance().removeEventFilter(global_filter)
 
                 # 좀비 청소
                 for action in menu.actions():
@@ -1025,7 +1049,25 @@ class WritingTreeMixin:
                 triggered_shortcut = custom_triggered_shortcut[0]
                 if triggered_shortcut:
                     QApplication.inputMethod().reset()
-                    QTimer.singleShot(0, callbacks[triggered_shortcut])
+                    dispatched = [False]
+
+                    def dispatch_shortcut():
+                        if dispatched[0]:
+                            return
+                        dispatched[0] = True
+                        QApplication.instance().removeEventFilter(
+                            global_filter
+                        )
+                        QApplication.inputMethod().reset()
+                        QTimer.singleShot(0, callbacks[triggered_shortcut])
+
+                    global_filter.release_callback = dispatch_shortcut
+                    # Some IMEs do not expose the physical release to Qt.
+                    # Keep a bounded fallback without allowing the activation
+                    # composition to survive into the name editor.
+                    QTimer.singleShot(250, dispatch_shortcut)
+                else:
+                    QApplication.instance().removeEventFilter(global_filter)
 
         QTimer.singleShot(50, _exec_menu)
 
@@ -2481,8 +2523,6 @@ class WritingTreeMixin:
                             self._rollback_structure_path(
                                 new_rel_path, old_rel_path
                             )
-                        if was_creating:
-                            self._finish_tree_item_creation(item)
                         print(f"[DEBUG] rename_item 실패! old={old_rel_path!r}, new={new_rel_path!r}, error={e!r}")
                         QMessageBox.warning(self, "오류", f"이름 변경 실패: {e}")
                         item.setText(0, os.path.basename(old_rel_path).replace(".txt", "") if not is_folder else os.path.basename(old_rel_path))

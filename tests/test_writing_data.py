@@ -8,10 +8,10 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from PyQt6.QtCore import QMutex, Qt
+from PyQt6.QtCore import QMutex, QPoint, QTimer, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
-    QApplication, QMessageBox, QTreeWidgetItem
+    QApplication, QMessageBox, QTreeWidgetItem, QWidget
 )
 
 from mode_writing import BinderTreeWidget, WritingModeWidget
@@ -100,6 +100,80 @@ class WritingDataTestCase(unittest.TestCase):
             lambda: manager._local_structure_worker is None
         ))
         app.processEvents()
+
+    def test_context_menu_folder_shortcut_waits_for_key_release(self):
+        class MenuHost(WritingTreeMixin, QWidget):
+            def __init__(host_self):
+                QWidget.__init__(host_self)
+                host_self.binder_tree = BinderTreeWidget(host_self)
+                host_self.binder_tree.setColumnCount(1)
+                host_self.root_nodes = {}
+                host_self.start_create_root_item = MagicMock()
+
+        host = MenuHost()
+        host.resize(320, 320)
+        host.binder_tree.resize(300, 300)
+        host.show()
+        host.binder_tree.show()
+
+        def press_shortcut():
+            popup = QApplication.activePopupWidget()
+            self.assertIsNotNone(popup)
+            QTest.keyPress(popup, Qt.Key.Key_F)
+
+        QTimer.singleShot(100, press_shortcut)
+        host.show_tree_context_menu(QPoint(20, 20))
+        QTest.qWait(180)
+        host.start_create_root_item.assert_not_called()
+
+        QTest.keyRelease(host.binder_tree, Qt.Key.Key_F)
+        self.assertTrue(self._wait_for(
+            lambda: host.start_create_root_item.call_count == 1
+        ))
+        host.start_create_root_item.assert_called_once_with(is_folder=True)
+        host.close()
+
+    def test_duplicate_initial_name_keeps_default_creation_pending(self):
+        panel = WritingTreeMixin()
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        item = QTreeWidgetItem(panel.binder_tree, ["ㄹ"])
+        item.setData(
+            0, Qt.ItemDataRole.UserRole, "메인/메모장/새 폴더"
+        )
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        item.setData(0, Qt.ItemDataRole.UserRole + 4, True)
+        panel.wpm = self.wpm
+        panel.wpm.rename_item = MagicMock(
+            side_effect=Exception("이미 같은 이름의 항목이 존재합니다.")
+        )
+        panel.sync_manager = SimpleNamespace(
+            background_local_structure_enabled=False,
+            local_structure_mutation=lambda: nullcontext(),
+            record_path_change=MagicMock(return_value=[]),
+            record_tree_order=MagicMock(),
+            retry_pending_syncs=MagicMock(),
+            record_structure_recovery=MagicMock(),
+        )
+
+        with patch.object(QMessageBox, "warning"):
+            panel._apply_tree_item_changed(item, 0)
+
+        self.assertEqual(item.text(0), "새 폴더")
+        self.assertTrue(
+            item.data(0, Qt.ItemDataRole.UserRole + 4)
+        )
+
+        self.assertTrue(panel._commit_tree_item_creation(item))
+        panel.sync_manager.record_path_change.assert_called_once_with(
+            "메인/메모장/새 폴더",
+            "메인/메모장/새 폴더",
+            retry=False,
+        )
+        panel.sync_manager.record_tree_order.assert_called_once()
+        self.assertFalse(
+            item.data(0, Qt.ItemDataRole.UserRole + 4)
+        )
 
     def test_slow_binder_delete_returns_before_trash_io_finishes(self):
         app = self.app
