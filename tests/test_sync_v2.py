@@ -513,10 +513,12 @@ class SyncV2StoreTestCase(unittest.TestCase):
 
     def test_folder_rename_intent_survives_restart_and_coalesces_chain(self):
         local_key = self.context["local_key"]
+        folder_id = str(uuid.uuid4())
         first = self.store.record_folder_rename_intent(
             local_key,
             "메인/메모장/처음 이름",
             "메인/메모장/중간 이름",
+            folder_id=folder_id,
         )
 
         reopened = SyncV2Store(self.db_path)
@@ -529,10 +531,13 @@ class SyncV2StoreTestCase(unittest.TestCase):
             local_key,
             "메인/메모장/중간 이름",
             "메인/메모장/최종 이름",
+            folder_id=folder_id,
         )
 
         self.assertEqual(recovered["intent_id"], first["intent_id"])
+        self.assertEqual(recovered["folder_id"], folder_id)
         self.assertEqual(chained["intent_id"], first["intent_id"])
+        self.assertEqual(chained["folder_id"], folder_id)
         self.assertIsNone(reopened.pending_folder_rename_intent(
             local_key,
             "메인/메모장/처음 이름",
@@ -988,7 +993,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         finally:
             raw.close()
         self.assertEqual(stored, "completed")
-        self.assertEqual(version, 8006)
+        self.assertEqual(version, 8007)
 
     def test_simultaneous_overlapping_save_is_kept_as_conflict(self):
         created = self.store.enqueue(self.context, "메인/원고/동시저장.txt", "공통 문장\n")
@@ -1525,6 +1530,254 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         self.assertEqual(result["created"], ["메인/설정집/구세계"])
         published = {row["folder_id"] for row in client.folder_rows}
         self.assertIn(created["uuid"], published)
+
+    def test_older_tree_snapshot_never_publishes_a_future_folder_identity(self):
+        first = create_item_at_path(
+            self.project_root, "메인", "첫 snapshot 폴더", True
+        )["nodes"][-1]
+        first_content = self.manager._tree_order_content({
+            "<root>": ["첫 snapshot 폴더"],
+            "메인/첫 snapshot 폴더": [],
+        })
+        future = create_item_at_path(
+            self.project_root, "메인", "미래 snapshot 폴더", True
+        )["nodes"][-1]
+        operation = {
+            **self.operation,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": self.manager._tree_order_content({"<root>": []}),
+            "content": first_content,
+        }
+        client = _FolderAwareClient([])
+
+        first_result = self.manager._commit_outbound_folder_lifecycle(
+            operation,
+            client,
+            snapshot_scope=(
+                self.manager._legacy_folder_scope_for_operation(operation)
+            ),
+        )
+
+        published = {row["folder_id"] for row in client.folder_rows}
+        self.assertIn(first["uuid"], published)
+        self.assertNotIn(future["uuid"], published)
+        self.assertIn("메인/첫 snapshot 폴더", first_result["created"])
+        self.assertNotIn("메인/미래 snapshot 폴더", first_result["created"])
+
+        operation["operation_id"] = str(uuid.uuid4())
+        operation["base_content"] = first_content
+        operation["content"] = self.manager._tree_order_content({
+            "<root>": ["첫 snapshot 폴더", "미래 snapshot 폴더"],
+            "메인/첫 snapshot 폴더": [],
+            "메인/미래 snapshot 폴더": [],
+        })
+        second_result = self.manager._commit_outbound_folder_lifecycle(
+            operation,
+            client,
+            snapshot_scope=(
+                self.manager._legacy_folder_scope_for_operation(operation)
+            ),
+        )
+
+        published = {row["folder_id"] for row in client.folder_rows}
+        self.assertIn(future["uuid"], published)
+        self.assertIn("메인/미래 snapshot 폴더", second_result["created"])
+
+    def test_six_rapid_folder_snapshots_publish_one_generation_at_a_time(self):
+        created = [
+            create_item_at_path(
+                self.project_root, "메인", f"연속 폴더 {number}", True
+            )["nodes"][-1]
+            for number in range(1, 7)
+        ]
+        contents = [self.manager._tree_order_content({"<root>": []})]
+        for count in range(1, 7):
+            names = [f"연속 폴더 {number}" for number in range(1, count + 1)]
+            contents.append(self.manager._tree_order_content({
+                "<root>": names,
+                **{f"메인/{name}": [] for name in names},
+            }))
+
+        client = _FolderAwareClient([])
+        all_user_ids = {node["uuid"] for node in created}
+        for index in range(1, 7):
+            operation = {
+                **self.operation,
+                "operation_id": str(uuid.uuid4()),
+                "local_key": self.context["local_key"],
+                "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                "base_content": contents[index - 1],
+                "content": contents[index],
+            }
+            self.manager._commit_outbound_folder_lifecycle(
+                operation,
+                client,
+                snapshot_scope=self.manager._legacy_folder_scope_for_operation(
+                    operation
+                ),
+            )
+
+            published_user_ids = {
+                row["folder_id"] for row in client.folder_rows
+            } & all_user_ids
+            self.assertEqual(
+                published_user_ids,
+                {node["uuid"] for node in created[:index]},
+            )
+
+    def test_reused_old_name_never_renames_the_replacement_folder(self):
+        old_path = "메인/새 폴더"
+        new_path = "메인/ㄹ"
+        original = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.assertTrue(self.wpm.rename_item(old_path, new_path))
+        rename_intent = self.manager.record_folder_rename_intent(
+            old_path, new_path
+        )
+        replacement = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+
+        root_id = self._uuid_of("메인")
+        original_row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == original["uuid"]
+        )
+        original_row["name"] = "ㄹ"
+        original_row["revision"] += 1
+        client.folder_rows.append({
+            "folder_id": replacement["uuid"],
+            "parent_folder_id": root_id,
+            "name": "새 폴더",
+            "revision": 1,
+            "is_deleted": False,
+        })
+        operation = {
+            **self.operation,
+            "operation_id": str(uuid.uuid4()),
+            "local_key": self.context["local_key"],
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": self.manager._tree_order_content({
+                "<root>": ["새 폴더"],
+                old_path: [],
+            }),
+            "content": self.manager._tree_order_content({
+                "<root>": ["ㄹ", "새 폴더"],
+                new_path: [],
+                old_path: [],
+            }),
+        }
+        calls_before = len(client.calls)
+
+        result = self.manager._commit_outbound_folder_rename(
+            operation, client
+        )
+
+        self.assertEqual(result["status"], "already_applied")
+        self.assertEqual(len(client.calls), calls_before)
+        self.assertIsNone(self.store.pending_folder_rename_intent(
+            self.context["local_key"], old_path, new_path
+        ))
+        by_id = {row["folder_id"]: row for row in client.folder_rows}
+        self.assertEqual(by_id[original["uuid"]]["name"], "ㄹ")
+        self.assertEqual(by_id[replacement["uuid"]]["name"], "새 폴더")
+        self.assertEqual(
+            self.store.folder_rename_intent_events(rename_intent["intent_id"])[
+                -1
+            ]["event_type"],
+            "completed",
+        )
+
+    def test_restart_after_rename_and_old_name_reuse_keeps_both_folder_ids(self):
+        """An older snapshot must not publish the replacement under its old name."""
+        old_path = "메인/새 폴더"
+        new_path = "메인/ㄹ"
+        original = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+        first_operation = {
+            **self.operation,
+            "local_key": self.context["local_key"],
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": self.manager._tree_order_content({"<root>": []}),
+            "content": self.manager._tree_order_content({
+                "<root>": ["새 폴더"],
+                old_path: [],
+            }),
+        }
+
+        self.assertTrue(self.wpm.rename_item(old_path, new_path))
+        rename_intent = self.manager.record_folder_rename_intent(
+            old_path, new_path
+        )
+        replacement = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+        second_operation = {
+            **self.operation,
+            "operation_id": str(uuid.uuid4()),
+            "local_key": self.context["local_key"],
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": first_operation["content"],
+            "content": self.manager._tree_order_content({
+                "<root>": ["ㄹ", "새 폴더"],
+                new_path: [],
+                old_path: [],
+            }),
+        }
+
+        reopened_store = SyncV2Store(self.store.db_path)
+        restarted = SyncManager()
+        restarted._v2_store = reopened_store
+        restarted._v2_context = self.context
+        restarted._v2_wpm = self.wpm
+        restarted._v2_device_id = str(uuid.uuid4())
+        client = _FolderAwareClient([])
+
+        restarted._commit_outbound_folder_rename(first_operation, client)
+        restarted._commit_outbound_folder_lifecycle(
+            first_operation,
+            client,
+            snapshot_scope=restarted._legacy_folder_scope_for_operation(
+                first_operation
+            ),
+        )
+
+        first_ids = {row["folder_id"] for row in client.folder_rows}
+        self.assertNotIn(original["uuid"], first_ids)
+        self.assertNotIn(replacement["uuid"], first_ids)
+        self.assertEqual(
+            reopened_store.pending_folder_rename_intent(
+                self.context["local_key"], old_path, new_path
+            )["folder_id"],
+            original["uuid"],
+        )
+
+        restarted._commit_outbound_folder_rename(second_operation, client)
+        restarted._commit_outbound_folder_lifecycle(
+            second_operation,
+            client,
+            snapshot_scope=restarted._legacy_folder_scope_for_operation(
+                second_operation
+            ),
+        )
+        restarted._commit_outbound_folder_rename(second_operation, client)
+
+        paths = restarted._folder_rows_with_tree_paths(client.folder_rows)
+        self.assertEqual(paths[original["uuid"]]["local_path"], new_path)
+        self.assertEqual(paths[replacement["uuid"]]["local_path"], old_path)
+        self.assertIsNone(reopened_store.pending_folder_rename_intent(
+            self.context["local_key"], old_path, new_path
+        ))
+        self.assertEqual(
+            reopened_store.folder_rename_intent_events(
+                rename_intent["intent_id"]
+            )[-1]["event_type"],
+            "completed",
+        )
 
     def test_the_local_folder_row_records_the_published_identity(self):
         client = _FolderAwareClient([])
@@ -6402,9 +6655,12 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         operation = self._persist_local_empty_folder_rename(
             "새 폴더F", "새 폴더H", local_order
         )
-        main_id = str(uuid.uuid4())
-        memo_id = str(uuid.uuid4())
-        folder_id = str(uuid.uuid4())
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        main_id = node_for_path(project_root, "메인")["uuid"]
+        memo_id = node_for_path(project_root, "메인/메모장")["uuid"]
+        folder_id = node_for_path(
+            project_root, "메인/메모장/새 폴더F"
+        )["uuid"]
         self.manager.supabase = _FolderAwareClient([
             {
                 "folder_id": main_id,
@@ -6461,9 +6717,12 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         operation = self._persist_local_empty_folder_rename(
             "새 폴더F", "새 폴더H", local_order
         )
-        main_id = str(uuid.uuid4())
-        memo_id = str(uuid.uuid4())
-        folder_id = str(uuid.uuid4())
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        main_id = node_for_path(project_root, "메인")["uuid"]
+        memo_id = node_for_path(project_root, "메인/메모장")["uuid"]
+        folder_id = node_for_path(
+            project_root, "메인/메모장/새 폴더F"
+        )["uuid"]
         client = _FolderAwareClient([
             {
                 "folder_id": main_id, "parent_folder_id": None,
@@ -6506,15 +6765,18 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.wpm.project_settings["tree_order"] = current_order
         self.assertTrue(self.wpm.save_settings())
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        created = create_item_at_path(
+            project_root, "메인", "아팯_빈폴더_윈", True
+        )["nodes"][-1]
         old_folder = Path(self.wpm.writing_root_path, old_path)
         new_folder = Path(self.wpm.writing_root_path, new_path)
-        old_folder.mkdir(parents=True)
         os.rename(old_folder, new_folder)
         self.manager.record_folder_rename_intent(old_path, new_path)
 
         operation = self.manager.record_tree_order(current_order, retry=False)
-        main_id = str(uuid.uuid4())
-        folder_id = str(uuid.uuid4())
+        main_id = node_for_path(project_root, "메인")["uuid"]
+        folder_id = created["uuid"]
         client = _FolderAwareClient([
             {
                 "folder_id": main_id, "parent_folder_id": None,

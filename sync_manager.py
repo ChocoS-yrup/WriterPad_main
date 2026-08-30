@@ -2359,8 +2359,32 @@ class SyncManager(QObject):
         ):
             raise ValueError("INVALID_LOCAL_FOLDER_RENAME_INTENT")
         with self._structure_mutation_gate:
+            identity_nodes = [
+                node for node in self._publishable_identity_folders()
+                if not node.get("wants_deleted")
+            ]
+            matches = [
+                node for node in identity_nodes
+                if self._tree_path_comparison_key(node.get("legacy_path"))
+                == self._tree_path_comparison_key(new_path)
+            ]
+            if not matches:
+                # Some legacy callers record the durable intent immediately
+                # after the filesystem rename and update identity in the same
+                # enclosing mutation. The pre-rename identity is still a safe
+                # anchor here because the old name has not yet been reusable.
+                matches = [
+                    node for node in identity_nodes
+                    if self._tree_path_comparison_key(node.get("legacy_path"))
+                    == self._tree_path_comparison_key(old_path)
+                ]
+            if len(matches) != 1:
+                raise ValueError("FOLDER_RENAME_IDENTITY_NOT_FOUND")
             return self._v2_store.record_folder_rename_intent(
-                self._v2_context["local_key"], old_path, new_path
+                self._v2_context["local_key"],
+                old_path,
+                new_path,
+                folder_id=matches[0]["uuid"],
             )
 
     def record_created_document(self, relative_path, retry=True):
@@ -4538,8 +4562,84 @@ class SyncManager(QObject):
             rpc_name="commit_folder",
         )
 
+    def _legacy_folder_scope_for_operation(self, operation):
+        """Return the folder paths this immutable tree snapshot may publish.
+
+        The identity file keeps advancing while an older tree-order operation
+        is in flight. Publishing every identity visible at dispatch time lets
+        a future folder row overtake the tree snapshot that actually names it.
+        A pull then observes two structural moments and correctly fails closed.
+
+        Older payloads without explicit ``folder_paths`` retain the historical
+        behavior. Current payloads carry enough evidence to scope both live
+        publication and tombstones to the operation's own before/after images.
+        """
+        if str(operation.get("relative_path") or "") != TREE_ORDER_DOCUMENT_PATH:
+            return None
+
+        def explicit_keys(content):
+            try:
+                payload = json.loads(content or "{}")
+                if not isinstance(payload, dict) or payload.get("version") != 1:
+                    return None
+                tree_order = self._validated_remote_tree_order(
+                    payload.get("tree_order")
+                )
+                return self._validated_remote_tree_folder_paths(
+                    payload.get("folder_paths"), tree_order
+                )
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+        live_keys = explicit_keys(operation.get("content"))
+        if live_keys is None:
+            return None
+        base_keys = explicit_keys(operation.get("base_content")) or set()
+        fixed_keys = {
+            self._tree_path_comparison_key("메인"),
+            *(
+                self._tree_path_comparison_key(f"메인/{storage_name}")
+                for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+            ),
+        }
+        scope = {
+            "live_keys": set(live_keys) | fixed_keys,
+            "deleted_keys": set(base_keys) - set(live_keys),
+            "expected_ids": {},
+        }
+        local_key = operation.get("local_key") or self._v2_context["local_key"]
+        identity_by_path = {
+            self._tree_path_comparison_key(node.get("legacy_path")): node
+            for node in self._publishable_identity_folders()
+            if not node.get("wants_deleted")
+        }
+        for intent in self._v2_store.pending_folder_rename_intents(local_key):
+            old_key = self._tree_path_comparison_key(intent.get("old_path"))
+            new_key = self._tree_path_comparison_key(intent.get("new_path"))
+            folder_id = str(intent.get("folder_id") or "")
+            if not folder_id:
+                # Databases upgraded from 8006 have path-only intents. Their
+                # current destination identity is the only safe compatibility
+                # anchor; absence or ambiguity leaves the operation scoped by
+                # path but never authorizes a guessed rename.
+                destination = identity_by_path.get(new_key)
+                folder_id = str(destination.get("uuid") or "") if destination else ""
+            if not folder_id:
+                continue
+            if old_key in scope["live_keys"] and new_key not in scope["live_keys"]:
+                scope["expected_ids"][old_key] = folder_id
+            if new_key in scope["live_keys"]:
+                scope["expected_ids"][new_key] = folder_id
+        return scope
+
     def _commit_outbound_folder_lifecycle(
-        self, operation, client, *, publish_live_only=False, candidates=None
+        self,
+        operation,
+        client,
+        *,
+        publish_live_only=False,
+        candidates=None,
+        snapshot_scope=None,
     ):
         """Make the server's folder rows agree with identity before tree-order.
 
@@ -4564,6 +4664,25 @@ class SyncManager(QObject):
             if candidates is not None
             else self._publishable_identity_folders()
         )
+        if snapshot_scope is not None:
+            live_keys = set(snapshot_scope.get("live_keys") or ())
+            expected_ids = dict(snapshot_scope.get("expected_ids") or {})
+            candidates = [
+                node for node in candidates
+                if node["wants_deleted"]
+                or (
+                    self._tree_path_comparison_key(node["legacy_path"])
+                    in live_keys
+                    and (
+                        not expected_ids.get(self._tree_path_comparison_key(
+                            node["legacy_path"]
+                        ))
+                        or str(node["uuid"]) == expected_ids[
+                            self._tree_path_comparison_key(node["legacy_path"])
+                        ]
+                    )
+                )
+            ]
         if not candidates:
             return empty
 
@@ -4618,6 +4737,16 @@ class SyncManager(QObject):
                 self._safe_relative_path(server_folder.get("local_path"))
                 if server_folder else ""
             )
+            if snapshot_scope is not None:
+                deleted_keys = set(
+                    snapshot_scope.get("deleted_keys") or ()
+                )
+                if (
+                    not server_path
+                    or self._tree_path_comparison_key(server_path)
+                    not in deleted_keys
+                ):
+                    continue
             if server_path and any(
                 path == server_path or path.startswith(server_path + "/")
                 for path in active_document_paths
@@ -4791,6 +4920,16 @@ class SyncManager(QObject):
         if self._v2_wpm is None:
             return None
         local_key = operation.get("local_key") or self._v2_context["local_key"]
+        identity_by_path = {}
+        for node in self._publishable_identity_folders():
+            if node.get("wants_deleted"):
+                continue
+            key = self._tree_path_comparison_key(node.get("legacy_path"))
+            if key in identity_by_path:
+                # Identity itself is ambiguous. No path-based rename may run.
+                identity_by_path[key] = None
+            else:
+                identity_by_path[key] = node
         rename_intent = None
         if intent is not None:
             rename_intent = self._v2_store.pending_folder_rename_intent(
@@ -4815,14 +4954,32 @@ class SyncManager(QObject):
                     new_parent, new_name = os.path.split(new_path)
                     sibling_key = "<root>" if old_parent == "메인" else old_parent
                     siblings = tree_order.get(sibling_key)
+                    old_identity = identity_by_path.get(
+                        self._tree_path_comparison_key(old_path)
+                    )
+                    new_identity = identity_by_path.get(
+                        self._tree_path_comparison_key(new_path)
+                    )
+                    old_name_was_reused = bool(
+                        old_identity
+                        and new_identity
+                        and str(old_identity.get("uuid"))
+                        != str(new_identity.get("uuid"))
+                    )
                     if (
                         old_parent == new_parent
                         and old_name
                         and new_name
                         and isinstance(siblings, list)
-                        and siblings.count(old_name) == 0
+                        and (
+                            siblings.count(old_name) == 0
+                            or old_name_was_reused
+                        )
                         and siblings.count(new_name) == 1
-                        and old_path not in tree_order
+                        and (
+                            old_path not in tree_order
+                            or old_name_was_reused
+                        )
                     ):
                         candidates.append((candidate, {
                             "old_relative_path": old_path,
@@ -4858,12 +5015,44 @@ class SyncManager(QObject):
         old_matches = self._folder_rows_by_tree_path(
             rows, intent["old_relative_path"]
         )
+        new_matches = self._folder_rows_by_tree_path(
+            rows, intent["new_relative_path"]
+        )
+        desired_identity = identity_by_path.get(
+            self._tree_path_comparison_key(intent["new_relative_path"])
+        )
+        desired_folder_id = (
+            str(rename_intent.get("folder_id") or "")
+            or (str(desired_identity.get("uuid")) if desired_identity else "")
+        )
+        if (
+            desired_folder_id
+            and len(new_matches) == 1
+            and str(new_matches[0].get("folder_id")) == desired_folder_id
+        ):
+            # The lifecycle pass may already have materialized the renamed
+            # identity at its destination. An old name can meanwhile belong to
+            # a newly-created UUID; its presence must not make us rename that
+            # replacement folder onto the occupied destination.
+            self._v2_store.complete_folder_rename_intent(
+                rename_intent["intent_id"]
+            )
+            return {"status": "already_applied", **new_matches[0]}
+
+        if desired_folder_id:
+            anchored_old_matches = [
+                row for row in old_matches
+                if str(row.get("folder_id")) == desired_folder_id
+            ]
+            if old_matches and len(anchored_old_matches) != 1:
+                self._report_folder_block(
+                    operation, desired_folder_id, "FOLDER_IDENTITY_MISMATCH"
+                )
+                return None
+            old_matches = anchored_old_matches
         if len(old_matches) != 1:
             # A prior replay may already have changed the projection. In that
             # case the desired identity is present and no second revision is needed.
-            new_matches = self._folder_rows_by_tree_path(
-                rows, intent["new_relative_path"]
-            )
             if len(old_matches) == 0 and len(new_matches) == 1:
                 self._v2_store.complete_folder_rename_intent(
                     rename_intent["intent_id"]
@@ -8868,9 +9057,19 @@ class SyncManager(QObject):
                             operation, client
                         )
                     if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
-                        # Folder state settles first: a rename needs its folder,
-                        # and a child needs its parent, to already be there.
-                        self._commit_outbound_folder_lifecycle(operation, client)
+                        # Vacate a renamed slot before a newer identity reuses
+                        # its old name. A folder that was renamed before its
+                        # first publication will not exist yet, so the second
+                        # idempotent pass completes that intent after lifecycle
+                        # has created it directly at the desired path.
+                        self._commit_outbound_folder_rename(operation, client)
+                        self._commit_outbound_folder_lifecycle(
+                            operation,
+                            client,
+                            snapshot_scope=(
+                                self._legacy_folder_scope_for_operation(operation)
+                            ),
+                        )
                         self._commit_outbound_folder_rename(operation, client)
                     lease_token = None
                     if operation["base_revision"] > 0:

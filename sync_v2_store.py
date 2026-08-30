@@ -35,7 +35,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8006
+STAGE8_USER_VERSION = 8007
 
 
 def _utc_now():
@@ -226,6 +226,7 @@ class SyncV2Store:
                     intent_id TEXT PRIMARY KEY,
                     local_key TEXT NOT NULL
                         REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    folder_id TEXT,
                     old_path TEXT NOT NULL,
                     new_path TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending'
@@ -337,6 +338,7 @@ class SyncV2Store:
             self._add_column(connection, "sync_documents", definition)
 
         self._add_column(connection, "sync_folders", "storage_name_key TEXT")
+        self._add_column(connection, "sync_folder_rename_intents", "folder_id TEXT")
 
         connection.executescript(
             """
@@ -4000,10 +4002,13 @@ class SyncV2Store:
             (event_id,),
         ).fetchone())
 
-    def record_folder_rename_intent(self, local_key, old_path, new_path):
+    def record_folder_rename_intent(
+        self, local_key, old_path, new_path, folder_id=None
+    ):
         """Durably record an explicit local folder rename, coalescing chains."""
         old_path = _normalize_path(old_path)
         new_path = _normalize_path(new_path)
+        folder_id = str(uuid.UUID(str(folder_id))) if folder_id else None
         if not old_path or not new_path or old_path == new_path:
             raise ValueError("invalid folder rename intent")
         now = _utc_now()
@@ -4022,19 +4027,32 @@ class SyncV2Store:
                 ) == "pending"
             ), None)
             if previous:
+                previous_folder_id = previous["folder_id"]
+                if (
+                    previous_folder_id
+                    and folder_id
+                    and str(previous_folder_id) != folder_id
+                ):
+                    raise ValueError("folder rename identity changed")
+                anchored_folder_id = previous_folder_id or folder_id
                 connection.execute(
                     """
                     UPDATE sync_folder_rename_intents
-                    SET new_path = ?, updated_at = ? WHERE intent_id = ?
+                    SET folder_id = ?, new_path = ?, updated_at = ?
+                    WHERE intent_id = ?
                     """,
-                    (new_path, now, previous["intent_id"]),
+                    (anchored_folder_id, new_path, now, previous["intent_id"]),
                 )
                 intent_id = previous["intent_id"]
                 self._append_folder_rename_intent_event(
                     connection,
                     intent_id,
                     "retargeted",
-                    detail={"old_path": old_path, "new_path": new_path},
+                    detail={
+                        "folder_id": anchored_folder_id,
+                        "old_path": old_path,
+                        "new_path": new_path,
+                    },
                 )
             else:
                 existing = next((
@@ -4052,29 +4070,44 @@ class SyncV2Store:
                 ), None)
                 if existing:
                     intent_id = existing["intent_id"]
+                    existing_folder_id = existing["folder_id"]
+                    if (
+                        existing_folder_id
+                        and folder_id
+                        and str(existing_folder_id) != folder_id
+                    ):
+                        raise ValueError("folder rename identity changed")
                     connection.execute(
                         """
-                        UPDATE sync_folder_rename_intents SET updated_at = ?
+                        UPDATE sync_folder_rename_intents
+                        SET folder_id = ?, updated_at = ?
                         WHERE intent_id = ?
                         """,
-                        (now, intent_id),
+                        (existing_folder_id or folder_id, now, intent_id),
                     )
                 else:
                     intent_id = str(uuid.uuid4())
                     connection.execute(
                         """
                         INSERT INTO sync_folder_rename_intents (
-                            intent_id, local_key, old_path, new_path, status,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                            intent_id, local_key, folder_id, old_path, new_path,
+                            status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                         """,
-                        (intent_id, local_key, old_path, new_path, now, now),
+                        (
+                            intent_id, local_key, folder_id, old_path, new_path,
+                            now, now,
+                        ),
                     )
                     self._append_folder_rename_intent_event(
                         connection,
                         intent_id,
                         "recorded",
-                        detail={"old_path": old_path, "new_path": new_path},
+                        detail={
+                            "folder_id": folder_id,
+                            "old_path": old_path,
+                            "new_path": new_path,
+                        },
                     )
             row = connection.execute(
                 "SELECT * FROM sync_folder_rename_intents WHERE intent_id = ?",
