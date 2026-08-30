@@ -3260,6 +3260,35 @@ class SyncV2Store:
         result["documents"] = len(outstanding_documents)
         return result
 
+    def has_outstanding_structure_intent(self, local_key):
+        """Whether an unsuperseded local operation still owns structure.
+
+        A restart baseline may inspect the server to choose an authority, but
+        it must not apply an older server tree over a durable local tree-order
+        or atomic structure intent that has not reached a terminal event yet.
+        """
+        with self._reader() as connection:
+            legacy_rows = connection.execute(
+                """
+                SELECT operation_id FROM sync_operations
+                WHERE local_key = ? AND relative_path = ?
+                ORDER BY queue_id
+                """,
+                (local_key, "__antigravity__/tree-order.json"),
+            ).fetchall()
+            contract_rows = connection.execute(
+                """
+                SELECT operation_id FROM sync_structure_operations
+                WHERE local_key = ? ORDER BY queue_id
+                """,
+                (local_key,),
+            ).fetchall()
+            return any(
+                self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+                for row in (*legacy_rows, *contract_rows)
+            )
+
     def conflict_documents(self, local_key=None):
         """Return every document waiting for the writer to pick a version."""
         params = ["conflict"]

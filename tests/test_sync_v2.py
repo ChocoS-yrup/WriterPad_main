@@ -183,6 +183,42 @@ class BackgroundStructureExecutionTestCase(unittest.TestCase):
             [(number, True, number, "") for number in range(5)],
         )
 
+    def test_background_enqueue_marshals_drain_to_manager_thread(self):
+        manager = SyncManager()
+        previous_blocked = manager._auth_retry_blocked
+        previous_shutdown = manager._shutting_down
+        caller_results = []
+        published_on = []
+        owner_thread_id = threading.get_ident()
+        manager._auth_retry_blocked = True
+        manager._shutting_down = False
+        try:
+            with patch.object(
+                manager,
+                "_publish_sync_state",
+                side_effect=lambda: published_on.append(
+                    threading.get_ident()
+                ),
+            ):
+                background = threading.Thread(
+                    target=lambda: caller_results.append(
+                        manager.retry_pending_syncs()
+                    )
+                )
+                background.start()
+                background.join(timeout=2.0)
+
+                deadline = time.monotonic() + 2.0
+                while not published_on and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    QTest.qWait(10)
+
+            self.assertEqual(caller_results, [True])
+            self.assertEqual(published_on, [owner_thread_id])
+        finally:
+            manager._auth_retry_blocked = previous_blocked
+            manager._shutting_down = previous_shutdown
+
 
 class ThreeWayMergeTestCase(unittest.TestCase):
     def test_non_overlapping_edits_merge_without_markers(self):
@@ -8972,6 +9008,13 @@ class UploadDrainPullCoordinatorTestCase(unittest.TestCase):
             f"본문 {number}",
         )
 
+    def _enqueue_tree_order(self, content='{"tree_order": {}}'):
+        return self.store.enqueue(
+            self.manager._v2_context,
+            "__antigravity__/tree-order.json",
+            content,
+        )
+
     def _finish_pull(self, worker):
         worker.resultReady.emit(True, {
             "documents": [],
@@ -8988,6 +9031,24 @@ class UploadDrainPullCoordinatorTestCase(unittest.TestCase):
         self.assertTrue(self.manager.pull_remote_changes_async())
         self.assertEqual(len(self.workers), 1)
         self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_restart_baseline_does_not_restore_server_tree_over_pending_delete(self):
+        self._enqueue_tree_order(
+            '{"tree_order":{"메인/원고":[]}}'
+        )
+
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        baseline = self.workers[0]
+        with patch.object(self.manager, "retry_pending_syncs") as retry:
+            self._finish_pull(baseline)
+
+        self.manager._apply_v2_remote_documents.assert_not_called()
+        self.assertTrue(self.coordinator["baseline_validated"])
+        self.assertTrue(self.coordinator["pull_pending"])
+        self.assertIsNone(
+            self.coordinator["applied_snapshot_fingerprint"]
+        )
+        retry.assert_called_once_with(manual=True)
 
     def test_fifty_uploads_coalesce_timer_requests_until_the_drain_boundary(self):
         self._accept_current_authority()

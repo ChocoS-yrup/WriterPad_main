@@ -2928,8 +2928,28 @@ class SyncManager(QObject):
         self._last_sync_error = payload["_retry_error"]
         self._last_failure_offline = bool(offline)
 
+    @pyqtSlot()
+    def _retry_pending_syncs_on_owner_thread(self):
+        """Run a background enqueue's drain request on this QObject's thread."""
+        self.retry_pending_syncs()
+
     def retry_pending_syncs(self, manual=False):
         """다른 서버 요청이 성공한 뒤 대기 중인 항목을 한 건씩 다시 전송한다."""
+        if (
+            not manual
+            and self.thread() is not None
+            and QThread.currentThread() != self.thread()
+        ):
+            # Binder structure actions persist their immutable operations on a
+            # serial worker. QTimer and the active-worker slots belong to the
+            # manager's UI thread, so touching them from that worker can lose
+            # the only wake-up while leaving the durable queue visibly stuck.
+            QMetaObject.invokeMethod(
+                self,
+                "_retry_pending_syncs_on_owner_thread",
+                Qt.ConnectionType.QueuedConnection,
+            )
+            return True
         if self._auth_retry_blocked or self._shutting_down:
             self._publish_sync_state()
             return False
@@ -8708,6 +8728,29 @@ class SyncManager(QObject):
                 }:
                     self._block_structure_authority(
                         "INVALID_TREE_ORDER_RESPONSE"
+                    )
+                    return
+                defer_baseline_apply = bool(
+                    reason == "baseline"
+                    and self._v2_store is not None
+                    and self._v2_store.has_outstanding_structure_intent(
+                        started_for[2]
+                    )
+                )
+                if defer_baseline_apply:
+                    # The fetched projection is complete enough to select the
+                    # server authority, but it predates a durable local tree
+                    # intent. Applying it now can resurrect folders before the
+                    # queued tombstones are published. Keep the local structure
+                    # untouched, drain the immutable queue, then require one
+                    # fresh general pull at the serialized drain boundary.
+                    self._accept_structure_authority(authority)
+                    started_coordinator["baseline_validated"] = True
+                    started_coordinator["pull_pending"] = True
+                    started_coordinator["applied_snapshot_fingerprint"] = None
+                    started_coordinator["applied_structure_generation"] = None
+                    retry_after_success["value"] = bool(
+                        retry_pending_after_pull
                     )
                     return
                 background_apply = payload.get("background_apply")
