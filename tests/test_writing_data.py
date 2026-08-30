@@ -130,8 +130,31 @@ class WritingDataTestCase(unittest.TestCase):
         self.assertTrue(self._wait_for(
             lambda: host.start_create_root_item.call_count == 1
         ))
-        host.start_create_root_item.assert_called_once_with(is_folder=True)
+        host.start_create_root_item.assert_called_once_with(
+            is_folder=True, edit_name=False
+        )
         host.close()
+
+    def test_shortcut_create_commits_default_name_without_opening_editor(self):
+        panel = WritingTreeMixin()
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        panel._commit_tree_item_creation = MagicMock(return_value=True)
+
+        with patch("writing_tree.QTimer.singleShot") as single_shot:
+            result = panel.start_create_root_item(
+                is_folder=True,
+                _structure_acquired=True,
+                _created_name="새 폴더",
+                edit_name=False,
+            )
+
+        self.assertTrue(result)
+        single_shot.assert_not_called()
+        item = panel.binder_tree.topLevelItem(0)
+        self.assertEqual(item.text(0), "새 폴더")
+        self.assertFalse(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        panel._commit_tree_item_creation.assert_called_once_with(item)
 
     def test_duplicate_initial_name_keeps_default_creation_pending(self):
         panel = WritingTreeMixin()

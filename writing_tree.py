@@ -946,7 +946,9 @@ class WritingTreeMixin:
             add_folder_action = QAction("새 폴더", self)
             add_folder_action.triggered.connect(lambda: self.start_create_root_item(is_folder=True))
             menu.addAction(add_folder_action)
-            callbacks['F'] = lambda: self.start_create_root_item(is_folder=True)
+            callbacks['F'] = lambda: self.start_create_root_item(
+                is_folder=True, edit_name=False
+            )
         elif item.text(0) == "📚 원고":
             add_volume_action = QAction("권 추가", self)
             add_volume_action.triggered.connect(self.add_volume)
@@ -999,12 +1001,16 @@ class WritingTreeMixin:
                     add_folder_action = QAction("새 폴더", self)
                     add_folder_action.triggered.connect(lambda: self.start_create_item(item, is_folder=True))
                     menu.addAction(add_folder_action)
-                    callbacks['F'] = lambda: self.start_create_item(item, is_folder=True)
+                    callbacks['F'] = lambda: self.start_create_item(
+                        item, is_folder=True, edit_name=False
+                    )
 
                     add_file_action = QAction("새 문서", self)
                     add_file_action.triggered.connect(lambda: self.start_create_item(item, is_folder=False))
                     menu.addAction(add_file_action)
-                    callbacks['N'] = lambda: self.start_create_item(item, is_folder=False)
+                    callbacks['N'] = lambda: self.start_create_item(
+                        item, is_folder=False, edit_name=False
+                    )
 
                 if item.parent() is not None or item.text(0) not in self.root_nodes:
                     is_volume = (item.parent() is not None and item.parent().text(0) == "📚 원고")
@@ -1990,7 +1996,11 @@ class WritingTreeMixin:
         )
 
     def start_create_root_item(
-        self, is_folder, _structure_acquired=False, _created_name=None
+        self,
+        is_folder,
+        _structure_acquired=False,
+        _created_name=None,
+        edit_name=True,
     ):
         # Rapid clicks can arrive before the first 150ms inline-editor timer.
         # Commit the previous default-named item so only one editor can open.
@@ -2018,6 +2028,7 @@ class WritingTreeMixin:
                     is_folder,
                     _structure_acquired=True,
                     _created_name=new_name,
+                    edit_name=edit_name,
                 )
 
             return WritingTreeMixin._submit_background_structure_action(
@@ -2034,7 +2045,10 @@ class WritingTreeMixin:
                 self,
                 action_key,
                 lambda: WritingTreeMixin.start_create_root_item(
-                    self, is_folder, _structure_acquired=True
+                    self,
+                    is_folder,
+                    _structure_acquired=True,
+                    edit_name=edit_name,
                 ),
             )
         self._finalize_current_tree_creation()
@@ -2073,6 +2087,14 @@ class WritingTreeMixin:
         self._pending_tree_creation_items = pending_items
         self._tree_creation_item = new_item
         self._tree_item_creation_active = True
+
+        if not edit_name:
+            self.binder_tree.blockSignals(True)
+            self.binder_tree.scrollToItem(new_item)
+            self.binder_tree.setCurrentItem(new_item)
+            self.binder_tree.blockSignals(False)
+            self._finish_item_name_edit(new_item, is_folder)
+            return self._commit_tree_item_creation(new_item)
 
         def edit_new_item():
             try:
@@ -2145,6 +2167,7 @@ class WritingTreeMixin:
         is_folder,
         _structure_acquired=False,
         _created_name=None,
+        edit_name=True,
     ):
         if not WritingTreeMixin._is_live_qt_object(parent_item): return
         if parent_item.data(0, Qt.ItemDataRole.UserRole + 1) is False:
@@ -2176,6 +2199,7 @@ class WritingTreeMixin:
                         is_folder,
                         _structure_acquired=True,
                         _created_name=new_name,
+                        edit_name=edit_name,
                     )
                 else:
                     self.load_tree_data()
@@ -2197,7 +2221,11 @@ class WritingTreeMixin:
                 self,
                 action_key,
                 lambda: WritingTreeMixin.start_create_item(
-                    self, parent_item, is_folder, _structure_acquired=True
+                    self,
+                    parent_item,
+                    is_folder,
+                    _structure_acquired=True,
+                    edit_name=edit_name,
                 ),
             )
         self._finalize_current_tree_creation()
@@ -2247,6 +2275,14 @@ class WritingTreeMixin:
         self._pending_tree_creation_items = pending_items
         self._tree_creation_item = new_item
         self._tree_item_creation_active = True
+
+        if not edit_name:
+            self.binder_tree.blockSignals(True)
+            self.binder_tree.scrollToItem(new_item)
+            self.binder_tree.setCurrentItem(new_item)
+            self.binder_tree.blockSignals(False)
+            self._finish_item_name_edit(new_item, is_folder)
+            return self._commit_tree_item_creation(new_item)
 
         def edit_new_item():
             try:

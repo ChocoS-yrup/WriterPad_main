@@ -2837,7 +2837,7 @@ class SyncManager(QObject):
     def _v2_follow_up_delay_ms(
         kind, error_message="", lease_attempt=1, network_attempt=1
     ):
-        if kind in {"committed", "auto_merged", "conflict"}:
+        if kind in {"committed", "auto_merged", "conflict", "superseded"}:
             return 0
         if kind == "retry" and "LEASE_CONFLICT" in (error_message or ""):
             attempt_index = max(0, int(lease_attempt or 1) - 1)
@@ -9106,13 +9106,31 @@ class SyncManager(QObject):
                         # idempotent pass completes that intent after lifecycle
                         # has created it directly at the desired path.
                         self._commit_outbound_folder_rename(operation, client)
-                        self._commit_outbound_folder_lifecycle(
+                        lifecycle = self._commit_outbound_folder_lifecycle(
                             operation,
                             client,
                             snapshot_scope=(
                                 self._legacy_folder_scope_for_operation(operation)
                             ),
                         )
+                        if lifecycle.get("blocked"):
+                            recovery = (
+                                self._v2_store
+                                .mark_blocked_and_promote_dependent(
+                                    operation_id,
+                                    "FOLDER_LIFECYCLE_BLOCKED",
+                                )
+                            )
+                            return {
+                                "kind": (
+                                    "superseded"
+                                    if recovery.get("successor")
+                                    else "blocked"
+                                ),
+                                "error": "FOLDER_LIFECYCLE_BLOCKED",
+                                "operation": operation,
+                                "blocked_paths": lifecycle["blocked"],
+                            }
                         self._commit_outbound_folder_rename(operation, client)
                     lease_token = None
                     if operation["base_revision"] > 0:
@@ -9379,6 +9397,9 @@ class SyncManager(QObject):
                 self._last_failure_offline = False
                 if callback:
                     callback(False, self._last_sync_error, original["local_path"], None)
+            elif kind == "superseded":
+                self._last_sync_error = ""
+                self._last_failure_offline = False
             elif kind == "project_disabled":
                 self._last_sync_error = payload.get("error", "")
                 if callback:

@@ -1525,6 +1525,73 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertEqual(len(client.folder_rows), 1)
 
+    def test_blocked_folder_lifecycle_never_commits_tree_order(self):
+        foreign_main = str(uuid.uuid4())
+        client = _FolderAwareClient([{
+            "folder_id": foreign_main,
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+        first = self.manager.record_tree_order(
+            {"<root>": ["메모장"]}, retry=False
+        )
+        self.store.mark_attempt(first["operation_id"])
+        corrected = self.manager.record_tree_order(
+            {"<root>": ["메모장", "캐릭터"]}, retry=False
+        )
+        self.assertIsNone(corrected["base_revision"])
+
+        result = self.manager._process_v2_operation(first["operation_id"])
+
+        self.assertEqual(result["kind"], "superseded")
+        self.assertNotIn(
+            "commit_document", [name for name, _params in client.calls]
+        )
+        self.assertEqual(
+            self.store.operation(first["operation_id"])["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            self.store.operation(corrected["operation_id"])["status"],
+            "cancelled",
+        )
+        successor = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.assertIsNotNone(successor)
+        self.assertEqual(successor["content"], corrected["content"])
+        self.assertEqual(successor["base_revision"], 0)
+
+    def test_blocked_folder_lifecycle_without_correction_stays_blocked(self):
+        client = _FolderAwareClient([{
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+        operation = self.manager.record_tree_order(
+            {"<root>": ["메모장"]}, retry=False
+        )
+        self.store.mark_attempt(operation["operation_id"])
+
+        result = self.manager._process_v2_operation(
+            operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "blocked")
+        self.assertNotIn(
+            "commit_document", [name for name, _params in client.calls]
+        )
+        self.assertEqual(
+            self.store.operation(operation["operation_id"])["status"],
+            "blocked",
+        )
+
     def test_a_blocked_folder_is_reported_and_never_repaired(self):
         client = _FolderAwareClient([
             {

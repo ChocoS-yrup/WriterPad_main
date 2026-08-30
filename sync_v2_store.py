@@ -2804,6 +2804,99 @@ class SyncV2Store:
             )
             return self._operation_dict(connection, row)
 
+    def mark_blocked_and_promote_dependent(self, operation_id, error_code):
+        """Block an unsafe snapshot and resume from its next durable edit.
+
+        A LEGACY tree-order snapshot can discover that one of its folder rows
+        was refused by the server.  That exact snapshot must never be sent,
+        but a corrected snapshot may already be queued behind the in-flight
+        operation with ``base_revision IS NULL``.  Promote one such dependent
+        against the document's last accepted server revision atomically, so a
+        fast local correction cannot become stranded behind the refusal.
+        """
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = self._operation_row(connection, operation_id)
+            if row is None:
+                return {"blocked": None, "successor": None}
+            state = self._derived_state(connection, operation_id)
+            if state != "blocked" and state not in TERMINAL_STATES:
+                self._finish_attempt(
+                    connection, operation_id, "blocked", error_code=error_code
+                )
+                self._append_event(
+                    connection, operation_id, "blocked", error_code=error_code
+                )
+            if state in TERMINAL_STATES:
+                return {
+                    "blocked": self._operation_dict(connection, row),
+                    "successor": None,
+                }
+
+            dependent = next((
+                candidate for candidate in connection.execute(
+                    """
+                    SELECT * FROM sync_operations
+                    WHERE document_id = ? AND base_revision IS NULL
+                    ORDER BY queue_id
+                    """,
+                    (row["document_id"],),
+                ).fetchall()
+                if self._derived_state(
+                    connection, candidate["operation_id"]
+                ) in {"pending", "retry_wait"}
+            ), None)
+            if dependent is None:
+                return {
+                    "blocked": self._operation_dict(connection, row),
+                    "successor": None,
+                }
+
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (row["document_id"],),
+            ).fetchone()
+            successor = self._insert_document_operation(
+                connection,
+                context={
+                    "local_key": dependent["local_key"],
+                    "project_id": dependent["project_id"],
+                },
+                document=document,
+                local_path=dependent["local_path"],
+                relative_path=dependent["relative_path"],
+                base_revision=int(document["revision"] or 0),
+                base_content=document["base_content"],
+                content=dependent["content"],
+                is_deleted=bool(dependent["is_deleted"]),
+                supersedes_operation_id=dependent["operation_id"],
+            )
+            for superseded_id in (
+                operation_id, dependent["operation_id"]
+            ):
+                self._append_event(
+                    connection,
+                    superseded_id,
+                    "superseded",
+                    related_operation_id=successor["operation_id"],
+                    detail={
+                        "successor_operation_id": successor["operation_id"],
+                        "source": "blocked_folder_lifecycle",
+                    },
+                )
+            connection.execute(
+                """
+                UPDATE sync_documents
+                SET sync_state = 'pending', last_error = '', updated_at = ?
+                WHERE document_id = ?
+                """,
+                (now, row["document_id"]),
+            )
+            return {
+                "blocked": self._operation_dict(connection, row),
+                "successor": successor,
+            }
+
     def mark_success(self, operation_id, result):
         now = _utc_now()
         with self._transaction() as connection:
