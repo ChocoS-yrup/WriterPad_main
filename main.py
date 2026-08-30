@@ -3,6 +3,18 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget
 from PyQt6.QtGui import QIcon, QFont, QKeySequence, QShortcut
 from PyQt6.QtCore import QEvent, Qt
 
+
+if "--qt-import-smoke-test" in sys.argv:
+    # Release builds run this before installation. It validates not only the
+    # Python extension import but also the bundled Qt platform plugin and its
+    # MSVC runtime, without opening projects, credentials, or sync state.
+    smoke_app = QApplication(["writerpad-qt-import-smoke-test"])
+    smoke_window = QMainWindow()
+    smoke_window.winId()
+    smoke_app.processEvents()
+    sys.exit(0)
+
+
 from mode_assistant import AssistantModeWidget, SingleApplication
 from mode_writing import WritingModeWidget
 from project_manager import startup_mode_from_config
