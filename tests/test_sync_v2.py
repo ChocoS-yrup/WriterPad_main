@@ -9158,6 +9158,60 @@ class UploadDrainPullCoordinatorTestCase(unittest.TestCase):
         self.assertEqual(len(self.workers), 2)
         self.assertFalse(self.coordinator["pull_pending"])
 
+    def test_rapid_local_delete_gap_defers_only_the_final_pull(self):
+        self._accept_current_authority()
+        self.coordinator["pull_pending"] = True
+        self.coordinator["last_local_structure_monotonic"] = 100.0
+
+        with patch("sync_manager.time.monotonic", return_value=100.5), patch.object(
+            self.manager, "_schedule_v2_retry", return_value=True
+        ) as schedule:
+            self.assertTrue(self.manager._maybe_start_deferred_pull())
+
+        self.assertEqual(self.workers, [])
+        self.assertTrue(self.coordinator["pull_pending"])
+        delay_ms = schedule.call_args.args[0]
+        self.assertGreaterEqual(delay_ms, 999)
+        self.assertLessEqual(delay_ms, 1001)
+
+        operation = self._enqueue_tree_order()
+        with patch.object(self.manager, "_launch_v2_operation") as launch:
+            self.assertTrue(self.manager.retry_pending_syncs())
+        self.assertEqual(
+            launch.call_args.args[0]["operation_id"],
+            operation["operation_id"],
+        )
+
+    def test_final_pull_waits_while_local_structure_is_still_durable(self):
+        self._accept_current_authority()
+        self.coordinator["pull_pending"] = True
+        self.manager._local_structure_callbacks["accepted-delete"] = None
+        self.addCleanup(
+            self.manager._local_structure_callbacks.pop,
+            "accepted-delete",
+            None,
+        )
+
+        with patch.object(self.manager, "_schedule_v2_retry") as schedule:
+            self.assertFalse(self.manager._maybe_start_deferred_pull())
+
+        schedule.assert_not_called()
+        self.assertEqual(self.workers, [])
+        self.assertFalse(
+            self.manager._ordinary_pull_gate_is_open(self.coordinator)
+        )
+
+    def test_final_pull_starts_after_local_structure_quiet_window(self):
+        self._accept_current_authority()
+        self.coordinator["pull_pending"] = True
+        self.coordinator["last_local_structure_monotonic"] = 100.0
+
+        with patch("sync_manager.time.monotonic", return_value=101.6):
+            self.assertTrue(self.manager._maybe_start_deferred_pull())
+
+        self.assertEqual(len(self.workers), 1)
+        self.assertFalse(self.coordinator["pull_pending"])
+
     def test_successful_baseline_caches_snapshot_for_silent_noop_pull(self):
         self.assertTrue(self.manager.pull_remote_changes_async())
         baseline = self.workers[0]

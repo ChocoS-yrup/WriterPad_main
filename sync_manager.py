@@ -76,6 +76,12 @@ NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
 # while.  A periodic full pass still repairs out-of-process filesystem changes
 # that do not advance this process's structure generation.
 REMOTE_SNAPSHOT_FULL_APPLY_SECONDS = 300.0
+# A confirmation dialog makes rapid delete clicks arrive roughly one second
+# apart.  Starting the expensive final snapshot pull in every gap makes the
+# next durable delete wait behind that pull and look permanently stalled.
+# Uploads still dispatch immediately; only the queue-empty final pull waits for
+# this short project-scoped quiet window.
+LOCAL_STRUCTURE_PULL_QUIET_MS = 1500
 # 종료는 하나의 예산 안에서만 원격 작업을 시도한다. 예산이 끝나면 새 요청을
 # 만들지 않고 다음 실행으로 미룬다.
 SHUTDOWN_BUDGET_MS = 5000
@@ -974,6 +980,7 @@ class SyncManager(QObject):
                 "applied_snapshot_fingerprint": None,
                 "applied_structure_generation": None,
                 "last_full_apply_monotonic": 0.0,
+                "last_local_structure_monotonic": 0.0,
             }
             self._v2_pull_coordinators[local_key] = coordinator
         return coordinator
@@ -1074,6 +1081,9 @@ class SyncManager(QObject):
         """Evaluate queue-empty and pull-start as one main-thread transition."""
         if coordinator is None or not coordinator["baseline_validated"]:
             return False
+        with self._local_structure_queue_lock:
+            if self._local_structure_callbacks:
+                return False
         counts = self._v2_activity_counts(coordinator["identity"][2])
         return (
             self._outbound_work_count(counts) == 0
@@ -1086,7 +1096,26 @@ class SyncManager(QObject):
         coordinator = self._current_pull_coordinator(create=False)
         if not coordinator or not coordinator["pull_pending"]:
             return False
+        with self._local_structure_queue_lock:
+            if self._local_structure_callbacks:
+                # The completion callback is the durable wake-up.  Starting a
+                # pull here would put network snapshot work in front of the
+                # accepted binder operation.
+                return False
+        last_activity = float(
+            coordinator.get("last_local_structure_monotonic") or 0.0
+        )
+        if last_activity:
+            elapsed_ms = (time.monotonic() - last_activity) * 1000.0
+            remaining_ms = LOCAL_STRUCTURE_PULL_QUIET_MS - elapsed_ms
+            if remaining_ms > 0:
+                return self._schedule_v2_retry(int(remaining_ms) + 1)
         return self.pull_remote_changes_async(reason="general")
+
+    def _note_local_structure_activity(self):
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator is not None:
+            coordinator["last_local_structure_monotonic"] = time.monotonic()
 
     def release_v2(self):
         """Serve no project at all until something valid is attached.
@@ -1511,6 +1540,7 @@ class SyncManager(QObject):
             if dedupe_key:
                 self._local_structure_dedupe[str(dedupe_key)] = operation_id
             pending_count = len(self._local_structure_callbacks)
+        self._note_local_structure_activity()
         self.notify_local_structure_queue(pending_count)
         self._start_local_structure_worker()
         return operation_id
@@ -1552,6 +1582,7 @@ class SyncManager(QObject):
     def _handle_local_structure_result(
         self, operation_id, success, result, error_message
     ):
+        self._note_local_structure_activity()
         with self._local_structure_queue_lock:
             callback = self._local_structure_callbacks.pop(operation_id, None)
             for key, value in list(self._local_structure_dedupe.items()):
