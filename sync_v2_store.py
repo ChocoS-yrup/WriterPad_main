@@ -67,6 +67,7 @@ class SyncV2Store:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._schema_lock = threading.Lock()
         self._transaction_state = threading.local()
+        self._reader_state = threading.local()
         self._initialize()
 
     def _connect(self):
@@ -97,7 +98,60 @@ class SyncV2Store:
             connection.close()
 
     @contextmanager
+    def reader_session(self):
+        """Pin one read connection for a burst of lookups on this thread.
+
+        ``sqlite3.connect`` costs about 1.2 ms per call on Windows, and one
+        remote apply performs hundreds of document lookups on the GUI thread.
+        Reusing a single connection for that burst removes the churn without
+        changing what a lookup sees: the connection stays in autocommit, so
+        every statement still opens and closes its own read transaction.
+
+        The connection is closed when the outermost session exits.  No handle
+        outlives the burst, so a caller may still delete the database file
+        right afterwards.
+        """
+        state = self._reader_state
+        depth = int(getattr(state, "session_depth", 0))
+        if depth == 0:
+            state.connection = self._connect()
+        state.session_depth = depth + 1
+        try:
+            yield
+        finally:
+            state.session_depth = depth
+            if depth == 0:
+                connection = getattr(state, "connection", None)
+                state.connection = None
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+
+    @contextmanager
     def _reader(self):
+        pinned = getattr(self._reader_state, "connection", None)
+        if pinned is not None:
+            # End any read transaction a previous statement on this pinned
+            # connection may still hold, so this lookup observes writes the
+            # same thread committed on its separate transaction connection.
+            try:
+                pinned.rollback()
+            except sqlite3.Error:
+                pass
+            try:
+                yield pinned
+            except sqlite3.Error:
+                # A broken connection must not be handed to the rest of the
+                # session. Drop it; later lookups fall back to their own.
+                self._reader_state.connection = None
+                try:
+                    pinned.close()
+                except sqlite3.Error:
+                    pass
+                raise
+            return
         connection = self._connect()
         try:
             yield connection

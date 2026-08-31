@@ -1197,9 +1197,15 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             # Session refresh can swap clients briefly. Do not repaint a
             # healthy cloud project as local-only during that internal gap.
             account_email = previous_account_email
+        # The five-second background pull is deliberately invisible: the
+        # manager only raises pull_visible for a manual refresh or the first
+        # baseline pull. Counting every pull as busy made the button alternate
+        # between 동기화 완료 and 로컬 저장 완료 every five seconds while the
+        # writer sat idle. A pull that is still waiting on the upload queue
+        # publishes the pull_pending state, which has its own label.
         activity_busy = any(int(activity.get(name, 0) or 0) for name in (
             "transfer_pending", "transferring", "retry_wait", "conflict",
-            "blocked", "pull_pending", "pulling",
+            "blocked", "pull_visible",
         ))
         if (
             account_email and state == "saved" and not editor_dirty

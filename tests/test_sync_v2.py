@@ -375,6 +375,49 @@ class SyncV2StoreTestCase(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_reader_session_reuses_one_connection_and_releases_it(self):
+        path = "메인/원고/001화.txt"
+        local_key = self.context["local_key"]
+        self.store.enqueue(self.context, path, "본문")
+
+        opened = []
+        original_connect = self.store._connect
+
+        def counting_connect():
+            connection = original_connect()
+            opened.append(connection)
+            return connection
+
+        self.store._connect = counting_connect
+
+        with self.store.reader_session():
+            for _ in range(5):
+                self.assertIsNotNone(self.store.get_document(local_key, path))
+            pinned = list(opened)
+
+        self.assertEqual(len(pinned), 1)
+        # The burst must not leave a handle behind, or Windows cannot delete
+        # the database file afterwards.
+        with self.assertRaises(sqlite3.ProgrammingError):
+            pinned[0].execute("SELECT 1")
+
+        self.store.get_document(local_key, path)
+        self.assertEqual(len(opened), 2)
+
+    def test_reader_session_observes_writes_committed_during_the_burst(self):
+        path = "메인/원고/001화.txt"
+        local_key = self.context["local_key"]
+        self.store.enqueue(self.context, path, "첫 내용")
+
+        with self.store.reader_session():
+            before = self.store.get_document(local_key, path)
+            self.store.enqueue(self.context, path, "두 번째 내용")
+            after = self.store.get_document(local_key, path)
+
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        self.assertTrue(self.store.has_active_operations(after["document_id"]))
+
     def test_queue_survives_restart_and_keeps_operation_id(self):
         operation = self.store.enqueue(
             self.context, "메인/원고/001화.txt", "영구 보관할 내용"

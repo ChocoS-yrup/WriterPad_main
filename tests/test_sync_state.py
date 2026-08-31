@@ -798,6 +798,39 @@ class StorageStatusLabelTestCase(unittest.TestCase):
         )
         self.assertNotIn("충돌 30건", target.lbl_storage_status.text)
 
+    def test_invisible_background_pull_keeps_the_completed_sync_label(self):
+        activity = {
+            "transfer_pending": 0,
+            "transferring": 0,
+            "retry_wait": 0,
+            "conflict": 0,
+            "blocked": 0,
+            "pull_pending": 0,
+            "pulling": 1,
+            "pull_visible": 0,
+        }
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: activity,
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        # The five-second background pull must not repaint the button while
+        # the writer is idle.
+        self.assertEqual(target.lbl_storage_status.text, "● 동기화 완료")
+
+        activity["pull_visible"] = 1
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        # A manual refresh or the first baseline pull still reports progress.
+        self.assertEqual(target.lbl_storage_status.text, "● 로컬 저장 완료")
+
     def test_pending_34_and_conflict_zero_is_only_transfer_waiting(self):
         activity = {
             "transfer_pending": 34,

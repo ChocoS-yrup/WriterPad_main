@@ -10,7 +10,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from PyQt6.QtCore import (
     QObject, QThread, pyqtSignal, pyqtSlot, QMutex, QMutexLocker, QTimer,
@@ -1496,6 +1496,19 @@ class SyncManager(QObject):
     def structure_timing_snapshot(self):
         with self._structure_timing_lock:
             return dict(self._structure_timing)
+
+    def _store_reader_session(self):
+        """Pin one SQLite read connection for a burst of store lookups.
+
+        A remote apply asks the store about every document it received. Each
+        of those lookups used to open its own connection, which is about
+        1.2 ms on Windows and is what made the foreground apply hold the
+        structure gate — and the GUI thread — for hundreds of milliseconds.
+        """
+        session = getattr(self._v2_store, "reader_session", None)
+        if callable(session):
+            return session()
+        return nullcontext()
 
     @contextmanager
     def local_structure_mutation(self, blocking=True, advance_generation=True):
@@ -9517,9 +9530,10 @@ class SyncManager(QObject):
                     # A changed snapshot samples the editor protection set at
                     # this exact foreground boundary. Only unchanged snapshots
                     # take the worker fast-path above.
-                    with self.local_structure_mutation(
-                        blocking=False, advance_generation=False
-                    ) as current_generation:
+                    with self._store_reader_session(), \
+                            self.local_structure_mutation(
+                                blocking=False, advance_generation=False
+                            ) as current_generation:
                         if (
                             current_generation is False
                             or current_generation
