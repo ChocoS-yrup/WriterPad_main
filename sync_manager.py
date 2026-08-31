@@ -1482,6 +1482,28 @@ class SyncManager(QObject):
                 pending_count=self.pending_retry_count,
             )
 
+    def _record_tree_deferral(self, scope, error):
+        """Record a skipped tree-order apply and, when known, which entry.
+
+        The reason code alone says a snapshot could not be classified but not
+        what stopped it, which left the same refusal repeating with nothing to
+        act on. The entry is recorded as a separate event because the state
+        field is short and the reason line already fills it.
+        """
+        code = self._stable_error_code(error) or type(error).__name__
+        self._diagnostics.record(
+            "sync_tree_deferred",
+            state=f"{scope};reason={code}",
+            pending_count=self.pending_retry_count,
+        )
+        fingerprint = getattr(error, "tree_entry_fingerprint", "")
+        if fingerprint:
+            self._diagnostics.record(
+                "sync_tree_unresolved_entry",
+                state=str(fingerprint),
+                pending_count=self.pending_retry_count,
+            )
+
     def record_binder_timing(self, phase, elapsed_ms):
         """Record slow UI-side binder work without retaining project paths."""
         elapsed_ms = max(0.0, float(elapsed_ms or 0.0))
@@ -5826,6 +5848,36 @@ class SyncManager(QObject):
             raise FileExistsError("REMOTE_PATH_CONFLICT") from error
         return True
 
+    @staticmethod
+    def _tree_entry_fingerprint(kind, relative_path):
+        """Describe one unresolved tree-order entry without keeping its name.
+
+        Diagnostics deliberately never retain manuscript paths, so the log
+        gets the shape of the entry and a digest of it. The digest is a plain
+        SHA-256 of the same string the tree-order holds, so the machine that
+        recorded it can recompute the digests of its own tree-order and name
+        the entry locally. The log on its own reveals nothing.
+        """
+        path = str(relative_path or "")
+        digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
+        depth = path.count("/") + 1 if path else 0
+        suffix = "txt" if path.casefold().endswith(".txt") else "nam"
+        return f"{kind}:d{depth}:{suffix}:{digest}"
+
+    @classmethod
+    def _unresolved_tree_entry_error(cls, kind, relative_path):
+        """Refuse a tree-order entry while carrying which one it was.
+
+        The plan is built well below the manager's diagnostics, so the entry
+        travels on the exception and is recorded where the deferral already
+        is.
+        """
+        error = RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+        error.tree_entry_fingerprint = cls._tree_entry_fingerprint(
+            kind, relative_path
+        )
+        return error
+
     @classmethod
     def _build_remote_tree_folder_plan(
         cls,
@@ -5932,7 +5984,7 @@ class SyncManager(QObject):
                 # authoritative. An unclassified leaf is normally a document
                 # whose commit has not reached the projection yet; never turn
                 # it into a real directory, regardless of its extension.
-                raise RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+                raise cls._unresolved_tree_entry_error("leaf", child_path)
 
         if set(candidate_paths).intersection(live_path_keys):
             raise FileExistsError("REMOTE_PATH_CONFLICT")
@@ -5991,7 +6043,7 @@ class SyncManager(QObject):
                 # local UUID and turn one restored folder into two identities.
                 # Existing legacy directories are retained, but a missing
                 # directory needs the live folder row as its creation proof.
-                raise RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+                raise cls._unresolved_tree_entry_error("folder", relative_path)
             plan.append({
                 "relative_path": relative_path,
                 "full_path": full_path,
@@ -8342,12 +8394,7 @@ class SyncManager(QObject):
                 if strict:
                     raise
                 if remote_path == TREE_ORDER_DOCUMENT_PATH:
-                    code = self._stable_error_code(error) or type(error).__name__
-                    self._diagnostics.record(
-                        "sync_tree_deferred",
-                        state=f"revision={revision};reason={code}",
-                        pending_count=self.pending_retry_count,
-                    )
+                    self._record_tree_deferral(f"revision={revision}", error)
                 if self._v2_identity_apply_failed or isinstance(
                     error, (CreationError, IdentityError)
                 ):
@@ -8371,12 +8418,7 @@ class SyncManager(QObject):
             except Exception as error:
                 if strict:
                     raise
-                code = self._stable_error_code(error) or type(error).__name__
-                self._diagnostics.record(
-                    "sync_tree_deferred",
-                    state=f"contract;reason={code}",
-                    pending_count=self.pending_retry_count,
-                )
+                self._record_tree_deferral("contract", error)
         # Last, because the documents inside a folder deleted elsewhere have
         # just been tombstoned into 휴지통 on their own.
         changes.extend(

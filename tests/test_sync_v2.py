@@ -4971,6 +4971,80 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             self.manager._v2_protected_paths_provider,
         ) = previous
 
+    def test_unresolved_tree_leaf_names_itself_without_logging_the_path(self):
+        order = {
+            "<root>": ["원고"],
+            "메인/원고": ["001화.txt", "미확인 항목.txt"],
+        }
+
+        with self.assertRaises(RuntimeError) as caught:
+            SyncManager._build_remote_tree_folder_plan(
+                self.wpm.writing_root_path,
+                order,
+                {"메인/원고/001화.txt"},
+                {"메인/원고"},
+                {SyncManager._tree_path_comparison_key("메인/원고")},
+                True,
+            )
+
+        self.assertEqual(
+            str(caught.exception), "REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE"
+        )
+        fingerprint = caught.exception.tree_entry_fingerprint
+        self.assertEqual(
+            fingerprint,
+            SyncManager._tree_entry_fingerprint(
+                "leaf", "메인/원고/미확인 항목.txt"
+            ),
+        )
+        self.assertTrue(fingerprint.startswith("leaf:d3:txt:"))
+        # The digest is what makes the entry identifiable later. The name it
+        # was built from must never be readable in the log.
+        self.assertNotIn("미확인", fingerprint)
+        self.assertNotIn("원고", fingerprint)
+
+    def _capture_diagnostics(self):
+        """Swap this shared manager's diagnostics for the test only."""
+        recorded = []
+        previous = self.manager._diagnostics
+        self.addCleanup(setattr, self.manager, "_diagnostics", previous)
+        self.manager._diagnostics = SimpleNamespace(
+            record=lambda event, **kwargs: recorded.append((event, kwargs))
+        )
+        return recorded
+
+    def test_tree_deferral_records_the_entry_that_stopped_it(self):
+        recorded = self._capture_diagnostics()
+        error = SyncManager._unresolved_tree_entry_error(
+            "folder", "메인/윈도우-빈폴더"
+        )
+
+        self.manager._record_tree_deferral("revision=21", error)
+
+        self.assertEqual(
+            [event for event, _ in recorded],
+            ["sync_tree_deferred", "sync_tree_unresolved_entry"],
+        )
+        self.assertEqual(
+            recorded[0][1]["state"],
+            "revision=21;reason=REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE",
+        )
+        self.assertEqual(
+            recorded[1][1]["state"],
+            SyncManager._tree_entry_fingerprint("folder", "메인/윈도우-빈폴더"),
+        )
+
+    def test_tree_deferral_without_a_named_entry_records_only_the_reason(self):
+        recorded = self._capture_diagnostics()
+
+        self.manager._record_tree_deferral(
+            "contract", FileExistsError("REMOTE_PATH_CONFLICT")
+        )
+
+        # A refusal that never named an entry must not invent one.
+        self.assertEqual([event for event, _ in recorded], ["sync_tree_deferred"])
+        self.assertTrue(recorded[0][1]["state"].startswith("contract;reason="))
+
     def test_tree_order_protocol_canonicalizes_fixed_root_aliases(self):
         for alias in (
             "플롯",
