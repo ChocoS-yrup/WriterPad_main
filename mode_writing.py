@@ -510,15 +510,19 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
 
     @staticmethod
     def _editor_text_for_background_save(editor):
-        """Read committed text without disturbing a native IME composition."""
-        composing = WritingModeWidget._editor_is_composing(editor)
-        text = editor.toPlainText()
-        if composing and text == "":
-            # At the first preedit after a whole-document deletion there is no
-            # committed replacement yet. Defer this empty snapshot so the
-            # non-empty-content guard cannot mistake it for an intentional wipe.
-            return None
-        return text
+        """Read the editor for a background save without disturbing the IME.
+
+        The syllable being composed is included even though QTextDocument
+        does not hold it yet, so stopping mid-word no longer leaves it
+        unsaved. Reading it costs nothing: unlike a forced commit, nothing is
+        sent to the IME.
+        """
+        if not WritingModeWidget._editor_is_composing(editor):
+            return editor.toPlainText()
+        composed = getattr(editor, "text_with_pending_input_method", None)
+        if callable(composed):
+            return composed()
+        return editor.toPlainText()
 
     @staticmethod
     def _editor_is_composing(editor):
@@ -2101,12 +2105,16 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             if getattr(self, path_attr, None) != path:
                 continue
             editor = getattr(self, editor_attr, None)
-            if editor is None or editor.toPlainText() != content:
-                continue
-            if WritingModeWidget._editor_is_composing(editor):
-                # The committed prefix is durable, but the visible preedit is
-                # not. Keep pull protection and the dirty indicator until the
-                # native IME commits and schedules the next autosave.
+            # Compare against exactly what the background save reads, preedit
+            # included. Comparing the committed text alone would hold the
+            # 로컬 저장 대기 indicator open for as long as a Korean syllable
+            # sits in composition, which is most of a writer's pauses.
+            # Remote pulls stay blocked meanwhile: the protected-path set
+            # tests for an active composition on its own.
+            if editor is None or (
+                WritingModeWidget._editor_text_for_background_save(editor)
+                != content
+            ):
                 continue
             setattr(self, dirty_attr, False)
             editor.document().setModified(False)

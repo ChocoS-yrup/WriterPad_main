@@ -350,10 +350,11 @@ class WritingController(QObject):
         for path in list(self.pending_autosave_paths):
             content = self.get_editor_content(path)
             if content is None:
-                # An active Korean IME preedit is visible but is not part of
-                # QTextDocument yet. Background persistence must not force a
-                # native commit or inject cursor keys while the user types.
-                # Keep the exact path pending and retry after composition ends.
+                # The editor could not produce a snapshot for this path. For a
+                # document the writer still has open that is a transient
+                # condition, so keep the exact path queued and retry rather
+                # than dropping unsaved work; only a closed document's stale
+                # entry is discarded below.
                 if path in active_paths:
                     retry_needed = True
                     continue

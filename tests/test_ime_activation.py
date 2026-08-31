@@ -154,6 +154,47 @@ class InputMethodActivationTestCase(unittest.TestCase):
         self.assertFalse(self.editor._startup_ime_guard_active)
         self.assertFalse(SmartTextEdit._force_korean_on_first_activation)
 
+    def test_background_save_text_carries_the_preedit_at_the_caret(self):
+        self.editor.setPlainText("바다")
+        cursor = self.editor.textCursor()
+        cursor.setPosition(1)
+        self.editor.setTextCursor(cursor)
+
+        self.editor.inputMethodEvent(QInputMethodEvent("ㄷ", []))
+
+        self.assertTrue(self.editor.has_pending_input_method())
+        # The preedit is drawn but is not part of the document.
+        self.assertEqual(self.editor.toPlainText(), "바다")
+        self.assertEqual(self.editor.text_with_pending_input_method(), "바ㄷ다")
+
+    def test_background_save_text_matches_document_with_no_preedit(self):
+        self.editor.setPlainText("조합이 끝난 문장")
+
+        self.assertFalse(self.editor.has_pending_input_method())
+        self.assertEqual(
+            self.editor.text_with_pending_input_method(), "조합이 끝난 문장"
+        )
+
+    def test_reading_the_preedit_never_signals_the_input_method(self):
+        from PyQt6.QtGui import QTextCursor
+
+        self.editor.setPlainText("바")
+        self.editor.moveCursor(QTextCursor.MoveOperation.End)
+        self.editor.inputMethodEvent(QInputMethodEvent("ㄷ", []))
+
+        with patch.object(
+            self.editor, "commit_pending_input_method"
+        ) as commit, patch.object(
+            self.editor, "_send_windows_virtual_keys"
+        ) as send_keys:
+            text = WritingModeWidget._editor_text_for_background_save(
+                self.editor
+            )
+
+        self.assertEqual(text, "바ㄷ")
+        commit.assert_not_called()
+        send_keys.assert_not_called()
+
     def test_first_raw_english_key_is_replayed_after_ime_activation(self):
         event = QKeyEvent(
             QEvent.Type.KeyPress,

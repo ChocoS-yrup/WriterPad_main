@@ -256,12 +256,12 @@ class WritingIdleAutosaveTestCase(unittest.TestCase):
         panel.controller.notify_text_changed.assert_called_once_with(path)
         panel._refresh_storage_status_for_editor_state.assert_called_once_with()
 
-    def test_background_autosave_defers_ime_preedit_without_forcing_commit(self):
+    def test_background_autosave_saves_preedit_without_forcing_commit(self):
         path = "메인/원고/1권/006화.txt"
         editor = MagicMock()
         editor.isReadOnly.return_value = False
         editor.has_pending_input_method.return_value = True
-        editor.toPlainText.return_value = "이미 확정된 문장"
+        editor.text_with_pending_input_method.return_value = "이미 확정된 문장이다"
         panel = SimpleNamespace(
             current_loaded_file_left=path,
             current_loaded_file_right=None,
@@ -271,25 +271,26 @@ class WritingIdleAutosaveTestCase(unittest.TestCase):
 
         content = WritingModeWidget.get_editor_content(panel, path)
 
-        self.assertEqual(content, "이미 확정된 문장")
+        self.assertEqual(content, "이미 확정된 문장이다")
         editor.commit_pending_input_method.assert_not_called()
-        editor.toPlainText.assert_called_once_with()
 
-    def test_background_autosave_defers_empty_document_with_only_ime_preedit(self):
+    def test_empty_document_with_only_a_preedit_still_saves_the_syllable(self):
         editor = MagicMock()
         editor.has_pending_input_method.return_value = True
-        editor.toPlainText.return_value = ""
+        editor.text_with_pending_input_method.return_value = "ㄷ"
 
         content = WritingModeWidget._editor_text_for_background_save(editor)
 
-        self.assertIsNone(content)
+        # A preedit over an emptied document is not an empty save, so the
+        # non-empty-content guard has nothing to refuse.
+        self.assertEqual(content, "ㄷ")
         editor.commit_pending_input_method.assert_not_called()
 
-    def test_autosave_does_not_clear_dirty_while_preedit_is_still_visible(self):
+    def test_autosave_clears_dirty_once_the_preedit_is_persisted_too(self):
         path = "메인/원고/1권/006화.txt"
         editor = MagicMock()
-        editor.toPlainText.return_value = "이미 확정된 문장"
         editor.has_pending_input_method.return_value = True
+        editor.text_with_pending_input_method.return_value = "이미 확정된 문장이다"
         panel = SimpleNamespace(
             current_loaded_file_left=path,
             current_loaded_file_right=None,
@@ -301,7 +302,31 @@ class WritingIdleAutosaveTestCase(unittest.TestCase):
         )
 
         WritingModeWidget.on_idle_autosave_persisted(
-            panel, path, "이미 확정된 문장", True
+            panel, path, "이미 확정된 문장이다", True
+        )
+
+        # 로컬 저장 대기 must not stay on screen for the whole pause just
+        # because the last Korean syllable is still in composition.
+        self.assertFalse(panel.is_dirty_left)
+        editor.document().setModified.assert_called_once_with(False)
+
+    def test_autosave_keeps_dirty_when_the_composition_moved_on(self):
+        path = "메인/원고/1권/006화.txt"
+        editor = MagicMock()
+        editor.has_pending_input_method.return_value = True
+        editor.text_with_pending_input_method.return_value = "이미 확정된 문장이닫"
+        panel = SimpleNamespace(
+            current_loaded_file_left=path,
+            current_loaded_file_right=None,
+            left_editor=editor,
+            right_editor=MagicMock(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            _refresh_storage_status_for_editor_state=MagicMock(),
+        )
+
+        WritingModeWidget.on_idle_autosave_persisted(
+            panel, path, "이미 확정된 문장이다", True
         )
 
         self.assertTrue(panel.is_dirty_left)
