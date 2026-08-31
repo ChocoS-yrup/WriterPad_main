@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from mode_writing import WritingModeWidget
@@ -575,6 +575,95 @@ class _FakeLabel:
 
 
 class StorageStatusLabelTestCase(unittest.TestCase):
+    def test_editor_dirty_refresh_reuses_cached_activity_without_sqlite_query(self):
+        activity_query = MagicMock(
+            side_effect=AssertionError("typing must not query sync sqlite")
+        )
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            _storage_state="saved",
+            _storage_detail="",
+            _storage_pending_count=0,
+            _storage_account_email="writer@example.com",
+            _storage_sync_activity={},
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                sync_activity_snapshot=activity_query,
+            ),
+        )
+        target.update_storage_status = MethodType(
+            WritingModeWidget.update_storage_status, target
+        )
+
+        WritingModeWidget._refresh_storage_status_for_editor_state(target)
+
+        activity_query.assert_not_called()
+        self.assertIn("로컬 저장 대기 1건", target.lbl_storage_status.text)
+
+    def test_regular_status_refresh_never_falls_back_to_sqlite_snapshot(self):
+        sqlite_query = MagicMock(
+            side_effect=AssertionError("status paint must not query sqlite")
+        )
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _storage_sync_activity={"transfer_pending": 7},
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                sync_activity_snapshot=sqlite_query,
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "failed", "", 7)
+
+        sqlite_query.assert_not_called()
+        self.assertEqual(target._storage_sync_activity["transfer_pending"], 7)
+
+    def test_active_ime_preedit_protects_clean_editor_from_remote_pull(self):
+        left = MagicMock()
+        left.document().isModified.return_value = False
+        left.has_pending_input_method.return_value = True
+        right = MagicMock()
+        right.document().isModified.return_value = False
+        right.has_pending_input_method.return_value = False
+        target = SimpleNamespace(
+            current_loaded_file_left="메인/원고/001화.txt",
+            current_loaded_file_right="메인/원고/002화.txt",
+            is_dirty_left=False,
+            is_dirty_right=False,
+            left_editor=left,
+            right_editor=right,
+        )
+
+        protected = WritingModeWidget.get_remote_sync_protected_paths(target)
+
+        self.assertEqual(protected, {"메인/원고/001화.txt"})
+
+    def test_transient_empty_auth_and_duplicate_publish_do_not_repaint_status(self):
+        label = MagicMock()
+        manager = SimpleNamespace(
+            authenticated_email=MagicMock(return_value="writer@example.com"),
+            display_sync_activity_snapshot=lambda: {},
+        )
+        target = SimpleNamespace(
+            lbl_storage_status=label,
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=manager,
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+        manager.authenticated_email.return_value = ""
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertEqual(target._storage_account_email, "writer@example.com")
+        label.setText.assert_called_once_with("● 동기화 완료")
+        label.setStyleSheet.assert_called_once()
+        label.setToolTip.assert_called_once()
+
     def test_all_user_visible_status_labels(self):
         target = SimpleNamespace(lbl_storage_status=_FakeLabel())
         expected = {
@@ -725,7 +814,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             is_dirty_right=False,
             sync_manager=SimpleNamespace(
                 authenticated_email=lambda: "writer@example.com",
-                sync_activity_snapshot=lambda: activity,
+                display_sync_activity_snapshot=lambda: activity,
             ),
         )
 

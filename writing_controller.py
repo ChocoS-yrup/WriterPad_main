@@ -343,9 +343,20 @@ class WritingController(QObject):
             return
 
         retry_needed = False
+        try:
+            active_paths = set(self.get_active_paths() or ())
+        except (AttributeError, RuntimeError):
+            active_paths = set()
         for path in list(self.pending_autosave_paths):
             content = self.get_editor_content(path)
             if content is None:
+                # An active Korean IME preedit is visible but is not part of
+                # QTextDocument yet. Background persistence must not force a
+                # native commit or inject cursor keys while the user types.
+                # Keep the exact path pending and retry after composition ends.
+                if path in active_paths:
+                    retry_needed = True
+                    continue
                 self.pending_autosave_paths.discard(path)
                 self.user_edited_paths.discard(path)
                 continue

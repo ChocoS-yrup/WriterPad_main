@@ -849,6 +849,17 @@ class SyncManager(QObject):
         self._last_sync_error = ""
         self._last_failure_offline = False
         self.current_sync_state = "saved"
+        self._last_published_sync_activity = {
+            "transfer_pending": 0,
+            "transferring": 0,
+            "retry_wait": 0,
+            "conflict": 0,
+            "blocked": 0,
+            "pull_pending": 0,
+            "pulling": 0,
+            "pull_visible": 0,
+            "local_structure": 0,
+        }
         self._v2_store = None
         self._v2_context = None
         self._v2_context_generation = 0
@@ -1026,6 +1037,10 @@ class SyncManager(QObject):
             )),
             "local_structure": local_structure,
         }
+
+    def display_sync_activity_snapshot(self):
+        """Return the last published activity without querying SQLite on the UI thread."""
+        return dict(self._last_published_sync_activity)
 
     @staticmethod
     def _remote_snapshot_fingerprint(
@@ -3030,6 +3045,7 @@ class SyncManager(QObject):
 
     def _publish_sync_state(self):
         activity = self.sync_activity_snapshot()
+        self._last_published_sync_activity = dict(activity)
         pending_count = len(self._retry_queue) + sum(activity[name] for name in (
             "transfer_pending", "transferring", "retry_wait"
         ))

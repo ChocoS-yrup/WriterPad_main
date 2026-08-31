@@ -508,20 +508,45 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             commit_input()
         return editor.toPlainText()
 
+    @staticmethod
+    def _editor_text_for_background_save(editor):
+        """Read committed text without disturbing a native IME composition."""
+        composing = WritingModeWidget._editor_is_composing(editor)
+        text = editor.toPlainText()
+        if composing and text == "":
+            # At the first preedit after a whole-document deletion there is no
+            # committed replacement yet. Defer this empty snapshot so the
+            # non-empty-content guard cannot mistake it for an intentional wipe.
+            return None
+        return text
+
+    @staticmethod
+    def _editor_is_composing(editor):
+        pending_input = getattr(editor, "has_pending_input_method", None)
+        return bool(callable(pending_input) and pending_input() is True)
+
     def get_editor_content(self, path):
         if path == self.current_loaded_file_left and getattr(self, 'left_editor', None) and not self.left_editor.isReadOnly():
-            return WritingModeWidget._editor_text_for_save(self.left_editor)
+            return WritingModeWidget._editor_text_for_background_save(
+                self.left_editor
+            )
         if path == self.current_loaded_file_right and getattr(self, 'right_editor', None) and not self.right_editor.isReadOnly():
-            return WritingModeWidget._editor_text_for_save(self.right_editor)
+            return WritingModeWidget._editor_text_for_background_save(
+                self.right_editor
+            )
 
     def get_remote_sync_protected_paths(self):
         protected = set()
         if self.current_loaded_file_left and (
-            self.is_dirty_left or self.left_editor.document().isModified()
+            self.is_dirty_left
+            or self.left_editor.document().isModified()
+            or WritingModeWidget._editor_is_composing(self.left_editor)
         ):
             protected.add(self.current_loaded_file_left)
         if self.current_loaded_file_right and (
-            self.is_dirty_right or self.right_editor.document().isModified()
+            self.is_dirty_right
+            or self.right_editor.document().isModified()
+            or WritingModeWidget._editor_is_composing(self.right_editor)
         ):
             protected.add(self.current_loaded_file_right)
         return protected
@@ -861,7 +886,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.left_editor.compositionChanged.connect(
             self.on_editor_text_changed
         )
-        self.left_editor.selectionChanged.connect(self.update_editor_statistics)
+        self.left_editor.selectionChanged.connect(
+            self.schedule_editor_metadata_refresh
+        )
         
         # 포커스 이벤트 가로채기를 위한 이벤트 필터 설치
         self.left_editor.installEventFilter(self)
@@ -913,8 +940,21 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.right_editor.compositionChanged.connect(
             self.on_editor_text_changed
         )
-        self.right_editor.selectionChanged.connect(self.update_editor_statistics)
+        self.right_editor.selectionChanged.connect(
+            self.schedule_editor_metadata_refresh
+        )
         self.right_editor.installEventFilter(self)
+
+        # Binder icon scans and whole-document character counts are display
+        # metadata. Coalesce them after an input burst instead of doing both on
+        # every text/cursor signal on the GUI thread.
+        self._pending_editor_metadata_paths = set()
+        self._editor_metadata_timer = QTimer(self)
+        self._editor_metadata_timer.setSingleShot(True)
+        self._editor_metadata_timer.setInterval(75)
+        self._editor_metadata_timer.timeout.connect(
+            self._flush_editor_metadata_updates
+        )
         
         self.right_wrap_frame = QFrame()
         right_wrap_layout = QVBoxLayout(self.right_wrap_frame)
@@ -1002,7 +1042,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         finally:
             self._editor_splitter_snapping = False
 
-    def update_storage_status(self, state, detail="", pending_count=0):
+    def update_storage_status(
+        self, state, detail="", pending_count=0, refresh_activity=True
+    ):
         labels = {
             "saved": ("● 로컬 저장 완료", "#86efac", "#163522"),
             "backup": (
@@ -1069,13 +1111,19 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             ),
         }
         text, color, background = labels.get(state, labels["saved"])
-        activity = {}
-        try:
-            snapshot = getattr(getattr(self, "sync_manager", None), "sync_activity_snapshot", None)
-            if callable(snapshot):
-                activity = snapshot()
-        except Exception:
-            activity = {}
+        activity = dict(getattr(self, "_storage_sync_activity", {}) or {})
+        if refresh_activity:
+            try:
+                manager = getattr(self, "sync_manager", None)
+                snapshot = getattr(
+                    manager, "display_sync_activity_snapshot", None
+                )
+                if callable(snapshot):
+                    activity = snapshot()
+            except Exception:
+                activity = dict(
+                    getattr(self, "_storage_sync_activity", {}) or {}
+                )
         unsaved_editor_count = WritingModeWidget._unsaved_editor_count(self)
         editor_dirty = unsaved_editor_count > 0
         if editor_dirty and state != "empty_guard":
@@ -1130,13 +1178,25 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 )
             else:
                 text = f"{text} · {pending_count}건 대기"
-        account_email = ""
+        previous_account_email = str(
+            getattr(self, "_storage_account_email", "") or ""
+        )
+        observed_account_email = ""
         try:
             manager = getattr(self, "sync_manager", None)
             if manager:
-                account_email = manager.authenticated_email()
+                observed_account_email = manager.authenticated_email()
         except Exception:
-            account_email = ""
+            observed_account_email = ""
+        account_email = str(observed_account_email or "")
+        if (
+            not account_email
+            and previous_account_email
+            and state not in {"auth_required", "project_purged"}
+        ):
+            # Session refresh can swap clients briefly. Do not repaint a
+            # healthy cloud project as local-only during that internal gap.
+            account_email = previous_account_email
         activity_busy = any(int(activity.get(name, 0) or 0) for name in (
             "transfer_pending", "transferring", "retry_wait", "conflict",
             "blocked", "pull_pending", "pulling",
@@ -1152,8 +1212,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self._storage_editor_dirty_count = unsaved_editor_count
         self._storage_account_email = account_email
         self._storage_sync_activity = activity
-        self.lbl_storage_status.setText(text)
-        self.lbl_storage_status.setStyleSheet(
+        style_sheet = (
             f"QPushButton {{ color: {color}; background-color: {background}; border: 1px solid {color}; "
             "border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: bold; }}"
             f"QPushButton:hover {{ background-color: {background}; }}"
@@ -1172,7 +1231,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         )
         if account_email:
             tooltip = f"클라우드 자동 로그인됨: {account_email}\n{tooltip}"
-        self.lbl_storage_status.setToolTip(tooltip)
+        visual_signature = (text, style_sheet, tooltip)
+        if visual_signature != getattr(
+            self, "_storage_visual_signature", None
+        ):
+            self._storage_visual_signature = visual_signature
+            self.lbl_storage_status.setText(text)
+            self.lbl_storage_status.setStyleSheet(style_sheet)
+            self.lbl_storage_status.setToolTip(tooltip)
 
     @staticmethod
     def _storage_status_guidance(
@@ -1383,6 +1449,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             getattr(self, "_storage_state", "saved"),
             getattr(self, "_storage_detail", ""),
             getattr(self, "_storage_pending_count", 0),
+            refresh_activity=False,
         )
 
     def _retry_storage_sync(self):
@@ -1949,22 +2016,63 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
 
     def on_editor_text_changed(self):
         editor = self.sender() if self.sender() else self.active_editor
+        changed_path = None
         if editor == self.left_editor and getattr(self, 'current_loaded_file_left', None) and not editor.isReadOnly():
             self.is_dirty_left = True
-            has_content = len(editor.toPlainText().strip()) > 0
-            self.update_tree_icon(self.current_loaded_file_left, has_content)
-            self.controller.notify_text_changed(self.current_loaded_file_left)
+            changed_path = self.current_loaded_file_left
+            self.controller.notify_text_changed(changed_path)
         elif editor == self.right_editor and getattr(self, 'current_loaded_file_right', None) and not editor.isReadOnly():
             self.is_dirty_right = True
-            has_content = len(editor.toPlainText().strip()) > 0
-            self.update_tree_icon(self.current_loaded_file_right, has_content)
-            self.controller.notify_text_changed(self.current_loaded_file_right)
+            changed_path = self.current_loaded_file_right
+            self.controller.notify_text_changed(changed_path)
+
+        schedule_metadata = getattr(
+            self, "schedule_editor_metadata_refresh", None
+        )
+        if callable(schedule_metadata):
+            schedule_metadata(changed_path)
 
         refresh_status = getattr(
             self, "_refresh_storage_status_for_editor_state", None
         )
         if callable(refresh_status):
             refresh_status()
+
+    def schedule_editor_metadata_refresh(self, path=None):
+        pending = getattr(self, "_pending_editor_metadata_paths", None)
+        if pending is None:
+            pending = set()
+            self._pending_editor_metadata_paths = pending
+        if path:
+            pending.add(path)
+        timer = getattr(self, "_editor_metadata_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _flush_editor_metadata_updates(self):
+        paths = set(
+            getattr(self, "_pending_editor_metadata_paths", set()) or set()
+        )
+        self._pending_editor_metadata_paths.clear()
+        pairs = (
+            (
+                getattr(self, "current_loaded_file_left", None),
+                getattr(self, "left_editor", None),
+            ),
+            (
+                getattr(self, "current_loaded_file_right", None),
+                getattr(self, "right_editor", None),
+            ),
+        )
+        for path, editor in pairs:
+            if (
+                path
+                and path in paths
+                and editor is not None
+                and not editor.isReadOnly()
+            ):
+                has_content = bool(editor.toPlainText().strip())
+                self.update_tree_icon(path, has_content)
         self.update_editor_statistics()
 
     def on_idle_autosave_persisted(self, path, content, success):
@@ -1988,6 +2096,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 continue
             editor = getattr(self, editor_attr, None)
             if editor is None or editor.toPlainText() != content:
+                continue
+            if WritingModeWidget._editor_is_composing(editor):
+                # The committed prefix is durable, but the visible preedit is
+                # not. Keep pull protection and the dirty indicator until the
+                # native IME commits and schedules the next autosave.
                 continue
             setattr(self, dirty_attr, False)
             editor.document().setModified(False)

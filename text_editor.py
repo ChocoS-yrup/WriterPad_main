@@ -46,6 +46,10 @@ class SmartTextEdit(QTextEdit):
         self._remember_windows_ime_state()
         super().focusOutEvent(event)
 
+    def has_pending_input_method(self):
+        """Return whether Windows is still displaying an uncommitted preedit."""
+        return bool(self._is_composing and self._ime_preedit_text)
+
     def commit_pending_input_method(self):
         """Commit the focused editor's visible IME preedit before persistence."""
         if (

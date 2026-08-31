@@ -256,24 +256,12 @@ class WritingIdleAutosaveTestCase(unittest.TestCase):
         panel.controller.notify_text_changed.assert_called_once_with(path)
         panel._refresh_storage_status_for_editor_state.assert_called_once_with()
 
-    def test_autosave_commits_ime_preedit_before_reading_editor_text(self):
+    def test_background_autosave_defers_ime_preedit_without_forcing_commit(self):
         path = "메인/원고/1권/006화.txt"
         editor = MagicMock()
-        committed = False
-        call_order = []
-
-        def commit_preedit():
-            nonlocal committed
-            call_order.append("commit")
-            committed = True
-
-        def read_text():
-            call_order.append("read")
-            return "ex) 방가방가" if committed else "ex) 방가방"
-
         editor.isReadOnly.return_value = False
-        editor.commit_pending_input_method.side_effect = commit_preedit
-        editor.toPlainText.side_effect = read_text
+        editor.has_pending_input_method.return_value = True
+        editor.toPlainText.return_value = "이미 확정된 문장"
         panel = SimpleNamespace(
             current_loaded_file_left=path,
             current_loaded_file_right=None,
@@ -283,8 +271,84 @@ class WritingIdleAutosaveTestCase(unittest.TestCase):
 
         content = WritingModeWidget.get_editor_content(panel, path)
 
-        self.assertEqual(content, "ex) 방가방가")
-        self.assertEqual(call_order, ["commit", "read"])
+        self.assertEqual(content, "이미 확정된 문장")
+        editor.commit_pending_input_method.assert_not_called()
+        editor.toPlainText.assert_called_once_with()
+
+    def test_background_autosave_defers_empty_document_with_only_ime_preedit(self):
+        editor = MagicMock()
+        editor.has_pending_input_method.return_value = True
+        editor.toPlainText.return_value = ""
+
+        content = WritingModeWidget._editor_text_for_background_save(editor)
+
+        self.assertIsNone(content)
+        editor.commit_pending_input_method.assert_not_called()
+
+    def test_autosave_does_not_clear_dirty_while_preedit_is_still_visible(self):
+        path = "메인/원고/1권/006화.txt"
+        editor = MagicMock()
+        editor.toPlainText.return_value = "이미 확정된 문장"
+        editor.has_pending_input_method.return_value = True
+        panel = SimpleNamespace(
+            current_loaded_file_left=path,
+            current_loaded_file_right=None,
+            left_editor=editor,
+            right_editor=MagicMock(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            _refresh_storage_status_for_editor_state=MagicMock(),
+        )
+
+        WritingModeWidget.on_idle_autosave_persisted(
+            panel, path, "이미 확정된 문장", True
+        )
+
+        self.assertTrue(panel.is_dirty_left)
+        editor.document().setModified.assert_not_called()
+
+    def test_background_autosave_keeps_active_composition_pending(self):
+        path, wpm, sync_manager, persisted, controller = self._controller(
+            content=None
+        )
+
+        controller.sync_file()
+
+        self.assertIn(path, controller.pending_autosave_paths)
+        self.assertTrue(controller.idle_timer.isActive())
+        wpm.write_text_file.assert_not_called()
+        sync_manager.upload_autosave_async.assert_not_called()
+        sync_manager.upload_content_async.assert_not_called()
+        persisted.assert_not_called()
+
+    def test_typing_defers_binder_scan_and_full_document_statistics(self):
+        path = "메인/원고/1권/006화.txt"
+        editor = MagicMock()
+        editor.isReadOnly.return_value = False
+        panel = SimpleNamespace(
+            sender=lambda: editor,
+            active_editor=editor,
+            left_editor=editor,
+            right_editor=MagicMock(),
+            current_loaded_file_left=path,
+            current_loaded_file_right=None,
+            is_dirty_left=False,
+            is_dirty_right=False,
+            update_tree_icon=MagicMock(),
+            controller=MagicMock(),
+            _refresh_storage_status_for_editor_state=MagicMock(),
+            schedule_editor_metadata_refresh=MagicMock(),
+            update_editor_statistics=MagicMock(),
+        )
+
+        WritingModeWidget.on_editor_text_changed(panel)
+
+        self.assertTrue(panel.is_dirty_left)
+        panel.controller.notify_text_changed.assert_called_once_with(path)
+        panel.schedule_editor_metadata_refresh.assert_called_once_with(path)
+        editor.toPlainText.assert_not_called()
+        panel.update_tree_icon.assert_not_called()
+        panel.update_editor_statistics.assert_not_called()
 
     def test_manual_save_failure_does_not_claim_editor_was_saved(self):
         path = "메인/원고/1권/006화.txt"
