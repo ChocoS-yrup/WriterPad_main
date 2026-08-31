@@ -43,7 +43,7 @@ from sync_manager import (
     V2QueueWorker,
     is_live_document_path,
 )
-from sync_v2_store import SyncV2Store
+from sync_v2_store import STAGE8_USER_VERSION, SyncV2Store
 from three_way_merge import build_conflict_report, three_way_merge
 from writing_controller import WritingController
 from writing_tree import WritingTreeMixin
@@ -1029,7 +1029,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         finally:
             raw.close()
         self.assertEqual(stored, "completed")
-        self.assertEqual(version, 8007)
+        self.assertEqual(version, STAGE8_USER_VERSION)
 
     def test_simultaneous_overlapping_save_is_kept_as_conflict(self):
         created = self.store.enqueue(self.context, "메인/원고/동시저장.txt", "공통 문장\n")
@@ -1444,6 +1444,359 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
 
     def _uuid_of(self, legacy_path):
         return node_for_path(self.project_root, legacy_path)["uuid"]
+
+    def _prepare_pathless_base_folder_delete(self, *, accept_delete=True):
+        """Reproduce q1436/q1437 without touching a real project or server."""
+        folder_path = "메인/설정집/구세계"
+        document_path = f"{folder_path}/마법.txt"
+        folder = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        document = create_item_at_path(
+            self.project_root, folder_path, "마법", False
+        )["nodes"][-1]
+        body = "삭제 대기 중에도 보존할 본문"
+        Path(self.wpm.writing_root_path, document_path).write_text(
+            body, encoding="utf-8"
+        )
+
+        old_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": ["구세계"],
+            folder_path: ["마법.txt"],
+        }
+        old_payload = json.loads(self.manager._tree_order_content(old_order))
+        old_payload.pop("folder_paths", None)
+        pathless_base_content = json.dumps(
+            old_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        new_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": [],
+        }
+
+        identity = read_identity(self.project_root)
+        folder_rows = [
+            {
+                "folder_id": node["uuid"],
+                "parent_folder_id": node.get("parent_uuid"),
+                "local_path": node["legacy_path"],
+                "name": node["legacy_path"].rsplit("/", 1)[-1],
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for node in identity["nodes"]
+            if node["kind"] == "folder"
+        ]
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], folder_rows
+        )
+        client = _FolderAwareClient(folder_rows)
+
+        self.store.apply_remote_snapshot(
+            self.context,
+            document["uuid"],
+            document_path,
+            body,
+            2,
+            parent_folder_id=folder["uuid"],
+            name="마법",
+        )
+        tree_document_id = str(uuid.uuid5(
+            uuid.UUID(self.context["project_id"]), TREE_ORDER_DOCUMENT_PATH
+        ))
+        self.store.apply_remote_snapshot(
+            self.context,
+            tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            pathless_base_content,
+            28,
+            local_path=TREE_ORDER_DOCUMENT_PATH,
+        )
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(old_order)
+        self.assertTrue(self.wpm.save_settings())
+
+        tombstone_operation = None
+        trash_path = None
+        if accept_delete:
+            trash_path = self.wpm.move_to_trash(
+                folder_path,
+                tree_order_parent="메인/설정집",
+                tree_order_index=0,
+            )
+            self.manager.record_tombstone(
+                folder_path, trash_path, retry=False
+            )
+            tombstone_operation = self.store.next_ready_operation(
+                self.context["local_key"]
+            )
+            self.assertEqual(
+                tombstone_operation["document_id"], document["uuid"]
+            )
+
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(new_order)
+        self.assertTrue(self.wpm.save_settings())
+        tree_operation = self.manager.record_tree_order(
+            new_order, retry=False
+        )
+        self.assertEqual(tree_operation["base_revision"], 28)
+        self.assertNotIn(
+            "folder_paths", json.loads(tree_operation["base_content"])
+        )
+        self.assertNotIn(
+            folder_path, json.loads(tree_operation["content"])["folder_paths"]
+        )
+        return {
+            "folder": folder,
+            "document": document,
+            "folder_path": folder_path,
+            "document_path": document_path,
+            "body": body,
+            "trash_path": trash_path,
+            "client": client,
+            "tombstone_operation": tombstone_operation,
+            "tree_operation": tree_operation,
+        }
+
+    def _commit_operation(self, operation):
+        self.store.mark_attempt(operation["operation_id"])
+        result = self.manager._process_v2_operation(operation["operation_id"])
+        if result["kind"] == "committed":
+            self.store.mark_success(operation["operation_id"], result["result"])
+        elif result["kind"] == "retry":
+            self.store.mark_retry(operation["operation_id"], result["error"])
+        return result
+
+    def test_pathless_base_delete_waits_for_document_then_folder_then_tree(self):
+        case = self._prepare_pathless_base_folder_delete()
+        client = case["client"]
+        document_id = case["document"]["uuid"]
+        folder_id = case["folder"]["uuid"]
+        tree_id = case["tree_operation"]["document_id"]
+        remaining_conflicts = [2]
+        original_rpc = client.rpc
+
+        def rpc(name, params):
+            if (
+                name == "commit_document"
+                and params["p_document_id"] == document_id
+                and params["p_is_deleted"]
+                and remaining_conflicts[0] > 0
+            ):
+                class LeaseConflictCall:
+                    def execute(inner_self):
+                        client.calls.append((name, params))
+                        remaining_conflicts[0] -= 1
+                        raise RuntimeError("LEASE_CONFLICT")
+
+                return LeaseConflictCall()
+            return original_rpc(name, params)
+
+        client.rpc = rpc
+        self.manager.supabase = client
+        client.calls.clear()
+
+        for _attempt in range(2):
+            result = self._commit_operation(case["tombstone_operation"])
+            self.assertEqual(result["kind"], "retry")
+            self.assertEqual(
+                [
+                    params for name, params in client.calls
+                    if name == "commit_folder"
+                    and params["p_folder_id"] == folder_id
+                ],
+                [],
+            )
+            self.assertEqual(
+                [
+                    params for name, params in client.calls
+                    if name == "commit_document"
+                    and params["p_document_id"] == tree_id
+                ],
+                [],
+            )
+
+        document_result = self._commit_operation(case["tombstone_operation"])
+        self.assertEqual(document_result["kind"], "committed")
+        tree_result = self._commit_operation(case["tree_operation"])
+        self.assertEqual(tree_result["kind"], "committed")
+
+        indexed_calls = list(enumerate(client.calls))
+        document_calls = [
+            index for index, (name, params) in indexed_calls
+            if name == "commit_document"
+            and params["p_document_id"] == document_id
+        ]
+        folder_calls = [
+            (index, params) for index, (name, params) in indexed_calls
+            if name == "commit_folder" and params["p_folder_id"] == folder_id
+        ]
+        tree_calls = [
+            index for index, (name, params) in indexed_calls
+            if name == "commit_document" and params["p_document_id"] == tree_id
+        ]
+        self.assertEqual(
+            len(folder_calls),
+            1,
+            "base folder_paths가 없어도 정확한 폴더 UUID tombstone은 생략할 수 없다",
+        )
+        folder_index, folder_params = folder_calls[0]
+        self.assertEqual(folder_params["p_folder_id"], folder_id)
+        self.assertEqual(
+            folder_params["p_parent_folder_id"],
+            case["folder"]["parent_uuid"],
+        )
+        self.assertEqual(folder_params["p_name"], "구세계")
+        self.assertEqual(folder_params["p_base_revision"], 1)
+        self.assertTrue(folder_params["p_is_deleted"])
+        self.assertEqual(len(tree_calls), 1)
+        self.assertLess(max(document_calls), folder_index)
+        self.assertLess(folder_index, tree_calls[0])
+
+    def test_folder_delete_intent_is_durable_and_pins_exact_dependencies(self):
+        case = self._prepare_pathless_base_folder_delete()
+        reopened = SyncV2Store(self.store.db_path)
+        reader = getattr(reopened, "pending_folder_delete_intents", None)
+        self.assertTrue(
+            callable(reader),
+            "LEGACY folder delete를 재시작 후 복구할 durable intent API가 없다",
+        )
+
+        intents = reader(self.context["local_key"])
+        intent = next(
+            item for item in intents
+            if item["folder_id"] == case["folder"]["uuid"]
+        )
+        parent = node_for_path(self.project_root, "메인/설정집")
+        self.assertEqual(intent["parent_folder_id"], parent["uuid"])
+        self.assertEqual(intent["name"], "구세계")
+        self.assertEqual(intent["base_revision"], 1)
+        self.assertEqual(intent["pre_delete_path"], case["folder_path"])
+        self.assertEqual(intent["status"], "documents_pending")
+        self.assertEqual(
+            intent["dependent_documents"],
+            [{
+                "document_id": case["document"]["uuid"],
+                "tombstone_operation_id": case["tombstone_operation"][
+                    "operation_id"
+                ],
+            }],
+        )
+
+    def test_restart_resumes_same_intent_after_folder_before_tree_partial_commit(self):
+        case = self._prepare_pathless_base_folder_delete()
+        client = case["client"]
+        folder_id = case["folder"]["uuid"]
+        tree_id = case["tree_operation"]["document_id"]
+        self.manager.supabase = client
+        self.assertEqual(
+            self._commit_operation(case["tombstone_operation"])["kind"],
+            "committed",
+        )
+        original_rpc = client.rpc
+        failed_once = [False]
+
+        def rpc(name, params):
+            if (
+                name == "commit_document"
+                and params["p_document_id"] == tree_id
+                and not failed_once[0]
+            ):
+                class InterruptedTreeCall:
+                    def execute(inner_self):
+                        client.calls.append((name, params))
+                        failed_once[0] = True
+                        raise RuntimeError("network timeout")
+
+                return InterruptedTreeCall()
+            return original_rpc(name, params)
+
+        client.rpc = rpc
+        first = self._commit_operation(case["tree_operation"])
+        self.assertEqual(first["kind"], "retry")
+        self.assertTrue(next(
+            row for row in client.folder_rows
+            if row["folder_id"] == folder_id
+        )["is_deleted"])
+
+        reopened = SyncV2Store(self.store.db_path)
+        self.manager._v2_store = reopened
+        resumed_operation = reopened.operation(
+            case["tree_operation"]["operation_id"]
+        )
+        second = self._commit_operation(resumed_operation)
+        self.assertEqual(second["kind"], "committed")
+
+        folder_calls = [
+            params for name, params in client.calls
+            if name == "commit_folder" and params["p_folder_id"] == folder_id
+        ]
+        self.assertEqual(
+            len(folder_calls), 1,
+            "재시작 뒤 이미 완료된 folder tombstone을 새 작업으로 보내면 안 된다",
+        )
+        intents = reopened.pending_folder_delete_intents(
+            self.context["local_key"]
+        )
+        self.assertFalse(any(
+            item["folder_id"] == folder_id for item in intents
+        ))
+
+    def test_pathless_base_without_durable_delete_intent_never_commits_tree(self):
+        case = self._prepare_pathless_base_folder_delete(accept_delete=False)
+        client = case["client"]
+        tree_id = case["tree_operation"]["document_id"]
+        self.manager.supabase = client
+        client.calls.clear()
+
+        result = self._commit_operation(case["tree_operation"])
+
+        tree_calls = [
+            params for name, params in client.calls
+            if name == "commit_document" and params["p_document_id"] == tree_id
+        ]
+        self.assertEqual(
+            tree_calls,
+            [],
+            "삭제 UUID를 증명할 durable intent 없이 tree-order만 커밋했다",
+        )
+        self.assertIn(result["kind"], {"blocked", "retry"})
+
+    def test_folder_tombstone_failure_keeps_tree_order_uncommitted(self):
+        case = self._prepare_pathless_base_folder_delete()
+        client = case["client"]
+        folder_id = case["folder"]["uuid"]
+        tree_id = case["tree_operation"]["document_id"]
+        self.manager.supabase = client
+        client.calls.clear()
+        document_result = self._commit_operation(case["tombstone_operation"])
+        self.assertEqual(document_result["kind"], "committed")
+        original_rpc = client.rpc
+
+        def rpc(name, params):
+            if (
+                name == "commit_folder"
+                and params["p_folder_id"] == folder_id
+                and params["p_is_deleted"]
+            ):
+                raise RuntimeError("network timeout")
+            return original_rpc(name, params)
+
+        client.rpc = rpc
+        result = self._commit_operation(case["tree_operation"])
+
+        self.assertIn(result["kind"], {"blocked", "retry"})
+        self.assertEqual(
+            [
+                params for name, params in client.calls
+                if name == "commit_document" and params["p_document_id"] == tree_id
+            ],
+            [],
+            "folder tombstone 실패 뒤 tree-order가 완료되면 안 된다",
+        )
 
     def test_a_new_project_publishes_its_standard_folders_with_identity_uuids(self):
         client = _FolderAwareClient([])
@@ -5570,6 +5923,268 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             "revision": revision,
             "is_deleted": False,
         }
+
+    def _prepare_duplicate_tombstone_recovery(self, *, trash_content=None):
+        folder_path = "메인/설정집/중복복구"
+        live_path = f"{folder_path}/원본.txt"
+        folder = create_item_at_path(
+            self._project_root(), "메인/설정집", "중복복구", True
+        )["nodes"][-1]
+        document = create_item_at_path(
+            self._project_root(), folder_path, "원본", False
+        )["nodes"][-1]
+        content = "UUID와 revision까지 일치할 때만 보존할 본문"
+        Path(self.wpm.writing_root_path, live_path).write_text(
+            content, encoding="utf-8"
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"],
+            [{
+                "folder_id": folder["uuid"],
+                "parent_folder_id": folder.get("parent_uuid"),
+                "local_path": folder_path,
+                "name": "중복복구",
+                "revision": 1,
+                "is_deleted": False,
+            }],
+        )
+        self.store.apply_remote_snapshot(
+            self.context, document["uuid"], live_path, content, 2,
+            parent_folder_id=folder["uuid"], name="원본",
+        )
+        tombstone_operation = self.store.enqueue(
+            self.context, live_path, content,
+            relative_path=live_path, is_deleted=True,
+        )
+        self.store.mark_attempt(tombstone_operation["operation_id"])
+        self.store.mark_success(tombstone_operation["operation_id"], {
+            "revision": 3,
+            "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "status": "committed",
+        })
+        trash_path = self.wpm.materialize_remote_tombstone(
+            live_path,
+            content if trash_content is None else trash_content,
+            "2026-08-31T03:12:31+09:00",
+            document["uuid"],
+        )
+        remote = {
+            "document_id": document["uuid"],
+            "relative_path": live_path,
+            "content": content,
+            "revision": 3,
+            "is_deleted": True,
+            "deleted_at": "2026-08-31T03:12:31+09:00",
+            "parent_folder_id": folder["uuid"],
+            "name": "원본",
+        }
+        return {
+            "folder": folder,
+            "document": document,
+            "live_path": live_path,
+            "trash_path": trash_path,
+            "content": content,
+            "remote": remote,
+            "tombstone_operation": tombstone_operation,
+        }
+
+    def _prepare_completed_pathless_tree_removal(self, case):
+        folder_path = case["live_path"].rsplit("/", 1)[0]
+        folder_name = folder_path.rsplit("/", 1)[-1]
+        old_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": [folder_name],
+            folder_path: ["원본.txt"],
+        }
+        new_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": [],
+        }
+        old_payload = json.loads(self.manager._tree_order_content(old_order))
+        old_payload.pop("folder_paths", None)
+        pathless_base = json.dumps(
+            old_payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            pathless_base,
+            28,
+            local_path=TREE_ORDER_DOCUMENT_PATH,
+        )
+        tree_operation = self.manager.record_tree_order(
+            new_order, retry=False
+        )
+        self.store.mark_attempt(tree_operation["operation_id"])
+        self.store.mark_success(tree_operation["operation_id"], {
+            "revision": 29,
+            "content_hash": hashlib.sha256(
+                tree_operation["content"].encode("utf-8")
+            ).hexdigest(),
+            "status": "committed",
+        })
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(new_order)
+        self.assertTrue(self.wpm.save_settings())
+        return new_order, tree_operation
+
+    def test_same_uuid_revision_and_hash_converge_duplicate_tombstone_once(self):
+        case = self._prepare_duplicate_tombstone_recovery()
+
+        changes = self.manager._apply_v2_remote_documents(
+            [case["remote"]], strict=True
+        )
+
+        self.assertEqual(len(changes), 1)
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, case["live_path"]
+        ).exists())
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, case["trash_path"]).read_text(
+                encoding="utf-8"
+            ),
+            case["content"],
+        )
+        self.assertIsNone(self._identity_node(case["live_path"]))
+        self.assertEqual(
+            self._identity_node(case["trash_path"])["uuid"],
+            case["document"]["uuid"],
+        )
+        stored = self.store.get_document_by_id(case["document"]["uuid"])
+        self.assertEqual(stored["revision"], 3)
+        self.assertTrue(stored["is_deleted"])
+        self.assertEqual(stored["local_path"], case["trash_path"])
+
+        repeated = self.manager._apply_v2_remote_documents(
+            [case["remote"]], strict=True
+        )
+        self.assertEqual(repeated, [])
+        matching = [
+            item for item in self.wpm.list_trash_items()
+            if item["document_id"] == case["document"]["uuid"]
+        ]
+        self.assertEqual(len(matching), 1)
+        self._assert_project_still_opens()
+
+    def test_different_duplicate_body_blocks_without_deleting_or_overwriting(self):
+        case = self._prepare_duplicate_tombstone_recovery(
+            trash_content="휴지통에서 별도로 편집된 다른 본문"
+        )
+        live_before = Path(
+            self.wpm.writing_root_path, case["live_path"]
+        ).read_bytes()
+        trash_before = Path(
+            self.wpm.writing_root_path, case["trash_path"]
+        ).read_bytes()
+
+        changes = self.manager._apply_v2_remote_documents(
+            [case["remote"]], strict=False
+        )
+
+        self.assertEqual(changes, [])
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, case["live_path"]).read_bytes(),
+            live_before,
+        )
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, case["trash_path"]).read_bytes(),
+            trash_before,
+        )
+        self.assertEqual(
+            self._identity_node(case["live_path"])["uuid"],
+            case["document"]["uuid"],
+        )
+        self.assertIsNone(self._identity_node(case["trash_path"]))
+        self.assertEqual(
+            [
+                item["trash_path"] for item in self.wpm.list_trash_items()
+                if item["document_id"] == case["document"]["uuid"]
+            ],
+            [case["trash_path"]],
+        )
+        self.assertTrue(self.manager._v2_last_pull_apply_blocked)
+        self.assertEqual(self.manager.current_sync_state, "conflict")
+
+    def test_proven_partial_commit_reuses_completed_document_tombstone_for_repair(self):
+        case = self._prepare_duplicate_tombstone_recovery()
+        new_order, completed_tree = self._prepare_completed_pathless_tree_removal(
+            case
+        )
+        folder_path = case["live_path"].rsplit("/", 1)[0]
+
+        recovery = self.manager.prepare_legacy_folder_delete_recovery(
+            folder_path, new_order, retry=False
+        )
+
+        intent = recovery["intent"]
+        tree_operation = recovery["tree_operation"]
+        self.assertEqual(intent["folder_id"], case["folder"]["uuid"])
+        self.assertEqual(intent["base_revision"], 1)
+        self.assertEqual(
+            intent["dependent_documents"],
+            [{
+                "document_id": case["document"]["uuid"],
+                "tombstone_operation_id": case["tombstone_operation"][
+                    "operation_id"
+                ],
+            }],
+        )
+        self.assertNotEqual(
+            tree_operation["operation_id"], completed_tree["operation_id"]
+        )
+        self.assertEqual(tree_operation["base_revision"], 29)
+        pending = self.store.next_ready_operation(self.context["local_key"])
+        self.assertEqual(
+            pending["document_id"],
+            self.tree_document_id,
+            "복구가 이미 완료된 문서 tombstone을 새로 만들면 안 된다",
+        )
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 1
+        )
+
+        client = _FolderAwareClient([{
+            "folder_id": case["folder"]["uuid"],
+            "parent_folder_id": case["folder"]["parent_uuid"],
+            "name": "중복복구",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+        self.store.mark_attempt(tree_operation["operation_id"])
+        result = self.manager._process_v2_operation(
+            tree_operation["operation_id"]
+        )
+        self.assertEqual(result["kind"], "committed")
+        calls = [name for name, _params in client.calls]
+        self.assertLess(calls.index("commit_folder"), calls.index("commit_document"))
+
+    def test_partial_commit_recovery_refuses_different_body_before_queue_write(self):
+        case = self._prepare_duplicate_tombstone_recovery(
+            trash_content="별도로 편집된 휴지통 본문"
+        )
+        new_order, _completed_tree = self._prepare_completed_pathless_tree_removal(
+            case
+        )
+        folder_path = case["live_path"].rsplit("/", 1)[0]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "LEGACY_FOLDER_DELETE_RECOVERY_CONTENT_MISMATCH"
+        ):
+            self.manager.prepare_legacy_folder_delete_recovery(
+                folder_path, new_order, retry=False
+            )
+
+        self.assertEqual(
+            self.store.pending_folder_delete_intents(
+                self.context["local_key"]
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 0
+        )
 
     def _apply(self, tree_order, live_documents=None, revision=1, strict=True):
         documents = [self._tree_remote(tree_order, revision)]

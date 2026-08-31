@@ -1257,6 +1257,9 @@ class WritingTreeMixin:
                     trash_rel_path = None
                     with sync_manager.local_structure_mutation():
                         try:
+                            sync_manager.prepare_folder_delete_intent(
+                                rel_path, projected_order
+                            )
                             trash_rel_path = self.wpm.move_to_trash(
                                 rel_path,
                                 tree_order_parent=order_parent,
@@ -1356,6 +1359,10 @@ class WritingTreeMixin:
                     tree_order or {}, rel_path
                 )
                 with mutation_gate:
+                    if sync_manager is not None:
+                        sync_manager.prepare_folder_delete_intent(
+                            rel_path, projected_order
+                        )
                     trash_rel_path = self.wpm.move_to_trash(
                         rel_path,
                         tree_order_parent=order_parent,

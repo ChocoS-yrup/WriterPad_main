@@ -2328,6 +2328,255 @@ class SyncManager(QObject):
             self.retry_pending_syncs()
         return request
 
+    def prepare_folder_delete_intent(self, old_rel_path, tree_order=None):
+        """Persist the exact LEGACY folder identity before local deletion."""
+        if not self.is_v2_enabled or self._uses_contract_structure():
+            return None
+        old_rel_path = self._safe_relative_path(old_rel_path)
+        local_key = self._v2_context["local_key"]
+        folder = self._v2_store.get_folder_by_path(local_key, old_rel_path)
+        if folder is None:
+            return None
+        folder_id = str(folder["folder_id"])
+        identity_folders = self._publishable_identity_folders()
+        path_key = self._tree_path_comparison_key(old_rel_path)
+        node = next((
+            item for item in identity_folders
+            if self._tree_path_comparison_key(item.get("legacy_path"))
+            == path_key
+        ), None)
+        node_is_pre_delete = node is not None
+        if node is None:
+            node = next((
+                item for item in identity_folders
+                if str(item.get("uuid") or "") == folder_id
+            ), None)
+        if node is None:
+            # Pre-identity projects retain their document-only legacy path.
+            return None
+        if str(node.get("uuid") or "") != folder_id:
+            raise SyncContractError("FOLDER_DELETE_IDENTITY_CONFLICT")
+        parent_folder_id = node.get("parent_uuid")
+        name = old_rel_path.rsplit("/", 1)[-1]
+        if node_is_pre_delete:
+            if str(folder.get("parent_folder_id") or "") != str(
+                parent_folder_id or ""
+            ):
+                raise SyncContractError(
+                    "FOLDER_DELETE_PARENT_IDENTITY_CONFLICT"
+                )
+            if str(folder.get("name") or "") != name:
+                raise SyncContractError("FOLDER_DELETE_NAME_IDENTITY_CONFLICT")
+        else:
+            # Direct legacy callers may arrive after move_to_trash relocated
+            # identity. The old sync_folders row is then the immutable
+            # pre-delete snapshot; the UUID match plus a trash destination is
+            # the only permitted compatibility case.
+            if not node.get("wants_deleted"):
+                raise SyncContractError("FOLDER_DELETE_IDENTITY_CONFLICT")
+            parent_folder_id = folder.get("parent_folder_id")
+            name = str(folder.get("name") or "")
+            if not name:
+                raise SyncContractError("FOLDER_DELETE_NAME_IDENTITY_CONFLICT")
+        dependencies = []
+        for document in self._v2_store.list_documents(local_key):
+            local_path = self._safe_relative_path(document.get("local_path"))
+            if not local_path.startswith(old_rel_path + "/"):
+                continue
+            if (
+                int(document.get("revision") or 0) == 0
+                and not self._v2_store.has_active_operations(
+                    document["document_id"]
+                )
+            ):
+                continue
+            dependencies.append({
+                "document_id": document["document_id"],
+                "server_path": document["server_path"],
+                "base_revision": int(document.get("revision") or 0),
+            })
+        tree_order_content = (
+            self._tree_order_content(tree_order)
+            if isinstance(tree_order, dict) else None
+        )
+        return self._v2_store.record_folder_delete_intent(
+            local_key,
+            folder_id=folder_id,
+            parent_folder_id=parent_folder_id,
+            name=name,
+            base_revision=int(folder.get("revision") or 0),
+            pre_delete_path=old_rel_path,
+            dependent_documents=dependencies,
+            tree_order_content=tree_order_content,
+        )
+
+    def prepare_legacy_folder_delete_recovery(
+        self, folder_path, tree_order, retry=False
+    ):
+        """Queue a proven historical partial delete without touching its files."""
+        if not self.is_v2_enabled or self._uses_contract_structure():
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_MODE_REQUIRED")
+        folder_path = self._safe_relative_path(folder_path)
+        local_key = self._v2_context["local_key"]
+        folder = self._v2_store.get_folder_by_path(local_key, folder_path)
+        if folder is None or int(folder.get("revision") or 0) <= 0:
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_FOLDER_UNPROVEN")
+        identity = next((
+            item for item in self._publishable_identity_folders()
+            if str(item.get("uuid") or "") == str(folder["folder_id"])
+        ), None)
+        if (
+            identity is None
+            or identity.get("wants_deleted")
+            or self._safe_relative_path(identity.get("legacy_path")) != folder_path
+            or str(identity.get("parent_uuid") or "")
+            != str(folder.get("parent_folder_id") or "")
+            or folder_path.rsplit("/", 1)[-1] != str(folder.get("name") or "")
+        ):
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_IDENTITY_UNPROVEN")
+
+        tree_content = self._tree_order_content(tree_order)
+        explicit, live_keys = self._tree_folder_keys_from_content(tree_content)
+        folder_key = self._tree_path_comparison_key(folder_path)
+        if not explicit or folder_key in live_keys:
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_TREE_UNPROVEN")
+        tree_document_id = str(uuid.uuid5(
+            uuid.UUID(self._v2_context["project_id"]),
+            TREE_ORDER_DOCUMENT_PATH,
+        ))
+        tree_document = self._v2_store.get_document_by_id(tree_document_id)
+        if (
+            tree_document is None
+            or tree_document.get("base_content") != tree_content
+            or int(tree_document.get("revision") or 0) <= 0
+        ):
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_TREE_UNPROVEN")
+        completed_removal = next((
+            operation for operation in
+            self._v2_store.completed_document_operations(tree_document_id)
+            if operation.get("content") == tree_content
+            and operation.get("result_revision")
+            == int(tree_document["revision"])
+            and folder_key in self._tree_folder_keys_from_content(
+                operation.get("base_content")
+            )[1]
+            and folder_key not in self._tree_folder_keys_from_content(
+                operation.get("content")
+            )[1]
+        ), None)
+        if completed_removal is None:
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_TREE_UNPROVEN")
+
+        dependencies = []
+        operation_ids = {}
+        for document in self._v2_store.list_documents(local_key):
+            try:
+                server_path = self._safe_relative_path(
+                    document.get("server_path")
+                )
+            except ValueError:
+                continue
+            if not server_path.startswith(folder_path + "/"):
+                continue
+            document_id = str(document["document_id"])
+            revision = int(document.get("revision") or 0)
+            content = str(document.get("base_content") or "")
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if (
+                not document.get("is_deleted")
+                or revision <= 0
+                or self._v2_store.has_active_operations(document_id)
+                or str(document.get("base_hash") or "") != content_hash
+            ):
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_DOCUMENT_UNPROVEN"
+                )
+            completed_tombstone = next((
+                operation for operation in
+                self._v2_store.completed_document_operations(document_id)
+                if operation.get("is_deleted")
+                and operation.get("relative_path") == server_path
+                and operation.get("content") == content
+                and operation.get("result_revision") == revision
+            ), None)
+            if completed_tombstone is None:
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_DOCUMENT_UNPROVEN"
+                )
+
+            trash_matches = [
+                item for item in self._v2_wpm.list_trash_items()
+                if str(item.get("document_id") or "") == document_id
+                and self._safe_relative_path(item.get("original_path"))
+                == server_path
+            ]
+            if len(trash_matches) != 1:
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_TRASH_UNPROVEN"
+                )
+            trash_path = self._safe_relative_path(
+                trash_matches[0].get("trash_path")
+            )
+            trash_content = self._v2_wpm.read_text_file(trash_path)
+            local_path = self._safe_relative_path(document.get("local_path"))
+            local_content = self._v2_wpm.read_text_file(local_path)
+            if (
+                trash_content is None
+                or local_content is None
+                or hashlib.sha256(trash_content.encode("utf-8")).hexdigest()
+                != content_hash
+                or hashlib.sha256(local_content.encode("utf-8")).hexdigest()
+                != content_hash
+            ):
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_CONTENT_MISMATCH"
+                )
+            identity_document = self._identity_node_by_uuid(
+                self._identity_project_root(), document_id
+            )
+            if (
+                identity_document is None
+                or identity_document.get("kind") != "document"
+                or self._safe_relative_path(
+                    identity_document.get("legacy_path")
+                ) != local_path
+            ):
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_IDENTITY_UNPROVEN"
+                )
+            dependencies.append({
+                "document_id": document_id,
+                "server_path": server_path,
+                "base_revision": revision,
+            })
+            operation_ids[document_id] = completed_tombstone["operation_id"]
+
+        intent = self._v2_store.record_folder_delete_intent(
+            local_key,
+            folder_id=folder["folder_id"],
+            parent_folder_id=folder.get("parent_folder_id"),
+            name=folder["name"],
+            base_revision=int(folder["revision"]),
+            pre_delete_path=folder_path,
+            dependent_documents=dependencies,
+            tree_order_content=tree_content,
+        )
+        intent = self._v2_store.bind_folder_delete_document_operations(
+            intent["intent_id"], operation_ids
+        )
+        tree_operation = self.record_tree_order(tree_order, retry=retry)
+        attached = self._v2_store.folder_delete_intents_for_tree_operation(
+            tree_operation["operation_id"]
+        )
+        return {
+            "intent": next(
+                item for item in attached
+                if item["intent_id"] == intent["intent_id"]
+            ),
+            "tree_operation": tree_operation,
+            "completed_tree_operation": completed_removal,
+        }
+
     def record_tree_order(self, tree_order, retry=True):
         """Persist project binder order as one hidden revisioned v2 document."""
         if not self.is_v2_enabled:
@@ -2356,10 +2605,16 @@ class SyncManager(QObject):
                     self._v2_context["local_key"]
                 )
             )
+            pending_folder_deletes = (
+                self._v2_store.pending_folder_delete_intents(
+                    self._v2_context["local_key"]
+                )
+            )
             if (
                 document.get("base_content") == content
                 and not self._v2_store.has_active_operations(document["document_id"])
                 and not pending_folder_renames
+                and not pending_folder_deletes
             ):
                 return None
             operation = self._v2_store.enqueue(
@@ -2368,6 +2623,30 @@ class SyncManager(QObject):
                 content,
                 relative_path=TREE_ORDER_DOCUMENT_PATH,
             )
+            try:
+                live_folder_paths = set(json.loads(content).get(
+                    "folder_paths", []
+                ))
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                live_folder_paths = set()
+            attached_intents = [
+                intent["intent_id"]
+                for intent in pending_folder_deletes
+                if intent.get("status") in {
+                    "prepared", "documents_pending", "folder_pending",
+                    "folder_committed", "tree_pending",
+                }
+                and intent.get("pre_delete_path") not in live_folder_paths
+                and (
+                    not intent.get("tree_operation_id")
+                    or intent.get("tree_operation_id")
+                    == operation["operation_id"]
+                )
+            ]
+            if attached_intents:
+                self._v2_store.attach_folder_delete_tree_operation(
+                    attached_intents, operation["operation_id"], content
+                )
         self._publish_sync_state()
         if retry:
             self.retry_pending_syncs()
@@ -4612,6 +4891,221 @@ class SyncManager(QObject):
             project_id=operation["project_id"],
             rpc_name="commit_folder",
         )
+
+    @classmethod
+    def _tree_folder_keys_from_content(cls, content):
+        """Return (explicit, keys) without treating missing legacy evidence as empty."""
+        try:
+            payload = json.loads(content or "{}")
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return False, set()
+            tree_order = cls._validated_remote_tree_order(
+                payload.get("tree_order")
+            )
+            explicit = cls._validated_remote_tree_folder_paths(
+                payload.get("folder_paths"), tree_order
+            )
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return False, set()
+        if explicit is not None:
+            return True, set(explicit)
+        inferred = {
+            cls._tree_path_comparison_key(parent_path)
+            for parent_path in tree_order
+            if parent_path != "<root>"
+            and parent_path != "메인/휴지통"
+            and not parent_path.startswith("메인/휴지통/")
+        }
+        return False, inferred
+
+    def _unproven_legacy_folder_deletions(self, operation, intents):
+        """Find path removals an immutable LEGACY tree operation cannot prove."""
+        base_explicit, base_keys = self._tree_folder_keys_from_content(
+            operation.get("base_content")
+        )
+        if base_explicit:
+            return set()
+        _live_explicit, live_keys = self._tree_folder_keys_from_content(
+            operation.get("content")
+        )
+        fixed_keys = {
+            self._tree_path_comparison_key("메인"),
+            *(
+                self._tree_path_comparison_key(f"메인/{storage_name}")
+                for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+            ),
+        }
+        removed = set(base_keys) - set(live_keys) - fixed_keys
+        authorized = {
+            self._tree_path_comparison_key(intent.get("pre_delete_path"))
+            for intent in intents
+            if intent.get("pre_delete_path")
+        }
+        local_key = operation.get("local_key") or self._v2_context["local_key"]
+        for intent in self._v2_store.pending_folder_rename_intents(local_key):
+            if intent.get("old_path"):
+                authorized.add(self._tree_path_comparison_key(
+                    intent["old_path"]
+                ))
+        return removed - authorized
+
+    def _block_folder_delete_tree(self, operation, intents, error_code):
+        for intent in intents:
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "blocked", error=error_code
+            )
+        self._v2_store.mark_blocked(operation["operation_id"], error_code)
+        return {
+            "kind": "blocked",
+            "error": error_code,
+            "operation": operation,
+        }
+
+    def _commit_durable_folder_deletions(self, operation, client):
+        """Complete pinned child and folder tombstones before tree publication."""
+        intents = self._v2_store.folder_delete_intents_for_tree_operation(
+            operation["operation_id"]
+        )
+        unproven = self._unproven_legacy_folder_deletions(operation, intents)
+        if unproven:
+            return self._block_folder_delete_tree(
+                operation, intents, "FOLDER_DELETION_SCOPE_UNPROVEN"
+            )
+        if not intents:
+            return None
+
+        for intent in intents:
+            for dependency in intent.get("dependent_documents") or []:
+                tombstone_id = dependency.get("tombstone_operation_id")
+                tombstone = (
+                    self._v2_store.operation(tombstone_id)
+                    if tombstone_id else None
+                )
+                if tombstone is None:
+                    return self._block_folder_delete_tree(
+                        operation, intents,
+                        "FOLDER_DELETE_DOCUMENT_OPERATION_MISSING",
+                    )
+                if tombstone.get("status") in {"blocked", "conflict"}:
+                    return self._block_folder_delete_tree(
+                        operation, intents,
+                        "FOLDER_DELETE_DOCUMENT_BLOCKED",
+                    )
+                if tombstone.get("status") != "completed":
+                    self._v2_store.set_folder_delete_intent_status(
+                        intent["intent_id"], "documents_pending"
+                    )
+                    return {
+                        "kind": "retry",
+                        "error": "FOLDER_DELETE_DOCUMENTS_PENDING",
+                        "operation": operation,
+                    }
+
+        try:
+            folder_rows = self._fetch_v2_project_folders(
+                client, operation["project_id"]
+            )
+        except Exception as error:
+            code = self._stable_error_code(error) or str(error)
+            for intent in intents:
+                self._v2_store.set_folder_delete_intent_status(
+                    intent["intent_id"], "folder_pending", error=code
+                )
+            return {"kind": "retry", "error": code, "operation": operation}
+
+        rows_by_id = {}
+        for row in folder_rows:
+            folder_id = str(row.get("folder_id") or "")
+            if folder_id in rows_by_id:
+                return self._block_folder_delete_tree(
+                    operation, intents, "DUPLICATE_FOLDER_ID"
+                )
+            rows_by_id[folder_id] = row
+
+        for intent in intents:
+            if intent.get("status") in {"folder_committed", "tree_pending"}:
+                continue
+            folder_id = str(intent["folder_id"])
+            row = rows_by_id.get(folder_id)
+            base_revision = int(intent["base_revision"])
+            if row is None:
+                if base_revision == 0:
+                    self._v2_store.set_folder_delete_intent_status(
+                        intent["intent_id"], "folder_committed",
+                        folder_result_revision=0,
+                    )
+                    continue
+                return self._block_folder_delete_tree(
+                    operation, intents, "FOLDER_DELETE_TARGET_NOT_FOUND"
+                )
+            if (
+                str(row.get("parent_folder_id") or "")
+                != str(intent.get("parent_folder_id") or "")
+                or str(row.get("name") or "") != str(intent["name"])
+            ):
+                return self._block_folder_delete_tree(
+                    operation, intents, "FOLDER_DELETE_IDENTITY_CONFLICT"
+                )
+            row_revision = int(row.get("revision") or 0)
+            if row.get("is_deleted"):
+                if row_revision <= base_revision:
+                    return self._block_folder_delete_tree(
+                        operation, intents,
+                        "FOLDER_DELETE_REVISION_NOT_ADVANCED",
+                    )
+                self._v2_store.set_folder_delete_intent_status(
+                    intent["intent_id"], "folder_committed",
+                    folder_result_revision=row_revision,
+                )
+                continue
+            if row_revision != base_revision:
+                return self._block_folder_delete_tree(
+                    operation, intents, "FOLDER_DELETE_REVISION_CONFLICT"
+                )
+
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "folder_pending"
+            )
+            try:
+                response = client.rpc("commit_folder", {
+                    "p_folder_id": folder_id,
+                    "p_project_id": operation["project_id"],
+                    "p_operation_id": intent["folder_operation_id"],
+                    "p_device_id": self._v2_device_id,
+                    "p_base_revision": base_revision,
+                    "p_parent_folder_id": intent.get("parent_folder_id"),
+                    "p_name": intent["name"],
+                    "p_is_deleted": True,
+                }).execute()
+            except Exception as error:
+                code = self._stable_error_code(error) or str(error)
+                self._v2_store.set_folder_delete_intent_status(
+                    intent["intent_id"], "folder_pending", error=code
+                )
+                if code in PERMANENT_FOLDER_ERROR_CODES:
+                    return self._block_folder_delete_tree(
+                        operation, intents, code
+                    )
+                return {"kind": "retry", "error": code, "operation": operation}
+            result = self._response_data(response) or {}
+            if (
+                str(result.get("folder_id") or "") != folder_id
+                or not result.get("is_deleted")
+                or int(result.get("revision") or 0) <= base_revision
+            ):
+                return self._block_folder_delete_tree(
+                    operation, intents, "INVALID_FOLDER_DELETE_RESPONSE"
+                )
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "folder_committed",
+                folder_result_revision=int(result["revision"]),
+            )
+
+        for intent in intents:
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "tree_pending"
+            )
+        return None
 
     def _legacy_folder_scope_for_operation(self, operation):
         """Return the folder paths this immutable tree snapshot may publish.
@@ -7579,6 +8073,19 @@ class SyncManager(QObject):
                         raise RuntimeError("REMOTE_DOCUMENT_PATH_IS_PROTECTED")
                     continue
 
+                duplicate_recovery = self._repair_proven_duplicate_tombstone(
+                    document=document,
+                    document_id=document_id,
+                    old_path=old_path,
+                    remote_path=server_relative_path,
+                    content=content,
+                    revision=revision,
+                    deleted_at=deleted_at,
+                ) if is_deleted else None
+                if duplicate_recovery is not None:
+                    changes.append(duplicate_recovery)
+                    continue
+
                 local_path = old_path or remote_path
                 renamed_from = None
                 renamed_to = None
@@ -8225,6 +8732,173 @@ class SyncManager(QObject):
             return None
         legacy_path = node["legacy_path"]
         return legacy_path if is_live_document_path(legacy_path) else None
+
+    def _duplicate_tombstone_recovery_block(self, document_id, error_code):
+        error = RuntimeError(error_code)
+        self._record_identity_diagnostic(
+            "duplicate_tombstone_recovery_blocked",
+            entity_id=document_id,
+            error_code=error_code,
+        )
+        self._block_pull_with_conflict(error)
+        raise error
+
+    def _repair_proven_duplicate_tombstone(
+        self,
+        *,
+        document,
+        document_id,
+        old_path,
+        remote_path,
+        content,
+        revision,
+        deleted_at,
+    ):
+        """Converge only the exact live/trash duplicate left by a failed pull.
+
+        Equality of bytes alone is not authority. The synced tombstone row,
+        remote revision, identity UUID, original server path, and trash index
+        must all name the same document before the redundant live copy is
+        removed. Any contradictory proof leaves every byte untouched.
+        """
+        if not (
+            document
+            and document.get("is_deleted")
+            and old_path
+            and is_live_document_path(old_path)
+            and int(document.get("revision") or 0) == int(revision)
+            and self._safe_relative_path(document.get("server_path"))
+            == self._safe_relative_path(remote_path)
+        ):
+            return None
+
+        matches = []
+        for item in self._v2_wpm.list_trash_items():
+            try:
+                trash_path = self._safe_relative_path(item.get("trash_path"))
+                original_path = self._safe_relative_path(
+                    item.get("original_path")
+                )
+            except ValueError:
+                continue
+            if (
+                str(item.get("document_id") or "") == str(document_id)
+                and original_path == remote_path
+                and trash_path.startswith("메인/휴지통/")
+            ):
+                matches.append(trash_path)
+        if not matches:
+            return None
+        if len(set(matches)) != 1:
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_METADATA_AMBIGUOUS"
+            )
+        trash_path = matches[0]
+        root = os.path.abspath(self._v2_wpm.writing_root_path)
+        live_full = os.path.abspath(os.path.join(
+            root, old_path.replace("/", os.sep)
+        ))
+        trash_full = os.path.abspath(os.path.join(
+            root, trash_path.replace("/", os.sep)
+        ))
+        try:
+            if (
+                os.path.commonpath([root, live_full]) != root
+                or os.path.commonpath([root, trash_full]) != root
+                or not os.path.isfile(trash_full)
+                or self._is_reparse_path(trash_full)
+            ):
+                raise OSError("unsafe duplicate tombstone path")
+        except (OSError, ValueError):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_PATH_UNSAFE"
+            )
+
+        remote_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        live_content = self._v2_wpm.read_text_file(old_path)
+        trash_content = self._v2_wpm.read_text_file(trash_path)
+        if (
+            str(document.get("base_hash") or "") != remote_hash
+            or trash_content is None
+            or hashlib.sha256(trash_content.encode("utf-8")).hexdigest()
+            != remote_hash
+        ):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_CONTENT_MISMATCH"
+            )
+
+        project_root = self._identity_project_root()
+        identity_node = (
+            self._identity_node_by_uuid(project_root, document_id)
+            if project_root else None
+        )
+        if identity_node is None or identity_node.get("kind") != "document":
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_IDENTITY_MISSING"
+            )
+        identity_path = self._safe_relative_path(
+            identity_node.get("legacy_path")
+        )
+        from project_creation_v1 import node_for_path
+
+        target_node = node_for_path(project_root, trash_path) if project_root else None
+        if identity_path == old_path:
+            if (
+                live_content is None
+                or not os.path.isfile(live_full)
+                or self._is_reparse_path(live_full)
+                or hashlib.sha256(live_content.encode("utf-8")).hexdigest()
+                != remote_hash
+                or target_node is not None
+            ):
+                return self._duplicate_tombstone_recovery_block(
+                    document_id, "DUPLICATE_TOMBSTONE_CONTENT_MISMATCH"
+                )
+            self._relocate_remote_identity(
+                old_path, trash_path, lambda: os.remove(live_full)
+            )
+        elif identity_path == trash_path:
+            if os.path.lexists(live_full):
+                return self._duplicate_tombstone_recovery_block(
+                    document_id, "DUPLICATE_TOMBSTONE_IDENTITY_CONFLICT"
+                )
+        else:
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_IDENTITY_CONFLICT"
+            )
+
+        collision = self._v2_store.get_document(
+            self._v2_context["local_key"], trash_path
+        )
+        if collision and str(collision.get("document_id")) != str(document_id):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_STORE_CONFLICT"
+            )
+        applied = self._v2_store.relocate_deleted_document(
+            document_id, trash_path
+        )
+        if not applied.get("applied"):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_STORE_REPAIR_FAILED"
+            )
+        self._v2_wpm.update_trash_metadata(
+            trash_path, deleted_at, document_id
+        )
+        self._record_identity_diagnostic(
+            "duplicate_tombstone_converged",
+            entity_id=document_id,
+            state=f"revision={revision}",
+        )
+        return {
+            "kind": "duplicate_tombstone_recovered",
+            "document_id": document_id,
+            "old_local_path": old_path,
+            "new_local_path": trash_path,
+            "remote_path": remote_path,
+            "content": content,
+            "revision": revision,
+            "is_deleted": True,
+        }
 
     def _release_adopted_document(self, adopted, local_path):
         """Give back the id and the placeholder of a document that never landed.
@@ -9131,6 +9805,11 @@ class SyncManager(QObject):
                             operation, client
                         )
                     if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
+                        delete_gate = self._commit_durable_folder_deletions(
+                            operation, client
+                        )
+                        if delete_gate is not None:
+                            return delete_gate
                         # Vacate a renamed slot before a newer identity reuses
                         # its old name. A folder that was renamed before its
                         # first publication will not exist yet, so the second
@@ -10300,6 +10979,7 @@ class SyncManager(QObject):
             return []
         with self._structure_mutation_gate:
             folder_operation = None
+            folder_delete_intent = None
             contract_structure = self._uses_contract_structure()
             if contract_structure:
                 folder_operation = self._contract_folder_lifecycle_plan(
@@ -10308,6 +10988,13 @@ class SyncManager(QObject):
                     "contract_structure_intents": [],
                     "contract_path_change": None,
                 }
+            else:
+                # The binder records this before moving the folder. Keeping the
+                # fallback here also protects direct callers; identity still
+                # carries the exact UUID after the filesystem move.
+                folder_delete_intent = self.prepare_folder_delete_intent(
+                    old_rel_path
+                )
             # A previously deleted UUID may still reserve the same local trash path
             # even when its physical copy was removed. Relocate the new copy before
             # updating SQLite so repeated delete/restore cycles cannot violate the
@@ -10362,6 +11049,8 @@ class SyncManager(QObject):
                 moved = self._v2_store.move_local_path(
                     self._v2_context["local_key"], old_rel_path, trash_rel_path
                 )
+                queued_operations = []
+                document_operation_ids = {}
                 for document in moved:
                     # Keep a dependent tombstone behind an unfinished create.
                     if (
@@ -10373,13 +11062,23 @@ class SyncManager(QObject):
                         continue
                     content = self._v2_wpm.read_text_file(document["local_path"])
                     if content is not None:
-                        self._v2_store.enqueue(
+                        queued = self._v2_store.enqueue(
                             self._v2_context,
                             document["local_path"],
                             content,
                             relative_path=document["server_path"],
                             is_deleted=True,
                         )
+                        queued_operations.append(queued)
+                        document_operation_ids[document["document_id"]] = (
+                            queued["operation_id"]
+                        )
+                if folder_delete_intent is not None:
+                    self._v2_store.bind_folder_delete_document_operations(
+                        folder_delete_intent["intent_id"],
+                        document_operation_ids,
+                        trash_path=trash_rel_path,
+                    )
             if moved:
                 self._v2_wpm.update_trash_metadata(
                     trash_rel_path,
@@ -10390,7 +11089,9 @@ class SyncManager(QObject):
         self._publish_sync_state()
         if retry:
             self.retry_pending_syncs()
-        return ([folder_operation] if folder_operation else []) + moved
+        if contract_structure:
+            return ([folder_operation] if folder_operation else []) + moved
+        return queued_operations
 
     def record_restore(
         self, trash_rel_path, restored_rel_path,

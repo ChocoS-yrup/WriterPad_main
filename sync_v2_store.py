@@ -35,7 +35,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8007
+STAGE8_USER_VERSION = 8008
 
 
 def _utc_now():
@@ -255,6 +255,59 @@ class SyncV2Store:
                 CREATE INDEX IF NOT EXISTS sync_folder_rename_intent_events_idx
                     ON sync_folder_rename_intent_events(
                         intent_id, event_sequence
+                    );
+
+                CREATE TABLE IF NOT EXISTS sync_folder_delete_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    local_key TEXT NOT NULL
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    folder_id TEXT NOT NULL,
+                    parent_folder_id TEXT,
+                    name TEXT NOT NULL,
+                    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+                    pre_delete_path TEXT NOT NULL,
+                    trash_path TEXT,
+                    folder_operation_id TEXT NOT NULL UNIQUE,
+                    tree_operation_id TEXT,
+                    tree_order_content TEXT,
+                    tree_order_payload_sha256 TEXT,
+                    folder_result_revision INTEGER,
+                    status TEXT NOT NULL DEFAULT 'prepared'
+                        CHECK (status IN (
+                            'prepared', 'documents_pending', 'folder_pending',
+                            'folder_committed', 'tree_pending', 'completed',
+                            'blocked', 'cancelled'
+                        )),
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    sync_folder_delete_intents_active_folder_idx
+                    ON sync_folder_delete_intents(local_key, folder_id)
+                    WHERE status NOT IN ('completed', 'cancelled');
+                CREATE INDEX IF NOT EXISTS sync_folder_delete_intents_pending_idx
+                    ON sync_folder_delete_intents(local_key, status, created_at);
+                CREATE INDEX IF NOT EXISTS
+                    sync_folder_delete_intents_tree_operation_idx
+                    ON sync_folder_delete_intents(tree_operation_id)
+                    WHERE tree_operation_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS sync_folder_delete_intent_documents (
+                    intent_id TEXT NOT NULL REFERENCES
+                        sync_folder_delete_intents(intent_id) ON DELETE CASCADE,
+                    document_id TEXT NOT NULL,
+                    server_path TEXT NOT NULL,
+                    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+                    tombstone_operation_id TEXT,
+                    PRIMARY KEY(intent_id, document_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS
+                    sync_folder_delete_intent_documents_operation_idx
+                    ON sync_folder_delete_intent_documents(
+                        tombstone_operation_id
                     );
                 """
             )
@@ -2958,6 +3011,18 @@ class SyncV2Store:
                     operation["document_id"],
                 ),
             )
+            if operation["relative_path"] == "__antigravity__/tree-order.json":
+                connection.execute(
+                    """
+                    UPDATE sync_folder_delete_intents
+                    SET status = 'completed', last_error = '', updated_at = ?
+                    WHERE tree_operation_id = ?
+                      AND status IN (
+                          'folder_committed', 'tree_pending'
+                      )
+                    """,
+                    (now, operation_id),
+                )
             dependent = next((
                 row for row in connection.execute(
                 """
@@ -3436,6 +3501,34 @@ class SyncV2Store:
             return self._operation_dict(
                 connection, self._operation_row(connection, operation_id)
             )
+
+    def completed_document_operations(self, document_id):
+        """Return immutable completed document operations with result revisions."""
+        document_id = str(uuid.UUID(str(document_id)))
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_operations WHERE document_id = ? "
+                "ORDER BY queue_id DESC",
+                (document_id,),
+            ).fetchall()
+            completed = []
+            for row in rows:
+                if self._derived_state(connection, row["operation_id"]) != "completed":
+                    continue
+                result = self._operation_dict(connection, row)
+                attempt = connection.execute(
+                    "SELECT result_revision FROM sync_operation_attempts "
+                    "WHERE operation_id = ? AND outcome IN ('committed', 'replayed') "
+                    "ORDER BY attempt_number DESC LIMIT 1",
+                    (row["operation_id"],),
+                ).fetchone()
+                result["result_revision"] = (
+                    int(attempt["result_revision"])
+                    if attempt and attempt["result_revision"] is not None
+                    else None
+                )
+                completed.append(result)
+            return completed
 
     def latest_active_structure_operation(self, entity_id):
         entity_id = str(uuid.UUID(str(entity_id)))
@@ -4049,6 +4142,332 @@ class SyncV2Store:
             connection.execute(
                 "DELETE FROM sync_tree_barriers WHERE barrier_id = ?",
                 (barrier_id,),
+            )
+
+    @staticmethod
+    def _folder_delete_intent_dict(connection, row):
+        if row is None:
+            return None
+        result = dict(row)
+        dependencies = connection.execute(
+            """
+            SELECT document_id, tombstone_operation_id
+            FROM sync_folder_delete_intent_documents
+            WHERE intent_id = ? ORDER BY document_id
+            """,
+            (result["intent_id"],),
+        ).fetchall()
+        result["dependent_documents"] = [
+            {
+                "document_id": item["document_id"],
+                "tombstone_operation_id": item["tombstone_operation_id"],
+            }
+            for item in dependencies
+        ]
+        return result
+
+    def record_folder_delete_intent(
+        self,
+        local_key,
+        *,
+        folder_id,
+        parent_folder_id,
+        name,
+        base_revision,
+        pre_delete_path,
+        dependent_documents,
+        tree_order_content=None,
+    ):
+        """Pin one LEGACY folder deletion before its filesystem move begins."""
+        folder_id = str(uuid.UUID(str(folder_id)))
+        parent_folder_id = (
+            str(uuid.UUID(str(parent_folder_id))) if parent_folder_id else None
+        )
+        name = str(name or "")
+        pre_delete_path = _normalize_path(pre_delete_path)
+        base_revision = int(base_revision or 0)
+        if not name or not pre_delete_path or base_revision < 0:
+            raise ValueError("invalid folder delete intent")
+        normalized_dependencies = []
+        for dependency in dependent_documents or []:
+            document_id = str(uuid.UUID(str(dependency["document_id"])))
+            server_path = _normalize_path(dependency.get("server_path"))
+            document_revision = int(dependency.get("base_revision") or 0)
+            if not server_path or document_revision < 0:
+                raise ValueError("invalid folder delete dependency")
+            normalized_dependencies.append((
+                document_id, server_path, document_revision,
+            ))
+        if len({item[0] for item in normalized_dependencies}) != len(
+            normalized_dependencies
+        ):
+            raise ValueError("duplicate folder delete dependency")
+        now = _utc_now()
+        tree_hash = (
+            hashlib.sha256(tree_order_content.encode("utf-8")).hexdigest()
+            if tree_order_content is not None else None
+        )
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intents
+                WHERE local_key = ? AND folder_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                ORDER BY created_at, intent_id LIMIT 1
+                """,
+                (local_key, folder_id),
+            ).fetchone()
+            if existing is not None:
+                pinned = (
+                    existing["parent_folder_id"], existing["name"],
+                    int(existing["base_revision"]),
+                    existing["pre_delete_path"],
+                )
+                supplied = (
+                    parent_folder_id, name, base_revision, pre_delete_path,
+                )
+                if pinned != supplied:
+                    raise ValueError("folder delete identity changed")
+                if tree_order_content is not None:
+                    connection.execute(
+                        """
+                        UPDATE sync_folder_delete_intents
+                        SET tree_order_content = COALESCE(tree_order_content, ?),
+                            tree_order_payload_sha256 = COALESCE(
+                                tree_order_payload_sha256, ?
+                            ), updated_at = ?
+                        WHERE intent_id = ?
+                        """,
+                        (
+                            tree_order_content, tree_hash, now,
+                            existing["intent_id"],
+                        ),
+                    )
+                return self._folder_delete_intent_dict(
+                    connection,
+                    connection.execute(
+                        "SELECT * FROM sync_folder_delete_intents "
+                        "WHERE intent_id = ?",
+                        (existing["intent_id"],),
+                    ).fetchone(),
+                )
+
+            intent_id = str(uuid.uuid4())
+            folder_operation_id = str(uuid.uuid5(
+                uuid.UUID(intent_id), "folder-tombstone"
+            ))
+            connection.execute(
+                """
+                INSERT INTO sync_folder_delete_intents (
+                    intent_id, local_key, folder_id, parent_folder_id, name,
+                    base_revision, pre_delete_path, folder_operation_id,
+                    tree_order_content, tree_order_payload_sha256,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+                """,
+                (
+                    intent_id, local_key, folder_id, parent_folder_id, name,
+                    base_revision, pre_delete_path, folder_operation_id,
+                    tree_order_content, tree_hash, now, now,
+                ),
+            )
+            for document_id, server_path, document_revision in sorted(
+                normalized_dependencies
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO sync_folder_delete_intent_documents (
+                        intent_id, document_id, server_path, base_revision,
+                        tombstone_operation_id
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        intent_id, document_id, server_path,
+                        document_revision,
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM sync_folder_delete_intents WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            return self._folder_delete_intent_dict(connection, row)
+
+    def bind_folder_delete_document_operations(
+        self, intent_id, operation_ids, *, trash_path=None
+    ):
+        operation_ids = {
+            str(uuid.UUID(str(document_id))): str(uuid.UUID(str(operation_id)))
+            for document_id, operation_id in (operation_ids or {}).items()
+        }
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_folder_delete_intents WHERE intent_id = ?",
+                (str(intent_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(intent_id)
+            dependencies = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intent_documents
+                WHERE intent_id = ? ORDER BY document_id
+                """,
+                (str(intent_id),),
+            ).fetchall()
+            expected = {item["document_id"] for item in dependencies}
+            if expected != set(operation_ids):
+                raise ValueError("folder delete dependencies are incomplete")
+            for dependency in dependencies:
+                supplied = operation_ids[dependency["document_id"]]
+                existing = dependency["tombstone_operation_id"]
+                if existing and existing != supplied:
+                    raise ValueError("folder delete tombstone operation changed")
+                connection.execute(
+                    """
+                    UPDATE sync_folder_delete_intent_documents
+                    SET tombstone_operation_id = ?
+                    WHERE intent_id = ? AND document_id = ?
+                    """,
+                    (supplied, str(intent_id), dependency["document_id"]),
+                )
+            connection.execute(
+                """
+                UPDATE sync_folder_delete_intents
+                SET trash_path = COALESCE(?, trash_path),
+                    status = 'documents_pending', last_error = '',
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    _normalize_path(trash_path) if trash_path else None,
+                    now, str(intent_id),
+                ),
+            )
+            return self._folder_delete_intent_dict(
+                connection,
+                connection.execute(
+                    "SELECT * FROM sync_folder_delete_intents "
+                    "WHERE intent_id = ?",
+                    (str(intent_id),),
+                ).fetchone(),
+            )
+
+    def attach_folder_delete_tree_operation(
+        self, intent_ids, tree_operation_id, tree_order_content
+    ):
+        intent_ids = [str(item) for item in intent_ids or []]
+        if not intent_ids:
+            return []
+        tree_operation_id = str(uuid.UUID(str(tree_operation_id)))
+        tree_hash = hashlib.sha256(
+            tree_order_content.encode("utf-8")
+        ).hexdigest()
+        now = _utc_now()
+        with self._transaction() as connection:
+            attached = []
+            for intent_id in intent_ids:
+                row = connection.execute(
+                    "SELECT * FROM sync_folder_delete_intents "
+                    "WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(intent_id)
+                existing_operation = row["tree_operation_id"]
+                existing_hash = row["tree_order_payload_sha256"]
+                if existing_operation and existing_operation != tree_operation_id:
+                    raise ValueError("folder delete tree operation changed")
+                if existing_hash and existing_hash != tree_hash:
+                    raise ValueError("folder delete tree payload changed")
+                connection.execute(
+                    """
+                    UPDATE sync_folder_delete_intents
+                    SET tree_operation_id = ?, tree_order_content = ?,
+                        tree_order_payload_sha256 = ?, updated_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        tree_operation_id, tree_order_content, tree_hash,
+                        now, intent_id,
+                    ),
+                )
+                attached.append(self._folder_delete_intent_dict(
+                    connection,
+                    connection.execute(
+                        "SELECT * FROM sync_folder_delete_intents "
+                        "WHERE intent_id = ?",
+                        (intent_id,),
+                    ).fetchone(),
+                ))
+            return attached
+
+    def pending_folder_delete_intents(self, local_key):
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intents
+                WHERE local_key = ? AND status NOT IN ('completed', 'cancelled')
+                ORDER BY created_at, intent_id
+                """,
+                (local_key,),
+            ).fetchall()
+            return [
+                self._folder_delete_intent_dict(connection, row) for row in rows
+            ]
+
+    def folder_delete_intents_for_tree_operation(self, operation_id):
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intents
+                WHERE tree_operation_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                ORDER BY created_at, intent_id
+                """,
+                (str(operation_id),),
+            ).fetchall()
+            return [
+                self._folder_delete_intent_dict(connection, row) for row in rows
+            ]
+
+    def set_folder_delete_intent_status(
+        self, intent_id, status, *, error="", folder_result_revision=None
+    ):
+        allowed = {
+            "prepared", "documents_pending", "folder_pending",
+            "folder_committed", "tree_pending", "completed", "blocked",
+            "cancelled",
+        }
+        if status not in allowed:
+            raise ValueError("invalid folder delete intent status")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_folder_delete_intents WHERE intent_id = ?",
+                (str(intent_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE sync_folder_delete_intents
+                SET status = ?, last_error = ?,
+                    folder_result_revision = COALESCE(
+                        ?, folder_result_revision
+                    ), updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    status, str(error or ""), folder_result_revision,
+                    _utc_now(), str(intent_id),
+                ),
+            )
+            return self._folder_delete_intent_dict(
+                connection,
+                connection.execute(
+                    "SELECT * FROM sync_folder_delete_intents "
+                    "WHERE intent_id = ?",
+                    (str(intent_id),),
+                ).fetchone(),
             )
 
     @staticmethod
