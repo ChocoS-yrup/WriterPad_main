@@ -595,8 +595,14 @@ class V2PullWorker(QThread):
             for settle_attempt in range(
                 len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS) + 1
             ):
-                documents = self.sync_manager._fetch_v2_project_documents(
-                    project_id=project_id
+                # The shape of every document, then bodies only for the ones
+                # that moved. What this returns is what a full fetch returned;
+                # the difference is how much of it travelled.
+                documents = self.sync_manager._documents_with_content(
+                    project_id,
+                    self.sync_manager._fetch_v2_project_documents(
+                        project_id=project_id, include_content=False
+                    ),
                 )
                 folders = self.sync_manager._fetch_v2_project_folders(
                     self.sync_manager.supabase, project_id=project_id
@@ -1181,6 +1187,65 @@ class SyncManager(QObject):
         return cls._remote_snapshot_fingerprint(
             projected, folders, [], tree_orders, {"kind": "index"}
         )
+
+    def _documents_with_content(self, project_id, index_rows):
+        """Complete the shape with content, taking what it can from the ledger.
+
+        The ledger's ``base_content`` is by definition the content the server
+        gave for that document at that revision -- both are written by the
+        same statement and never drift apart. So a row whose revision has not
+        moved can be filled from disk instead of from the network, and only
+        the rows that actually moved are asked for.
+
+        What comes back is the same list a full fetch returns. Nothing
+        downstream can tell the difference, which is the point: classification
+        keeps seeing every document, and the manuscript stops crossing the
+        wire to say it did not change.
+        """
+        rows = [dict(row) for row in (index_rows or []) if isinstance(row, dict)]
+        known = {}
+        try:
+            for stored in self._v2_store.list_documents(
+                self._v2_context["local_key"]
+            ):
+                known[str(stored.get("document_id"))] = stored
+        except (AttributeError, KeyError, TypeError):
+            known = {}
+        active = self._active_v2_paths()
+        wanted = []
+        for row in rows:
+            stored = known.get(str(row.get("document_id")))
+            path = str(row.get("relative_path") or "").replace("\\", "/")
+            reusable = (
+                stored is not None
+                and int(stored.get("revision") or 0) == int(row.get("revision") or 0)
+                # A path the ledger disagrees about is the UUID adoption case,
+                # which compares the file against the server's own bytes.
+                and str(stored.get("local_path") or "") == path
+                and str(stored.get("server_path") or "") == path
+                and path not in active
+            )
+            if reusable:
+                row["content"] = stored.get("base_content") or ""
+            else:
+                wanted.append(row)
+        if wanted:
+            fetched = {
+                str(item.get("document_id")): item
+                for item in self._fetch_v2_project_documents(
+                    project_id=project_id,
+                    document_ids=[row.get("document_id") for row in wanted],
+                )
+            }
+            for row in wanted:
+                served = fetched.get(str(row.get("document_id")))
+                if served is None:
+                    # The row moved again between the two queries. Saying so is
+                    # the only safe answer: an absent body must never be read
+                    # as an empty chapter.
+                    raise RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+                row["content"] = served.get("content") or ""
+        return rows
 
     def _index_probe_authority(self):
         """The authority a shape-only pull may report, or None to fetch fully.
@@ -4701,7 +4766,7 @@ class SyncManager(QObject):
 
     def _fetch_v2_project_documents(
         self, require_connection=False, check_project_status=True,
-        project_id=None, include_content=True,
+        project_id=None, include_content=True, document_ids=None,
     ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             if require_connection:
@@ -4720,13 +4785,24 @@ class SyncManager(QObject):
             if include_content
             else self._DOCUMENT_INDEX_COLUMNS
         )
-        response = self._call_with_session(
-            lambda: self.supabase.table("documents")
-            .select(columns)
-            .eq("project_id", self._pull_project_id(project_id))
-            .execute(),
-            self.supabase,
+        wanted_ids = (
+            [str(item) for item in document_ids if item]
+            if document_ids is not None else None
         )
+        if wanted_ids is not None and not wanted_ids:
+            return []
+
+        def query():
+            request = (
+                self.supabase.table("documents")
+                .select(columns)
+                .eq("project_id", self._pull_project_id(project_id))
+            )
+            if wanted_ids is not None:
+                request = request.in_("document_id", wanted_ids)
+            return request.execute()
+
+        response = self._call_with_session(query, self.supabase)
         data = getattr(response, "data", None)
         if data is None:
             if require_connection:

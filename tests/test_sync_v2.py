@@ -5080,6 +5080,116 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         row.update(overrides)
         return row
 
+    def _seed_ledger_document(self, path, content, revision):
+        document_id = str(uuid.uuid4())
+        self.store.apply_remote_snapshot(
+            self.context, document_id, path, content, revision
+        )
+        return document_id
+
+    def test_an_unchanged_body_is_read_from_the_ledger_not_the_network(self):
+        """안 바뀐 본문은 이미 로컬에 있다. 그걸 다시 받을 이유가 없다."""
+        path = "메인/원고/1권/001화.txt"
+        document_id = self._seed_ledger_document(path, "서버가 준 본문", 4)
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(document_ids)
+            return []
+
+        self.manager._fetch_v2_project_documents = fetch
+        index = [{"document_id": document_id, "relative_path": path,
+                  "revision": 4, "is_deleted": False}]
+
+        rows = self.manager._documents_with_content("p", index)
+
+        self.assertEqual(rows[0]["content"], "서버가 준 본문")
+        self.assertEqual(asked, [])
+
+    def test_a_body_that_moved_is_fetched_and_only_that_one(self):
+        stale = "메인/원고/1권/001화.txt"
+        moved = "메인/원고/1권/002화.txt"
+        stale_id = self._seed_ledger_document(stale, "그대로", 4)
+        moved_id = self._seed_ledger_document(moved, "예전 본문", 4)
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(sorted(document_ids or []))
+            return [{"document_id": moved_id, "relative_path": moved,
+                     "content": "새 본문", "revision": 5, "is_deleted": False}]
+
+        self.manager._fetch_v2_project_documents = fetch
+        index = [
+            {"document_id": stale_id, "relative_path": stale,
+             "revision": 4, "is_deleted": False},
+            {"document_id": moved_id, "relative_path": moved,
+             "revision": 5, "is_deleted": False},
+        ]
+
+        rows = {r["document_id"]: r for r in self.manager._documents_with_content("p", index)}
+
+        self.assertEqual(asked, [[moved_id]])
+        self.assertEqual(rows[stale_id]["content"], "그대로")
+        self.assertEqual(rows[moved_id]["content"], "새 본문")
+
+    def test_a_document_the_ledger_never_saw_is_always_fetched(self):
+        unknown = str(uuid.uuid4())
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(sorted(document_ids or []))
+            return [{"document_id": unknown, "relative_path": "메인/원고/새.txt",
+                     "content": "처음 보는 본문", "revision": 1, "is_deleted": False}]
+
+        self.manager._fetch_v2_project_documents = fetch
+        rows = self.manager._documents_with_content("p", [
+            {"document_id": unknown, "relative_path": "메인/원고/새.txt",
+             "revision": 1, "is_deleted": False},
+        ])
+
+        self.assertEqual(asked, [[unknown]])
+        self.assertEqual(rows[0]["content"], "처음 보는 본문")
+
+    def test_a_body_that_vanished_between_the_two_queries_is_refused(self):
+        """빠진 본문을 빈 원고로 읽으면 한 화가 날아간다. 거부해야 한다."""
+        self.manager._fetch_v2_project_documents = (
+            lambda project_id=None, include_content=True, document_ids=None, **kw: []
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.manager._documents_with_content("p", [
+                {"document_id": str(uuid.uuid4()),
+                 "relative_path": "메인/원고/1권/001화.txt",
+                 "revision": 9, "is_deleted": False},
+            ])
+
+        self.assertIn("INCOMPLETE", str(caught.exception))
+
+    def test_an_open_document_is_fetched_even_at_the_same_revision(self):
+        """열려 있는 문서는 같은 revision 에서도 서버 본문과 대조한다."""
+        path = "메인/원고/1권/001화.txt"
+        document_id = self._seed_ledger_document(path, "원장 본문", 4)
+        previous = self.manager._v2_active_paths_provider
+        self.addCleanup(
+            setattr, self.manager, "_v2_active_paths_provider", previous
+        )
+        self.manager._v2_active_paths_provider = lambda: {path}
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(sorted(document_ids or []))
+            return [{"document_id": document_id, "relative_path": path,
+                     "content": "서버 본문", "revision": 4, "is_deleted": False}]
+
+        self.manager._fetch_v2_project_documents = fetch
+        rows = self.manager._documents_with_content("p", [
+            {"document_id": document_id, "relative_path": path,
+             "revision": 4, "is_deleted": False},
+        ])
+
+        self.assertEqual(asked, [[document_id]])
+        self.assertEqual(rows[0]["content"], "서버 본문")
+
     def test_the_shape_hashes_alike_with_and_without_the_manuscript(self):
         """전체 조회가 남긴 기준선을 본문 없는 조회가 이어받아야 한다.
 

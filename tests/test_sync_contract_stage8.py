@@ -1425,7 +1425,8 @@ class ContractStoreTests(unittest.TestCase):
         calls = []
         manager = SimpleNamespace(
             _ensure_contract_handshake=lambda: calls.append("handshake"),
-            _fetch_v2_project_documents=lambda project_id=None: [],
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: [],
+            _documents_with_content=lambda _project_id, rows: rows,
             _fetch_v2_project_folders=lambda _client, project_id=None: [],
             _needs_folder_history=lambda _rows: False,
             _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
@@ -1528,7 +1529,8 @@ class ContractStoreTests(unittest.TestCase):
         decision_manager = self._contract_manager()
         manager = SimpleNamespace(
             _ensure_contract_handshake=lambda: calls.append("handshake"),
-            _fetch_v2_project_documents=lambda project_id=None: (
+            _documents_with_content=lambda _project_id, rows: rows,
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: (
                 calls.append("documents") or document_reads.pop(0)
             ),
             _fetch_v2_project_folders=lambda _client, project_id=None: (
@@ -1620,7 +1622,8 @@ class ContractStoreTests(unittest.TestCase):
         waits = []
         manager = SimpleNamespace(
             _ensure_contract_handshake=lambda: None,
-            _fetch_v2_project_documents=lambda project_id=None: [stale_tree],
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: [stale_tree],
+            _documents_with_content=lambda _project_id, rows: rows,
             _fetch_v2_project_folders=lambda _client, project_id=None: folders,
             _fetch_v2_project_tree_orders=lambda _client, project_id=None: [],
             _legacy_structure_snapshot_in_flight=(
@@ -1657,7 +1660,8 @@ class ContractStoreTests(unittest.TestCase):
         decision_manager = self._contract_manager()
         manager = SimpleNamespace(
             _ensure_contract_handshake=lambda: None,
-            _fetch_v2_project_documents=lambda project_id=None: [],
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: [],
+            _documents_with_content=lambda _project_id, rows: rows,
             _fetch_v2_project_folders=lambda _client, project_id=None: [],
             _fetch_v2_project_tree_orders=lambda _client, project_id=None: [{
                 "tree_order_id": str(uuid.uuid4()),
