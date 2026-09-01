@@ -53,6 +53,48 @@ class WritingDataTestCase(unittest.TestCase):
     def path(self, relative_path):
         return Path(self.wpm.writing_root_path, relative_path)
 
+    def test_sync_protocol_state_is_refused_at_the_single_write_point(self):
+        """내부 문서가 원고 트리에 파일로 남으면 작품이 열리지 않는다.
+
+        호출부마다 막으면 새 호출부가 생길 때 또 뚫린다. 모든 쓰기가 지나는
+        한 곳에서 거절해야 한다.
+        """
+        for relative_path in (
+            "__antigravity__/tree-order.json",
+            "__antigravity__/trash-purge.json",
+            "__antigravity__",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertFalse(
+                    self.wpm.write_text_file(relative_path, '{"version":1}')
+                )
+
+        self.assertFalse(self.path("__antigravity__").exists())
+
+    def test_the_write_guard_leaves_backup_and_trash_paths_alone(self):
+        """백업·휴지통은 동기화 내부 경로가 아니다. 계속 써져야 한다."""
+        for relative_path in (
+            "백업/충돌/001화 (서버 최신본).txt",
+            "메인/휴지통/버린 원고.txt",
+            "메인/원고/1권/001화.txt",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertTrue(self.wpm.write_text_file(relative_path, "내용"))
+                self.assertEqual(
+                    self.path(relative_path).read_text(encoding="utf-8"), "내용"
+                )
+
+    def test_the_write_guard_and_the_sync_layer_agree_on_one_rule(self):
+        """규칙이 두 벌이면 한쪽은 건너뛰고 한쪽은 쓰게 된다."""
+        from project_creation_v1 import is_sync_internal_path
+        from sync_manager import TREE_ORDER_DOCUMENT_PATH, is_internal_sync_path
+
+        self.assertTrue(is_internal_sync_path(TREE_ORDER_DOCUMENT_PATH))
+        self.assertTrue(is_sync_internal_path(TREE_ORDER_DOCUMENT_PATH))
+        for manuscript in ("메인/원고/1권/001화.txt", "메인/휴지통/버린 원고.txt"):
+            self.assertFalse(is_internal_sync_path(manuscript))
+            self.assertFalse(is_sync_internal_path(manuscript))
+
     @staticmethod
     def _wait_for(predicate, timeout_seconds=5.0):
         app = QApplication.instance() or QApplication([])

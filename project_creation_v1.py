@@ -89,6 +89,29 @@ UNTRACKED_FILES = (
     ".server-project-import.json",
 )
 
+# Paths the sync layer owns. They hold protocol state, not manuscript, so they
+# carry no UUID and identity must never name them. Nothing here creates them
+# either: unlike UNTRACKED_FOLDERS these are not part of a project's shape, and
+# a project that has never synced has none of them. They are listed so a stray
+# one on disk is skipped rather than read as identity divergence, which would
+# otherwise refuse to open the whole project over a file the writer cannot see.
+SYNC_INTERNAL_ROOTS = (
+    "__antigravity__",
+)
+
+
+def is_sync_internal_path(relative_path):
+    """Whether a writing-root path belongs to the sync layer, not the binder.
+
+    One rule, so the audit that skips these and the writer that refuses them
+    cannot drift apart. A second copy of the rule is how a path ends up
+    skipped by one side and written by the other.
+    """
+    path = str(relative_path or "").replace("\\", "/").strip("/")
+    if not path:
+        return False
+    return path.split("/")[0] in SYNC_INTERNAL_ROOTS
+
 
 class CreationError(Exception):
     """A creation transaction cannot proceed or cannot be recovered safely."""
@@ -1203,7 +1226,7 @@ def tracked_tree_entries(root):
     that rebuilds identity has to walk it the same way or the project will
     refuse to open over a difference nobody can see. Both read it from here.
     """
-    skip = set(UNTRACKED_FOLDERS)
+    skip = set(UNTRACKED_FOLDERS) | set(SYNC_INTERNAL_ROOTS)
     for current, directories, files in os.walk(root):
         relative = os.path.relpath(current, root).replace(os.sep, "/")
         if relative == ".":
@@ -1215,7 +1238,9 @@ def tracked_tree_entries(root):
             if name in UNTRACKED_FILES or name.startswith("."):
                 continue
             candidate = f"{relative}/{name}" if relative else name
-            if candidate in skip or candidate.split("/")[0] in ("백업",):
+            if candidate in skip or candidate.split("/")[0] in (
+                "백업",
+            ) + SYNC_INTERNAL_ROOTS:
                 continue
             yield candidate, os.path.isdir(os.path.join(current, name))
 

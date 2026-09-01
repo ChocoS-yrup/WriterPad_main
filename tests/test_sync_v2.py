@@ -362,6 +362,42 @@ class ThreeWayMergeTestCase(unittest.TestCase):
             for noise in ("+++", "---", "@@"):
                 self.assertNotIn(noise, comparison)
 
+    def test_sync_protocol_state_produces_no_conflict_artifacts(self):
+        """순서표 충돌은 원고 충돌이 아니다. 충돌 폴더에 사본을 남기면 안 된다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "충돌 작품"
+            wpm.writing_root_path = str(Path(temp_dir, "충돌 작품", "집필모드"))
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            rel_path = "__antigravity__/tree-order.json"
+            label = MagicMock()
+            widget = SimpleNamespace(
+                wpm=wpm,
+                current_loaded_file_left=None,
+                current_loaded_file_right=None,
+                lbl_current_doc=label,
+                lbl_r_doc=MagicMock(),
+            )
+
+            WritingModeWidget.on_conflict_detected(widget, {
+                "operation": {
+                    "local_path": rel_path,
+                    "base_content": '{"version":1}',
+                    "content": '{"version":1}',
+                },
+                "base_content": '{"version":1}',
+                "local_content": '{"version":1}',
+                "merged_content": '{"version":1}',
+                "remote": {"content": '{"version":1}'},
+            })
+
+            self.assertFalse(Path(wpm.writing_root_path, "백업", "충돌").exists())
+            # The stray file that made a whole project refuse to open started
+            # as one of these copies being offered to the writer.
+            self.assertFalse(Path(wpm.writing_root_path, "__antigravity__").exists())
+            label.setText.assert_not_called()
+
 
 class SyncV2StoreTestCase(unittest.TestCase):
     def setUp(self):

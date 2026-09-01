@@ -14,7 +14,11 @@ from ui_components import SmartTextEdit
 from datetime import datetime
 
 from project_manager_writing import WritingProjectManager
-from sync_manager import SyncManager, is_live_document_path
+from sync_manager import (
+    SyncManager,
+    is_internal_sync_path,
+    is_live_document_path,
+)
 from three_way_merge import build_conflict_report
 from writing_backup import HistoryViewerDialog
 from writing_search import GlobalSearchDialog, LocalSearchDialog
@@ -280,11 +284,23 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         
         # 프로젝트 열기 판정 (열기는 폴더나 UUID를 만들지 않는다)
         self.open_verdict = None
+        # Set here rather than only on refusal, so the status button cannot
+        # inherit a stale refusal if this widget is ever reused for a second
+        # project instead of being rebuilt.
+        self._open_blocked_reason = ""
         if self.pm.current_project:
             from project_creation_v1 import OPEN_OK
 
             self.open_verdict = self.wpm.initialize_project(self.pm.current_project)
             if self.open_verdict["status"] != OPEN_OK:
+                # Kept for the status button. A refused project releases the
+                # shared sync manager, so the last state it published belongs
+                # to whichever project opened before this one, and the toolbar
+                # went on reporting that one as 동기화 완료.
+                self._open_blocked_reason = (
+                    self.open_verdict.get("reason")
+                    or "작품 구성 검사를 통과하지 못했습니다."
+                )
                 QMessageBox.warning(
                     self,
                     "프로젝트를 열 수 없습니다",
@@ -1049,6 +1065,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
     def update_storage_status(
         self, state, detail="", pending_count=0, refresh_activity=True
     ):
+        blocked_reason = str(getattr(self, "_open_blocked_reason", "") or "")
+        if blocked_reason:
+            # Nothing is being synced for a project that would not open, so no
+            # state the manager publishes describes it. Say that instead of
+            # inheriting the previous project's answer.
+            state = "project_unopened"
+            detail = blocked_reason
+            pending_count = 0
         labels = {
             "saved": ("● 로컬 저장 완료", "#86efac", "#163522"),
             "backup": (
@@ -1113,6 +1137,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "#fca5a5",
                 "#451f24",
             ),
+            "project_unopened": (
+                "● 작품을 열지 못함 · 동기화 중지",
+                "#fca5a5",
+                "#451f24",
+            ),
         }
         text, color, background = labels.get(state, labels["saved"])
         activity = dict(getattr(self, "_storage_sync_activity", {}) or {})
@@ -1130,7 +1159,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 )
         unsaved_editor_count = WritingModeWidget._unsaved_editor_count(self)
         editor_dirty = unsaved_editor_count > 0
-        if editor_dirty and state != "empty_guard":
+        if editor_dirty and state not in {"empty_guard", "project_unopened"}:
             dirty_suffix = {
                 "offline": " · 오프라인",
                 "auth_required": " · 로그인 필요",
@@ -1257,6 +1286,18 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         """Translate internal sync state into plain-language cause and action."""
         pending_count = max(0, int(pending_count or 0))
         dirty_count = max(0, int(dirty_count or 0))
+        if state == "project_unopened":
+            return {
+                "title": "작품을 열지 못했습니다",
+                "summary": (
+                    "로컬 파일은 그대로 있습니다. 이 작품은 열리지 않아 "
+                    "동기화를 시작하지 않았습니다."
+                ),
+                "cause": detail or "작품 구성 검사를 통과하지 못했습니다.",
+                "action": "원인을 확인한 뒤 다시 열어주세요. 파일은 변경되지 않았습니다.",
+                "action_code": "",
+                "warning": True,
+            }
         if state == "empty_guard":
             return {
                 "title": "전체 삭제 확인 필요",
@@ -2176,6 +2217,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         return [
             build_conflict_view(self.wpm, document, build_conflict_report)
             for document in documents
+            # Protocol state such as the binder order document is not a
+            # manuscript. Offering it as a version to choose between asks the
+            # writer about a file they cannot read, and picking one wrote it
+            # into the project tree without ever clearing the conflict.
+            if not is_internal_sync_path(document.get("local_path"))
         ]
 
     def open_conflict_resolver(self):
@@ -2202,6 +2248,10 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
     def apply_conflict_choice(self, relative_path, content, label=""):
         """Write the chosen version and let the normal save path clear the conflict."""
         if not relative_path:
+            return False
+        if is_internal_sync_path(relative_path):
+            # Sync protocol state has no editor and no save path, so writing it
+            # here cleared nothing and left the file behind in the project tree.
             return False
         if not self.wpm.write_text_file(relative_path, content):
             QMessageBox.warning(
@@ -2483,6 +2533,12 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "<<<<<<< 내 로컬 편집본\n" + local_content +
                 "\n=======\n" + server_content + "\n>>>>>>> 서버 최신본\n"
             )
+
+        if is_internal_sync_path(rel_path):
+            # A conflict on sync protocol state is not a manuscript conflict.
+            # Comparison copies of it are unreadable to the writer, and the
+            # 충돌 폴더 they land in makes it look like their work is at risk.
+            return
 
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H%M%S")
         base, ext = os.path.splitext(os.path.basename(rel_path))

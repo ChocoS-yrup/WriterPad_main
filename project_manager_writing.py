@@ -165,6 +165,16 @@ class WritingProjectManager:
         if not self.writing_root_path:
             return False
 
+        from project_creation_v1 import is_sync_internal_path
+
+        if is_sync_internal_path(relative_path):
+            # Sync protocol state lives in the durable store, never in the
+            # project tree. One stray copy of it on disk was enough to make a
+            # whole project refuse to open, so the refusal sits at the single
+            # place every writer goes through rather than at each caller.
+            print(f"동기화 내부 경로에는 쓰지 않습니다: {relative_path}")
+            return False
+
         target_path = os.path.join(self.writing_root_path, relative_path)
 
         # 파일이 저장될 폴더가 없을 경우 대비

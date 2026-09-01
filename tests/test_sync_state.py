@@ -798,6 +798,76 @@ class StorageStatusLabelTestCase(unittest.TestCase):
         )
         self.assertNotIn("충돌 30건", target.lbl_storage_status.text)
 
+    def test_a_project_that_would_not_open_is_never_reported_as_synced(self):
+        """열지 못한 작품에 이전 작품의 상태를 물려주면 안 된다.
+
+        열기가 거부되면 공유 매니저가 해제되어 아무것도 전송되지 않는데,
+        버튼은 직전 작품의 '동기화 완료'를 그대로 들고 있었다.
+        """
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _open_blocked_reason="identity와 파일 트리가 일치하지 않는다",
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertEqual(
+            target.lbl_storage_status.text, "● 작품을 열지 못함 · 동기화 중지"
+        )
+        self.assertNotIn("동기화 완료", target.lbl_storage_status.text)
+        guidance = WritingModeWidget._storage_status_guidance(
+            "project_unopened", "identity와 파일 트리가 일치하지 않는다"
+        )
+        self.assertEqual(
+            guidance["cause"], "identity와 파일 트리가 일치하지 않는다"
+        )
+        self.assertTrue(guidance["warning"])
+        self.assertIn("파일은 그대로", guidance["summary"])
+
+    def test_a_pending_count_from_another_project_is_not_shown_either(self):
+        """해제된 매니저가 남긴 대기 건수는 이 작품의 것이 아니다."""
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            _open_blocked_reason="레거시 프로젝트 — 명시적 가져오기 필요",
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "failed", "이전 작품 오류", 7)
+
+        self.assertEqual(
+            target.lbl_storage_status.text, "● 작품을 열지 못함 · 동기화 중지"
+        )
+        self.assertNotIn("7건", target.lbl_storage_status.text)
+        self.assertNotIn("로컬 저장 대기", target.lbl_storage_status.text)
+
+    def test_an_opened_project_keeps_reporting_normally(self):
+        """열린 작품에는 아무 영향이 없어야 한다."""
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _open_blocked_reason="",
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertEqual(target.lbl_storage_status.text, "● 동기화 완료")
+
     def test_invisible_background_pull_keeps_the_completed_sync_label(self):
         activity = {
             "transfer_pending": 0,
