@@ -38,6 +38,8 @@ from sync_manager import (
     STRUCTURE_AUTHORITY_LEGACY,
     TRASH_PURGE_DOCUMENT_PATH,
     TREE_ORDER_DOCUMENT_PATH,
+    TREE_ORDER_STALL_ATTEMPTS,
+    TREE_ORDER_STALL_SECONDS,
     SyncManager,
     V2PullWorker,
     V2QueueWorker,
@@ -5048,6 +5050,74 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             record=lambda event, **kwargs: recorded.append((event, kwargs))
         )
         return recorded
+
+    def _watch_one_entry(self):
+        """Point the stall watch at a fixed identity and one entry."""
+        self.manager._tree_order_stall = {}
+        self.manager._tree_order_stall_identity = None
+        self.addCleanup(setattr, self.manager, "_tree_order_stall", {})
+        self.addCleanup(
+            setattr, self.manager, "_tree_order_stall_identity", None
+        )
+        return SyncManager._tree_entry_fingerprint(
+            "leaf", "메인/윈도우-든폴더/문서문서.txt"
+        )
+
+    def test_the_burst_a_pull_makes_on_open_stays_quiet(self):
+        """열자마자 수십 번 몰아치는 건 순서 문제지 정합성 문제가 아니다."""
+        self._capture_diagnostics()
+        fingerprint = self._watch_one_entry()
+
+        for _ in range(25):
+            self.assertFalse(
+                self.manager._note_tree_order_stall(fingerprint)
+            )
+
+        self.assertFalse(self.manager._tree_order_stalled())
+
+    def test_one_entry_refusing_for_long_enough_is_surfaced_once(self):
+        """스스로 낫지 않는 건 알려야 한다. 다만 한 번만."""
+        recorded = self._capture_diagnostics()
+        fingerprint = self._watch_one_entry()
+        for _ in range(TREE_ORDER_STALL_ATTEMPTS):
+            self.manager._note_tree_order_stall(fingerprint)
+        self.assertFalse(self.manager._tree_order_stalled())
+
+        watch = self.manager._tree_order_stall[fingerprint]
+        watch["first_seen"] -= TREE_ORDER_STALL_SECONDS + 1
+
+        self.assertTrue(self.manager._note_tree_order_stall(fingerprint))
+        self.assertTrue(self.manager._tree_order_stalled())
+        self.assertFalse(self.manager._note_tree_order_stall(fingerprint))
+        self.assertEqual(
+            [e for e, _ in recorded if e == "sync_tree_order_stalled"],
+            ["sync_tree_order_stalled"],
+        )
+
+    def test_the_warning_clears_when_the_order_finally_applies(self):
+        """해소된 정체가 계속 경고하면 다음 경고를 아무도 믿지 않는다."""
+        self._capture_diagnostics()
+        fingerprint = self._watch_one_entry()
+        self.manager._tree_order_stall[fingerprint] = {
+            "first_seen": 0.0, "attempts": 9, "escalated": True
+        }
+        self.manager._tree_order_stall_identity = (
+            self.manager._v2_pull_identity()
+        )
+        self.assertTrue(self.manager._tree_order_stalled())
+
+        self.assertTrue(self.manager._clear_tree_order_stall())
+
+        self.assertFalse(self.manager._tree_order_stalled())
+
+    def test_a_different_project_does_not_inherit_the_watch(self):
+        fingerprint = self._watch_one_entry()
+        self.manager._tree_order_stall[fingerprint] = {
+            "first_seen": 0.0, "attempts": 9, "escalated": True
+        }
+        self.manager._tree_order_stall_identity = ("다른", "작품", "키")
+
+        self.assertFalse(self.manager._tree_order_stalled())
 
     def test_tree_deferral_records_the_entry_that_stopped_it(self):
         recorded = self._capture_diagnostics()

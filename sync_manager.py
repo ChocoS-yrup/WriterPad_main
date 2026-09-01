@@ -82,6 +82,15 @@ REMOTE_SNAPSHOT_FULL_APPLY_SECONDS = 300.0
 # Uploads still dispatch immediately; only the queue-empty final pull waits for
 # this short project-scoped quiet window.
 LOCAL_STRUCTURE_PULL_QUIET_MS = 1500
+# A tree-order entry the server projections do not confirm is usually a commit
+# that has not reached them yet, and it clears by itself. One that never clears
+# is a different thing: the binder order from the writer's other devices stops
+# arriving and nothing says so. Neither can be told apart from a single refusal,
+# only from the same entry refusing for a while, so the two are separated by
+# time rather than by the reason code. The attempt floor keeps the burst a pull
+# makes on open from escalating in seconds.
+TREE_ORDER_STALL_ATTEMPTS = 3
+TREE_ORDER_STALL_SECONDS = 900.0
 # 종료는 하나의 예산 안에서만 원격 작업을 시도한다. 예산이 끝나면 새 요청을
 # 만들지 않고 다음 실행으로 미룬다.
 SHUTDOWN_BUDGET_MS = 5000
@@ -849,6 +858,11 @@ class SyncManager(QObject):
         self._last_sync_error = ""
         self._last_failure_offline = False
         self.current_sync_state = "saved"
+        # Held in memory on purpose. A restart is a fair reason to assume the
+        # projections have caught up, and nothing here belongs in the durable
+        # queue.
+        self._tree_order_stall = {}
+        self._tree_order_stall_identity = None
         self._last_published_sync_activity = {
             "transfer_pending": 0,
             "transferring": 0,
@@ -1553,6 +1567,55 @@ class SyncManager(QObject):
                 state=str(fingerprint),
                 pending_count=self.pending_retry_count,
             )
+            self._note_tree_order_stall(str(fingerprint))
+
+    def _note_tree_order_stall(self, fingerprint):
+        """Count how long one entry has gone unconfirmed, and escalate once.
+
+        Returns whether this observation is the one that escalated.
+        """
+        identity = self._v2_pull_identity()
+        if self._tree_order_stall_identity != identity:
+            self._tree_order_stall_identity = identity
+            self._tree_order_stall = {}
+        now = time.monotonic()
+        entry = self._tree_order_stall.setdefault(
+            fingerprint, {"first_seen": now, "attempts": 0, "escalated": False}
+        )
+        entry["attempts"] += 1
+        if entry["escalated"]:
+            return False
+        if (
+            entry["attempts"] < TREE_ORDER_STALL_ATTEMPTS
+            or now - entry["first_seen"] < TREE_ORDER_STALL_SECONDS
+        ):
+            return False
+        entry["escalated"] = True
+        self._diagnostics.record(
+            "sync_tree_order_stalled",
+            state=fingerprint,
+            pending_count=self.pending_retry_count,
+        )
+        self._publish_sync_state()
+        return True
+
+    def _clear_tree_order_stall(self):
+        """Forget the watch once an order snapshot applies without refusing."""
+        if not self._tree_order_stall:
+            return False
+        escalated = self._tree_order_stalled()
+        self._tree_order_stall = {}
+        if escalated:
+            self._publish_sync_state()
+        return escalated
+
+    def _tree_order_stalled(self):
+        identity = self._v2_pull_identity()
+        if self._tree_order_stall_identity != identity:
+            return False
+        return any(
+            entry.get("escalated") for entry in self._tree_order_stall.values()
+        )
 
     def record_binder_timing(self, phase, elapsed_ms):
         """Record slow UI-side binder work without retaining project paths."""
@@ -3230,6 +3293,15 @@ class SyncManager(QObject):
             publish("pull_pending", "업로드가 안정 지점에 도달하면 서버 변경을 확인합니다.")
         elif self._active_backups > 0:
             publish("backup", "로컬 자동백업을 만드는 중입니다.")
+        elif self._tree_order_stalled():
+            # Below every transfer state: documents are still syncing, and only
+            # the arrangement is not arriving. Saying nothing was worse -- the
+            # writer reorders on one device and watches the other never follow.
+            publish(
+                "tree_order_stalled",
+                "다른 기기가 보낸 바인더 순서가 서버 문서 목록과 맞지 않아 "
+                "적용하지 못하고 있습니다. 원고 자체는 계속 동기화됩니다.",
+            )
         else:
             publish("saved", "현재 로컬 변경 사항이 저장되어 있습니다.")
 
@@ -8034,6 +8106,10 @@ class SyncManager(QObject):
                         folder_rows is not None,
                         remote_folder_ids=remote_folder_ids,
                     )
+                    # Reached only when the plan classified every entry, which
+                    # includes the snapshot that changes nothing. The watch has
+                    # to end there too, or a resolved stall keeps warning.
+                    self._clear_tree_order_stall()
                     if change:
                         changes.append(change)
                         self._diagnostics.record(

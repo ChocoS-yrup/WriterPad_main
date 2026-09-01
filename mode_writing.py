@@ -1142,6 +1142,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "#fca5a5",
                 "#451f24",
             ),
+            "tree_order_stalled": (
+                "● 원고 동기화 중 · 바인더 순서 대기",
+                "#fcd34d",
+                "#3b3017",
+            ),
         }
         text, color, background = labels.get(state, labels["saved"])
         activity = dict(getattr(self, "_storage_sync_activity", {}) or {})
@@ -1295,6 +1300,23 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 ),
                 "cause": detail or "작품 구성 검사를 통과하지 못했습니다.",
                 "action": "원인을 확인한 뒤 다시 열어주세요. 파일은 변경되지 않았습니다.",
+                "action_code": "",
+                "warning": True,
+            }
+        if state == "tree_order_stalled":
+            return {
+                "title": "바인더 순서만 반영되지 않음",
+                "summary": (
+                    "원고는 정상적으로 동기화되고 있습니다. 다른 기기에서 바꾼 "
+                    "폴더·화 순서만 적용되지 않고 있습니다."
+                ),
+                "cause": detail or (
+                    "다른 기기가 보낸 순서표가 서버 문서 목록과 맞지 않습니다."
+                ),
+                "action": (
+                    "다른 기기에서 순서를 한 번 다시 정리하면 새 순서표가 올라와 "
+                    "해소될 수 있습니다. 원고는 안전합니다."
+                ),
                 "action_code": "",
                 "warning": True,
             }

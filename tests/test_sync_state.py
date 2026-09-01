@@ -798,6 +798,33 @@ class StorageStatusLabelTestCase(unittest.TestCase):
         )
         self.assertNotIn("충돌 30건", target.lbl_storage_status.text)
 
+    def test_a_stalled_binder_order_says_the_manuscript_is_still_syncing(self):
+        """순서만 막힌 것을 원고 사고처럼 보이게 하면 안 된다."""
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "tree_order_stalled", "서버 문서 목록과 맞지 않습니다.", 0
+        )
+
+        self.assertEqual(
+            target.lbl_storage_status.text, "● 원고 동기화 중 · 바인더 순서 대기"
+        )
+        guidance = WritingModeWidget._storage_status_guidance(
+            "tree_order_stalled", "서버 문서 목록과 맞지 않습니다."
+        )
+        self.assertIn("원고는 정상적으로 동기화", guidance["summary"])
+        self.assertIn("원고는 안전", guidance["action"])
+        self.assertTrue(guidance["warning"])
+        self.assertEqual(guidance["action_code"], "")
+
     def test_a_project_that_would_not_open_is_never_reported_as_synced(self):
         """열지 못한 작품에 이전 작품의 상태를 물려주면 안 된다.
 
