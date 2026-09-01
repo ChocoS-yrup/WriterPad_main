@@ -1482,6 +1482,31 @@ class SyncManager(QObject):
                 pending_count=self.pending_retry_count,
             )
 
+    def _retire_stuck_tree_order_conflict_from_snapshot(self, documents):
+        """Retire a stuck order conflict using the tree order a pull just read.
+
+        The apply is where the server's order is normally in hand, but a pull
+        that defers its apply never gets there. The fetched rows carry the
+        same order, so the conflict can be retired from them instead.
+        """
+        for remote in documents or []:
+            try:
+                path = self._safe_relative_path(remote.get("relative_path"))
+            except ValueError:
+                continue
+            if path != TREE_ORDER_DOCUMENT_PATH:
+                continue
+            try:
+                document_id = str(uuid.UUID(str(remote.get("document_id"))))
+            except (TypeError, ValueError):
+                return 0
+            return self._retire_stuck_tree_order_conflict(
+                document_id,
+                remote.get("content") or "",
+                int(remote.get("revision") or 0),
+            )
+        return 0
+
     def _retire_stuck_tree_order_conflict(self, document_id, content, revision):
         """Clear a binder-order conflict queued before automatic resolution.
 
@@ -9537,6 +9562,13 @@ class SyncManager(QObject):
                         "INVALID_TREE_ORDER_RESPONSE"
                     )
                     return
+                # Before that decision, not after it. A conflict counts as an
+                # outstanding intent, so a stuck order conflict defers the very
+                # apply that would have retired it, and the two keep each other
+                # alive: every later pull is an ordinary one, and one conflict
+                # closes that gate. Retiring it here breaks the ring, and the
+                # successor it leaves is a live intent the drain can publish.
+                self._retire_stuck_tree_order_conflict_from_snapshot(documents)
                 defer_baseline_apply = bool(
                     reason == "baseline"
                     and self._v2_store is not None

@@ -5607,6 +5607,77 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertNotEqual(document["sync_state"], "conflict")
         self.assertEqual(document["base_content"], remote_content)
 
+    def _stick_a_tree_order_conflict(self, remote_content):
+        """Leave the queue in the state an older build could not get out of."""
+        operation = self.manager.record_tree_order(
+            {"메인/메모장": ["B", "A"]}, retry=False
+        )
+        self.store.mark_conflict(
+            operation["operation_id"],
+            2,
+            TREE_ORDER_DOCUMENT_PATH,
+            remote_content,
+            operation["content"],
+            operation["content"],
+            error_message="TREE_ORDER_CONFLICT",
+        )
+        return operation
+
+    def test_a_stuck_conflict_is_retired_from_the_fetched_snapshot(self):
+        """적용을 건너뛰는 pull 도 충돌을 회수할 수 있어야 한다.
+
+        충돌은 활성 intent 로 세어지고, 활성 intent 가 있으면 baseline pull 이
+        적용을 통째로 건너뛴다. 회수를 적용 안에만 두면 그 둘이 서로를
+        영원히 살려둔다 — 실제로 그렇게 멈춰 있었다.
+        """
+        content = self.manager._tree_order_content
+        remote_content = content({"메인/메모장": ["A", "C", "B"]})
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            content({"메인/메모장": ["A", "B"]}),
+            1,
+        )
+        self._stick_a_tree_order_conflict(remote_content)
+        local_key = self.context["local_key"]
+        self.assertTrue(self.store.has_outstanding_structure_intent(local_key))
+
+        retired = self.manager._retire_stuck_tree_order_conflict_from_snapshot([
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": "메인/원고/001화.txt",
+                "content": "원고",
+                "revision": 3,
+            },
+            {
+                "document_id": self.tree_document_id,
+                "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                "content": remote_content,
+                "revision": 2,
+            },
+        ])
+
+        self.assertEqual(retired, 1)
+        self.assertEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+        # The successor is a live intent the drain can publish, which is what
+        # lets the queue move again instead of standing still.
+        self.assertIsNotNone(self.store.next_ready_operation(local_key))
+
+    def test_a_snapshot_without_the_order_document_retires_nothing(self):
+        retired = self.manager._retire_stuck_tree_order_conflict_from_snapshot([
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": "메인/원고/001화.txt",
+                "content": "원고",
+                "revision": 3,
+            },
+        ])
+
+        self.assertEqual(retired, 0)
+
     def test_retiring_finds_nothing_when_there_is_no_conflict(self):
         self.assertEqual(
             self.manager._retire_stuck_tree_order_conflict(
