@@ -2053,6 +2053,25 @@ class SyncV2Store:
         with self._reader() as connection:
             return self._has_active_connection(connection, document_id)
 
+    def conflicted_operations(self, document_id):
+        """Return this document's operation ids that stopped at a conflict.
+
+        A conflict is an active state, so one that nothing can resolve keeps
+        the document's work queued for good. The caller needs the ids to
+        retire them.
+        """
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT operation_id FROM sync_operations WHERE document_id = ?"
+                " ORDER BY queue_id",
+                (document_id,),
+            ).fetchall()
+            return [
+                row["operation_id"]
+                for row in rows
+                if self._derived_state(connection, row["operation_id"]) == "conflict"
+            ]
+
     def active_document_server_paths(self, local_key):
         """Return server paths whose document work has not reached a terminal state.
 

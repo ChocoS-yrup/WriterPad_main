@@ -1482,6 +1482,31 @@ class SyncManager(QObject):
                 pending_count=self.pending_retry_count,
             )
 
+    def _retire_stuck_tree_order_conflict(self, document_id, content, revision):
+        """Clear a binder-order conflict queued before automatic resolution.
+
+        A conflict on this document is not one the writer can resolve, and a
+        single conflict closes the project's ordinary pull gate, so one
+        already sitting in the queue would stay there for good. Retire it the
+        way a new one is now resolved: onto the server's order.
+        """
+        lister = getattr(self._v2_store, "conflicted_operations", None)
+        if not callable(lister):
+            return 0
+        retired = 0
+        for operation_id in lister(document_id):
+            self._v2_store.rebase_clean_merge(
+                operation_id, revision, content, content
+            )
+            retired += 1
+        if retired:
+            self._diagnostics.record(
+                "sync_tree_order_server_wins",
+                state=f"retired={retired};revision={revision}",
+                pending_count=self.pending_retry_count,
+            )
+        return retired
+
     def _record_tree_deferral(self, scope, error):
         """Record a skipped tree-order apply and, when known, which entry.
 
@@ -7967,6 +7992,12 @@ class SyncManager(QObject):
                         # multi-rename batch. Never materialize that unconfirmed
                         # path, but do not withhold unrelated confirmed changes.
                         continue
+                    # A pull is the one place holding the server's order, so it
+                    # is where a conflict queued by an older build can finally
+                    # be retired.
+                    self._retire_stuck_tree_order_conflict(
+                        document_id, content, revision
+                    )
                     change = self._apply_remote_tree_order_document(
                         document_id,
                         content,
@@ -9987,25 +10018,27 @@ class SyncManager(QObject):
                         remote.get("content", ""),
                     )
                     if merged_tree_content is None:
-                        self._v2_store.mark_conflict(
-                            operation_id,
-                            remote["revision"],
-                            remote.get("relative_path", TREE_ORDER_DOCUMENT_PATH),
-                            remote.get("content", ""),
-                            operation.get("content", ""),
-                            operation.get("content", ""),
-                            error_message="TREE_ORDER_CONFLICT",
+                        # Binder order is display state and it has no editor,
+                        # so there is nowhere for the writer to resolve a
+                        # conflict on it. Queuing one instead stopped the
+                        # project syncing altogether: a single conflict closes
+                        # the ordinary pull gate, and the conflict resolver
+                        # could not clear this document -- picking a version
+                        # only wrote protocol state into the project tree and
+                        # left the operation exactly where it was.
+                        #
+                        # Take the server's order. It is the arrangement both
+                        # peers already hold, so it converges without asking,
+                        # and a writer who wants their own arrangement back
+                        # only has to drag the rows again. That is true of
+                        # order and of nothing else here, which is why no
+                        # other document resolves itself.
+                        merged_tree_content = remote.get("content", "")
+                        self._diagnostics.record(
+                            "sync_tree_order_server_wins",
+                            state=f"revision={remote['revision']}",
+                            pending_count=self.pending_retry_count,
                         )
-                        return {
-                            "kind": "conflict",
-                            "operation": operation,
-                            "remote": remote,
-                            "base_content": operation.get("base_content", ""),
-                            "local_content": operation.get("content", ""),
-                            "merged_content": operation.get("content", ""),
-                            "conflict_count": 1,
-                            "error": "TREE_ORDER_CONFLICT",
-                        }
                     self._v2_store.rebase_clean_merge(
                         operation_id,
                         remote["revision"],

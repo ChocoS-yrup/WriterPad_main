@@ -5474,7 +5474,7 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.assertIsNone(merged)
 
-    def test_unsafe_tree_order_conflict_is_recorded_instead_of_rebased(self):
+    def test_unsafe_tree_order_conflict_settles_on_the_server_order(self):
         content = self.manager._tree_order_content
         base_content = content({"메인/메모장": ["A", "B"]})
         local_order = {"메인/메모장": ["B", "A"]}
@@ -5514,14 +5514,106 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
                 operation["operation_id"]
             )
 
-        self.assertEqual(result["kind"], "conflict")
-        self.assertEqual(result["error"], "TREE_ORDER_CONFLICT")
+        # Binder order has no editor to resolve a conflict in, and one queued
+        # conflict closes the project's pull gate. Settling on the server's
+        # order is what keeps the project syncing at all.
+        self.assertEqual(result["kind"], "auto_merged")
+        self.assertEqual(result["merged_content"], remote_content)
         document = self.store.get_document(
             self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
         )
-        self.assertEqual(document["sync_state"], "conflict")
+        self.assertNotEqual(document["sync_state"], "conflict")
         self.assertEqual(document["revision"], 2)
         self.assertEqual(document["base_content"], remote_content)
+        self.assertEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+
+    def test_a_manuscript_conflict_still_waits_for_the_writer(self):
+        """자동 해소는 순서표에만 적용된다. 원고는 작가가 골라야 한다."""
+        path = "메인/원고/001화.txt"
+        self.store.apply_remote_snapshot(
+            self.context, str(uuid.uuid4()), path, "서버 기준본", 1
+        )
+        operation = self.store.enqueue(self.context, path, "로컬 편집본")
+        client = _FakeClient()
+        real_rpc = client.rpc
+
+        def conflict_rpc(name, params):
+            if name == "commit_document":
+                return SimpleNamespace(
+                    execute=MagicMock(side_effect=RuntimeError("REVISION_CONFLICT"))
+                )
+            return real_rpc(name, params)
+
+        client.rpc = conflict_rpc
+        self.manager.supabase = client
+        with patch.object(
+            self.manager,
+            "_fetch_remote_document",
+            return_value={
+                "document_id": operation["document_id"],
+                "relative_path": path,
+                "content": "서버가 따로 고친 본문",
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ):
+            result = self.manager._process_v2_operation(
+                operation["operation_id"]
+            )
+
+        self.assertEqual(result["kind"], "conflict")
+
+    def test_a_binder_order_conflict_from_an_older_build_is_retired(self):
+        """이미 굳은 충돌은 재시도 대상이 아니라, pull 이 직접 풀어야 한다."""
+        content = self.manager._tree_order_content
+        base_content = content({"메인/메모장": ["A", "B"]})
+        remote_content = content({"메인/메모장": ["A", "C", "B"]})
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            base_content,
+            1,
+        )
+        operation = self.manager.record_tree_order(
+            {"메인/메모장": ["B", "A"]}, retry=False
+        )
+        self.store.mark_conflict(
+            operation["operation_id"],
+            2,
+            TREE_ORDER_DOCUMENT_PATH,
+            remote_content,
+            operation["content"],
+            operation["content"],
+            error_message="TREE_ORDER_CONFLICT",
+        )
+        self.assertNotEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+
+        retired = self.manager._retire_stuck_tree_order_conflict(
+            self.tree_document_id, remote_content, 2
+        )
+
+        self.assertEqual(retired, 1)
+        self.assertEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+        document = self.store.get_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
+        )
+        self.assertNotEqual(document["sync_state"], "conflict")
+        self.assertEqual(document["base_content"], remote_content)
+
+    def test_retiring_finds_nothing_when_there_is_no_conflict(self):
+        self.assertEqual(
+            self.manager._retire_stuck_tree_order_conflict(
+                self.tree_document_id, "{}", 1
+            ),
+            0,
+        )
 
     def test_second_rapid_volume_skeleton_runs_before_waiting_chapters(self):
         baseline = {"<root>": ["원고"], "메인/원고": []}
