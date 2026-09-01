@@ -515,6 +515,7 @@ class V2PullWorker(QThread):
         pull_identity=None,
         expected_structure_generation=None,
         cached_snapshot_fingerprint=None,
+        cached_index_fingerprint=None,
     ):
         super().__init__()
         self.sync_manager = sync_manager
@@ -525,6 +526,43 @@ class V2PullWorker(QThread):
         self.pull_identity = pull_identity
         self.expected_structure_generation = expected_structure_generation
         self.cached_snapshot_fingerprint = cached_snapshot_fingerprint
+        self.cached_index_fingerprint = cached_index_fingerprint
+
+    def _unchanged_payload(self, probe, authority):
+        """Report a shape that did not move, exactly as a full fetch would.
+
+        The same staleness checks under the same gate: a reply is only allowed
+        to say nothing changed about the project and generation it was started
+        for. The snapshot fingerprint is restated so the caller's cache stays
+        the one it already validated.
+        """
+        payload = {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {"kind": authority, "folder_paths": None},
+            "snapshot_fingerprint": self.cached_snapshot_fingerprint,
+            "index_fingerprint": probe["fingerprint"],
+        }
+        with self.sync_manager._structure_mutation_gate:
+            if (
+                self.pull_identity is not None
+                and self.sync_manager._v2_pull_identity() != self.pull_identity
+            ):
+                kind = "stale_project"
+            elif (
+                self.expected_structure_generation is not None
+                and self.sync_manager.local_structure_generation
+                != self.expected_structure_generation
+            ):
+                kind = "stale_generation"
+            else:
+                kind = "unchanged"
+            payload["background_apply"] = {
+                "kind": kind, "changes": [], "recovered_count": 0
+            }
+        return payload
 
     def run(self):
         try:
@@ -534,6 +572,23 @@ class V2PullWorker(QThread):
             # once per opened project is the whole policy. The reading has to be
             # in hand before the structure branch below consults it.
             self.sync_manager._ensure_contract_handshake()
+            # Ask for the shape first. Only a project whose shape moved is
+            # worth moving the manuscript for, and most pulls find it has not:
+            # the timer runs every five seconds and a writer changes something
+            # far less often than that. Taken only with both baselines in
+            # hand, so the settle loop and the authority selection below have
+            # already run once on a snapshot that applied cleanly.
+            if self.cached_index_fingerprint and self.cached_snapshot_fingerprint:
+                authority = self.sync_manager._index_probe_authority()
+                if authority:
+                    probe = self.sync_manager._probe_remote_index(
+                        project_id, self.cached_index_fingerprint
+                    )
+                    if probe and probe["unchanged"]:
+                        self.resultReady.emit(
+                            True, self._unchanged_payload(probe, authority)
+                        )
+                        return
             documents = []
             folders = []
             tree_orders = []
@@ -611,6 +666,11 @@ class V2PullWorker(QThread):
                 "tree_orders": tree_orders,
                 "structure_authority": structure_authority,
                 "snapshot_fingerprint": snapshot_fingerprint,
+                "index_fingerprint": (
+                    self.sync_manager._remote_index_fingerprint(
+                        documents, folders, tree_orders
+                    )
+                ),
             }
             if (
                 self.cached_snapshot_fingerprint
@@ -1003,6 +1063,7 @@ class SyncManager(QObject):
                 "pulling": False,
                 "pull_visible": False,
                 "applied_snapshot_fingerprint": None,
+                "applied_index_fingerprint": None,
                 "applied_structure_generation": None,
                 "last_full_apply_monotonic": 0.0,
                 "last_local_structure_monotonic": 0.0,
@@ -1099,6 +1160,78 @@ class SyncManager(QObject):
             default=str,
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _remote_index_fingerprint(cls, documents, folders, tree_orders):
+        """Hash a snapshot's shape without its manuscript.
+
+        The same canonicalisation the full fingerprint uses, over rows that
+        carry no content. Two projects that hash alike here differ in nothing
+        a pull would apply: content never moves without revision moving too.
+        """
+        # Projected explicitly so a full fetch and a shape-only fetch hash
+        # alike. The full pull seeds this baseline; without that the probe
+        # could never take over from it.
+        columns = tuple(cls._DOCUMENT_INDEX_COLUMNS.split(","))
+        projected = [
+            {column: row.get(column) for column in columns}
+            for row in (documents or [])
+            if isinstance(row, dict)
+        ]
+        return cls._remote_snapshot_fingerprint(
+            projected, folders, [], tree_orders, {"kind": "index"}
+        )
+
+    def _index_probe_authority(self):
+        """The authority a shape-only pull may report, or None to fetch fully.
+
+        Two things make the manuscript worth downloading even when nothing
+        changed. An authority that was never settled cannot be restated from
+        memory, and a pull that skips the rows cannot retire a stuck order
+        conflict, because that is retired from the rows themselves.
+        """
+        authority = self._v2_structure_authority
+        if authority not in {
+            STRUCTURE_AUTHORITY_CONTRACT, STRUCTURE_AUTHORITY_LEGACY
+        }:
+            return None
+        checker = getattr(
+            self._v2_store, "has_outstanding_structure_intent", None
+        )
+        if not callable(checker):
+            return None
+        try:
+            if checker((self._v2_context or {}).get("local_key")):
+                return None
+        except Exception:
+            return None
+        return authority
+
+    def _probe_remote_index(self, project_id, cached_index_fingerprint):
+        """Ask what the project looks like now, without downloading it.
+
+        Returns the fingerprint of the shape and whether it still matches the
+        one a previous pull applied. A caller with no baseline gets ``None``
+        and must fetch in full.
+        """
+        if not cached_index_fingerprint:
+            return None
+        documents = self._fetch_v2_project_documents(
+            project_id=project_id, include_content=False
+        )
+        folders = self._fetch_v2_project_folders(
+            self.supabase, project_id=project_id
+        )
+        tree_orders = self._fetch_v2_project_tree_orders(
+            self.supabase, project_id=project_id
+        )
+        fingerprint = self._remote_index_fingerprint(
+            documents, folders, tree_orders
+        )
+        return {
+            "fingerprint": fingerprint,
+            "unchanged": fingerprint == cached_index_fingerprint,
+        }
 
     @staticmethod
     def _outbound_work_count(counts):
@@ -4552,9 +4685,23 @@ class SyncManager(QObject):
         """The project a request is about: the one it froze, or the one open."""
         return str(project_id or (self._v2_context or {}).get("project_id") or "")
 
+    # Every column the pull reads except the manuscript itself. Content is the
+    # whole weight of a snapshot -- a thousand chapters is tens of megabytes --
+    # and a commit that changes it always advances revision, which is here. So
+    # this is enough to tell an unchanged project from a changed one without
+    # moving the manuscript at all.
+    _DOCUMENT_INDEX_COLUMNS = (
+        "document_id,relative_path,revision,is_deleted,deleted_at,"
+        "parent_folder_id,name,structure_revision,updated_at"
+    )
+    _DOCUMENT_FULL_COLUMNS = (
+        "document_id,relative_path,content,revision,is_deleted,deleted_at,"
+        "parent_folder_id,name,structure_revision,updated_at"
+    )
+
     def _fetch_v2_project_documents(
         self, require_connection=False, check_project_status=True,
-        project_id=None,
+        project_id=None, include_content=True,
     ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             if require_connection:
@@ -4568,12 +4715,14 @@ class SyncManager(QObject):
                 raise RuntimeError("PROJECT_TRASHED")
             if state == "purged":
                 raise RuntimeError("PROJECT_PURGED")
+        columns = (
+            self._DOCUMENT_FULL_COLUMNS
+            if include_content
+            else self._DOCUMENT_INDEX_COLUMNS
+        )
         response = self._call_with_session(
             lambda: self.supabase.table("documents")
-            .select(
-                "document_id,relative_path,content,revision,is_deleted,deleted_at,"
-                "parent_folder_id,name,structure_revision,updated_at"
-            )
+            .select(columns)
             .eq("project_id", self._pull_project_id(project_id))
             .execute(),
             self.supabase,
@@ -9589,6 +9738,13 @@ class SyncManager(QObject):
             started_coordinator.get("applied_snapshot_fingerprint")
             if cache_is_fresh else None
         )
+        # Handed over on the same condition. The periodic full apply is what
+        # repairs out-of-process changes to the files, and a shape-only pull
+        # would never reach it, so the shape baseline expires with the other.
+        worker.cached_index_fingerprint = (
+            started_coordinator.get("applied_index_fingerprint")
+            if cache_is_fresh else None
+        )
         self._v2_pull_worker = worker
         self._v2_pull_worker_identity = started_for
         retry_after_success = {"value": False}
@@ -9663,6 +9819,7 @@ class SyncManager(QObject):
                     started_coordinator["baseline_validated"] = True
                     started_coordinator["pull_pending"] = True
                     started_coordinator["applied_snapshot_fingerprint"] = None
+                    started_coordinator["applied_index_fingerprint"] = None
                     started_coordinator["applied_structure_generation"] = None
                     retry_after_success["value"] = bool(
                         retry_pending_after_pull
@@ -9786,6 +9943,12 @@ class SyncManager(QObject):
                     started_coordinator["applied_snapshot_fingerprint"] = (
                         snapshot_fingerprint
                     )
+                    # Cached together, so a shape baseline can never outlive
+                    # the snapshot baseline it was taken beside.
+                    started_coordinator["applied_index_fingerprint"] = (
+                        payload.get("index_fingerprint")
+                        or started_coordinator.get("applied_index_fingerprint")
+                    )
                     started_coordinator["applied_structure_generation"] = (
                         self._local_structure_generation
                     )
@@ -9801,6 +9964,7 @@ class SyncManager(QObject):
                         )
                 elif isinstance(background_apply, dict):
                     started_coordinator["applied_snapshot_fingerprint"] = None
+                    started_coordinator["applied_index_fingerprint"] = None
                     started_coordinator["applied_structure_generation"] = None
                 if self._outbound_work_count(
                     self._v2_activity_counts(started_for[2])

@@ -36,6 +36,7 @@ from project_manager_writing import WritingProjectManager
 from sync_manager import (
     LockWorker,
     STRUCTURE_AUTHORITY_LEGACY,
+    STRUCTURE_AUTHORITY_UNKNOWN,
     TRASH_PURGE_DOCUMENT_PATH,
     TREE_ORDER_DOCUMENT_PATH,
     TREE_ORDER_STALL_ATTEMPTS,
@@ -5062,6 +5063,87 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         return SyncManager._tree_entry_fingerprint(
             "leaf", "메인/윈도우-든폴더/문서문서.txt"
         )
+
+    def _document_row(self, **overrides):
+        row = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "메인/원고/1권/001화.txt",
+            "content": "본문" * 3000,
+            "revision": 3,
+            "is_deleted": False,
+            "deleted_at": None,
+            "parent_folder_id": None,
+            "name": None,
+            "structure_revision": None,
+            "updated_at": "2026-09-02T00:00:00+00:00",
+        }
+        row.update(overrides)
+        return row
+
+    def test_the_shape_hashes_alike_with_and_without_the_manuscript(self):
+        """전체 조회가 남긴 기준선을 본문 없는 조회가 이어받아야 한다.
+
+        둘이 다르게 해시되면 탐침이 기준선을 물려받지 못해 영원히 부트스트랩
+        되지 않는다.
+        """
+        full = [self._document_row()]
+        light = [{k: v for k, v in full[0].items() if k != "content"}]
+
+        self.assertEqual(
+            SyncManager._remote_index_fingerprint(full, [], []),
+            SyncManager._remote_index_fingerprint(light, [], []),
+        )
+
+    def test_every_change_a_pull_would_apply_moves_the_shape(self):
+        """탐침이 놓치는 변경이 있으면 그 변경은 영영 안 내려온다."""
+        base = [self._document_row()]
+        baseline = SyncManager._remote_index_fingerprint(base, [], [])
+        for label, row in (
+            ("본문 수정(서버가 revision 을 함께 올린다)",
+             self._document_row(content="다른 본문", revision=4)),
+            ("삭제", self._document_row(is_deleted=True)),
+            ("이름/경로 변경",
+             self._document_row(relative_path="메인/원고/1권/002화.txt")),
+            ("폴더 이동", self._document_row(parent_folder_id=str(uuid.uuid4()))),
+            ("구조 revision 변경", self._document_row(structure_revision=7)),
+        ):
+            with self.subTest(label=label):
+                self.assertNotEqual(
+                    SyncManager._remote_index_fingerprint([row], [], []),
+                    baseline,
+                )
+        self.assertNotEqual(
+            SyncManager._remote_index_fingerprint(base + [self._document_row()], [], []),
+            baseline,
+        )
+        self.assertNotEqual(
+            SyncManager._remote_index_fingerprint([], [], []), baseline
+        )
+
+    def test_a_shape_only_pull_is_refused_without_a_settled_authority(self):
+        """기준을 정한 적 없으면 기억으로 되풀이할 수 없다."""
+        previous = self.manager._v2_structure_authority
+        self.addCleanup(
+            setattr, self.manager, "_v2_structure_authority", previous
+        )
+        self.manager._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+
+        self.assertIsNone(self.manager._index_probe_authority())
+
+    def test_a_shape_only_pull_is_refused_while_structure_intent_is_open(self):
+        """굳은 순서표 충돌은 받아온 행에서 회수한다. 행을 안 받으면 못 푼다."""
+        previous = self.manager._v2_structure_authority
+        self.addCleanup(
+            setattr, self.manager, "_v2_structure_authority", previous
+        )
+        self.manager._v2_structure_authority = STRUCTURE_AUTHORITY_LEGACY
+        self.assertEqual(
+            self.manager._index_probe_authority(), STRUCTURE_AUTHORITY_LEGACY
+        )
+
+        self.manager.record_tree_order({"메인/메모장": ["A"]}, retry=False)
+
+        self.assertIsNone(self.manager._index_probe_authority())
 
     def test_the_burst_a_pull_makes_on_open_stays_quiet(self):
         """열자마자 수십 번 몰아치는 건 순서 문제지 정합성 문제가 아니다."""
