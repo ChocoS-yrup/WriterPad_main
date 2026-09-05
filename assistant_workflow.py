@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import time
+from uuid import uuid4
 
 from PyQt6.QtCore import Qt, QSettings, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QAction, QFont, QShortcut, QKeySequence, QTextCursor
@@ -11,10 +12,68 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QStatusBar, QLabel, QSplitter,
 )
 
-from assistant_runtime import AIGenerationWorker
+from assistant_runtime import AIGenerationWorker, AIRequestContext
 
 
 class AssistantWorkflowMixin:
+    def _ai_session_key(self, step_name):
+        return (self.pm.project_path, self.current_chapter, step_name)
+
+    def _start_ai_request(self, step_name, selected_model, *, feedback=False, use_context_caching=False):
+        request = AIRequestContext(
+            str(uuid4()), self.pm.current_project, self.pm.project_path,
+            self.current_chapter, step_name, selected_model, feedback,
+        )
+        worker = AIGenerationWorker(
+            step_name, self.ai_panel.chat_session, selected_model,
+            use_context_caching=use_context_caching, parent=self,
+        )
+        worker.request_context = request
+        if not hasattr(self, "_ai_workers"):
+            self._ai_workers = []
+        self._ai_workers.append(worker)
+        self._active_ai_request = request
+        self._ai_session_context = self._ai_session_key(step_name)
+        self.is_working = True
+        self.sidebar.setEnabled(False)
+        self.chapter_selector.setEnabled(False)
+        self.update_status_bar()
+        worker.resultReady.connect(self._on_ai_request_result)
+        worker.error.connect(self._on_ai_request_error)
+        worker.finished.connect(self._on_ai_worker_finished)
+        if feedback:
+            self.chat_worker = worker
+        else:
+            self.ai_worker = worker
+        worker.start()
+
+    def _on_ai_request_result(self, step_name, text, in_tok, out_tok):
+        self.on_ai_finished(
+            step_name, text, in_tok, out_tok,
+            request=self.sender().request_context,
+        )
+
+    def _on_ai_request_error(self, message):
+        self.on_ai_error(message, request=self.sender().request_context)
+
+    def _on_ai_worker_finished(self):
+        worker = self.sender()
+        if worker in self._ai_workers:
+            self._ai_workers.remove(worker)
+        worker.deleteLater()
+
+    def has_running_ai_workers(self):
+        return any(worker.isRunning() for worker in getattr(self, "_ai_workers", ()))
+
+    def _cancel_ai_request(self):
+        request = getattr(self, "_active_ai_request", None)
+        self._active_ai_request = None  # invalidate even already-queued callbacks
+        for worker in getattr(self, "_ai_workers", ()):
+            if worker.request_context == request:
+                worker.requestInterruption()
+        self.is_working = False
+        return request is not None
+
     def handle_ai_open(self, step_name):
         """AI 세션을 초기화(또는 기존 세션 유지)하고 창만 엽니다."""
         if self.is_working:
@@ -30,8 +89,10 @@ class AssistantWorkflowMixin:
         elif step_name == "요약":
             system_prompt = self.pm.get_project_setting("prompt_summary", self.pm.global_config.get("prompt_summary", ""))
 
-        if getattr(self.ai_panel, 'step_name', None) != step_name:
-            self.ai_panel.init_session(step_name, system_prompt, "", is_generation=False)
+        session_key = self._ai_session_key(step_name)
+        if getattr(self, "_ai_session_context", None) != session_key:
+            self.ai_panel.init_session(step_name, system_prompt, "", is_generation=False, reset=True)
+        self._ai_session_context = session_key
 
         self.ai_panel.show()
 
@@ -65,9 +126,13 @@ class AssistantWorkflowMixin:
 
         if original_step == "초안":
             # [기능 추가] 초안 작성 시 완성본 탭(인덱스 1)의 화수도 현재 화수로 자동 동기화
-            self.left_panels[1].current_chapter = self.current_chapter
-            if self.is_split_mode:
+            completed = self.left_panels[1]
+            if completed.current_chapter != self.current_chapter:
+                if not self.sync_internal_storage(completed):
+                    return
+                completed.current_chapter = self.current_chapter
                 self.right_panels[1].current_chapter = self.current_chapter
+                self.load_content_for_panel(completed)
             self.pm.set_project_setting("chapter_tab_1", self.current_chapter)
 
             if context is None:
@@ -95,7 +160,7 @@ class AssistantWorkflowMixin:
                 self.ai_panel.init_session(original_step, system_prompt, context)
             else:
                 # 사용자가 수동으로 버튼을 눌렀을 경우, 워커 실행 없이 채팅창만 염
-                self.ai_panel.show()
+                self.handle_ai_open(step_name)
                 return
 
         # 2. 상태 업데이트 및 작업 시작
@@ -118,10 +183,7 @@ class AssistantWorkflowMixin:
         model_key = model_mapping.get(step_name, "model_eval")
         selected_model = self.pm.get_project_setting(model_key, self.pm.global_config.get(model_key, "Gemini 3.1 Pro"))
 
-        self.ai_worker = AIGenerationWorker(step_name, self.ai_panel.chat_session, selected_model)
-        self.ai_worker.finished.connect(self.on_ai_finished)
-        self.ai_worker.error.connect(self.on_ai_error)
-        self.ai_worker.start()
+        self._start_ai_request(step_name, selected_model)
 
     def gather_context(self, step_name, current_chapter, max_summary_ch=None):
         """초안 탭 등에서 직전 화수(N-1)의 요약 탭 텍스트를 실제 파일에서 불러옵니다."""
@@ -137,22 +199,16 @@ class AssistantWorkflowMixin:
         return prev_summary
 
     def stop_ai_generation(self):
-        stopped = False
-        if hasattr(self, 'ai_worker') and self.ai_worker.isRunning():
-            self.ai_worker.terminate()
-            self.ai_worker.wait()
-            stopped = True
-        if hasattr(self, 'chat_worker') and self.chat_worker.isRunning():
-            self.chat_worker.terminate()
-            self.chat_worker.wait()
-            stopped = True
-
-        if stopped:
-            self.is_working = False
+        if self._cancel_ai_request():
             self.ai_panel.stop_loading_animation()
             self.ai_panel.append_chat("AI", "사용자에 의해 생성이 중단되었습니다.")
+            self.update_status_bar()
 
     def hide_ai_panel(self):
+        self._cancel_ai_request()
+        self.ai_panel.stop_loading_animation()
+        self.ai_panel.is_final_confirm_mode = False
+        self.ai_panel.pending_raw_texts = ""
         self.ai_panel.hide()
         self.sidebar.setEnabled(True) # 탭 이동 버튼 잠금 해제
         if hasattr(self, 'chapter_selector'):
@@ -162,8 +218,18 @@ class AssistantWorkflowMixin:
 
     def handle_final_confirm(self):
         """평가 탭에서 최종 확정 버튼 클릭 시 호출됨"""
+        if self.is_working:
+            return
         self.hide_ai_panel()
         chapter = self.current_chapter
+
+        summary_panel = self.left_panels[3]
+        if summary_panel.current_chapter != chapter:
+            if not self.sync_internal_storage(summary_panel):
+                return
+            summary_panel.current_chapter = chapter
+            self.right_panels[3].current_chapter = chapter
+            self.load_content_for_panel(summary_panel)
 
         # 1. 완성본 텍스트 가져오기 (양쪽 패널 중 완성본 찾기)
         completed_text = ""
@@ -234,8 +300,6 @@ class AssistantWorkflowMixin:
                 recent_raws.append(f"[{i}화 원문]\n{raw_text}\n")
 
             combined_recent_raws = "\n".join(recent_raws)
-            self.ai_panel.pending_raw_texts = combined_recent_raws
-            self.ai_panel.is_final_confirm_mode = True
 
             # 요약 탭 이동 설정
             if self.is_split_mode:
@@ -254,15 +318,14 @@ class AssistantWorkflowMixin:
             user_text = f"다음 1~21화 전체 원문을 쪼개지 말고 한 번에 요약해주세요.\n\n{combined_1_21}"
 
             self.ai_panel.init_session("요약", system_prompt=prompt_summary, user_text=user_text)
+            self.ai_panel.pending_raw_texts = combined_recent_raws
+            self.ai_panel.is_final_confirm_mode = True
             self.ai_panel.show()
             self.ai_panel.append_chat("AI", "1~21화 One-Shot 컨텍스트 캐싱 요약을 백그라운드에서 진행 중입니다. 잠시만 기다려주세요...")
 
             # AIGenerationWorker 사용 (Context Caching 활성화)
             summary_model = self.pm.get_project_setting("model_summary", self.pm.global_config.get("model_summary", "Gemini 3.1 Pro"))
-            self.ai_worker = AIGenerationWorker("요약", self.ai_panel.chat_session, summary_model, use_context_caching=True)
-            self.ai_worker.finished.connect(self.on_ai_finished)
-            self.ai_worker.error.connect(self.on_ai_error)
-            self.ai_worker.start()
+            self._start_ai_request("요약", summary_model, use_context_caching=True)
 
         else:
             # [3구간] 27화 이상: 정밀 롤링 방식 (이전 요약본 + 밀려난 1개 원문) -> AI 요약 -> 최근 5개 원문 병합
@@ -288,9 +351,6 @@ class AssistantWorkflowMixin:
 
             combined_recent_raws = "\n".join(recent_raws)
 
-            self.ai_panel.pending_raw_texts = combined_recent_raws
-            self.ai_panel.is_final_confirm_mode = True
-
             # 요약 탭 이동
             if self.is_split_mode:
                 self.btn_split.blockSignals(True)
@@ -310,15 +370,20 @@ class AssistantWorkflowMixin:
             user_text = f"[이전 요약(1~{chapter-6}화)]\n{prev_summary}\n\n[추가 원문({chapter-5}화)]\n{shifted_raw}"
 
             self.ai_panel.init_session("요약", system_prompt=prompt_summary, user_text=user_text)
+            self.ai_panel.pending_raw_texts = combined_recent_raws
+            self.ai_panel.is_final_confirm_mode = True
             self.ai_panel.show()
             self.ai_panel.append_chat("AI", f"1~{chapter-5}화 롤링 요약을 백그라운드에서 진행 중입니다. 잠시만 기다려주세요...")
 
-            self.ai_worker = AIGenerationWorker("요약", self.ai_panel.chat_session, summary_model)
-            self.ai_worker.finished.connect(self.on_ai_finished)
-            self.ai_worker.error.connect(self.on_ai_error)
-            self.ai_worker.start()
+            self._start_ai_request("요약", summary_model)
 
     def apply_ai_result(self, final_text):
+        if (
+            self.is_working
+            or getattr(self, "_ai_session_context", None)
+            != self._ai_session_key(self.ai_panel.step_name)
+        ):
+            return
         target_panel = None
         left_p = self.left_panels[self.left_stack.currentIndex()]
         right_p = self.right_panels[self.right_stack.currentIndex()] if self.is_split_mode else None
@@ -328,6 +393,8 @@ class AssistantWorkflowMixin:
         elif right_p and right_p.step_name == self.ai_panel.step_name:
             target_panel = right_p
 
+        if target_panel and target_panel.current_chapter != self.current_chapter:
+            return
         if target_panel:
             if getattr(self.ai_panel, "is_final_confirm_mode", False):
                 full_text = final_text + "\n\n--- 원문 ---\n\n" + getattr(self.ai_panel, "pending_raw_texts", "")
@@ -358,6 +425,8 @@ class AssistantWorkflowMixin:
 
 
     def handle_ai_feedback(self, feedback_text):
+        if self.is_working:
+            return
         step_name = self.ai_panel.step_name
         model_mapping = {
             "초안": "model_draft",
@@ -367,47 +436,32 @@ class AssistantWorkflowMixin:
         model_key = model_mapping.get(step_name, "model_eval")
         selected_model = self.pm.get_project_setting(model_key, self.pm.global_config.get(model_key, "Gemini 3.1 Pro"))
 
-        self.chat_worker = AIGenerationWorker(step_name, self.ai_panel.chat_session, selected_model)
+        self._start_ai_request(step_name, selected_model, feedback=True)
 
-        def on_chat_finished(s_name, new_text, in_tok=0, out_tok=0):
-            self.pm.log_api_cost(s_name, selected_model, in_tok, out_tok)
-            self.update_status_bar()
-            self.ai_panel.update_result(new_text, "요청하신 대로 텍스트를 수정했습니다.")
-            self.pm.save_ai_response(s_name, self.current_chapter, new_text)
-
-        def on_chat_error(err):
-            self.ai_panel.update_result("", f"오류 발생: {err}")
-
-        self.chat_worker.finished.connect(on_chat_finished)
-        self.chat_worker.error.connect(on_chat_error)
-        self.chat_worker.start()
-
-    def on_ai_finished(self, step_name, generated_text, in_tok=0, out_tok=0):
-        if not self.pm.current_project:
+    def on_ai_finished(self, step_name, generated_text, in_tok=0, out_tok=0, *, request=None):
+        if request is None or request != getattr(self, "_active_ai_request", None):
             return
-
-        # 비용 로깅 및 UI 업데이트
-        model_name = "Gemini 3.1 Pro"
-        if hasattr(self, 'model_selector'):
-            if step_name == "요약":
-                model_name = self.model_selector.current_model_display_name(self.model_selector.cb_summary)
-            elif step_name == "초안":
-                model_name = self.model_selector.current_model_display_name(self.model_selector.cb_draft)
-            elif step_name in ["평가", "완성본"]:
-                model_name = self.model_selector.current_model_display_name(self.model_selector.cb_eval)
-
-        self.pm.log_api_cost(step_name, model_name, in_tok, out_tok)
+        self._active_ai_request = None
+        self.is_working = False
+        if (self.pm.current_project, self.pm.project_path) != (request.project_name, request.project_path):
+            self.update_status_bar()
+            return
+        self.pm.log_api_cost(request.step_name, request.model, in_tok, out_tok)
+        self.pm.save_ai_response(request.step_name, request.chapter, generated_text)
         self.update_status_bar()
 
-        panel = None
-        if self.ai_panel.isVisible() and self.ai_panel.step_name == step_name:
-            if step_name in ["완성본", "평가"]:
+        if (
+            self.ai_panel.isVisible()
+            and self._ai_session_key(step_name) == self._ai_session_context
+            and self.current_chapter == request.chapter
+        ):
+            if request.feedback:
+                msg = "요청하신 대로 텍스트를 수정했습니다."
+            elif step_name in ["완성본", "평가"]:
                 msg = "작성된 내용을 확인해보세요. 수정하고 싶은 부분이 있다면 말씀해 주세요."
             else:
                 msg = "작성된 초안을 확인해보세요. 수정하고 싶은 부분이 있다면 말씀해 주세요."
             self.ai_panel.update_result(generated_text, msg)
-
-        self.pm.save_ai_response(step_name, self.current_chapter, generated_text)
 
     def handle_extraction(self, is_full, start, end, fmt):
         if is_full:
@@ -471,7 +525,14 @@ class AssistantWorkflowMixin:
             except Exception as e:
                 QMessageBox.critical(self, "오류", f"PDF 저장 실패:\n{e}")
 
-    def on_ai_error(self, err_msg):
+    def on_ai_error(self, err_msg, *, request=None):
+        if request is None or request != getattr(self, "_active_ai_request", None):
+            return
+        self._active_ai_request = None
+        self.is_working = False
+        if (self.pm.current_project, self.pm.project_path) != (request.project_name, request.project_path):
+            self.update_status_bar()
+            return
         if self.ai_panel.isVisible():
             self.ai_panel.update_result("", f"AI 생성 중 오류가 발생했습니다:\n{err_msg}", is_error=True)
         self.update_status_bar()

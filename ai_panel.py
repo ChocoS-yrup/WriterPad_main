@@ -57,6 +57,9 @@ class AIPanelWidgetBase(QWidget):
         self.loading_timer.timeout.connect(self.update_loading_animation)
         self.loading_bubble = None
         self.loading_dots = 0
+        self.scroll_timer = QTimer(self)
+        self.scroll_timer.setSingleShot(True)
+        self.scroll_timer.timeout.connect(self.scroll_chat_to_bottom)
 
         # 상단 스플리터 (좌: 에디터, 우: 채팅)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -155,6 +158,8 @@ class AIPanelWidgetBase(QWidget):
         self.stopRequested.emit()
 
     def start_loading_animation(self):
+        self.btn_apply.setEnabled(False)
+        self.btn_apply_selected.setEnabled(False)
         self.btn_send.setEnabled(True)
         self.btn_send.setText("중지")
         self.btn_send.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold;")
@@ -197,6 +202,7 @@ class AIPanelWidgetBase(QWidget):
             self.btn_toggle_chat.setText("💬 채팅창 닫기")
 
     def init_session(self, step_name, system_prompt="", user_text="", is_generation=True):
+        self.stop_loading_animation()
         self.step_name = step_name
         self.result_editor.clear()
 
@@ -230,8 +236,12 @@ class AIPanelWidgetBase(QWidget):
         bubble = ChatBubble(text, is_me)
         self.chat_vbox.addWidget(bubble)
         # 스크롤 최하단으로 이동
-        QTimer.singleShot(50, lambda: self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum()))
+        self.scroll_timer.start(50)
         return bubble
+
+    def scroll_chat_to_bottom(self):
+        scrollbar = self.chat_scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def send_feedback(self):
         feedback = self.chat_input.toPlainText().strip()
@@ -369,13 +379,16 @@ class AIPanelWidget(QWidget):
     def is_final_confirm_mode(self, value):
         self.current_panel.is_final_confirm_mode = value
 
-    def init_session(self, step_name, system_prompt="", user_text="", is_generation=True):
+    def init_session(self, step_name, system_prompt="", user_text="", is_generation=True, *, reset=False):
         if step_name in self.panels:
             self.current_panel = self.panels[step_name]
             self.step_name = step_name
             self.stack.setCurrentWidget(self.current_panel)
 
-            if is_generation or not getattr(self.current_panel, 'chat_session', None):
+            if reset:
+                self.current_panel.is_final_confirm_mode = False
+                self.current_panel.pending_raw_texts = ""
+            if reset or is_generation or not getattr(self.current_panel, 'chat_session', None):
                 self.current_panel.init_session(step_name, system_prompt, user_text, is_generation)
 
     def update_result(self, *args, **kwargs):

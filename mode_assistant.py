@@ -216,6 +216,9 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
                 stack.addWidget(p)
                 if j < 4: # EditorPanel
                     p.saveRequested.connect(self.save_content)
+                    p.autoSaveRequested.connect(
+                        lambda step, text, panel=p: self.autosave_panel(panel, text)
+                    )
                     p.aiGenerationRequested.connect(self.handle_ai_generation)
                     p.aiOpenRequested.connect(self.handle_ai_open)
                     p.text_edit.textChanged.connect(self.update_status_bar)
@@ -291,7 +294,9 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
                     worker.finished.connect(lambda w=worker: self.save_workers.remove(w) if w in self.save_workers else None)
                     worker.start()
                     
-                self.sync_internal_storage(old_panel)
+                if not self.sync_internal_storage(old_panel):
+                    self.update_sidebar_buttons()
+                    return
                 old_panel.text_edit.document().setModified(False)
 
         # 설정 탭(4번) 진입 시 분할 모드 임시 해제 로직
@@ -446,17 +451,45 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
         return None
 
     def sync_internal_storage(self, panel):
-        if not panel: return
-        text = panel.text_edit.toPlainText()
-        self.pm.save_chapter_text(panel.step_name, panel.current_chapter, text)
+        if not panel: return True
+        panel.autosave_timer.stop()
+        text = panel.text_edit.text_with_pending_input_method()
+        return self.autosave_panel(panel, text)
+
+    def autosave_panel(self, panel, text):
+        """The shared document belongs to its panel's chapter, not the toolbar."""
+        try:
+            self.pm.save_chapter_text(panel.step_name, panel.current_chapter, text)
+        except (OSError, UnicodeError) as error:
+            panel.text_edit.document().setModified(True)
+            panel.autosave_timer.start()
+            self.status_bar.showMessage(f"자동저장 실패 — 다시 시도합니다: {error}")
+            return False
+        if panel.text_edit.text_with_pending_input_method() == text:
+            panel.autosave_timer.stop()
+            # Saving a visible preedit must not force or disturb Korean IME.
+            panel.text_edit.document().setModified(
+                panel.text_edit.has_pending_input_method()
+            )
+        return True
 
     def load_content_for_panel(self, panel):
         if not panel: return
+        # Paired editors share a QTextDocument; neither timer may retain work
+        # from the chapter that is being replaced.
+        for paired in self.left_panels[:4] + self.right_panels[:4]:
+            if paired.step_name == panel.step_name:
+                paired.autosave_timer.stop()
         loaded_text = self.pm.load_chapter_text(panel.step_name, panel.current_chapter)
                 
-        panel.text_edit.blockSignals(True)
-        panel.text_edit.setPlainText(loaded_text)
-        panel.text_edit.blockSignals(False)
+        editors = [p.text_edit for p in self.left_panels[:4] + self.right_panels[:4]
+                   if p.step_name == panel.step_name]
+        previous_blocks = [editor.blockSignals(True) for editor in editors]
+        try:
+            panel.text_edit.setPlainText(loaded_text)
+        finally:
+            for editor, blocked in zip(editors, previous_blocks):
+                editor.blockSignals(blocked)
         panel.text_edit.document().setModified(False)
         panel.update_count()
     def on_chapter_changed(self, chapter):
@@ -470,7 +503,11 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
 
         panel = self.get_active_panel()
         if panel:
-            self.sync_internal_storage(panel)
+            if not self.sync_internal_storage(panel):
+                self.chapter_selector.blockSignals(True)
+                self.chapter_selector.set_value(self.current_chapter)
+                self.chapter_selector.blockSignals(False)
+                return
             panel.current_chapter = chapter
             
             # 현재 탭 인덱스를 확인하여 좌/우 패널 모두 화수 업데이트 및 개별 저장
@@ -732,10 +769,8 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
     def manual_save(self):
         panel = self.get_active_panel()
         if panel:
-            text = panel.text_edit.toPlainText()
-            self.pm.save_chapter_text(panel.step_name, panel.current_chapter, text, is_backup=False)
-            panel.text_edit.document().setModified(False)
-            self.status_bar.showMessage(f"[{panel.step_name}] 메인 폴더에 수동 저장되었습니다.", 2000)
+            if self.sync_internal_storage(panel):
+                self.status_bar.showMessage(f"[{panel.step_name}] 메인 폴더에 수동 저장되었습니다.", 2000)
 
     def check_unsaved_changes(self, is_final_quit=False):
         """저장되지 않은 변경사항이 있는지 확인하고 처리. 진행(True) / 취소(False) 반환"""
@@ -801,7 +836,8 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
         if msg_box.clickedButton() == btn_save:
             for p in panels:
                 if p.text_edit.document().isModified():
-                    self.sync_internal_storage(p)
+                    if not self.sync_internal_storage(p):
+                        return False
                     p.text_edit.document().setModified(False)
                     
             if writing_mode_needs_save and hasattr(self, 'writing_mode'):
@@ -874,11 +910,12 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
                     self.pm.set_project_setting("current_tab_index", i)
                     break
         
-        if self.is_working:
+        if self.is_working or self.has_running_ai_workers():
             QMessageBox.warning(
                 self, 
                 "사용 중", 
-                "사용 중입니다. (현재 작업이 완료된 후 종료할 수 있습니다)"
+                "AI 요청이 실행 중이거나 취소한 요청을 정리하고 있습니다.\n"
+                "요청이 끝난 뒤 종료해 주세요."
             )
             event.ignore() # 종료 차단
             return
@@ -903,13 +940,14 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
     def force_quit(self):
         """프로세스를 완전히 종료하는 메서드"""
         # 트레이의 '종료' 버튼을 눌렀을 때도 작업 중이면 종료 차단
-        if self.is_working:
+        if self.is_working or self.has_running_ai_workers():
             self.showNormal()
             self.activateWindow()
             QMessageBox.warning(
                 self, 
                 "사용 중", 
-                "사용 중입니다. (현재 작업이 완료된 후 종료할 수 있습니다)"
+                "AI 요청이 실행 중이거나 취소한 요청을 정리하고 있습니다.\n"
+                "요청이 끝난 뒤 종료해 주세요."
             )
             return
             
