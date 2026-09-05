@@ -1321,7 +1321,7 @@ class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
                     SyncManager, "_persist_supabase_session", staticmethod(persist)
                 ), \
                 patch.dict("sys.modules", {"supabase": supabase}):
-            yield lambda: SyncManager.create_supabase_client(config)
+            yield lambda **kwargs: SyncManager.create_supabase_client(config, **kwargs)
 
     def test_a_timeout_leaves_the_writer_signed_in(self):
         auth = SimpleNamespace(
@@ -1336,6 +1336,7 @@ class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
         self.assertIsNotNone(client)
         self.assertFalse(client._antigravity_authenticated)
         self.assertEqual(client._antigravity_restore_error_kind, "timeout")
+        self.assertTrue(client._antigravity_restore_pending)
         # The session is still there, so the next attempt can recover by itself.
         self.assertEqual(self.keyring.clears, 0)
         self.assertTrue(self.keyring.present)
@@ -1354,6 +1355,7 @@ class SessionRestoreThroughTheClientTestCase(unittest.TestCase):
 
         self.assertFalse(client._antigravity_authenticated)
         self.assertEqual(client._antigravity_restore_error_kind, "authentication")
+        self.assertFalse(client._antigravity_restore_pending)
         self.assertEqual(self.keyring.clears, 1)
         self.assertFalse(self.keyring.present)
 

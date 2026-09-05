@@ -124,15 +124,19 @@ def arm_contract_handshake(
         access_token_with_subject(subject) if subject is not None else "not-a-jwt"
     )
     identity = manager._contract_identity()
+    project = manager._v2_store.get_project(manager._v2_context["local_key"])
     manager._contract_handshake = {
         "generation": manager._v2_context_generation,
+        "context_key": manager._contract_context_key(),
         "project_id": manager._v2_context["project_id"],
         "identity": identity,
         "contract_sha256": CANONICAL_CONTRACT_SHA256,
         "observed_at": "",
         "outcome": outcome,
+        "project_sync_mode": project["project_sync_mode"],
+        "migration_epoch": project["migration_epoch"],
     }
-    manager._contract_handshake_attempt = manager._v2_context_generation
+    manager._contract_handshake_attempt = manager._contract_context_key()
 
 
 class _HandshakeClient:
@@ -2132,6 +2136,9 @@ class ContractStoreTests(unittest.TestCase):
         manager._v2_context = dict(self.context)
         manager._v2_device_id = DEVICE_ID
         manager.supabase = Client()
+        arm_contract_handshake(manager)
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
         self.store.mark_attempt(operation["operation_id"])
         result = manager._process_v2_operation(operation["operation_id"])
         self.assertEqual(result["kind"], "committed")
@@ -2180,7 +2187,7 @@ class ContractStoreTests(unittest.TestCase):
         reopened.mark_attempt(operation["operation_id"])
         result = manager._process_v2_operation(operation["operation_id"])
         self.assertEqual(result["kind"], "committed")
-        self.assertEqual([name for name, _ in manager.supabase.calls], ["ensure_project"])
+        self.assertEqual([name for name, _ in manager.supabase.calls], [])
 
     def test_contract_document_partial_response_is_not_recorded_or_applied(self):
         self._activate_id_based()
@@ -2358,6 +2365,9 @@ class ContractStoreTests(unittest.TestCase):
             manager._v2_context = dict(self.context)
             manager._v2_device_id = DEVICE_ID
             manager.supabase = Client()
+            arm_contract_handshake(manager)
+            manager._auth_retry_blocked = False
+            manager._shutting_down = False
             result = manager._process_contract_structure_batch(BATCH_ID)
 
             self.assertEqual(result, response)

@@ -29,7 +29,6 @@ from runtime_profile import is_forced_offline
 from sync_contract import (
     CANONICAL_CONTRACT_SHA256,
     SyncContractError,
-    read_handshake_compatibility,
     require_server_compatibility,
 )
 from binder_order import (
@@ -42,6 +41,8 @@ from binder_order import (
 from project_paths import LocalProjectPathError, validate_local_project_name
 from sync_diagnostics import SyncDiagnosticLog, format_diagnostic_report
 from sync_v2_store import SyncV2Store
+from handshake_lifecycle import HandshakeLifecycleMixin, ContractDispatchPaused
+from network_recovery import NetworkRecoveryMixin
 from three_way_merge import three_way_merge
 
 
@@ -467,7 +468,9 @@ class V2QueueWorker(QThread):
 
     def run(self):
         try:
-            result = self.sync_manager._process_v2_operation(self.operation_id)
+            context = getattr(self, "dispatch_context", None)
+            result = (self.sync_manager._process_v2_operation(self.operation_id, context)
+                      if context is not None else self.sync_manager._process_v2_operation(self.operation_id))
             kind = result.get("kind")
             self.resultReady.emit(
                 kind in {"committed", "auto_merged", "conflict", "blocked"},
@@ -488,7 +491,9 @@ class V2StructureBatchWorker(QThread):
 
     def run(self):
         try:
-            result = self.sync_manager._process_contract_structure_batch(self.batch_id)
+            result = self.sync_manager._process_contract_structure_batch(
+                self.batch_id, getattr(self, "dispatch_context", None)
+            )
             self.resultReady.emit(
                 result.get("kind") in {
                     "atomic_structure_commit_success",
@@ -569,8 +574,8 @@ class V2PullWorker(QThread):
             project_id = self.project_id
             # The pull for an opened project is where the handshake happens: it
             # is off the UI thread, a connection is already assumed, and asking
-            # once per opened project is the whole policy. The reading has to be
-            # in hand before the structure branch below consults it.
+            # once per session/project is enough after a definitive answer.
+            # Transient failures retry on this worker with bounded backoff.
             self.sync_manager._ensure_contract_handshake()
             # Ask for the shape first. Only a project whose shape moved is
             # worth moving the manuscript for, and most pulls find it has not:
@@ -711,7 +716,9 @@ class V2PullWorker(QThread):
             # who started typing during fetch to be overwritten.
             self.resultReady.emit(True, payload)
         except Exception as error:
-            self.resultReady.emit(False, str(error))
+            self.resultReady.emit(False, (
+                error if SyncManager._transient_handshake_error(error) else str(error)
+            ))
 
 
 class ServerActionWorker(QThread):
@@ -870,7 +877,7 @@ def auth_error_facts(error, classified):
     }
 
 
-class SyncManager(QObject):
+class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
     syncStateChanged = pyqtSignal(str, str, int)  # state, detail, pending retry count
     conflictDetected = pyqtSignal(object)
     autoMergeApplied = pyqtSignal(object)
@@ -946,6 +953,8 @@ class SyncManager(QObject):
         # The last handshake reading, and the generation it was asked for.
         # Both live in memory only: restarting the app is one of the events
         # that has to make an old reading stop counting.
+        self._init_handshake_lifecycle()
+        self._auth_context_generation = 0
         self._contract_handshake = None
         self._contract_handshake_attempt = None
         self._contract_handshake_error = ""
@@ -1050,6 +1059,7 @@ class SyncManager(QObject):
             self._v2_context_generation,
             str(context.get("project_id") or ""),
             str(context.get("local_key") or ""),
+            self._auth_context_generation,
         )
 
     def _current_pull_coordinator(self, create=True):
@@ -1354,11 +1364,12 @@ class SyncManager(QObject):
         afterwards finds nothing to apply.
         """
         self._cancel_scheduled_v2_retry(reset_backoff=True)
-        self._v2_context = None
-        # Every request already in the air belongs to the generation that is
-        # ending here. None of them may land on whatever is attached next.
-        self._v2_context_generation += 1
-        self._forget_contract_handshake()
+        with self._contract_lock:
+            self._v2_context = None
+            # Every request already in the air belongs to the generation that is
+            # ending here. None of them may land on whatever is attached next.
+            self._v2_context_generation += 1
+            self._forget_contract_handshake()
         self._v2_wpm = None
         self._v2_untracked_recovery_paths = set()
         self._v2_structure_authority = None
@@ -1396,19 +1407,21 @@ class SyncManager(QObject):
                 "열 수 없는 프로젝트는 동기화에 연결하지 않습니다."
             )
         self._cancel_scheduled_v2_retry(reset_backoff=True)
-        self._v2_store = store or self._v2_store or SyncV2Store()
-        self._v2_wpm = wpm
-        self._v2_device_id = str(device_id)
-        local_key = self._v2_store.local_key_for(writing_root_path)
-        project_was_configured = self._v2_store.get_project(local_key) is not None
-        selected_project_id = project_id or forced_project_id() or None
-        self._v2_context = self._v2_store.configure_project(
-            wpm.writing_root_path, project_name, selected_project_id
-        )
-        self._v2_context["writer_device_id"] = self._v2_device_id
-        # A new project is a new generation, even when the one before it was
-        # released first: a reply from the old one must not pass for this one.
-        self._v2_context_generation += 1
+        with self._contract_lock:
+            self._forget_contract_handshake()
+            self._v2_store = store or self._v2_store or SyncV2Store()
+            self._v2_wpm = wpm
+            self._v2_device_id = str(device_id)
+            local_key = self._v2_store.local_key_for(writing_root_path)
+            project_was_configured = self._v2_store.get_project(local_key) is not None
+            selected_project_id = project_id or forced_project_id() or None
+            self._v2_context = self._v2_store.configure_project(
+                wpm.writing_root_path, project_name, selected_project_id
+            )
+            self._v2_context["writer_device_id"] = self._v2_device_id
+            # A new project is a new generation, even when the one before it was
+            # released first: a reply from the old one must not pass for this one.
+            self._v2_context_generation += 1
         self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
         self._v2_structure_authority_error = ""
         self._v2_structure_authority_identity = self._v2_pull_identity()
@@ -1996,6 +2009,8 @@ class SyncManager(QObject):
         invalidation marker. It is never identity proof or an authorization
         decision; the server still owns both of those.
         """
+        if not getattr(self.supabase, "_antigravity_authenticated", True):
+            return ""
         try:
             token = str(
                 getattr(self.supabase, "_antigravity_access_token", "") or ""
@@ -2012,11 +2027,6 @@ class SyncManager(QObject):
             return ""
         return hashlib.sha256(subject.encode("utf-8")).hexdigest()[:16]
 
-    def _forget_contract_handshake(self):
-        """Drop the reading so nothing downstream can act on it any more."""
-        self._contract_handshake = None
-        self._contract_handshake_attempt = None
-
     def _forget_stale_contract_handshake(self, error):
         """Drop the reading when a server answer has overtaken it."""
         if self._stable_error_code(error) in self._CONTRACT_HANDSHAKE_INVALIDATING:
@@ -2026,6 +2036,8 @@ class SyncManager(QObject):
         """The last handshake, but only while it still describes what is open."""
         reading = self._contract_handshake
         if not isinstance(reading, dict) or not self.is_v2_enabled:
+            return None
+        if reading.get("context_key") != self._contract_context_key():
             return None
         if reading.get("generation") != self._v2_context_generation:
             return None
@@ -2058,98 +2070,6 @@ class SyncManager(QObject):
             "path_enabled": self.contract_path_enabled(),
         }
 
-    def perform_contract_handshake(self, *, require_connection=False):
-        """Ask the server what it supports for the project that is open.
-
-        The reply is recorded and nothing more. It never opens the contract
-        path: that stays a separate, local, deliberate act. The reading is tied
-        to the project, the account and the client digest that produced it, so
-        it cannot survive any of them moving.
-        """
-        if not self.is_v2_enabled:
-            raise RuntimeError("v2 project is not configured")
-        self._forget_contract_handshake()
-        if is_forced_offline() or not self.supabase:
-            if require_connection:
-                raise RuntimeError("NETWORK_UNAVAILABLE")
-            return None
-
-        generation = self._v2_context_generation
-        project_id = self._v2_context["project_id"]
-        response = self._call_with_session(
-            lambda: self.supabase.rpc("get_sync_handshake", {
-                "p_project_id": project_id,
-                "p_contract_sha256": CANONICAL_CONTRACT_SHA256,
-            }).execute(),
-            self.supabase,
-        )
-
-        # Session validation above may have refreshed the token. Bind the
-        # reading to the subject of the token that actually made the request,
-        # and refuse to cache it when no non-empty marker can be derived.
-        identity = self._contract_identity()
-        if not identity:
-            raise SyncContractError("AUTH_REQUIRED")
-        handshake = self._response_data(response)
-        if not isinstance(handshake, dict):
-            raise SyncContractError("INVALID_ARGUMENT", "invalid handshake")
-        answered = handshake.get("project_id")
-        if answered is not None and str(answered) != project_id:
-            # The answer is about a different project, so none of it applies
-            # here. Storing it would bind one project's state to another.
-            raise SyncContractError("INVALID_ARGUMENT", "handshake project mismatch")
-
-        reading = {
-            "generation": generation,
-            "project_id": project_id,
-            "identity": identity,
-            "contract_sha256": CANONICAL_CONTRACT_SHA256,
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-            "outcome": "unsupported",
-        }
-        if handshake.get("supported") is not True:
-            # An unsupported answer leaves nothing behind. There is no partial
-            # state to store and nothing that could be promoted later.
-            self._contract_handshake_error = ""
-            self._contract_handshake = reading
-            return reading
-
-        compatibility = read_handshake_compatibility(handshake)
-        if generation != self._v2_context_generation:
-            raise RuntimeError("PROJECT_CONTEXT_CHANGED")
-        project = self.activate_contract_project(**compatibility)
-        reading["outcome"] = "supported"
-        reading["project_sync_mode"] = project["project_sync_mode"]
-        reading["migration_epoch"] = int(project["migration_epoch"] or 0)
-        self._contract_handshake_error = ""
-        self._contract_handshake = reading
-        return reading
-
-    def _ensure_contract_handshake(self):
-        """Ask once for the project that is open, then leave the server alone.
-
-        The call is read-only but it costs the server a membership, settings
-        and allowlist lookup every time. Polling it would buy nothing: a stale
-        positive never arms the contract path, and explicit activation takes a
-        fresh reading of its own.
-        """
-        if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
-            return None
-        if self._contract_handshake_attempt == self._v2_context_generation:
-            return self._contract_handshake_reading()
-        try:
-            reading = self.perform_contract_handshake()
-        except Exception as error:
-            # A handshake is diagnostic. The legacy path does not depend on it
-            # and must not fall over because the server refused, the arguments
-            # were rejected, or the network dropped.
-            self._contract_handshake_error = (
-                self._stable_error_code(error) or "HANDSHAKE_FAILED"
-            )
-            reading = None
-        self._contract_handshake_attempt = self._v2_context_generation
-        return reading
-
     def contract_path_enabled(self):
         if not self.is_v2_enabled:
             return False
@@ -2166,11 +2086,13 @@ class SyncManager(QObject):
         if not self.is_v2_enabled:
             raise RuntimeError("v2 project is not configured")
         reading = self.perform_contract_handshake(require_connection=True)
-        if not reading or reading.get("outcome") != "supported":
-            raise SyncContractError("CONTRACT_NOT_ALLOWED")
-        project = self._v2_store.set_contract_path_enabled(
-            self._v2_context["local_key"], True
-        )
+        with self._contract_lock:
+            if (not reading or reading.get("outcome") != "supported"
+                    or reading != self._contract_handshake_reading()):
+                raise SyncContractError("CONTRACT_NOT_ALLOWED")
+            project = self._v2_store.set_contract_path_enabled(
+                self._v2_context["local_key"], True
+            )
         self._publish_sync_state()
         return project
 
@@ -2178,10 +2100,11 @@ class SyncManager(QObject):
         """Close the local gate and drop the reading that armed it."""
         if not self.is_v2_enabled:
             raise RuntimeError("v2 project is not configured")
-        project = self._v2_store.set_contract_path_enabled(
-            self._v2_context["local_key"], False
-        )
-        self._forget_contract_handshake()
+        with self._contract_lock:
+            project = self._v2_store.set_contract_path_enabled(
+                self._v2_context["local_key"], False
+            )
+            self._forget_contract_handshake()
         self._publish_sync_state()
         return project
 
@@ -2228,6 +2151,10 @@ class SyncManager(QObject):
         self._v2_structure_authority = authority
         self._v2_structure_authority_error = ""
         self._v2_structure_authority_identity = self._v2_pull_identity()
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator:
+            coordinator.pop('network_retry_after', None)
+            coordinator.pop('network_retry_count', None)
 
     def _block_structure_authority(self, error):
         """Keep pull apply and every queued upload closed after a bad choice."""
@@ -2236,6 +2163,10 @@ class SyncManager(QObject):
         self._v2_structure_authority_error = code
         self._v2_structure_authority_identity = self._v2_pull_identity()
         self._v2_last_pull_apply_blocked = True
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator:
+            coordinator.pop('network_retry_after', None)
+            coordinator.pop('network_retry_count', None)
         self._set_sync_state(
             "blocked",
             "서버 구조 기준을 하나로 확정하지 못해 적용과 업로드를 "
@@ -3420,6 +3351,10 @@ class SyncManager(QObject):
                     "다시 로그인하면 대기 작업이 이어서 전송됩니다."
                 ),
             )
+        elif self._session_restore_waiting() or (
+            (self._current_pull_coordinator(create=False) or {}).get('network_retry_after')
+        ):
+            publish('offline', '로컬 저장 완료. 서버 연결 복구를 기다리며 자동으로 다시 확인합니다.')
         elif (
             self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
             and self._v2_structure_authority_identity == self._v2_pull_identity()
@@ -3677,6 +3612,8 @@ class SyncManager(QObject):
                 else None
             )
             if structure_request:
+                if not self._contract_request_ready(structure_request):
+                    return False
                 self._launch_contract_structure_batch(
                     structure_request["batch"]["batch_id"]
                 )
@@ -3693,6 +3630,10 @@ class SyncManager(QObject):
                         self._v2_context["local_key"]
                     )
             if operation:
+                if operation.get("provenance_kind") == "CONTRACT_BATCH" and not self._contract_request_ready(
+                    self._v2_store.structure_batch_request(operation["batch_id"])
+                ):
+                    return False
                 self._launch_v2_operation(operation)
                 return True
             # This is the serialized drain boundary: no ready, claimed, retry
@@ -3874,7 +3815,7 @@ class SyncManager(QObject):
         return server_success, effective_error
         
     @staticmethod
-    def create_supabase_client(config=None):
+    def create_supabase_client(config=None, *, restore_session=True):
         config = config or load_cloud_client_config(supabase_config_dir())
         if not config.is_ready:
             return None
@@ -3921,6 +3862,7 @@ class SyncManager(QObject):
             client._antigravity_httpx_client = custom_httpx_client
 
             authenticated = False
+            client._antigravity_restore_pending = False
             client._antigravity_refresh_token = ""
             client._antigravity_session_generation = SyncManager._session_generation
             # A process can build several clients at once, and refresh tokens
@@ -3930,7 +3872,10 @@ class SyncManager(QObject):
             with SyncManager._session_restore_lock:
                 try:
                     from security_manager import SecurityManager
-                    access_token, refresh_token = SecurityManager.get_supabase_session()
+                    access_token, refresh_token = (
+                        SecurityManager.get_supabase_session()
+                        if restore_session else ('', '')
+                    )
                 except Exception:
                     access_token, refresh_token = "", ""
 
@@ -3960,6 +3905,10 @@ class SyncManager(QObject):
                     facts = auth_error_facts(auth_error, classified)
                     client._antigravity_restore_error_kind = classified.kind
                     client._antigravity_restore_error_facts = facts
+                    client._antigravity_restore_pending = bool(
+                        access_token and refresh_token
+                        and SyncManager._transient_handshake_error(auth_error)
+                    )
                     detail = (
                         f"{facts['exception_class']}"
                         f"/{facts['auth_error_status'] or 'no-status'}"
@@ -3983,6 +3932,9 @@ class SyncManager(QObject):
 
             try:
                 def persist_auth_event(event, session):
+                    guard = getattr(client, '_antigravity_auth_callback_guard', None)
+                    if guard is not None and not guard():
+                        return
                     event_name = str(getattr(event, "value", event) or "").upper()
                     if session and event_name in {
                         "SIGNED_IN", "TOKEN_REFRESHED", "USER_UPDATED"
@@ -4158,6 +4110,7 @@ class SyncManager(QObject):
         auth = getattr(client, "auth", None)
         if auth is None:
             return None
+        context = self._contract_context_key()
         try:
             from security_manager import SecurityManager
             with SyncManager._session_restore_lock:
@@ -4169,6 +4122,8 @@ class SyncManager(QObject):
             with SyncManager._session_exchange_in_flight():
                 response = auth.set_session(access, refresh)
                 session = self._session_from_response(response)
+                if context != self._contract_context_key():
+                    raise ContractDispatchPaused()
                 if not getattr(session, "refresh_token", ""):
                     return None
                 self._persist_supabase_session(
@@ -4178,8 +4133,13 @@ class SyncManager(QObject):
                         client, "_antigravity_session_generation", None
                     ),
                 )
-                self._remember_client_session(client, session)
+                with self._contract_lock:
+                    if context != self._contract_context_key():
+                        raise ContractDispatchPaused()
+                    self._remember_client_session(client, session)
                 return session
+        except ContractDispatchPaused:
+            raise
         except Exception:
             return None
 
@@ -4258,8 +4218,10 @@ class SyncManager(QObject):
         return getattr(response, "session", None) or response
 
     def _mark_auth_required(self, error=None):
-        self._auth_retry_blocked = True
-        self._forget_contract_handshake()
+        with self._contract_lock:
+            self._auth_retry_blocked = True
+            self._auth_context_generation += 1
+            self._forget_contract_handshake()
         # 로그인 만료는 오프라인이 아니다. offline 로 표시하면 네트워크를
         # 확인하라는 안내가 나가고 정작 필요한 재로그인은 안내되지 않는다.
         self._last_failure_offline = False
@@ -4286,10 +4248,22 @@ class SyncManager(QObject):
             return True
         if self._auth_retry_blocked and not force_refresh:
             raise RuntimeError("AUTH_REQUIRED")
+        if getattr(client, '_antigravity_restore_pending', False):
+            raise RuntimeError('NETWORK_UNAVAILABLE')
 
         observed_generation = self._auth_refresh_generation
+        # A session reply must not revive an account/project that was replaced
+        # while the auth SDK was waiting. Worker clients may differ from the
+        # main client, so bind to the manager's state at entry, not client == self.
+        session_context = self._contract_context_key()
+
+        def check_context():
+            if session_context != self._contract_context_key():
+                raise ContractDispatchPaused()
+
         with self._session_refresh_lock:
             try:
+                check_context()
                 session = None
                 if force_refresh and observed_generation == self._auth_refresh_generation:
                     # Somebody else may already have done this. Taking their
@@ -4300,6 +4274,7 @@ class SyncManager(QObject):
                         with SyncManager._session_exchange_in_flight():
                             response = auth.refresh_session()
                             session = self._session_from_response(response)
+                            check_context()
                             if not getattr(session, "access_token", "") or not getattr(
                                 session, "refresh_token", ""
                             ):
@@ -4313,11 +4288,14 @@ class SyncManager(QObject):
                                     client, "_antigravity_session_generation", None
                                 ),
                             )
-                            self._remember_client_session(client, session)
+                            with self._contract_lock:
+                                check_context()
+                                self._remember_client_session(client, session)
                     self._auth_refresh_generation += 1
                 else:
                     response = auth.get_session()
                     session = self._session_from_response(response)
+                    check_context()
                     if not getattr(session, "access_token", "") or not getattr(
                         session, "refresh_token", ""
                     ):
@@ -4331,15 +4309,23 @@ class SyncManager(QObject):
                             client, "_antigravity_session_generation", None
                         ),
                     )
-                    self._remember_client_session(client, session)
+                    with self._contract_lock:
+                        check_context()
+                        self._remember_client_session(client, session)
                 if not getattr(session, "access_token", "") or not getattr(
                     session, "refresh_token", ""
                 ):
                     raise RuntimeError("AUTH_REQUIRED")
-                client._antigravity_authenticated = True
-                self._auth_retry_blocked = False
+                with self._contract_lock:
+                    check_context()
+                    client._antigravity_authenticated = True
+                    self._auth_retry_blocked = False
                 return True
             except Exception as error:
+                if (isinstance(error, ContractDispatchPaused)
+                        or session_context != self._contract_context_key()
+                        or self._transient_handshake_error(error)):
+                    raise
                 self._mark_auth_required(error)
                 raise RuntimeError("AUTH_REQUIRED") from error
 
@@ -4425,6 +4411,10 @@ class SyncManager(QObject):
             self.init_supabase()
         if not self.cloud_network_enabled:
             return False, self.cloud_config_message or CLOUD_INVALID_MESSAGE
+        with self._contract_lock:
+            self._auth_retry_blocked = True
+            self._auth_context_generation += 1
+            self._forget_contract_handshake()
         try:
             response = self.supabase.auth.sign_in_with_password({
                 "email": email.strip(),
@@ -4439,16 +4429,22 @@ class SyncManager(QObject):
                 SyncManager._session_generation += 1
                 generation = SyncManager._session_generation
                 self._persist_supabase_session(session, generation=generation)
-            try:
-                self.supabase._antigravity_session_generation = generation
-                self._remember_client_session(self.supabase, session)
-                self.supabase._antigravity_authenticated = True
-            except Exception:
-                pass
-            self._auth_retry_blocked = False
+            with self._contract_lock:
+                try:
+                    self.supabase._antigravity_session_generation = generation
+                    self._remember_client_session(self.supabase, session)
+                    self.supabase._antigravity_authenticated = True
+                    self.supabase._antigravity_restore_pending = False
+                except Exception:
+                    pass
+                self._forget_contract_handshake()
+                self._auth_retry_blocked = False
+                self._begin_structure_authority_selection()
             self._last_sync_error = ""
             self._last_failure_offline = False
             self._publish_sync_state()
+            QTimer.singleShot(0, self.request_contract_handshake_async)
+            QTimer.singleShot(0, self.pull_remote_changes_async)
             QTimer.singleShot(0, self.retry_pending_syncs)
             user = getattr(response, "user", None)
             signed_in_email = getattr(user, "email", None) or email.strip()
@@ -4460,6 +4456,12 @@ class SyncManager(QObject):
             return False, classified.message
 
     def sign_out(self):
+        with self._contract_lock:
+            self._auth_retry_blocked = True
+            self._auth_context_generation += 1
+            if self.supabase:
+                self.supabase._antigravity_restore_pending = False
+            self._forget_contract_handshake()
         try:
             if self.supabase:
                 self.supabase.auth.sign_out()
@@ -9736,7 +9738,17 @@ class SyncManager(QObject):
     ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             return False
+        self.request_contract_handshake_async()
+        if self._auth_retry_blocked or self._session_restore_waiting() or self._shutting_down:
+            self._publish_sync_state()
+            return False
         coordinator = self._current_pull_coordinator()
+        if coordinator.get('network_retry_after') is not None:
+            if not manual and time.monotonic() < coordinator['network_retry_after']:
+                return False
+            # Revalidate the baseline even with queued local edits. The normal
+            # outbound gate would otherwise prevent recovery indefinitely.
+            reason = 'baseline'
         if reason is None:
             reason = (
                 "baseline"
@@ -9778,6 +9790,7 @@ class SyncManager(QObject):
             return False
 
         started_for = self._v2_pull_identity()
+        started_account = self._contract_identity()
         started_coordinator = coordinator
         coordinator["pull_pending"] = False
         coordinator["pulling"] = True
@@ -9832,7 +9845,8 @@ class SyncManager(QObject):
             )
 
         def handle_result(success, payload):
-            if not self.is_v2_enabled or self._v2_pull_identity() != started_for:
+            if (not self.is_v2_enabled or self._v2_pull_identity() != started_for
+                    or self._contract_identity() != started_account):
                 # This reply belongs to the project that was open when the
                 # request went out. Releasing, or opening another project, ends
                 # that generation: nothing in the reply may be applied to
@@ -10063,9 +10077,21 @@ class SyncManager(QObject):
                     self._schedule_v2_retry(0)
             else:
                 code = self._stable_error_code(payload)
-                self._block_structure_authority(
-                    code or "STRUCTURE_AUTHORITY_UNRESOLVED"
-                )
+                if self._transient_handshake_error(payload):
+                    self._begin_structure_authority_selection()
+                    count = min(started_coordinator.get('network_retry_count', 0) + 1, 6)
+                    started_coordinator['network_retry_count'] = count
+                    started_coordinator['network_retry_after'] = time.monotonic() + min(60, 2 ** count)
+                    started_coordinator['baseline_validated'] = False
+                    started_coordinator['pull_pending'] = True
+                    self._publish_sync_state()
+                elif code in {'AUTH_REQUIRED', 'AUTH_EXPIRED'}:
+                    self._mark_auth_required(payload)
+                    self._publish_sync_state()
+                else:
+                    self._block_structure_authority(
+                        code or "STRUCTURE_AUTHORITY_UNRESOLVED"
+                    )
                 if code == "PROJECT_TRASHED":
                     self.mark_project_server_state(
                         self._v2_context["project_id"], "trashed"
@@ -10082,7 +10108,7 @@ class SyncManager(QObject):
                         self._v2_context["project_id"],
                         self._absent_project_state(),
                     )
-                print(f"Failed to pull v2 documents: {payload}")
+                print(f"Failed to pull v2 documents: {code or type(payload).__name__}")
 
         def handle_finished():
             started_coordinator["pulling"] = False
@@ -10124,59 +10150,51 @@ class SyncManager(QObject):
         self._start_worker(worker)
         return True
 
-    def _process_contract_structure_batch(self, batch_id):
-        if is_forced_offline():
-            raise RuntimeError("테스트 오프라인 모드")
-        if not self.supabase:
-            raise RuntimeError("서버 연결 없음")
-        request = self._v2_store.structure_batch_request(batch_id)
-        if (
-            not request
-            or request.get("batch", {}).get("batch_id") != batch_id
-            or request.get("project_id") != self._v2_context["project_id"]
-        ):
-            raise RuntimeError("BATCH_NOT_READY")
-        response = self.supabase.rpc(
-            "atomic_structure_commit", {"p_request": request}
-        ).execute()
-        result = self._response_data(response)
-        return self._v2_store.record_structure_batch_response(batch_id, result)
+    def _process_contract_structure_batch(self, batch_id, dispatch_context=None):
+        context = dispatch_context or self._contract_dispatch_context()
+        store = context[1]
+        request = store.structure_batch_request(batch_id)
+        if not request or request.get("batch", {}).get("batch_id") != batch_id:
+            raise ContractDispatchPaused()
+        return self._send_contract_request("atomic_structure_commit", request, context)
 
     def _launch_contract_structure_batch(self, batch_id):
+        context = self._contract_dispatch_context()
+        store = context[1]
+        request = store.structure_batch_request(batch_id)
+        if not self._contract_request_ready(request):
+            return None
+        if self._v2_structure_worker is not None or self._active_server_syncs:
+            return None
         coordinator = self._current_pull_coordinator(create=False)
         if coordinator and coordinator["baseline_validated"]:
             coordinator["pull_pending"] = True
-        operation_ids = self._v2_store.mark_structure_batch_attempt(batch_id)
+        operation_ids = store.mark_structure_batch_attempt(batch_id)
         worker = V2StructureBatchWorker(self, batch_id)
+        worker.dispatch_context = context
         self._v2_structure_worker = worker
         self._active_server_syncs += 1
         self._publish_sync_state()
 
         def handle_result(success, error_message, payload):
             self._active_server_syncs = max(0, self._active_server_syncs - 1)
-            self._v2_structure_worker = None
+            if self._v2_structure_worker is worker:
+                self._v2_structure_worker = None
             if not success:
-                self._v2_store.mark_structure_batch_retry(batch_id, error_message)
-                self._v2_store.record_diagnostic(
-                    self._v2_context["local_key"],
-                    "structure_batch_retry",
-                    batch_id=batch_id,
-                    error_code=self._stable_error_code(error_message) or "CLIENT_ERROR",
-                )
-                self._last_sync_error = error_message
-                self._last_failure_offline = self._is_connectivity_error(error_message)
-            else:
-                self._last_sync_error = ""
-                self._last_failure_offline = False
-                self._v2_store.record_diagnostic(
-                    self._v2_context["local_key"],
-                    "structure_batch_result",
-                    batch_id=batch_id,
-                    state="completed" if payload.get("applied") else "blocked",
-                )
+                store.mark_structure_batch_retry(batch_id, error_message)
+            # Receipt persistence already happened against the captured store.
+            # Never publish an old account/project's completion into the new UI.
+            if context[0] != self._contract_context_key():
+                return
+            store.record_diagnostic(
+                context[0][4], "structure_batch_result" if success else "structure_batch_retry",
+                batch_id=batch_id,
+                state="completed" if success and payload.get("applied") else "blocked",
+            )
+            self._last_sync_error = "" if success else error_message
+            self._last_failure_offline = not success and self._is_connectivity_error(error_message)
             self._publish_sync_state()
             if success and payload.get("applied"):
-                from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, self.retry_pending_syncs)
 
         worker.resultReady.connect(handle_result)
@@ -10184,8 +10202,9 @@ class SyncManager(QObject):
         self._start_worker(worker)
         return {"worker": worker, "operation_ids": operation_ids}
 
-    def _process_v2_operation(self, operation_id):
-        operation = self._v2_store.operation(operation_id)
+    def _process_v2_operation(self, operation_id, dispatch_context=None):
+        context = dispatch_context or self._contract_dispatch_context()
+        operation = context[1].operation(operation_id)
         if not operation:
             return {"kind": "retry", "error": "대기 작업을 찾을 수 없습니다."}
         is_contract_document = (
@@ -10210,11 +10229,23 @@ class SyncManager(QObject):
             error_code = response["error"]["code"]
             if error_code in {"REVISION_CONFLICT", "DOCUMENT_ALREADY_EXISTS"}:
                 raise RuntimeError(error_code)
-            self._v2_store.mark_blocked(operation_id, error_code)
+            context[1].mark_blocked(operation_id, error_code)
             return {
                 "kind": "blocked", "error": error_code,
                 "operation": operation,
             }
+
+        if is_contract_document:
+            try:
+                cached = context[1].document_batch_response(operation["batch_id"])
+                if cached and cached.get("applied"):
+                    return contract_result(cached)
+                with self._contract_lock:
+                    self._check_contract_dispatch(
+                        context[1].structure_batch_request(operation["batch_id"]), context
+                    )
+            except ContractDispatchPaused:
+                return {"kind": "paused", "error": "CONTRACT_DISPATCH_PAUSED", "operation": operation}
 
         if is_forced_offline():
             error = "테스트 오프라인 모드"
@@ -10230,27 +10261,11 @@ class SyncManager(QObject):
                     self.ensure_session_valid(
                         client, force_refresh=bool(auth_attempt)
                     )
-                    self._ensure_remote_project(client)
                     if is_contract_document:
-                        cached = self._v2_store.document_batch_response(
-                            operation["batch_id"]
-                        )
-                        if cached:
-                            return contract_result(cached)
-                        request = self._v2_store.structure_batch_request(
-                            operation["batch_id"]
-                        )
-                        if not request:
-                            raise RuntimeError("CONTRACT_BATCH_NOT_FOUND")
-                        response = client.rpc(
-                            "document_commit", {"p_request": request}
-                        ).execute()
-                        wire_response = self._response_data(response) or {}
-                        wire_response = self._v2_store.record_document_batch_response(
-                            operation["batch_id"], wire_response
-                        )
-                        return contract_result(wire_response)
-
+                        request = context[1].structure_batch_request(operation["batch_id"])
+                        response = self._send_contract_request("document_commit", request, context)
+                        return contract_result(response)
+                    self._ensure_remote_project(client)
                     if not operation["is_deleted"]:
                         self._publish_live_parents_before_legacy_document(
                             operation, client
@@ -10329,6 +10344,10 @@ class SyncManager(QObject):
                         continue
                     raise
         except Exception as error:
+            if is_contract_document and (
+                isinstance(error, ContractDispatchPaused) or context[0] != self._contract_context_key()
+            ):
+                return {"kind": "paused", "error": "CONTRACT_DISPATCH_PAUSED", "operation": operation}
             code = self._stable_error_code(error)
             if code in {"AUTH_EXPIRED", "AUTH_REQUIRED"}:
                 self._mark_auth_required(error)
@@ -10507,6 +10526,13 @@ class SyncManager(QObject):
             return {"kind": "retry", "error": message, "operation": operation}
 
     def _launch_v2_operation(self, operation):
+        contract_context = None
+        if operation.get("provenance_kind") == "CONTRACT_BATCH":
+            contract_context = self._contract_dispatch_context()
+            request = contract_context[1].structure_batch_request(operation["batch_id"])
+            if not self._contract_request_ready(request):
+                return None
+        captured_store = self._v2_store
         # A manual retry or another successful operation may start before a
         # scheduled lease retry fires. Cancel that reservation so only one
         # retry chain can exist at a time.
@@ -10516,6 +10542,7 @@ class SyncManager(QObject):
             coordinator["pull_pending"] = True
         self._v2_store.mark_attempt(operation["operation_id"])
         worker = V2QueueWorker(self, operation["operation_id"])
+        worker.dispatch_context = contract_context
         self._v2_worker = worker
         self._v2_workers.append(worker)
         self._active_server_syncs += 1
@@ -10523,8 +10550,17 @@ class SyncManager(QObject):
 
         def handle_finished(success, error_message, payload):
             self._active_server_syncs = max(0, self._active_server_syncs - 1)
-            self._v2_worker = None
+            if self._v2_worker is worker:
+                self._v2_worker = None
             kind = (payload or {}).get("kind", "retry")
+            if contract_context is not None and contract_context[0] != self._contract_context_key():
+                if kind == "committed":
+                    captured_store.mark_success(operation["operation_id"], payload["result"])
+                elif kind in {"retry", "paused"}:
+                    captured_store.mark_retry(operation["operation_id"], "CONTRACT_DISPATCH_PAUSED")
+                self._v2_callbacks.pop(operation["operation_id"], None)
+                self._v2_conflict_callbacks.pop(operation["operation_id"], None)
+                return
             original = (payload or {}).get("operation") or operation
             callback = self._v2_callbacks.pop(operation["operation_id"], None)
             conflict_callback = self._v2_conflict_callbacks.pop(operation["operation_id"], None)

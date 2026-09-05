@@ -1222,6 +1222,7 @@ def arm_manager_from_stored_contract(manager, project):
     offline_identity = manager._contract_identity()
     reading = {
         "generation": manager._v2_context_generation,
+        "context_key": manager._contract_context_key(),
         "project_id": manager._v2_context["project_id"],
         "identity": offline_identity,
         "contract_sha256": CANONICAL_CONTRACT_SHA256,
