@@ -156,6 +156,10 @@ class _HandshakeClient:
 
     def rpc(self, name, params):
         self.calls.append((name, dict(params)))
+        if name == "get_project_status":
+            return SimpleNamespace(execute=lambda: SimpleNamespace(data={
+                "project_id": params["p_project_id"], "state": "active",
+            }))
         return SimpleNamespace(execute=self._answer)
 
     def _answer(self):
@@ -2129,6 +2133,8 @@ class ContractStoreTests(unittest.TestCase):
 
             def rpc(inner_self, name, params):
                 inner_self.calls.append((name, params))
+                if name == "get_project_status":
+                    return RpcCall({"project_id": PROJECT_ID, "state": "active"})
                 return RpcCall({"project_id": PROJECT_ID} if name == "ensure_project" else response)
 
         manager = SyncManager()
@@ -2140,6 +2146,8 @@ class ContractStoreTests(unittest.TestCase):
         manager._auth_retry_blocked = False
         manager._shutting_down = False
         self.store.mark_attempt(operation["operation_id"])
+        manager._accept_structure_authority(STRUCTURE_AUTHORITY_CONTRACT)
+        manager.mark_project_server_state(PROJECT_ID, "active")
         result = manager._process_v2_operation(operation["operation_id"])
         self.assertEqual(result["kind"], "committed")
         self.assertEqual(
@@ -2351,6 +2359,9 @@ class ContractStoreTests(unittest.TestCase):
 
             def rpc(inner_self, name, params):
                 inner_self.calls.append((name, params))
+                if name == "get_project_status":
+                    return SimpleNamespace(execute=lambda: SimpleNamespace(data={
+                        "project_id": PROJECT_ID, "state": "active"}))
                 return RpcCall()
 
         manager = SyncManager()
@@ -2368,12 +2379,15 @@ class ContractStoreTests(unittest.TestCase):
             arm_contract_handshake(manager)
             manager._auth_retry_blocked = False
             manager._shutting_down = False
+            manager._accept_structure_authority(STRUCTURE_AUTHORITY_CONTRACT)
+            manager.mark_project_server_state(PROJECT_ID, "active")
             result = manager._process_contract_structure_batch(BATCH_ID)
 
             self.assertEqual(result, response)
             self.assertEqual(
                 manager.supabase.calls,
-                [("atomic_structure_commit", {"p_request": request})],
+                [("get_project_status", {"p_project_id": PROJECT_ID}),
+                 ("atomic_structure_commit", {"p_request": request})],
             )
         finally:
             (

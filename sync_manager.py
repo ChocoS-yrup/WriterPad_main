@@ -2137,10 +2137,12 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
 
     def _begin_structure_authority_selection(self):
         """Close every server-write exit while one pull chooses its source."""
-        if self.is_v2_enabled:
-            self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
-            self._v2_structure_authority_error = ""
-            self._v2_structure_authority_identity = self._v2_pull_identity()
+        with self._contract_lock:
+            if self.is_v2_enabled:
+                self._contract_write_epoch += 1
+                self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+                self._v2_structure_authority_error = ""
+                self._v2_structure_authority_identity = self._v2_pull_identity()
 
     def _accept_structure_authority(self, authority):
         if authority not in {
@@ -2148,9 +2150,13 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             STRUCTURE_AUTHORITY_LEGACY,
         }:
             raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
-        self._v2_structure_authority = authority
-        self._v2_structure_authority_error = ""
-        self._v2_structure_authority_identity = self._v2_pull_identity()
+        with self._contract_lock:
+            if (self._v2_structure_authority != authority
+                    or self._v2_structure_authority_identity != self._v2_pull_identity()):
+                self._contract_write_epoch += 1
+            self._v2_structure_authority = authority
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = self._v2_pull_identity()
         coordinator = self._current_pull_coordinator(create=False)
         if coordinator:
             coordinator.pop('network_retry_after', None)
@@ -2159,9 +2165,11 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
     def _block_structure_authority(self, error):
         """Keep pull apply and every queued upload closed after a bad choice."""
         code = self._stable_error_code(error) or "STRUCTURE_AUTHORITY_UNRESOLVED"
-        self._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
-        self._v2_structure_authority_error = code
-        self._v2_structure_authority_identity = self._v2_pull_identity()
+        with self._contract_lock:
+            self._contract_write_epoch += 1
+            self._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+            self._v2_structure_authority_error = code
+            self._v2_structure_authority_identity = self._v2_pull_identity()
         self._v2_last_pull_apply_blocked = True
         coordinator = self._current_pull_coordinator(create=False)
         if coordinator:
@@ -3243,20 +3251,31 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             self._v2_context.get("server_state") or "active"
         )
 
-    def mark_project_server_state(self, project_id, state):
+    def mark_project_server_state(self, project_id, state, *, expected_context=None,
+                                  expected_write_epoch=None):
         if state not in {"active", "trashed", "purged"}:
             return False
-        if self._v2_store is not None:
-            setter = getattr(
-                self._v2_store, "set_project_server_state", None
-            )
-            if callable(setter):
-                setter(project_id, state)
-        if (
-            self._v2_context
-            and self._v2_context.get("project_id") == str(project_id)
-        ):
-            self._v2_context["server_state"] = state
+        with self._contract_lock:
+            if (expected_context is not None
+                    and expected_context != self._contract_project_context()):
+                return False
+            if (expected_write_epoch is not None
+                    and expected_write_epoch != self._contract_write_epoch):
+                return False
+            current = bool(self._v2_context
+                           and self._v2_context.get("project_id") == str(project_id))
+            if current:
+                context = self._contract_project_context()
+                if (self._current_project_server_state() != state
+                        or self._contract_project_state_context != context):
+                    self._contract_write_epoch += 1
+                self._v2_context["server_state"] = state
+                self._contract_project_state_context = context
+            if self._v2_store is not None:
+                setter = getattr(self._v2_store, "set_project_server_state", None)
+                if callable(setter):
+                    setter(project_id, state)
+        if current:
             if state in {"trashed", "purged"}:
                 # Project trash removes leases on the server. Do not issue
                 # release RPCs after access has already been revoked.
@@ -4509,7 +4528,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
         if "permission denied for function" in lowered:
             return "SERVER_RPC_PERMISSION_DENIED"
         for code in (
-            "AUTH_REQUIRED", "FORBIDDEN", "INVALID_ARGUMENT",
+            "AUTH_REQUIRED", "AUTH_EXPIRED", "FORBIDDEN", "INVALID_ARGUMENT",
             "PROJECT_TRASHED", "PROJECT_PURGED", "PROJECT_NOT_FOUND",
             "DOCUMENT_NOT_FOUND", "DOCUMENT_ALREADY_EXISTS",
             # PARENT_FOLDER_NOT_FOUND must stay ahead of FOLDER_NOT_FOUND:
@@ -4542,19 +4561,24 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
         }).execute()
         return self._response_data(response)
 
-    def _fetch_v2_project_status(self, require_connection=False):
+    def _fetch_v2_project_status(self, require_connection=False, project_id=None):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             if require_connection:
                 raise RuntimeError("NETWORK_UNAVAILABLE")
             return self._current_project_server_state()
-        project_id = self._v2_context["project_id"]
+        with self._contract_lock:
+            project_id = str(project_id or self._v2_context["project_id"])
+            expected_context = self._contract_project_context()
+            expected_write_epoch = self._contract_write_epoch
+            client = self.supabase
+            absent_state = self._absent_project_state()
         try:
             response = self._call_with_session(
-                lambda: self.supabase.rpc(
+                lambda: client.rpc(
                     "get_project_status",
                     {"p_project_id": project_id},
                 ).execute(),
-                self.supabase,
+                client,
             )
             data = self._response_data(response) or {}
         except Exception as status_error:
@@ -4565,15 +4589,15 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                 # The RPC answered. It is deployed, so the compatibility
                 # path below has nothing left to discover: the server
                 # simply holds no row for this project.
-                data = {"state": self._absent_project_state()}
+                data = {"state": absent_state}
             else:
                 # Compatibility path for a server that has the project-trash
                 # migration but has not deployed get_project_status yet.
                 trashed_response = self._call_with_session(
-                    lambda: self.supabase.rpc(
+                    lambda: client.rpc(
                         "list_trashed_projects", {}
                     ).execute(),
-                    self.supabase,
+                    client,
                 )
                 trashed_rows = getattr(trashed_response, "data", None)
                 if not isinstance(trashed_rows, list):
@@ -4585,12 +4609,12 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                     data = {"state": "trashed"}
                 else:
                     active_response = self._call_with_session(
-                        lambda: self.supabase.table("projects")
+                        lambda: client.table("projects")
                         .select("project_id")
                         .eq("project_id", project_id)
                         .limit(1)
                         .execute(),
-                        self.supabase,
+                        client,
                     )
                     active_rows = getattr(active_response, "data", None)
                     if not isinstance(active_rows, list):
@@ -4598,14 +4622,15 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                     data = {
                         "state": (
                             "active" if active_rows
-                            else self._absent_project_state()
+                            else absent_state
                         )
                     }
         state = str(data.get("state") or "")
         if state not in {"active", "trashed", "purged"}:
             raise RuntimeError("INVALID_RESPONSE")
         self.mark_project_server_state(
-            self._v2_context["project_id"], state
+            project_id, state, expected_context=expected_context,
+            expected_write_epoch=expected_write_epoch,
         )
         return state
 
@@ -4776,7 +4801,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             return []
         if check_project_status:
             state = self._fetch_v2_project_status(
-                require_connection=require_connection
+                require_connection=require_connection, project_id=project_id
             )
             if state == "trashed":
                 raise RuntimeError("PROJECT_TRASHED")

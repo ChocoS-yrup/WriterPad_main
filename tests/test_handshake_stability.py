@@ -25,6 +25,10 @@ class HandshakeStabilityTests(unittest.TestCase):
         self.manager._v2_context["writer_device_id"] = self.manager._v2_device_id
         self.store = self.fixture.store
         self.client = self.fixture._attach(fixtures.supported_handshake())
+        # Dispatch tests start after an independently confirmed baseline and
+        # project-status read, not from the handshake alone.
+        self.manager._accept_structure_authority(STRUCTURE_AUTHORITY_LEGACY)
+        self.manager.mark_project_server_state(fixtures.PROJECT_ID, "active")
         self.manager._auth_retry_blocked = False
         self.manager._shutting_down = False
         self.manager._v2_worker = None
@@ -144,7 +148,10 @@ class HandshakeStabilityTests(unittest.TestCase):
     def test_state_change_during_rpc_construction_prevents_execute(self):
         request = self.make_batch()
         execute = unittest.mock.Mock()
-        def prepare(*_):
+        def prepare(name, _params):
+            if name == "get_project_status":
+                return SimpleNamespace(execute=lambda: SimpleNamespace(data={
+                    "project_id": fixtures.PROJECT_ID, "state": "active"}))
             self.manager.disable_contract_path()
             return SimpleNamespace(execute=execute)
         with patch.object(self.client, "rpc", side_effect=prepare):
@@ -486,14 +493,15 @@ class HandshakeStabilityTests(unittest.TestCase):
                 for _ in range(10):
                     with self.assertRaises(ContractDispatchPaused):
                         self.manager._process_contract_structure_batch(request["batch"]["batch_id"])
-                self.assertEqual(len(self.client.calls), 1)
+                self.assertEqual([name for name, _ in self.client.calls],
+                                 ["get_project_status", "atomic_structure_commit"])
             finally:
                 release.set()
                 thread.join(3)
         self.assertFalse(thread.is_alive())
         self.assertTrue(result[0]["applied"])
         self.manager._process_contract_structure_batch(request["batch"]["batch_id"])
-        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(len(self.client.calls), 2)
 
     def test_late_handshake_after_same_account_relogin_is_ignored(self):
         def answer():

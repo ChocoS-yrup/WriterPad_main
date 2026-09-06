@@ -1,4 +1,5 @@
 import os
+import hashlib
 import re
 import time
 from PyQt6.QtWidgets import (
@@ -435,6 +436,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         # Reinsert the path so dictionary order acts as a small LRU list.
         side_states.pop(rel_path, None)
         side_states[rel_path] = {
+            "content_sha256": hashlib.sha256(
+                editor.toPlainText().encode("utf-8")
+            ).hexdigest(),
             "cursor": editor.textCursor().position(),
             "vertical_scroll": editor.verticalScrollBar().value(),
             "horizontal_scroll": editor.horizontalScrollBar().value(),
@@ -468,6 +472,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         state = self._saved_editor_view_state(editor, rel_path)
         if not state:
             return False
+        # An unopened chapter may have changed on another device. Positions
+        # belong to the text the writer last saw, not just its unchanged path.
+        # Older settings have no text identity: use the normal end-of-file
+        # fallback once, then remember a verifiable position on the next save.
+        if state.get("content_sha256") != hashlib.sha256(
+            editor.toPlainText().encode("utf-8")
+        ).hexdigest():
+            return False
         try:
             cursor_position = int(state.get("cursor", 0))
             vertical_scroll = int(state.get("vertical_scroll", 0))
@@ -478,8 +490,10 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         from PyQt6.QtGui import QTextCursor
 
         cursor = QTextCursor(editor.document())
-        cursor.setPosition(max(0, min(cursor_position, len(editor.toPlainText()))))
+        cursor.setPosition(max(0, min(cursor_position, editor.document().characterCount() - 1)))
         editor.setTextCursor(cursor)
+        restored_document = editor.document()
+        restored_revision = restored_document.revision()
 
         def restore_scrollbars():
             if editor is getattr(self, "left_editor", None):
@@ -487,6 +501,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             else:
                 current_path = getattr(self, "current_loaded_file_right", None)
             if current_path != rel_path:
+                return
+            if (editor.document() is not restored_document
+                    or restored_document.revision() != restored_revision):
                 return
             editor.verticalScrollBar().setValue(vertical_scroll)
             editor.horizontalScrollBar().setValue(horizontal_scroll)
@@ -1781,8 +1798,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         # 스크롤바가 우측 끝에 붙도록 스타일시트의 padding 대신 QTextFrameFormat을 통해 텍스트 여백을 설정
         self.apply_editor_margins()
 
-    def apply_editor_margins(self):
-        for editor in [self.left_editor, self.right_editor]:
+    def apply_editor_margins(self, editor=None):
+        editors = [editor] if editor is not None else [self.left_editor, self.right_editor]
+        for editor in editors:
             doc = editor.document()
             was_modified = doc.isModified()
             signals_were_blocked = editor.blockSignals(True)
@@ -2502,6 +2520,12 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 if editor.toPlainText() != remote_content:
                     editor.blockSignals(True)
                     editor.setPlainText(remote_content)
+                    self.apply_editor_margins(editor)
+                    # Replacing the snapshot resets Qt's cursor to the start.
+                    # Continue writing after the text received from another device.
+                    from PyQt6.QtGui import QTextCursor
+                    editor.moveCursor(QTextCursor.MoveOperation.End)
+                    editor.ensureCursorVisible()
                     editor.document().setModified(False)
                     editor.blockSignals(False)
                 else:

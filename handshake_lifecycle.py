@@ -4,10 +4,11 @@ import threading
 import time
 
 from cloud_config import classify_cloud_error
+from contract_transport import CONTRACT_REFUSALS, execute_contract_rpc
 from runtime_profile import is_forced_offline
 from sync_contract import (
     CONTRACT_VERSION, CANONICAL_CONTRACT_SHA256, SYNC_PROTOCOL_VERSION,
-    CLIENT_CAPABILITIES, SyncContractError, read_handshake_compatibility,
+    CLIENT_CAPABILITIES, SyncContractError, read_handshake_compatibility, require_uuid,
 )
 
 
@@ -25,7 +26,10 @@ class HandshakeLifecycleMixin:
         self._contract_retry_count = 0
         self._contract_retry_after = 0.0
         self._contract_sending = set()
+        self._contract_preparing = set()
         self._contract_probe_pending = None
+        self._contract_write_epoch = 0
+        self._contract_project_state_context = None
 
     def _contract_context_key(self):
         context = self._v2_context or {}
@@ -51,19 +55,19 @@ class HandshakeLifecycleMixin:
     @staticmethod
     def _transient_handshake_error(error):
         seen = set()
+        chain = []
         while error is not None and id(error) not in seen:
             seen.add(id(error))
+            chain.append(error)
             # Explicit contract/auth refusals must not be retried because an
             # older exception happened to be attached to them.
-            if isinstance(error, SyncContractError):
+            if isinstance(error, SyncContractError) or str(error) in CONTRACT_REFUSALS:
                 return False
             status = getattr(error, 'status_code', None) or getattr(error, 'status', None)
             if str(status) in {'400', '401', '403'}:
                 return False
-            if HandshakeLifecycleMixin._transient_transport_error(error):
-                return True
             error = getattr(error, '__cause__', None) or getattr(error, '__context__', None)
-        return False
+        return any(HandshakeLifecycleMixin._transient_transport_error(item) for item in chain)
 
     @staticmethod
     def _transient_transport_error(error):
@@ -109,18 +113,20 @@ class HandshakeLifecycleMixin:
             with self._contract_lock:
                 if key != self._contract_context_key():
                     return None
-            response = client.rpc("get_sync_handshake", {
+            response = execute_contract_rpc(client.rpc("get_sync_handshake", {
                 "p_project_id": project_id,
                 "p_contract_sha256": CANONICAL_CONTRACT_SHA256,
-            }).execute()
+            }))
             handshake = self._response_data(response)
             with self._contract_lock:
                 if key != self._contract_context_key():
                     return None
                 if not isinstance(handshake, dict):
                     raise SyncContractError("INVALID_ARGUMENT")
-                answered = handshake.get("project_id")
-                if answered is not None and str(answered) != project_id:
+                if not isinstance(handshake.get("project_id"), str):
+                    raise SyncContractError("INVALID_ARGUMENT", "invalid project_id")
+                answered = require_uuid(handshake["project_id"], "project_id")
+                if answered != require_uuid(project_id, "project_id"):
                     raise SyncContractError("INVALID_ARGUMENT")
                 reading = {
                     "generation": self._v2_context_generation,
@@ -189,7 +195,28 @@ class HandshakeLifecycleMixin:
 
     def _contract_dispatch_context(self):
         with self._contract_lock:
-            return (self._contract_context_key(), self._v2_store, self.supabase)
+            return (self._contract_context_key(), self._v2_store, self.supabase,
+                    (self._contract_write_epoch, self._contract_queue_stamp()))
+
+    def _contract_queue_stamp(self):
+        reader = getattr(self._v2_store, "contract_queue_authority_stamp", None)
+        if callable(reader) and self._v2_context:
+            return reader(self._v2_context["local_key"])
+        return None
+
+    def _contract_project_context(self):
+        return (self._v2_pull_identity(), id(self._v2_store),
+                id(self.supabase), self._contract_identity())
+
+    def _contract_authority_allows_dispatch(self):
+        # An old/default state is not a current authorization. Unlike the
+        # general legacy path, contract writes require an observed baseline.
+        return (
+            self._v2_structure_authority_identity == self._v2_pull_identity()
+            and self._v2_structure_authority in {"contract", "legacy"}
+            and self._contract_project_state_context == self._contract_project_context()
+            and self._current_project_server_state() == "active"
+        )
 
     def request_contract_handshake_async(self):
         """A read-only probe is independent of the outbound/pull queue gate.
@@ -240,11 +267,18 @@ class HandshakeLifecycleMixin:
             raise
 
     def _check_contract_dispatch(self, request, context):
-        key, store, client = context
+        key, store, client, authority = context
         if (key != self._contract_context_key() or not key[-1]
                 or self._auth_retry_blocked or self._shutting_down
                 or is_forced_offline() or not client
+                or authority[0] != self._contract_write_epoch
+                or not self._contract_authority_allows_dispatch()
                 or not self._uses_contract_structure()):
+            raise ContractDispatchPaused()
+        counts = self._v2_activity_counts(key[4])
+        if counts.get("blocked", 0) or counts.get("conflict", 0):
+            raise ContractDispatchPaused()
+        if authority[1] is None or authority[1] != self._contract_queue_stamp():
             raise ContractDispatchPaused()
         project = store.get_project(key[4])
         reading = self._contract_handshake_reading() or {}
@@ -270,32 +304,47 @@ class HandshakeLifecycleMixin:
             return False
 
     def _send_contract_request(self, rpc_name, request, context):
-        key, store, client = context
+        key, store, client, _write_epoch = context
         batch_id = request["batch"]["batch_id"]
         with self._contract_lock:
             self._check_contract_dispatch(request, context)
-            if batch_id in self._contract_sending:
+            if batch_id in self._contract_preparing or batch_id in self._contract_sending:
                 raise ContractDispatchPaused()
             cached = store.document_batch_response(batch_id)
             if cached is not None:
                 return cached
-        self.ensure_session_valid(client)
-        with self._contract_lock:
-            self._check_contract_dispatch(request, context)
-        call = client.rpc(rpc_name, {"p_request": request})
-        with self._contract_lock:
-            # RPC construction/session refresh may have yielded to logout,
-            # project switching or gate closure. This is the transport start
-            # boundary. After reservation, closing the gate is not a rollback.
-            self._check_contract_dispatch(request, context)
-            if batch_id in self._contract_sending:
-                raise ContractDispatchPaused()
-            cached = store.document_batch_response(batch_id)
-            if cached is not None:
-                return cached
-            self._contract_sending.add(batch_id)
+            # Preparation includes a potentially slow read. Duplicate recovery
+            # notifications must not start additional reads for this batch.
+            self._contract_preparing.add(batch_id)
         try:
-            response = self._response_data(call.execute())
+            self.ensure_session_valid(client)
+            with self._contract_lock:
+                self._check_contract_dispatch(request, context)
+            # A contract-only read: never use the legacy compatibility fallback
+            # or a cached/default active value to approve this send.
+            status = self._response_data(execute_contract_rpc(client.rpc(
+                "get_project_status", {"p_project_id": key[5]}
+            )))
+            with self._contract_lock:
+                self._check_contract_dispatch(request, context)
+                if (not isinstance(status, dict)
+                        or not isinstance(status.get("project_id"), str)
+                        or require_uuid(status["project_id"], "project_id") != key[5]
+                        or status.get("state") not in {"active", "trashed", "purged"}):
+                    raise SyncContractError("INVALID_ARGUMENT", "invalid project status")
+                if status["state"] != "active":
+                    self.mark_project_server_state(key[5], status["state"])
+                    raise ContractDispatchPaused()
+            call = client.rpc(rpc_name, {"p_request": request})
+            with self._contract_lock:
+                # The status read and RPC construction can both yield. The
+                # captured queue history also rejects blocked -> resolved ABA.
+                self._check_contract_dispatch(request, context)
+                cached = store.document_batch_response(batch_id)
+                if cached is not None:
+                    return cached
+                self._contract_sending.add(batch_id)
+            response = self._response_data(execute_contract_rpc(call))
             # A receipt belongs to the captured store even if the UI moved on.
             if rpc_name == "atomic_structure_commit":
                 receipt = store.record_structure_batch_response(batch_id, response)
@@ -313,3 +362,4 @@ class HandshakeLifecycleMixin:
         finally:
             with self._contract_lock:
                 self._contract_sending.discard(batch_id)
+                self._contract_preparing.discard(batch_id)

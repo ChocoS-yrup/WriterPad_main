@@ -3456,6 +3456,34 @@ class SyncV2Store:
                     conflicts.append(dict(occupant))
             return conflicts
 
+    def contract_queue_authority_stamp(self, local_key):
+        """Fingerprint durable entries into AND exits from blocked/conflict.
+
+        Ordinary enqueue/attempt/retry events do not revoke a valid baseline.
+        The existing append-only journal makes an intervening block observable
+        even if it was resolved before the next check, across store instances.
+        No schema change, manuscript read or mutation is needed.
+        """
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                WITH project_operations AS (
+                    SELECT operation_id FROM sync_operations WHERE local_key = ?
+                    UNION
+                    SELECT operation_id FROM sync_structure_operations WHERE local_key = ?
+                )
+                SELECT e.event_id FROM sync_operation_events e
+                JOIN project_operations o ON o.operation_id = e.operation_id
+                LEFT JOIN sync_operation_events previous
+                  ON previous.operation_id = e.operation_id
+                 AND previous.event_sequence = e.event_sequence - 1
+                WHERE e.event_type IN ('blocked', 'conflict_detected')
+                   OR previous.event_type IN ('blocked', 'conflict_detected')
+                ORDER BY e.event_id
+                """, (local_key, local_key),
+            ).fetchall()
+        return hashlib.sha256("\n".join(row[0] for row in rows).encode("ascii")).hexdigest()
+
     def counts(self, local_key=None):
         with self._reader() as connection:
             params = []

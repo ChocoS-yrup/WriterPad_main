@@ -314,6 +314,10 @@ def read_handshake_compatibility(handshake):
     if not isinstance(handshake, dict):
         raise SyncContractError("INVALID_ARGUMENT", "invalid handshake")
 
+    if not isinstance(handshake.get("project_id"), str):
+        raise SyncContractError("INVALID_ARGUMENT", "invalid project_id")
+    require_uuid(handshake["project_id"], "project_id")
+
     mode = handshake.get("project_sync_mode")
     if not isinstance(mode, str) or mode not in PROJECT_MODES:
         raise SyncContractError("INVALID_ARGUMENT", "invalid project_sync_mode")
@@ -345,6 +349,8 @@ def read_handshake_compatibility(handshake):
         raise SyncContractError(
             "INVALID_ARGUMENT", "invalid server_capabilities"
         )
+    if len(set(capabilities)) != len(capabilities):
+        raise SyncContractError("INVALID_ARGUMENT", "duplicate server_capabilities")
 
     _require_coherent_handshake(handshake, digest, protocol_version)
 
@@ -364,13 +370,15 @@ def _require_coherent_handshake(handshake, digest, protocol_version):
             "INVALID_ARGUMENT", "missing supported_protocol_versions"
         )
     supported_versions = handshake["supported_protocol_versions"]
-    if not isinstance(supported_versions, (list, tuple)) or not all(
-        isinstance(item, int) and not isinstance(item, bool)
+    if not isinstance(supported_versions, (list, tuple)) or not supported_versions or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0
         for item in supported_versions
     ):
         raise SyncContractError(
             "INVALID_ARGUMENT", "invalid supported_protocol_versions"
         )
+    if len(set(supported_versions)) != len(supported_versions):
+        raise SyncContractError("INVALID_ARGUMENT", "duplicate supported_protocol_versions")
     if SYNC_PROTOCOL_VERSION not in supported_versions:
         # server_protocol_version on its own is only a ceiling, so a server
         # that has dropped protocol 3 and answers 4 clears the >= check while

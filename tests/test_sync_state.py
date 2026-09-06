@@ -1135,6 +1135,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             current_loaded_file_right=None,
             left_editor=editor,
             right_editor=MagicMock(),
+            apply_editor_margins=MagicMock(),
             lbl_current_doc=_FakeLabel(),
             lbl_r_doc=_FakeLabel(),
             is_dirty_left=False,
@@ -1155,6 +1156,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
 
         self.assertEqual(target.current_loaded_file_left, "메인/메모장/새이름.txt")
         editor.setPlainText.assert_called_once_with("다른 Windows에서 저장한 내용")
+        target.apply_editor_margins.assert_called_once_with(editor)
         self.assertEqual(target.lbl_current_doc.text, "새이름.txt")
         self.assertEqual(target.loaded_versions["메인/메모장/새이름.txt"], 7)
         target.controller.rename_path.assert_called_once()
