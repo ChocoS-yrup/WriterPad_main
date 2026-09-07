@@ -432,6 +432,9 @@ class SettingsPanel(QWidget):
         self.btn_post_coordination_resume.clicked.connect(self.send_post_coordination_resume)
         review_layout.addWidget(self.btn_post_coordination_resume)
         cloud_layout.addWidget(review_card)
+        # Visibility only: this opt-in never grants execution or opens a gate.
+        review_card.setObjectName('ContractReviewDiagnosticsCard')
+        review_card.setVisible(os.environ.get('WRITERPAD_CONTRACT_REVIEW_UI') == '1')
         cloud_layout.addStretch()
         self.refresh_supabase_account_status()
         self.refresh_sync_diagnostics()

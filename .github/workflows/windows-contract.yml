@@ -6,12 +6,13 @@ on:
     branches:
       - main
     paths:
-      - "sync_contract.py"
-      - "sync_v2_store.py"
-      - "sync_manager.py"
+      - "**/*.py"
       - "tests/**"
       - "requirements-stage8.txt"
-      - "Antigravity_AI_Writer.spec"
+      - "작가님힘내세요.spec"
+      - "style.qss"
+      - "app_icon.ico"
+      - "model_catalog.json"
       - ".github/workflows/windows-contract.yml"
   workflow_dispatch:
 
@@ -26,6 +27,7 @@ jobs:
       EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
+      WRITERPAD_CONTRACT_REVIEW_UI: "0"
       WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
     steps:
       - name: Check out exact Windows client head
@@ -79,12 +81,20 @@ jobs:
         run: python -X faulthandler -m unittest discover -s tests -v
 
       - name: Build distributable executable
-        run: python -m PyInstaller --noconfirm --clean Antigravity_AI_Writer.spec
+        run: python -m PyInstaller --noconfirm --clean "작가님힘내세요.spec"
+
+      - name: Check packaged Qt startup without opening projects
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
+          $smoke = Start-Process -FilePath $artifact.FullName -ArgumentList '--qt-import-smoke-test' -WindowStyle Hidden -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) { throw "Packaged Qt startup failed: $($smoke.ExitCode)" }
 
       - name: Record executable digest
         shell: pwsh
         run: |
-          $artifact = Get-Item -LiteralPath dist/Antigravity_AI_Writer.exe
+          $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
           $digest = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "executable=$($artifact.FullName)"
           Write-Host "bytes=$($artifact.Length)"
