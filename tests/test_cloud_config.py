@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -229,6 +230,9 @@ class CloudErrorClassificationTestCase(unittest.TestCase):
         sentinel = "credential-and-key-sentinel"
         target = SimpleNamespace(
             cloud_network_enabled=True,
+            _contract_lock=threading.RLock(),
+            _auth_context_generation=0,
+            _forget_contract_handshake=MagicMock(),
             supabase=SimpleNamespace(
                 auth=SimpleNamespace(
                     sign_in_with_password=MagicMock(
@@ -248,6 +252,10 @@ class CloudErrorClassificationTestCase(unittest.TestCase):
             )
 
         self.assertFalse(success)
+        target.supabase.auth.sign_in_with_password.assert_called_once_with({
+            "email": "account@example.invalid",
+            "password": sentinel,
+        })
         self.assertNotIn(sentinel, message)
         self.assertNotIn(sentinel, output.getvalue())
 
