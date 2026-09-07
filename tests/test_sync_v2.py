@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import unicodedata
 import uuid
@@ -34,16 +35,192 @@ from project_identity_v1 import IdentityError, read_identity
 from project_manager_writing import WritingProjectManager
 from sync_manager import (
     LockWorker,
+    STRUCTURE_AUTHORITY_LEGACY,
+    STRUCTURE_AUTHORITY_UNKNOWN,
     TRASH_PURGE_DOCUMENT_PATH,
     TREE_ORDER_DOCUMENT_PATH,
+    TREE_ORDER_STALL_ATTEMPTS,
+    TREE_ORDER_STALL_SECONDS,
     SyncManager,
+    V2PullWorker,
     V2QueueWorker,
     is_live_document_path,
 )
-from sync_v2_store import SyncV2Store
+from sync_v2_store import STAGE8_USER_VERSION, SyncV2Store
 from three_way_merge import build_conflict_report, three_way_merge
 from writing_controller import WritingController
 from writing_tree import WritingTreeMixin
+
+
+class BackgroundStructureExecutionTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_unchanged_pull_snapshot_skips_durable_projection(self):
+        manager = MagicMock()
+        manager._ensure_contract_handshake.return_value = None
+        manager._fetch_v2_project_documents.return_value = []
+        manager._fetch_v2_project_folders.return_value = []
+        manager._fetch_v2_project_tree_orders.return_value = []
+        manager._legacy_structure_snapshot_in_flight.return_value = False
+        manager._needs_folder_history.return_value = False
+        authority = {"kind": "legacy", "folder_paths": []}
+        manager._select_remote_structure_authority.return_value = authority
+        manager._remote_snapshot_fingerprint.side_effect = (
+            SyncManager._remote_snapshot_fingerprint
+        )
+        fingerprint = SyncManager._remote_snapshot_fingerprint(
+            [], [], [], [], authority
+        )
+        worker = V2PullWorker(manager, project_id="project-id")
+        worker.cached_snapshot_fingerprint = fingerprint
+        results = []
+        worker.resultReady.connect(lambda success, payload: results.append(
+            (success, payload)
+        ))
+
+        worker.run()
+
+        self.assertTrue(results[0][0])
+        self.assertEqual(
+            results[0][1]["background_apply"]["kind"], "unchanged"
+        )
+        manager._apply_v2_remote_documents.assert_not_called()
+
+    def test_snapshot_fingerprint_ignores_unordered_rpc_row_order(self):
+        documents = [
+            {"document_id": "b", "revision": 2, "content": "two"},
+            {"document_id": "a", "revision": 1, "content": "one"},
+        ]
+        tree_orders = [
+            {"tree_order_id": "second", "children": ["B", "A"]},
+            {"tree_order_id": "first", "children": ["A", "B"]},
+        ]
+        authority = {
+            "kind": "projection",
+            "folder_paths": ["메인/둘", "메인/하나"],
+        }
+
+        forward = SyncManager._remote_snapshot_fingerprint(
+            documents, [], [], tree_orders, authority
+        )
+        reversed_rows = SyncManager._remote_snapshot_fingerprint(
+            list(reversed(documents)),
+            [],
+            [],
+            list(reversed(tree_orders)),
+            {
+                "kind": "projection",
+                "folder_paths": list(reversed(authority["folder_paths"])),
+            },
+        )
+
+        self.assertEqual(forward, reversed_rows)
+        changed_children = copy.deepcopy(tree_orders)
+        changed_children[0]["children"] = ["A", "B"]
+        self.assertNotEqual(
+            forward,
+            SyncManager._remote_snapshot_fingerprint(
+                documents, [], [], changed_children, authority
+            ),
+        )
+
+    def test_changed_pull_defers_apply_for_fresh_editor_protection_check(self):
+        manager = MagicMock()
+        manager._ensure_contract_handshake.return_value = None
+        manager._fetch_v2_project_documents.return_value = []
+        manager._fetch_v2_project_folders.return_value = []
+        manager._fetch_v2_project_tree_orders.return_value = []
+        manager._legacy_structure_snapshot_in_flight.return_value = False
+        manager._needs_folder_history.return_value = False
+        authority = {"kind": "legacy", "folder_paths": []}
+        manager._select_remote_structure_authority.return_value = authority
+        manager._remote_snapshot_fingerprint.side_effect = (
+            SyncManager._remote_snapshot_fingerprint
+        )
+        worker = V2PullWorker(manager, project_id="project")
+        worker.pull_identity = (1, "project", "local")
+        worker.expected_structure_generation = 8
+        results = []
+        worker.resultReady.connect(lambda success, payload: results.append(
+            (success, payload)
+        ))
+
+        worker.run()
+
+        self.assertTrue(results[0][0])
+        self.assertNotIn("background_apply", results[0][1])
+        manager._apply_v2_remote_documents.assert_not_called()
+
+    def test_local_structure_executor_preserves_submission_order(self):
+        manager = SyncManager()
+        completed = []
+        execution = []
+
+        for number in range(5):
+            manager.submit_local_structure_action(
+                lambda value=number: execution.append(value) or value,
+                lambda success, result, error, value=number: completed.append(
+                    (value, success, result, error)
+                ),
+            )
+
+        deadline = time.monotonic() + 5.0
+        while len(completed) < 5 and time.monotonic() < deadline:
+            self.app.processEvents()
+            QTest.qWait(10)
+
+        manager.wait_all_workers(5000)
+        deadline = time.monotonic() + 2.0
+        while (
+            manager._local_structure_worker is not None
+            and time.monotonic() < deadline
+        ):
+            self.app.processEvents()
+            QTest.qWait(10)
+        self.app.processEvents()
+        self.assertEqual(execution, [0, 1, 2, 3, 4])
+        self.assertEqual(
+            completed,
+            [(number, True, number, "") for number in range(5)],
+        )
+
+    def test_background_enqueue_marshals_drain_to_manager_thread(self):
+        manager = SyncManager()
+        previous_blocked = manager._auth_retry_blocked
+        previous_shutdown = manager._shutting_down
+        caller_results = []
+        published_on = []
+        owner_thread_id = threading.get_ident()
+        manager._auth_retry_blocked = True
+        manager._shutting_down = False
+        try:
+            with patch.object(
+                manager,
+                "_publish_sync_state",
+                side_effect=lambda: published_on.append(
+                    threading.get_ident()
+                ),
+            ):
+                background = threading.Thread(
+                    target=lambda: caller_results.append(
+                        manager.retry_pending_syncs()
+                    )
+                )
+                background.start()
+                background.join(timeout=2.0)
+
+                deadline = time.monotonic() + 2.0
+                while not published_on and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    QTest.qWait(10)
+
+            self.assertEqual(caller_results, [True])
+            self.assertEqual(published_on, [owner_thread_id])
+        finally:
+            manager._auth_retry_blocked = previous_blocked
+            manager._shutting_down = previous_shutdown
 
 
 class ThreeWayMergeTestCase(unittest.TestCase):
@@ -188,6 +365,42 @@ class ThreeWayMergeTestCase(unittest.TestCase):
             for noise in ("+++", "---", "@@"):
                 self.assertNotIn(noise, comparison)
 
+    def test_sync_protocol_state_produces_no_conflict_artifacts(self):
+        """순서표 충돌은 원고 충돌이 아니다. 충돌 폴더에 사본을 남기면 안 된다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wpm = WritingProjectManager()
+            wpm.workspace_dir = temp_dir
+            wpm.current_project = "충돌 작품"
+            wpm.writing_root_path = str(Path(temp_dir, "충돌 작품", "집필모드"))
+            Path(wpm.writing_root_path).mkdir(parents=True)
+            rel_path = "__antigravity__/tree-order.json"
+            label = MagicMock()
+            widget = SimpleNamespace(
+                wpm=wpm,
+                current_loaded_file_left=None,
+                current_loaded_file_right=None,
+                lbl_current_doc=label,
+                lbl_r_doc=MagicMock(),
+            )
+
+            WritingModeWidget.on_conflict_detected(widget, {
+                "operation": {
+                    "local_path": rel_path,
+                    "base_content": '{"version":1}',
+                    "content": '{"version":1}',
+                },
+                "base_content": '{"version":1}',
+                "local_content": '{"version":1}',
+                "merged_content": '{"version":1}',
+                "remote": {"content": '{"version":1}'},
+            })
+
+            self.assertFalse(Path(wpm.writing_root_path, "백업", "충돌").exists())
+            # The stray file that made a whole project refuse to open started
+            # as one of these copies being offered to the writer.
+            self.assertFalse(Path(wpm.writing_root_path, "__antigravity__").exists())
+            label.setText.assert_not_called()
+
 
 class SyncV2StoreTestCase(unittest.TestCase):
     def setUp(self):
@@ -200,6 +413,49 @@ class SyncV2StoreTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_reader_session_reuses_one_connection_and_releases_it(self):
+        path = "메인/원고/001화.txt"
+        local_key = self.context["local_key"]
+        self.store.enqueue(self.context, path, "본문")
+
+        opened = []
+        original_connect = self.store._connect
+
+        def counting_connect():
+            connection = original_connect()
+            opened.append(connection)
+            return connection
+
+        self.store._connect = counting_connect
+
+        with self.store.reader_session():
+            for _ in range(5):
+                self.assertIsNotNone(self.store.get_document(local_key, path))
+            pinned = list(opened)
+
+        self.assertEqual(len(pinned), 1)
+        # The burst must not leave a handle behind, or Windows cannot delete
+        # the database file afterwards.
+        with self.assertRaises(sqlite3.ProgrammingError):
+            pinned[0].execute("SELECT 1")
+
+        self.store.get_document(local_key, path)
+        self.assertEqual(len(opened), 2)
+
+    def test_reader_session_observes_writes_committed_during_the_burst(self):
+        path = "메인/원고/001화.txt"
+        local_key = self.context["local_key"]
+        self.store.enqueue(self.context, path, "첫 내용")
+
+        with self.store.reader_session():
+            before = self.store.get_document(local_key, path)
+            self.store.enqueue(self.context, path, "두 번째 내용")
+            after = self.store.get_document(local_key, path)
+
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        self.assertTrue(self.store.has_active_operations(after["document_id"]))
 
     def test_queue_survives_restart_and_keeps_operation_id(self):
         operation = self.store.enqueue(
@@ -375,10 +631,12 @@ class SyncV2StoreTestCase(unittest.TestCase):
 
     def test_folder_rename_intent_survives_restart_and_coalesces_chain(self):
         local_key = self.context["local_key"]
+        folder_id = str(uuid.uuid4())
         first = self.store.record_folder_rename_intent(
             local_key,
             "메인/메모장/처음 이름",
             "메인/메모장/중간 이름",
+            folder_id=folder_id,
         )
 
         reopened = SyncV2Store(self.db_path)
@@ -391,10 +649,13 @@ class SyncV2StoreTestCase(unittest.TestCase):
             local_key,
             "메인/메모장/중간 이름",
             "메인/메모장/최종 이름",
+            folder_id=folder_id,
         )
 
         self.assertEqual(recovered["intent_id"], first["intent_id"])
+        self.assertEqual(recovered["folder_id"], folder_id)
         self.assertEqual(chained["intent_id"], first["intent_id"])
+        self.assertEqual(chained["folder_id"], folder_id)
         self.assertIsNone(reopened.pending_folder_rename_intent(
             local_key,
             "메인/메모장/처음 이름",
@@ -596,6 +857,56 @@ class SyncV2StoreTestCase(unittest.TestCase):
         self.assertEqual(promoted["base_revision"], 1)
         self.assertEqual(promoted["base_content"], "첫 저장")
         self.assertEqual(self.store.operation_state_divergences(), [])
+
+    def test_recovery_promotes_only_one_of_many_chained_snapshots(self):
+        path = "__antigravity__/tree-order.json"
+        first = self.store.enqueue(self.context, path, "order-1")
+        dependents = [
+            self.store.enqueue(self.context, path, f"order-{number}")
+            for number in range(2, 5)
+        ]
+        self.assertTrue(all(
+            operation["base_revision"] is None for operation in dependents
+        ))
+
+        self.store.cancel_operation(first["operation_id"], str(uuid.uuid4()))
+
+        self.assertEqual(
+            self.store.recover_stranded_operations(self.context["local_key"]),
+            1,
+        )
+        reopened = SyncV2Store(self.db_path)
+        promoted = reopened.next_ready_operation(self.context["local_key"])
+        self.assertEqual(promoted["content"], "order-2")
+
+        # Restart recovery before the promoted operation commits must not
+        # create another ready operation against the same base revision.
+        self.assertEqual(
+            reopened.recover_stranded_operations(self.context["local_key"]),
+            0,
+        )
+        self.assertEqual(
+            reopened.next_ready_operation(self.context["local_key"])[
+                "operation_id"
+            ],
+            promoted["operation_id"],
+        )
+
+        for expected_revision, expected_content in ((1, "order-3"), (2, "order-4")):
+            reopened.mark_success(promoted["operation_id"], {
+                "revision": expected_revision,
+            })
+            promoted = reopened.next_ready_operation(
+                self.context["local_key"]
+            )
+            self.assertEqual(promoted["content"], expected_content)
+            self.assertEqual(promoted["base_revision"], expected_revision)
+
+        reopened.mark_success(promoted["operation_id"], {"revision": 3})
+        self.assertIsNone(
+            reopened.next_ready_operation(self.context["local_key"])
+        )
+        self.assertEqual(reopened.operation_state_divergences(), [])
 
     def test_unsent_saves_for_one_document_keep_immutable_intents(self):
         first = self.store.enqueue(
@@ -800,7 +1111,7 @@ class SyncV2StoreTestCase(unittest.TestCase):
         finally:
             raw.close()
         self.assertEqual(stored, "completed")
-        self.assertEqual(version, 8006)
+        self.assertEqual(version, STAGE8_USER_VERSION)
 
     def test_simultaneous_overlapping_save_is_kept_as_conflict(self):
         created = self.store.enqueue(self.context, "메인/원고/동시저장.txt", "공통 문장\n")
@@ -1131,6 +1442,7 @@ class _RpcCall:
 class _FakeClient:
     def __init__(self):
         self.calls = []
+        self.folder_reads = 0
         # Every real client can read the folder projection, and tree-order
         # commits now publish folder identity before the document lands.
         self.folder_rows = []
@@ -1155,6 +1467,7 @@ class _FolderQuery:
         return self
 
     def execute(self):
+        self.client.folder_reads += 1
         return _Response([dict(row) for row in self.client.folder_rows])
 
 
@@ -1213,6 +1526,359 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
 
     def _uuid_of(self, legacy_path):
         return node_for_path(self.project_root, legacy_path)["uuid"]
+
+    def _prepare_pathless_base_folder_delete(self, *, accept_delete=True):
+        """Reproduce q1436/q1437 without touching a real project or server."""
+        folder_path = "메인/설정집/구세계"
+        document_path = f"{folder_path}/마법.txt"
+        folder = create_item_at_path(
+            self.project_root, "메인/설정집", "구세계", True
+        )["nodes"][-1]
+        document = create_item_at_path(
+            self.project_root, folder_path, "마법", False
+        )["nodes"][-1]
+        body = "삭제 대기 중에도 보존할 본문"
+        Path(self.wpm.writing_root_path, document_path).write_text(
+            body, encoding="utf-8"
+        )
+
+        old_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": ["구세계"],
+            folder_path: ["마법.txt"],
+        }
+        old_payload = json.loads(self.manager._tree_order_content(old_order))
+        old_payload.pop("folder_paths", None)
+        pathless_base_content = json.dumps(
+            old_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        new_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": [],
+        }
+
+        identity = read_identity(self.project_root)
+        folder_rows = [
+            {
+                "folder_id": node["uuid"],
+                "parent_folder_id": node.get("parent_uuid"),
+                "local_path": node["legacy_path"],
+                "name": node["legacy_path"].rsplit("/", 1)[-1],
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for node in identity["nodes"]
+            if node["kind"] == "folder"
+        ]
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], folder_rows
+        )
+        client = _FolderAwareClient(folder_rows)
+
+        self.store.apply_remote_snapshot(
+            self.context,
+            document["uuid"],
+            document_path,
+            body,
+            2,
+            parent_folder_id=folder["uuid"],
+            name="마법",
+        )
+        tree_document_id = str(uuid.uuid5(
+            uuid.UUID(self.context["project_id"]), TREE_ORDER_DOCUMENT_PATH
+        ))
+        self.store.apply_remote_snapshot(
+            self.context,
+            tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            pathless_base_content,
+            28,
+            local_path=TREE_ORDER_DOCUMENT_PATH,
+        )
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(old_order)
+        self.assertTrue(self.wpm.save_settings())
+
+        tombstone_operation = None
+        trash_path = None
+        if accept_delete:
+            trash_path = self.wpm.move_to_trash(
+                folder_path,
+                tree_order_parent="메인/설정집",
+                tree_order_index=0,
+            )
+            self.manager.record_tombstone(
+                folder_path, trash_path, retry=False
+            )
+            tombstone_operation = self.store.next_ready_operation(
+                self.context["local_key"]
+            )
+            self.assertEqual(
+                tombstone_operation["document_id"], document["uuid"]
+            )
+
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(new_order)
+        self.assertTrue(self.wpm.save_settings())
+        tree_operation = self.manager.record_tree_order(
+            new_order, retry=False
+        )
+        self.assertEqual(tree_operation["base_revision"], 28)
+        self.assertNotIn(
+            "folder_paths", json.loads(tree_operation["base_content"])
+        )
+        self.assertNotIn(
+            folder_path, json.loads(tree_operation["content"])["folder_paths"]
+        )
+        return {
+            "folder": folder,
+            "document": document,
+            "folder_path": folder_path,
+            "document_path": document_path,
+            "body": body,
+            "trash_path": trash_path,
+            "client": client,
+            "tombstone_operation": tombstone_operation,
+            "tree_operation": tree_operation,
+        }
+
+    def _commit_operation(self, operation):
+        self.store.mark_attempt(operation["operation_id"])
+        result = self.manager._process_v2_operation(operation["operation_id"])
+        if result["kind"] == "committed":
+            self.store.mark_success(operation["operation_id"], result["result"])
+        elif result["kind"] == "retry":
+            self.store.mark_retry(operation["operation_id"], result["error"])
+        return result
+
+    def test_pathless_base_delete_waits_for_document_then_folder_then_tree(self):
+        case = self._prepare_pathless_base_folder_delete()
+        client = case["client"]
+        document_id = case["document"]["uuid"]
+        folder_id = case["folder"]["uuid"]
+        tree_id = case["tree_operation"]["document_id"]
+        remaining_conflicts = [2]
+        original_rpc = client.rpc
+
+        def rpc(name, params):
+            if (
+                name == "commit_document"
+                and params["p_document_id"] == document_id
+                and params["p_is_deleted"]
+                and remaining_conflicts[0] > 0
+            ):
+                class LeaseConflictCall:
+                    def execute(inner_self):
+                        client.calls.append((name, params))
+                        remaining_conflicts[0] -= 1
+                        raise RuntimeError("LEASE_CONFLICT")
+
+                return LeaseConflictCall()
+            return original_rpc(name, params)
+
+        client.rpc = rpc
+        self.manager.supabase = client
+        client.calls.clear()
+
+        for _attempt in range(2):
+            result = self._commit_operation(case["tombstone_operation"])
+            self.assertEqual(result["kind"], "retry")
+            self.assertEqual(
+                [
+                    params for name, params in client.calls
+                    if name == "commit_folder"
+                    and params["p_folder_id"] == folder_id
+                ],
+                [],
+            )
+            self.assertEqual(
+                [
+                    params for name, params in client.calls
+                    if name == "commit_document"
+                    and params["p_document_id"] == tree_id
+                ],
+                [],
+            )
+
+        document_result = self._commit_operation(case["tombstone_operation"])
+        self.assertEqual(document_result["kind"], "committed")
+        tree_result = self._commit_operation(case["tree_operation"])
+        self.assertEqual(tree_result["kind"], "committed")
+
+        indexed_calls = list(enumerate(client.calls))
+        document_calls = [
+            index for index, (name, params) in indexed_calls
+            if name == "commit_document"
+            and params["p_document_id"] == document_id
+        ]
+        folder_calls = [
+            (index, params) for index, (name, params) in indexed_calls
+            if name == "commit_folder" and params["p_folder_id"] == folder_id
+        ]
+        tree_calls = [
+            index for index, (name, params) in indexed_calls
+            if name == "commit_document" and params["p_document_id"] == tree_id
+        ]
+        self.assertEqual(
+            len(folder_calls),
+            1,
+            "base folder_paths가 없어도 정확한 폴더 UUID tombstone은 생략할 수 없다",
+        )
+        folder_index, folder_params = folder_calls[0]
+        self.assertEqual(folder_params["p_folder_id"], folder_id)
+        self.assertEqual(
+            folder_params["p_parent_folder_id"],
+            case["folder"]["parent_uuid"],
+        )
+        self.assertEqual(folder_params["p_name"], "구세계")
+        self.assertEqual(folder_params["p_base_revision"], 1)
+        self.assertTrue(folder_params["p_is_deleted"])
+        self.assertEqual(len(tree_calls), 1)
+        self.assertLess(max(document_calls), folder_index)
+        self.assertLess(folder_index, tree_calls[0])
+
+    def test_folder_delete_intent_is_durable_and_pins_exact_dependencies(self):
+        case = self._prepare_pathless_base_folder_delete()
+        reopened = SyncV2Store(self.store.db_path)
+        reader = getattr(reopened, "pending_folder_delete_intents", None)
+        self.assertTrue(
+            callable(reader),
+            "LEGACY folder delete를 재시작 후 복구할 durable intent API가 없다",
+        )
+
+        intents = reader(self.context["local_key"])
+        intent = next(
+            item for item in intents
+            if item["folder_id"] == case["folder"]["uuid"]
+        )
+        parent = node_for_path(self.project_root, "메인/설정집")
+        self.assertEqual(intent["parent_folder_id"], parent["uuid"])
+        self.assertEqual(intent["name"], "구세계")
+        self.assertEqual(intent["base_revision"], 1)
+        self.assertEqual(intent["pre_delete_path"], case["folder_path"])
+        self.assertEqual(intent["status"], "documents_pending")
+        self.assertEqual(
+            intent["dependent_documents"],
+            [{
+                "document_id": case["document"]["uuid"],
+                "tombstone_operation_id": case["tombstone_operation"][
+                    "operation_id"
+                ],
+            }],
+        )
+
+    def test_restart_resumes_same_intent_after_folder_before_tree_partial_commit(self):
+        case = self._prepare_pathless_base_folder_delete()
+        client = case["client"]
+        folder_id = case["folder"]["uuid"]
+        tree_id = case["tree_operation"]["document_id"]
+        self.manager.supabase = client
+        self.assertEqual(
+            self._commit_operation(case["tombstone_operation"])["kind"],
+            "committed",
+        )
+        original_rpc = client.rpc
+        failed_once = [False]
+
+        def rpc(name, params):
+            if (
+                name == "commit_document"
+                and params["p_document_id"] == tree_id
+                and not failed_once[0]
+            ):
+                class InterruptedTreeCall:
+                    def execute(inner_self):
+                        client.calls.append((name, params))
+                        failed_once[0] = True
+                        raise RuntimeError("network timeout")
+
+                return InterruptedTreeCall()
+            return original_rpc(name, params)
+
+        client.rpc = rpc
+        first = self._commit_operation(case["tree_operation"])
+        self.assertEqual(first["kind"], "retry")
+        self.assertTrue(next(
+            row for row in client.folder_rows
+            if row["folder_id"] == folder_id
+        )["is_deleted"])
+
+        reopened = SyncV2Store(self.store.db_path)
+        self.manager._v2_store = reopened
+        resumed_operation = reopened.operation(
+            case["tree_operation"]["operation_id"]
+        )
+        second = self._commit_operation(resumed_operation)
+        self.assertEqual(second["kind"], "committed")
+
+        folder_calls = [
+            params for name, params in client.calls
+            if name == "commit_folder" and params["p_folder_id"] == folder_id
+        ]
+        self.assertEqual(
+            len(folder_calls), 1,
+            "재시작 뒤 이미 완료된 folder tombstone을 새 작업으로 보내면 안 된다",
+        )
+        intents = reopened.pending_folder_delete_intents(
+            self.context["local_key"]
+        )
+        self.assertFalse(any(
+            item["folder_id"] == folder_id for item in intents
+        ))
+
+    def test_pathless_base_without_durable_delete_intent_never_commits_tree(self):
+        case = self._prepare_pathless_base_folder_delete(accept_delete=False)
+        client = case["client"]
+        tree_id = case["tree_operation"]["document_id"]
+        self.manager.supabase = client
+        client.calls.clear()
+
+        result = self._commit_operation(case["tree_operation"])
+
+        tree_calls = [
+            params for name, params in client.calls
+            if name == "commit_document" and params["p_document_id"] == tree_id
+        ]
+        self.assertEqual(
+            tree_calls,
+            [],
+            "삭제 UUID를 증명할 durable intent 없이 tree-order만 커밋했다",
+        )
+        self.assertIn(result["kind"], {"blocked", "retry"})
+
+    def test_folder_tombstone_failure_keeps_tree_order_uncommitted(self):
+        case = self._prepare_pathless_base_folder_delete()
+        client = case["client"]
+        folder_id = case["folder"]["uuid"]
+        tree_id = case["tree_operation"]["document_id"]
+        self.manager.supabase = client
+        client.calls.clear()
+        document_result = self._commit_operation(case["tombstone_operation"])
+        self.assertEqual(document_result["kind"], "committed")
+        original_rpc = client.rpc
+
+        def rpc(name, params):
+            if (
+                name == "commit_folder"
+                and params["p_folder_id"] == folder_id
+                and params["p_is_deleted"]
+            ):
+                raise RuntimeError("network timeout")
+            return original_rpc(name, params)
+
+        client.rpc = rpc
+        result = self._commit_operation(case["tree_operation"])
+
+        self.assertIn(result["kind"], {"blocked", "retry"})
+        self.assertEqual(
+            [
+                params for name, params in client.calls
+                if name == "commit_document" and params["p_document_id"] == tree_id
+            ],
+            [],
+            "folder tombstone 실패 뒤 tree-order가 완료되면 안 된다",
+        )
 
     def test_a_new_project_publishes_its_standard_folders_with_identity_uuids(self):
         client = _FolderAwareClient([])
@@ -1294,6 +1960,73 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertEqual(len(client.folder_rows), 1)
 
+    def test_blocked_folder_lifecycle_never_commits_tree_order(self):
+        foreign_main = str(uuid.uuid4())
+        client = _FolderAwareClient([{
+            "folder_id": foreign_main,
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+        first = self.manager.record_tree_order(
+            {"<root>": ["메모장"]}, retry=False
+        )
+        self.store.mark_attempt(first["operation_id"])
+        corrected = self.manager.record_tree_order(
+            {"<root>": ["메모장", "캐릭터"]}, retry=False
+        )
+        self.assertIsNone(corrected["base_revision"])
+
+        result = self.manager._process_v2_operation(first["operation_id"])
+
+        self.assertEqual(result["kind"], "superseded")
+        self.assertNotIn(
+            "commit_document", [name for name, _params in client.calls]
+        )
+        self.assertEqual(
+            self.store.operation(first["operation_id"])["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            self.store.operation(corrected["operation_id"])["status"],
+            "cancelled",
+        )
+        successor = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.assertIsNotNone(successor)
+        self.assertEqual(successor["content"], corrected["content"])
+        self.assertEqual(successor["base_revision"], 0)
+
+    def test_blocked_folder_lifecycle_without_correction_stays_blocked(self):
+        client = _FolderAwareClient([{
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+        operation = self.manager.record_tree_order(
+            {"<root>": ["메모장"]}, retry=False
+        )
+        self.store.mark_attempt(operation["operation_id"])
+
+        result = self.manager._process_v2_operation(
+            operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "blocked")
+        self.assertNotIn(
+            "commit_document", [name for name, _params in client.calls]
+        )
+        self.assertEqual(
+            self.store.operation(operation["operation_id"])["status"],
+            "blocked",
+        )
+
     def test_a_blocked_folder_is_reported_and_never_repaired(self):
         client = _FolderAwareClient([
             {
@@ -1336,6 +2069,254 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         published = {row["folder_id"] for row in client.folder_rows}
         self.assertIn(created["uuid"], published)
 
+    def test_older_tree_snapshot_never_publishes_a_future_folder_identity(self):
+        first = create_item_at_path(
+            self.project_root, "메인", "첫 snapshot 폴더", True
+        )["nodes"][-1]
+        first_content = self.manager._tree_order_content({
+            "<root>": ["첫 snapshot 폴더"],
+            "메인/첫 snapshot 폴더": [],
+        })
+        future = create_item_at_path(
+            self.project_root, "메인", "미래 snapshot 폴더", True
+        )["nodes"][-1]
+        operation = {
+            **self.operation,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": self.manager._tree_order_content({"<root>": []}),
+            "content": first_content,
+        }
+        client = _FolderAwareClient([])
+
+        first_result = self.manager._commit_outbound_folder_lifecycle(
+            operation,
+            client,
+            snapshot_scope=(
+                self.manager._legacy_folder_scope_for_operation(operation)
+            ),
+        )
+
+        published = {row["folder_id"] for row in client.folder_rows}
+        self.assertIn(first["uuid"], published)
+        self.assertNotIn(future["uuid"], published)
+        self.assertIn("메인/첫 snapshot 폴더", first_result["created"])
+        self.assertNotIn("메인/미래 snapshot 폴더", first_result["created"])
+
+        operation["operation_id"] = str(uuid.uuid4())
+        operation["base_content"] = first_content
+        operation["content"] = self.manager._tree_order_content({
+            "<root>": ["첫 snapshot 폴더", "미래 snapshot 폴더"],
+            "메인/첫 snapshot 폴더": [],
+            "메인/미래 snapshot 폴더": [],
+        })
+        second_result = self.manager._commit_outbound_folder_lifecycle(
+            operation,
+            client,
+            snapshot_scope=(
+                self.manager._legacy_folder_scope_for_operation(operation)
+            ),
+        )
+
+        published = {row["folder_id"] for row in client.folder_rows}
+        self.assertIn(future["uuid"], published)
+        self.assertIn("메인/미래 snapshot 폴더", second_result["created"])
+
+    def test_six_rapid_folder_snapshots_publish_one_generation_at_a_time(self):
+        created = [
+            create_item_at_path(
+                self.project_root, "메인", f"연속 폴더 {number}", True
+            )["nodes"][-1]
+            for number in range(1, 7)
+        ]
+        contents = [self.manager._tree_order_content({"<root>": []})]
+        for count in range(1, 7):
+            names = [f"연속 폴더 {number}" for number in range(1, count + 1)]
+            contents.append(self.manager._tree_order_content({
+                "<root>": names,
+                **{f"메인/{name}": [] for name in names},
+            }))
+
+        client = _FolderAwareClient([])
+        all_user_ids = {node["uuid"] for node in created}
+        for index in range(1, 7):
+            operation = {
+                **self.operation,
+                "operation_id": str(uuid.uuid4()),
+                "local_key": self.context["local_key"],
+                "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                "base_content": contents[index - 1],
+                "content": contents[index],
+            }
+            self.manager._commit_outbound_folder_lifecycle(
+                operation,
+                client,
+                snapshot_scope=self.manager._legacy_folder_scope_for_operation(
+                    operation
+                ),
+            )
+
+            published_user_ids = {
+                row["folder_id"] for row in client.folder_rows
+            } & all_user_ids
+            self.assertEqual(
+                published_user_ids,
+                {node["uuid"] for node in created[:index]},
+            )
+
+    def test_reused_old_name_never_renames_the_replacement_folder(self):
+        old_path = "메인/새 폴더"
+        new_path = "메인/ㄹ"
+        original = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        self.assertTrue(self.wpm.rename_item(old_path, new_path))
+        rename_intent = self.manager.record_folder_rename_intent(
+            old_path, new_path
+        )
+        replacement = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+
+        root_id = self._uuid_of("메인")
+        original_row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == original["uuid"]
+        )
+        original_row["name"] = "ㄹ"
+        original_row["revision"] += 1
+        client.folder_rows.append({
+            "folder_id": replacement["uuid"],
+            "parent_folder_id": root_id,
+            "name": "새 폴더",
+            "revision": 1,
+            "is_deleted": False,
+        })
+        operation = {
+            **self.operation,
+            "operation_id": str(uuid.uuid4()),
+            "local_key": self.context["local_key"],
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": self.manager._tree_order_content({
+                "<root>": ["새 폴더"],
+                old_path: [],
+            }),
+            "content": self.manager._tree_order_content({
+                "<root>": ["ㄹ", "새 폴더"],
+                new_path: [],
+                old_path: [],
+            }),
+        }
+        calls_before = len(client.calls)
+
+        result = self.manager._commit_outbound_folder_rename(
+            operation, client
+        )
+
+        self.assertEqual(result["status"], "already_applied")
+        self.assertEqual(len(client.calls), calls_before)
+        self.assertIsNone(self.store.pending_folder_rename_intent(
+            self.context["local_key"], old_path, new_path
+        ))
+        by_id = {row["folder_id"]: row for row in client.folder_rows}
+        self.assertEqual(by_id[original["uuid"]]["name"], "ㄹ")
+        self.assertEqual(by_id[replacement["uuid"]]["name"], "새 폴더")
+        self.assertEqual(
+            self.store.folder_rename_intent_events(rename_intent["intent_id"])[
+                -1
+            ]["event_type"],
+            "completed",
+        )
+
+    def test_restart_after_rename_and_old_name_reuse_keeps_both_folder_ids(self):
+        """An older snapshot must not publish the replacement under its old name."""
+        old_path = "메인/새 폴더"
+        new_path = "메인/ㄹ"
+        original = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+        first_operation = {
+            **self.operation,
+            "local_key": self.context["local_key"],
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": self.manager._tree_order_content({"<root>": []}),
+            "content": self.manager._tree_order_content({
+                "<root>": ["새 폴더"],
+                old_path: [],
+            }),
+        }
+
+        self.assertTrue(self.wpm.rename_item(old_path, new_path))
+        rename_intent = self.manager.record_folder_rename_intent(
+            old_path, new_path
+        )
+        replacement = create_item_at_path(
+            self.project_root, "메인", "새 폴더", True
+        )["nodes"][-1]
+        second_operation = {
+            **self.operation,
+            "operation_id": str(uuid.uuid4()),
+            "local_key": self.context["local_key"],
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "base_content": first_operation["content"],
+            "content": self.manager._tree_order_content({
+                "<root>": ["ㄹ", "새 폴더"],
+                new_path: [],
+                old_path: [],
+            }),
+        }
+
+        reopened_store = SyncV2Store(self.store.db_path)
+        restarted = SyncManager()
+        restarted._v2_store = reopened_store
+        restarted._v2_context = self.context
+        restarted._v2_wpm = self.wpm
+        restarted._v2_device_id = str(uuid.uuid4())
+        client = _FolderAwareClient([])
+
+        restarted._commit_outbound_folder_rename(first_operation, client)
+        restarted._commit_outbound_folder_lifecycle(
+            first_operation,
+            client,
+            snapshot_scope=restarted._legacy_folder_scope_for_operation(
+                first_operation
+            ),
+        )
+
+        first_ids = {row["folder_id"] for row in client.folder_rows}
+        self.assertNotIn(original["uuid"], first_ids)
+        self.assertNotIn(replacement["uuid"], first_ids)
+        self.assertEqual(
+            reopened_store.pending_folder_rename_intent(
+                self.context["local_key"], old_path, new_path
+            )["folder_id"],
+            original["uuid"],
+        )
+
+        restarted._commit_outbound_folder_rename(second_operation, client)
+        restarted._commit_outbound_folder_lifecycle(
+            second_operation,
+            client,
+            snapshot_scope=restarted._legacy_folder_scope_for_operation(
+                second_operation
+            ),
+        )
+        restarted._commit_outbound_folder_rename(second_operation, client)
+
+        paths = restarted._folder_rows_with_tree_paths(client.folder_rows)
+        self.assertEqual(paths[original["uuid"]]["local_path"], new_path)
+        self.assertEqual(paths[replacement["uuid"]]["local_path"], old_path)
+        self.assertIsNone(reopened_store.pending_folder_rename_intent(
+            self.context["local_key"], old_path, new_path
+        ))
+        self.assertEqual(
+            reopened_store.folder_rename_intent_events(
+                rename_intent["intent_id"]
+            )[-1]["event_type"],
+            "completed",
+        )
+
     def test_the_local_folder_row_records_the_published_identity(self):
         client = _FolderAwareClient([])
 
@@ -1345,6 +2326,370 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
             self.context["local_key"], "메인/원고"
         )
         self.assertEqual(stored["folder_id"], self._uuid_of("메인/원고"))
+
+    def _queue_generated_chapters(self, volume_number, names=None):
+        start = (volume_number - 1) * 25 + 1
+        names = names or range(start, start + 25)
+        return [
+            self.manager.record_created_document(
+                f"메인/원고/{volume_number}권/{number:03d}화.txt",
+                retry=False,
+            )
+            for number in names
+        ]
+
+    @staticmethod
+    def _rpc_index(client, name, *, folder_name=None):
+        for index, (rpc_name, params) in enumerate(client.calls):
+            if rpc_name != name:
+                continue
+            if folder_name is None or params.get("p_name") == folder_name:
+                return index
+        raise AssertionError(f"missing RPC: {name} {folder_name or ''}")
+
+    def test_two_rapid_volumes_publish_both_folders_before_any_chapter(self):
+        create_volume(self.project_root)
+        create_volume(self.project_root)
+        self._queue_generated_chapters(1)
+        self._queue_generated_chapters(2)
+        client = _FolderAwareClient([])
+        self.manager.supabase = client
+        first = self.store.next_ready_operation(self.context["local_key"])
+
+        result = self.manager._process_v2_operation(first["operation_id"])
+
+        self.assertEqual(result["kind"], "committed")
+        document_index = self._rpc_index(client, "commit_document")
+        self.assertLess(
+            self._rpc_index(client, "commit_folder", folder_name="1권"),
+            document_index,
+        )
+        self.assertLess(
+            self._rpc_index(client, "commit_folder", folder_name="2권"),
+            document_index,
+        )
+        self.assertEqual(first["relative_path"], "메인/원고/1권/001화.txt")
+
+    def test_new_second_volume_overtakes_remaining_first_volume_chapters(self):
+        create_volume(self.project_root)
+        first, second = self._queue_generated_chapters(1, names=(1, 2))
+        client = _FolderAwareClient([])
+        self.manager.supabase = client
+
+        first_result = self.manager._process_v2_operation(
+            first["operation_id"]
+        )
+        self.assertEqual(first_result["kind"], "committed")
+        calls_before_second_volume = len(client.calls)
+
+        create_volume(self.project_root)
+        self._queue_generated_chapters(2, names=(26,))
+        second_result = self.manager._process_v2_operation(
+            second["operation_id"]
+        )
+
+        self.assertEqual(second_result["kind"], "committed")
+        later_calls = client.calls[calls_before_second_volume:]
+        second_folder = next(
+            index for index, (name, params) in enumerate(later_calls)
+            if name == "commit_folder" and params.get("p_name") == "2권"
+        )
+        next_document = next(
+            index for index, (name, _params) in enumerate(later_calls)
+            if name == "commit_document"
+        )
+        self.assertLess(second_folder, next_document)
+
+    def test_restart_reproves_volume_folder_before_resuming_chapter(self):
+        create_volume(self.project_root)
+        operation = self._queue_generated_chapters(1, names=(1,))[0]
+        project_id = self.context["project_id"]
+        self.manager.release_v2()
+        self.context = self.manager.configure_v2(
+            self.wpm,
+            "폴더 발행",
+            str(uuid.uuid4()),
+            store=self.store,
+            project_id=project_id,
+            recover_local_changes=False,
+        )
+        client = _FolderAwareClient([])
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(operation["operation_id"])
+
+        self.assertEqual(result["kind"], "committed")
+        self.assertGreater(client.folder_reads, 0)
+        self.assertLess(
+            self._rpc_index(client, "commit_folder", folder_name="1권"),
+            self._rpc_index(client, "commit_document"),
+        )
+
+    def test_unpublished_volume_parent_never_sends_its_chapter(self):
+        create_volume(self.project_root)
+        operation = self._queue_generated_chapters(1, names=(1,))[0]
+        foreign_volume_id = str(uuid.uuid4())
+        client = _FolderAwareClient([{
+            "folder_id": foreign_volume_id,
+            "parent_folder_id": self._uuid_of("메인/원고"),
+            "name": "1권",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(operation["operation_id"])
+
+        self.assertEqual(result["kind"], "retry")
+        self.assertNotIn(
+            "commit_document", [name for name, _params in client.calls]
+        )
+
+    def test_regular_folder_is_published_before_its_first_document(self):
+        folder_path = "메인/설정집/윈도우-든폴더"
+        document_path = f"{folder_path}/문서문서.txt"
+        create_item_at_path(
+            self.project_root, "메인/설정집", "윈도우-든폴더", True
+        )
+        self.assertTrue(self.wpm.write_text_file(document_path, "본문"))
+        operation = self.manager.record_created_document(
+            document_path, retry=False
+        )
+        client = _FolderAwareClient([])
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(
+            operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "committed")
+        self.assertLess(
+            self._rpc_index(
+                client, "commit_folder", folder_name="윈도우-든폴더"
+            ),
+            self._rpc_index(client, "commit_document"),
+        )
+
+    def test_unpublished_regular_parent_never_sends_its_document(self):
+        folder_path = "메인/설정집/아이패드-든폴더"
+        document_path = f"{folder_path}/문문서서.txt"
+        create_item_at_path(
+            self.project_root, "메인/설정집", "아이패드-든폴더", True
+        )
+        self.assertTrue(self.wpm.write_text_file(document_path, "본문"))
+        operation = self.manager.record_created_document(
+            document_path, retry=False
+        )
+        client = _FolderAwareClient([{
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": self._uuid_of("메인/설정집"),
+            "name": "아이패드-든폴더",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(
+            operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "retry")
+        self.assertNotIn(
+            "commit_document", [name for name, _params in client.calls]
+        )
+
+    def _published_nonempty_folder(self, folder_name):
+        folder_path = f"메인/설정집/{folder_name}"
+        document_path = f"{folder_path}/문서.txt"
+        create_item_at_path(
+            self.project_root, "메인/설정집", folder_name, True
+        )
+        self.assertTrue(self.wpm.write_text_file(document_path, "본문"))
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(
+            self.operation, client
+        )
+        create_operation = self.manager.record_created_document(
+            document_path, retry=False
+        )
+        self.store.mark_success(
+            create_operation["operation_id"], {"revision": 1}
+        )
+        return client, folder_path, document_path
+
+    def test_older_tree_never_tombstones_folder_with_active_child_work(self):
+        client, folder_path, _document_path = self._published_nonempty_folder(
+            "삭제대기폴더"
+        )
+        trash_path = self.wpm.move_to_trash(folder_path)
+        self.manager.record_tombstone(
+            folder_path, trash_path, retry=False
+        )
+        client.calls.clear()
+
+        result = self.manager._commit_outbound_folder_lifecycle(
+            {**self.operation, "operation_id": str(uuid.uuid4())}, client
+        )
+
+        self.assertEqual(result["deleted"], [])
+        row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == self._uuid_of(
+                "메인/휴지통/삭제대기폴더"
+            )
+        )
+        self.assertFalse(row["is_deleted"])
+        self.assertNotIn(
+            "commit_folder", [name for name, _params in client.calls]
+        )
+
+    def test_nonempty_restore_publishes_parent_before_live_document(self):
+        client, folder_path, _document_path = self._published_nonempty_folder(
+            "복원폴더"
+        )
+        trash_path = self.wpm.move_to_trash(folder_path)
+        self.manager.record_tombstone(
+            folder_path, trash_path, retry=False
+        )
+        delete_operation = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.store.mark_success(
+            delete_operation["operation_id"], {"revision": 2}
+        )
+        self.manager._commit_outbound_folder_lifecycle(
+            {**self.operation, "operation_id": str(uuid.uuid4())}, client
+        )
+        deleted = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == self._uuid_of(
+                "메인/휴지통/복원폴더"
+            )
+        )
+        self.assertTrue(deleted["is_deleted"])
+
+        restored_path = self.wpm.restore_from_trash(trash_path)
+        self.manager.record_restore(
+            trash_path,
+            restored_path,
+            original_rel_path=folder_path,
+            retry=False,
+        )
+        restore_operation = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        client.calls.clear()
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(
+            restore_operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "committed")
+        self.assertLess(
+            self._rpc_index(client, "commit_folder", folder_name="복원폴더"),
+            self._rpc_index(client, "commit_document"),
+        )
+        restored = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == self._uuid_of("메인/설정집/복원폴더")
+        )
+        self.assertFalse(restored["is_deleted"])
+
+    def test_folder_restore_reattaches_remote_tombstoned_child_uuid(self):
+        """An iPad folder delete leaves its child at the Windows trash root."""
+        client, folder_path, document_path = self._published_nonempty_folder(
+            "아이패드-든폴더"
+        )
+        document = self.store.get_document(
+            self.context["local_key"], document_path
+        )
+        document_id = document["document_id"]
+        folder_id = self._uuid_of(folder_path)
+        for row in client.folder_rows:
+            if row["folder_id"] == folder_id:
+                row["is_deleted"] = True
+                row["revision"] = 2
+
+        self._pull(
+            client.folder_rows,
+            [{
+                "document_id": document_id,
+                "relative_path": document_path,
+                "content": "본문",
+                "revision": 2,
+                "is_deleted": True,
+            }],
+            {"<root>": ["설정집"], "메인/설정집": []},
+            tree_revision=2,
+        )
+
+        identity = read_identity(self.project_root)
+        folder_trash = next(
+            node["legacy_path"] for node in identity["nodes"]
+            if node["uuid"] == folder_id
+        )
+        document_trash = next(
+            node["legacy_path"] for node in identity["nodes"]
+            if node["uuid"] == document_id
+        )
+        self.assertTrue(folder_trash.startswith("메인/휴지통/"))
+        self.assertTrue(document_trash.startswith("메인/휴지통/"))
+        self.assertFalse(document_trash.startswith(folder_trash + "/"))
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, folder_trash
+        ).joinpath("문서.txt").exists())
+
+        restored_path = self.wpm.restore_from_trash(folder_trash)
+        operations = self.manager.record_restore(
+            folder_trash,
+            restored_path,
+            original_rel_path=folder_path,
+            retry=False,
+        )
+
+        self.assertEqual(restored_path, folder_path)
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, document_path
+        ).is_file())
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, document_trash
+        ).exists())
+        restored_document = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == document_id
+        )
+        self.assertEqual(restored_document["legacy_path"], document_path)
+        self.assertEqual(
+            [operation["document_id"] for operation in operations
+             if operation.get("operation_id")],
+            [document_id],
+        )
+
+        restore_operation = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.assertEqual(restore_operation["document_id"], document_id)
+        self.assertFalse(restore_operation["is_deleted"])
+        self.assertEqual(restore_operation["relative_path"], document_path)
+        client.calls.clear()
+        self.manager.supabase = client
+
+        result = self.manager._process_v2_operation(
+            restore_operation["operation_id"]
+        )
+
+        self.assertEqual(result["kind"], "committed")
+        self.assertLess(
+            self._rpc_index(
+                client, "commit_folder", folder_name="아이패드-든폴더"
+            ),
+            self._rpc_index(client, "commit_document"),
+        )
+        restored_row = next(
+            row for row in client.folder_rows if row["folder_id"] == folder_id
+        )
+        self.assertFalse(restored_row["is_deleted"])
 
     def _rows_by_name(self, client):
         return {row["name"]: row for row in client.folder_rows}
@@ -1480,7 +2825,9 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         ]
         self.assertEqual([row["folder_id"] for row in live], [replacement["uuid"]])
 
-    def _pull(self, folder_rows, remote_documents, tree_order):
+    def _pull(
+        self, folder_rows, remote_documents, tree_order, *, tree_revision=1
+    ):
         """Apply one pull the way _process_v2_pull hands it to the manager."""
         documents = [{
             "document_id": str(uuid.uuid5(
@@ -1488,7 +2835,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
             )),
             "relative_path": TREE_ORDER_DOCUMENT_PATH,
             "content": self.manager._tree_order_content(tree_order),
-            "revision": 1,
+            "revision": tree_revision,
             "is_deleted": False,
         }]
         documents.extend(remote_documents)
@@ -1666,6 +3013,100 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertEqual(moved["legacy_path"], "메인/설정집/구세계")
 
+    def test_tree_order_waits_for_the_original_live_folder_row_before_restore(self):
+        """A newer name-only snapshot must not mint a replacement folder UUID."""
+        folder = create_item_at_path(
+            self.project_root, "메인", "윈도우-빈폴더", True
+        )["nodes"][-1]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        for row in client.folder_rows:
+            if row["folder_id"] == folder["uuid"]:
+                row["is_deleted"] = True
+                row["revision"] = 2
+        self._pull(
+            client.folder_rows, [], {"<root>": []}, tree_revision=1
+        )
+        original_uuid = folder["uuid"]
+        trash_node = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == original_uuid
+        )
+        self.assertTrue(trash_node["legacy_path"].startswith("메인/휴지통/"))
+
+        # The tree-order commit can overtake commit_folder. It names the old
+        # slot again, but the only folder row for that slot is still the
+        # original UUID's tombstone.
+        first_changes = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=2,
+        )
+
+        target_path = "메인/윈도우-빈폴더"
+        target = Path(self.wpm.writing_root_path, target_path)
+        self.assertFalse(target.exists())
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, trash_node["legacy_path"]
+        ).is_dir())
+        self.assertEqual(
+            [node for node in read_identity(self.project_root)["nodes"]
+             if node["legacy_path"] == target_path],
+            [],
+        )
+        self.assertFalse(any(
+            change.get("kind") == "tree_order" for change in first_changes
+        ))
+
+        # Only the stable projection may prove a restore. The same UUID then
+        # moves out of trash exactly once; no replacement UUID is issued.
+        for row in client.folder_rows:
+            if row["folder_id"] == original_uuid:
+                row["is_deleted"] = False
+                row["revision"] = 3
+        second_changes = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=3,
+        )
+
+        self.assertTrue(target.is_dir())
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, trash_node["legacy_path"]
+        ).exists())
+        matching = [
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["legacy_path"] == target_path
+        ]
+        self.assertEqual([node["uuid"] for node in matching], [original_uuid])
+        self.assertEqual(
+            [change.get("kind") for change in second_changes
+             if change.get("kind") == "folder_restore"],
+            ["folder_restore"],
+        )
+        second_kinds = [change.get("kind") for change in second_changes]
+        self.assertLess(
+            second_kinds.index("folder_restore"),
+            second_kinds.index("tree_order"),
+        )
+
+        repeated = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=3,
+        )
+        self.assertFalse(any(
+            change.get("kind") == "folder_restore" for change in repeated
+        ))
+        self.assertEqual(
+            [node["uuid"] for node in read_identity(self.project_root)["nodes"]
+             if node["legacy_path"] == target_path],
+            [original_uuid],
+        )
+
     def test_following_a_remote_restore_does_not_start_a_delete_fight(self):
         """복원을 안 따라가면 바깥으로 내보내는 쪽이 상대의 복원을 되돌린다."""
         folder, client = self._publish_then_delete_remotely()
@@ -1691,6 +3132,91 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.assertFalse(row["is_deleted"])
         self.assertEqual(row["revision"], 3)
+
+    def test_corrected_snapshot_recovers_original_uuid_from_shadow_folder(self):
+        """Keep the bad replacement recoverable while returning the original."""
+        folder = create_item_at_path(
+            self.project_root, "메인", "윈도우-빈폴더", True
+        )["nodes"][-1]
+        original_uuid = folder["uuid"]
+        client = _FolderAwareClient([])
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        for row in client.folder_rows:
+            if row["folder_id"] == original_uuid:
+                row["is_deleted"] = True
+                row["revision"] = 2
+        self._pull(client.folder_rows, [], {"<root>": []}, tree_revision=1)
+        original_trash = next(
+            node["legacy_path"]
+            for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == original_uuid
+        )
+
+        replacement = create_item_at_path(
+            self.project_root, "메인", "윈도우-빈폴더", True
+        )["nodes"][-1]
+        self.operation["operation_id"] = str(uuid.uuid4())
+        self.manager._commit_outbound_folder_lifecycle(self.operation, client)
+        replacement_row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == replacement["uuid"]
+        )
+
+        # A repair commits the duplicate tombstone first and restores the
+        # original second. This is the first complete snapshot Windows sees.
+        replacement_row["is_deleted"] = True
+        replacement_row["revision"] = 2
+        original_row = next(
+            row for row in client.folder_rows
+            if row["folder_id"] == original_uuid
+        )
+        original_row["is_deleted"] = False
+        original_row["revision"] = 3
+
+        changes = self._pull(
+            client.folder_rows,
+            [],
+            {"<root>": ["윈도우-빈폴더"]},
+            tree_revision=2,
+        )
+
+        live_path = "메인/윈도우-빈폴더"
+        live = node_for_path(self.project_root, live_path)
+        self.assertEqual(live["uuid"], original_uuid)
+        original = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == original_uuid
+        )
+        self.assertEqual(original["legacy_path"], live_path)
+        retired_replacement = next(
+            node for node in read_identity(self.project_root)["nodes"]
+            if node["uuid"] == replacement["uuid"]
+        )
+        self.assertTrue(
+            retired_replacement["legacy_path"].startswith("메인/휴지통/")
+        )
+        self.assertNotEqual(retired_replacement["legacy_path"], original_trash)
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, retired_replacement["legacy_path"]
+        ).is_dir())
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, original_trash
+        ).exists())
+        self.assertEqual(
+            [change.get("reason") for change in changes
+             if change.get("reason") == "shadowed_restore_recovery"],
+            ["shadowed_restore_recovery"],
+        )
+        self.assertEqual(
+            [record["event"] for record in self.store.diagnostics(
+                self.context["local_key"]
+            ) if record["event"] == "folder_restore_shadow_recovered"],
+            ["folder_restore_shadow_recovered"],
+        )
+        self.assertEqual(prepare_open(self.project_root)["status"], OPEN_OK)
+        report = audit(self.project_root)
+        self.assertEqual(report["missing_in_identity"], [])
+        self.assertEqual(report["missing_on_disk"], [])
 
     def test_an_occupied_target_leaves_the_restored_folder_in_the_trash(self):
         folder, client = self._publish_then_delete_remotely()
@@ -3484,6 +5010,339 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             self.manager._v2_protected_paths_provider,
         ) = previous
 
+    def test_unresolved_tree_leaf_names_itself_without_logging_the_path(self):
+        order = {
+            "<root>": ["원고"],
+            "메인/원고": ["001화.txt", "미확인 항목.txt"],
+        }
+
+        with self.assertRaises(RuntimeError) as caught:
+            SyncManager._build_remote_tree_folder_plan(
+                self.wpm.writing_root_path,
+                order,
+                {"메인/원고/001화.txt"},
+                {"메인/원고"},
+                {SyncManager._tree_path_comparison_key("메인/원고")},
+                True,
+            )
+
+        self.assertEqual(
+            str(caught.exception), "REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE"
+        )
+        fingerprint = caught.exception.tree_entry_fingerprint
+        self.assertEqual(
+            fingerprint,
+            SyncManager._tree_entry_fingerprint(
+                "leaf", "메인/원고/미확인 항목.txt"
+            ),
+        )
+        self.assertTrue(fingerprint.startswith("leaf:d3:txt:"))
+        # The digest is what makes the entry identifiable later. The name it
+        # was built from must never be readable in the log.
+        self.assertNotIn("미확인", fingerprint)
+        self.assertNotIn("원고", fingerprint)
+
+    def _capture_diagnostics(self):
+        """Swap this shared manager's diagnostics for the test only."""
+        recorded = []
+        previous = self.manager._diagnostics
+        self.addCleanup(setattr, self.manager, "_diagnostics", previous)
+        self.manager._diagnostics = SimpleNamespace(
+            record=lambda event, **kwargs: recorded.append((event, kwargs))
+        )
+        return recorded
+
+    def _watch_one_entry(self):
+        """Point the stall watch at a fixed identity and one entry."""
+        self.manager._tree_order_stall = {}
+        self.manager._tree_order_stall_identity = None
+        self.addCleanup(setattr, self.manager, "_tree_order_stall", {})
+        self.addCleanup(
+            setattr, self.manager, "_tree_order_stall_identity", None
+        )
+        return SyncManager._tree_entry_fingerprint(
+            "leaf", "메인/윈도우-든폴더/문서문서.txt"
+        )
+
+    def _document_row(self, **overrides):
+        row = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "메인/원고/1권/001화.txt",
+            "content": "본문" * 3000,
+            "revision": 3,
+            "is_deleted": False,
+            "deleted_at": None,
+            "parent_folder_id": None,
+            "name": None,
+            "structure_revision": None,
+            "updated_at": "2026-09-02T00:00:00+00:00",
+        }
+        row.update(overrides)
+        return row
+
+    def _seed_ledger_document(self, path, content, revision):
+        document_id = str(uuid.uuid4())
+        self.store.apply_remote_snapshot(
+            self.context, document_id, path, content, revision
+        )
+        return document_id
+
+    def test_an_unchanged_body_is_read_from_the_ledger_not_the_network(self):
+        """안 바뀐 본문은 이미 로컬에 있다. 그걸 다시 받을 이유가 없다."""
+        path = "메인/원고/1권/001화.txt"
+        document_id = self._seed_ledger_document(path, "서버가 준 본문", 4)
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(document_ids)
+            return []
+
+        self.manager._fetch_v2_project_documents = fetch
+        index = [{"document_id": document_id, "relative_path": path,
+                  "revision": 4, "is_deleted": False}]
+
+        rows = self.manager._documents_with_content("p", index)
+
+        self.assertEqual(rows[0]["content"], "서버가 준 본문")
+        self.assertEqual(asked, [])
+
+    def test_a_body_that_moved_is_fetched_and_only_that_one(self):
+        stale = "메인/원고/1권/001화.txt"
+        moved = "메인/원고/1권/002화.txt"
+        stale_id = self._seed_ledger_document(stale, "그대로", 4)
+        moved_id = self._seed_ledger_document(moved, "예전 본문", 4)
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(sorted(document_ids or []))
+            return [{"document_id": moved_id, "relative_path": moved,
+                     "content": "새 본문", "revision": 5, "is_deleted": False}]
+
+        self.manager._fetch_v2_project_documents = fetch
+        index = [
+            {"document_id": stale_id, "relative_path": stale,
+             "revision": 4, "is_deleted": False},
+            {"document_id": moved_id, "relative_path": moved,
+             "revision": 5, "is_deleted": False},
+        ]
+
+        rows = {r["document_id"]: r for r in self.manager._documents_with_content("p", index)}
+
+        self.assertEqual(asked, [[moved_id]])
+        self.assertEqual(rows[stale_id]["content"], "그대로")
+        self.assertEqual(rows[moved_id]["content"], "새 본문")
+
+    def test_a_document_the_ledger_never_saw_is_always_fetched(self):
+        unknown = str(uuid.uuid4())
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(sorted(document_ids or []))
+            return [{"document_id": unknown, "relative_path": "메인/원고/새.txt",
+                     "content": "처음 보는 본문", "revision": 1, "is_deleted": False}]
+
+        self.manager._fetch_v2_project_documents = fetch
+        rows = self.manager._documents_with_content("p", [
+            {"document_id": unknown, "relative_path": "메인/원고/새.txt",
+             "revision": 1, "is_deleted": False},
+        ])
+
+        self.assertEqual(asked, [[unknown]])
+        self.assertEqual(rows[0]["content"], "처음 보는 본문")
+
+    def test_a_body_that_vanished_between_the_two_queries_is_refused(self):
+        """빠진 본문을 빈 원고로 읽으면 한 화가 날아간다. 거부해야 한다."""
+        self.manager._fetch_v2_project_documents = (
+            lambda project_id=None, include_content=True, document_ids=None, **kw: []
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.manager._documents_with_content("p", [
+                {"document_id": str(uuid.uuid4()),
+                 "relative_path": "메인/원고/1권/001화.txt",
+                 "revision": 9, "is_deleted": False},
+            ])
+
+        self.assertIn("INCOMPLETE", str(caught.exception))
+
+    def test_an_open_document_is_fetched_even_at_the_same_revision(self):
+        """열려 있는 문서는 같은 revision 에서도 서버 본문과 대조한다."""
+        path = "메인/원고/1권/001화.txt"
+        document_id = self._seed_ledger_document(path, "원장 본문", 4)
+        previous = self.manager._v2_active_paths_provider
+        self.addCleanup(
+            setattr, self.manager, "_v2_active_paths_provider", previous
+        )
+        self.manager._v2_active_paths_provider = lambda: {path}
+        asked = []
+
+        def fetch(project_id=None, include_content=True, document_ids=None, **kw):
+            asked.append(sorted(document_ids or []))
+            return [{"document_id": document_id, "relative_path": path,
+                     "content": "서버 본문", "revision": 4, "is_deleted": False}]
+
+        self.manager._fetch_v2_project_documents = fetch
+        rows = self.manager._documents_with_content("p", [
+            {"document_id": document_id, "relative_path": path,
+             "revision": 4, "is_deleted": False},
+        ])
+
+        self.assertEqual(asked, [[document_id]])
+        self.assertEqual(rows[0]["content"], "서버 본문")
+
+    def test_the_shape_hashes_alike_with_and_without_the_manuscript(self):
+        """전체 조회가 남긴 기준선을 본문 없는 조회가 이어받아야 한다.
+
+        둘이 다르게 해시되면 탐침이 기준선을 물려받지 못해 영원히 부트스트랩
+        되지 않는다.
+        """
+        full = [self._document_row()]
+        light = [{k: v for k, v in full[0].items() if k != "content"}]
+
+        self.assertEqual(
+            SyncManager._remote_index_fingerprint(full, [], []),
+            SyncManager._remote_index_fingerprint(light, [], []),
+        )
+
+    def test_every_change_a_pull_would_apply_moves_the_shape(self):
+        """탐침이 놓치는 변경이 있으면 그 변경은 영영 안 내려온다."""
+        base = [self._document_row()]
+        baseline = SyncManager._remote_index_fingerprint(base, [], [])
+        for label, row in (
+            ("본문 수정(서버가 revision 을 함께 올린다)",
+             self._document_row(content="다른 본문", revision=4)),
+            ("삭제", self._document_row(is_deleted=True)),
+            ("이름/경로 변경",
+             self._document_row(relative_path="메인/원고/1권/002화.txt")),
+            ("폴더 이동", self._document_row(parent_folder_id=str(uuid.uuid4()))),
+            ("구조 revision 변경", self._document_row(structure_revision=7)),
+        ):
+            with self.subTest(label=label):
+                self.assertNotEqual(
+                    SyncManager._remote_index_fingerprint([row], [], []),
+                    baseline,
+                )
+        self.assertNotEqual(
+            SyncManager._remote_index_fingerprint(base + [self._document_row()], [], []),
+            baseline,
+        )
+        self.assertNotEqual(
+            SyncManager._remote_index_fingerprint([], [], []), baseline
+        )
+
+    def test_a_shape_only_pull_is_refused_without_a_settled_authority(self):
+        """기준을 정한 적 없으면 기억으로 되풀이할 수 없다."""
+        previous = self.manager._v2_structure_authority
+        self.addCleanup(
+            setattr, self.manager, "_v2_structure_authority", previous
+        )
+        self.manager._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+
+        self.assertIsNone(self.manager._index_probe_authority())
+
+    def test_a_shape_only_pull_is_refused_while_structure_intent_is_open(self):
+        """굳은 순서표 충돌은 받아온 행에서 회수한다. 행을 안 받으면 못 푼다."""
+        previous = self.manager._v2_structure_authority
+        self.addCleanup(
+            setattr, self.manager, "_v2_structure_authority", previous
+        )
+        self.manager._v2_structure_authority = STRUCTURE_AUTHORITY_LEGACY
+        self.assertEqual(
+            self.manager._index_probe_authority(), STRUCTURE_AUTHORITY_LEGACY
+        )
+
+        self.manager.record_tree_order({"메인/메모장": ["A"]}, retry=False)
+
+        self.assertIsNone(self.manager._index_probe_authority())
+
+    def test_the_burst_a_pull_makes_on_open_stays_quiet(self):
+        """열자마자 수십 번 몰아치는 건 순서 문제지 정합성 문제가 아니다."""
+        self._capture_diagnostics()
+        fingerprint = self._watch_one_entry()
+
+        for _ in range(25):
+            self.assertFalse(
+                self.manager._note_tree_order_stall(fingerprint)
+            )
+
+        self.assertFalse(self.manager._tree_order_stalled())
+
+    def test_one_entry_refusing_for_long_enough_is_surfaced_once(self):
+        """스스로 낫지 않는 건 알려야 한다. 다만 한 번만."""
+        recorded = self._capture_diagnostics()
+        fingerprint = self._watch_one_entry()
+        for _ in range(TREE_ORDER_STALL_ATTEMPTS):
+            self.manager._note_tree_order_stall(fingerprint)
+        self.assertFalse(self.manager._tree_order_stalled())
+
+        watch = self.manager._tree_order_stall[fingerprint]
+        watch["first_seen"] -= TREE_ORDER_STALL_SECONDS + 1
+
+        self.assertTrue(self.manager._note_tree_order_stall(fingerprint))
+        self.assertTrue(self.manager._tree_order_stalled())
+        self.assertFalse(self.manager._note_tree_order_stall(fingerprint))
+        self.assertEqual(
+            [e for e, _ in recorded if e == "sync_tree_order_stalled"],
+            ["sync_tree_order_stalled"],
+        )
+
+    def test_the_warning_clears_when_the_order_finally_applies(self):
+        """해소된 정체가 계속 경고하면 다음 경고를 아무도 믿지 않는다."""
+        self._capture_diagnostics()
+        fingerprint = self._watch_one_entry()
+        self.manager._tree_order_stall[fingerprint] = {
+            "first_seen": 0.0, "attempts": 9, "escalated": True
+        }
+        self.manager._tree_order_stall_identity = (
+            self.manager._v2_pull_identity()
+        )
+        self.assertTrue(self.manager._tree_order_stalled())
+
+        self.assertTrue(self.manager._clear_tree_order_stall())
+
+        self.assertFalse(self.manager._tree_order_stalled())
+
+    def test_a_different_project_does_not_inherit_the_watch(self):
+        fingerprint = self._watch_one_entry()
+        self.manager._tree_order_stall[fingerprint] = {
+            "first_seen": 0.0, "attempts": 9, "escalated": True
+        }
+        self.manager._tree_order_stall_identity = ("다른", "작품", "키")
+
+        self.assertFalse(self.manager._tree_order_stalled())
+
+    def test_tree_deferral_records_the_entry_that_stopped_it(self):
+        recorded = self._capture_diagnostics()
+        error = SyncManager._unresolved_tree_entry_error(
+            "folder", "메인/윈도우-빈폴더"
+        )
+
+        self.manager._record_tree_deferral("revision=21", error)
+
+        self.assertEqual(
+            [event for event, _ in recorded],
+            ["sync_tree_deferred", "sync_tree_unresolved_entry"],
+        )
+        self.assertEqual(
+            recorded[0][1]["state"],
+            "revision=21;reason=REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE",
+        )
+        self.assertEqual(
+            recorded[1][1]["state"],
+            SyncManager._tree_entry_fingerprint("folder", "메인/윈도우-빈폴더"),
+        )
+
+    def test_tree_deferral_without_a_named_entry_records_only_the_reason(self):
+        recorded = self._capture_diagnostics()
+
+        self.manager._record_tree_deferral(
+            "contract", FileExistsError("REMOTE_PATH_CONFLICT")
+        )
+
+        # A refusal that never named an entry must not invent one.
+        self.assertEqual([event for event, _ in recorded], ["sync_tree_deferred"])
+        self.assertTrue(recorded[0][1]["state"].startswith("contract;reason="))
+
     def test_tree_order_protocol_canonicalizes_fixed_root_aliases(self):
         for alias in (
             "플롯",
@@ -3514,6 +5373,633 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.assertIn("메인/스토리 플롯", validated)
         self.assertNotIn("메인/플롯", validated)
+
+    def test_tree_order_conflict_keeps_rapid_volume_additions_from_both_devices(self):
+        chapters = lambda start: [
+            f"{number:03d}화.txt" for number in range(start, start + 25)
+        ]
+        base_order = {
+            "<root>": ["원고"],
+            "메인/원고": [],
+        }
+        local_order = {
+            **base_order,
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": chapters(1),
+            "메인/원고/2권": chapters(26),
+        }
+        remote_order = {
+            **local_order,
+            "메인/원고": ["1권", "2권", "3권", "4권"],
+            "메인/원고/3권": chapters(51),
+            "메인/원고/4권": chapters(76),
+        }
+        base_content = self.manager._tree_order_content(base_order)
+        local_content = self.manager._tree_order_content(local_order)
+        remote_content = self.manager._tree_order_content(remote_order)
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            base_content,
+            1,
+        )
+        operation = self.manager.record_tree_order(local_order, retry=False)
+        client = _FakeClient()
+        real_rpc = client.rpc
+
+        def conflict_rpc(name, params):
+            if name == "commit_document":
+                return SimpleNamespace(
+                    execute=MagicMock(side_effect=RuntimeError("REVISION_CONFLICT"))
+                )
+            return real_rpc(name, params)
+
+        client.rpc = conflict_rpc
+        self.manager.supabase = client
+        with patch.object(
+            self.manager,
+            "_fetch_remote_document",
+            return_value={
+                "document_id": self.tree_document_id,
+                "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                "content": remote_content,
+                "revision": 3,
+                "is_deleted": False,
+            },
+        ):
+            result = self.manager._process_v2_operation(
+                operation["operation_id"]
+            )
+
+        self.assertEqual(result["kind"], "auto_merged")
+        merged = json.loads(result["merged_content"])["tree_order"]
+        self.assertEqual(merged["메인/원고"], ["1권", "2권", "3권", "4권"])
+        self.assertEqual(merged["메인/원고/1권"], chapters(1))
+        self.assertEqual(merged["메인/원고/2권"], chapters(26))
+        self.assertEqual(merged["메인/원고/3권"], chapters(51))
+        self.assertEqual(merged["메인/원고/4권"], chapters(76))
+        successor = self.store.next_ready_operation(self.context["local_key"])
+        self.assertEqual(successor["base_revision"], 3)
+        self.assertEqual(successor["content"], result["merged_content"])
+
+    def test_legacy_pull_keeps_pending_chapters_while_materializing_peer_volumes(self):
+        """The measured 70-remote/30-pending Test105 state stays openable."""
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        create_volume(project_root)
+        create_volume(project_root)
+        identity = read_identity(project_root)
+        nodes_by_path = {
+            node["legacy_path"]: node for node in identity["nodes"]
+        }
+        first = [f"메인/원고/1권/{number:03d}화.txt" for number in range(1, 26)]
+        second = [f"메인/원고/2권/{number:03d}화.txt" for number in range(26, 51)]
+        local_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": [Path(path).name for path in first],
+            "메인/원고/2권": [Path(path).name for path in second],
+        }
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(local_order)
+        self.assertTrue(self.wpm.save_settings())
+
+        operations = []
+        for path in first + second:
+            operations.append(
+                self.manager.record_created_document(path, retry=False)
+            )
+        for operation in operations[:20]:
+            self.store.mark_success(operation["operation_id"], {"revision": 1})
+
+        local_skeleton = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": [],
+            "메인/원고/2권": [],
+        }
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            self.manager._tree_order_content(local_skeleton),
+            2,
+        )
+
+        folder_rows = []
+        for node in identity["nodes"]:
+            if node["kind"] != "folder":
+                continue
+            folder_rows.append({
+                "folder_id": node["uuid"],
+                "parent_folder_id": node["parent_uuid"],
+                "name": node["legacy_path"].rsplit("/", 1)[-1],
+                "revision": 1,
+                "is_deleted": False,
+            })
+        manuscript_id = nodes_by_path["메인/원고"]["uuid"]
+        peer_volume_ids = {name: str(uuid.uuid4()) for name in ("3권", "4권")}
+        for name, folder_id in peer_volume_ids.items():
+            folder_rows.append({
+                "folder_id": folder_id,
+                "parent_folder_id": manuscript_id,
+                "name": name,
+                "revision": 1,
+                "is_deleted": False,
+            })
+
+        third = [f"메인/원고/3권/{number:03d}화.txt" for number in range(51, 76)]
+        fourth = [f"메인/원고/4권/{number:03d}화.txt" for number in range(76, 101)]
+        remote_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권", "3권", "4권"],
+            "메인/원고/1권": [Path(path).name for path in first[:20]],
+            "메인/원고/2권": [],
+            "메인/원고/3권": [Path(path).name for path in third],
+            "메인/원고/4권": [Path(path).name for path in fourth],
+        }
+        remote_documents = [
+            {
+                "document_id": nodes_by_path[path]["uuid"],
+                "relative_path": path,
+                "content": "",
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for path in first[:20]
+        ]
+        remote_documents.extend({
+            "document_id": str(uuid.uuid4()),
+            "relative_path": path,
+            "content": "",
+            "revision": 1,
+            "is_deleted": False,
+        } for path in third + fourth)
+        remote_documents.append({
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": self.manager._tree_order_content(remote_order),
+            "revision": 4,
+            "is_deleted": False,
+        })
+        before_counts = self.store.counts(self.context["local_key"])
+
+        changes = self.manager._apply_v2_remote_documents(
+            remote_documents,
+            strict=True,
+            folder_rows=folder_rows,
+            structure_authority="legacy",
+        )
+
+        applied_order = self.wpm.project_settings["tree_order"]
+        self.assertEqual(applied_order["메인/원고/1권"], local_order["메인/원고/1권"])
+        self.assertEqual(applied_order["메인/원고/2권"], local_order["메인/원고/2권"])
+        self.assertEqual(applied_order["메인/원고/3권"], remote_order["메인/원고/3권"])
+        self.assertEqual(applied_order["메인/원고/4권"], remote_order["메인/원고/4권"])
+        self.assertTrue(self.manager._identity_audit_is_clean())
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["documents"], 30
+        )
+        self.assertEqual(
+            self.store.counts(self.context["local_key"]), before_counts
+        )
+        self.assertTrue(any(change.get("new_local_path", "").startswith("메인/원고/4권/") for change in changes))
+
+    def test_legacy_pull_does_not_preserve_pending_create_over_peer_uuid(self):
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        created = create_item_at_path(
+            project_root, "메인/메모장", "같은 이름", False
+        )["nodes"][-1]
+        path = created["legacy_path"]
+        operation = self.manager.record_created_document(path, retry=False)
+        remote_document_id = str(uuid.uuid4())
+        remote_order = {
+            "<root>": ["메모장"],
+            "메인/메모장": [Path(path).name],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "DOCUMENT_UUID_CONFLICT"):
+            self.manager._apply_v2_remote_documents(
+                [
+                    {
+                        "document_id": remote_document_id,
+                        "relative_path": path,
+                        "content": "",
+                        "revision": 1,
+                        "is_deleted": False,
+                    },
+                    {
+                        "document_id": self.tree_document_id,
+                        "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                        "content": self.manager._tree_order_content(remote_order),
+                        "revision": 2,
+                        "is_deleted": False,
+                    },
+                ],
+                strict=True,
+                structure_authority="legacy",
+            )
+
+        self.assertEqual(
+            self.store.operation(operation["operation_id"])["status"], "pending"
+        )
+        self.assertEqual(node_for_path(project_root, path)["uuid"], created["uuid"])
+        self.assertNotEqual(created["uuid"], remote_document_id)
+
+    def test_legacy_pull_repairs_tree_lagging_behind_live_documents(self):
+        """The measured Test106 12-tree/16-live/34-pending split stays openable."""
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        create_volume(project_root)
+        create_volume(project_root)
+        identity = read_identity(project_root)
+        nodes_by_path = {
+            node["legacy_path"]: node for node in identity["nodes"]
+        }
+        first = [f"메인/원고/1권/{number:03d}화.txt" for number in range(1, 26)]
+        second = [f"메인/원고/2권/{number:03d}화.txt" for number in range(26, 51)]
+        local_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": [Path(path).name for path in first],
+            "메인/원고/2권": [Path(path).name for path in second],
+        }
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(local_order)
+        self.assertTrue(self.wpm.save_settings())
+
+        operations = [
+            self.manager.record_created_document(path, retry=False)
+            for path in first + second
+        ]
+        for operation in operations[:16]:
+            self.store.mark_success(operation["operation_id"], {"revision": 1})
+
+        local_skeleton = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권"],
+            "메인/원고/1권": [],
+            "메인/원고/2권": [],
+        }
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            self.manager._tree_order_content(local_skeleton),
+            2,
+        )
+
+        folder_rows = []
+        for node in identity["nodes"]:
+            if node["kind"] != "folder":
+                continue
+            folder_rows.append({
+                "folder_id": node["uuid"],
+                "parent_folder_id": node["parent_uuid"],
+                "name": node["legacy_path"].rsplit("/", 1)[-1],
+                "revision": 1,
+                "is_deleted": False,
+            })
+        manuscript_id = nodes_by_path["메인/원고"]["uuid"]
+        for name in ("3권", "4권"):
+            folder_rows.append({
+                "folder_id": str(uuid.uuid4()),
+                "parent_folder_id": manuscript_id,
+                "name": name,
+                "revision": 1,
+                "is_deleted": False,
+            })
+
+        third = [f"메인/원고/3권/{number:03d}화.txt" for number in range(51, 76)]
+        fourth = [f"메인/원고/4권/{number:03d}화.txt" for number in range(76, 101)]
+        remote_order = {
+            "<root>": ["원고"],
+            "메인/원고": ["1권", "2권", "3권", "4권"],
+            # The peer wrote rev 4 after seeing only chapters 1-12, while
+            # document commits 13-16 landed independently on the server.
+            "메인/원고/1권": [Path(path).name for path in first[:12]],
+            "메인/원고/2권": [],
+            "메인/원고/3권": [Path(path).name for path in third],
+            "메인/원고/4권": [Path(path).name for path in fourth],
+        }
+        remote_documents = [
+            {
+                "document_id": nodes_by_path[path]["uuid"],
+                "relative_path": path,
+                "content": "",
+                "revision": 1,
+                "is_deleted": False,
+            }
+            for path in first[:16]
+        ]
+        remote_documents.extend({
+            "document_id": str(uuid.uuid4()),
+            "relative_path": path,
+            "content": "",
+            "revision": 1,
+            "is_deleted": False,
+        } for path in third + fourth)
+        remote_documents.append({
+            "document_id": self.tree_document_id,
+            "relative_path": TREE_ORDER_DOCUMENT_PATH,
+            "content": self.manager._tree_order_content(remote_order),
+            "revision": 4,
+            "is_deleted": False,
+        })
+        before_counts = self.store.counts(self.context["local_key"])
+
+        changes = self.manager._apply_v2_remote_documents(
+            remote_documents,
+            strict=True,
+            folder_rows=folder_rows,
+            structure_authority="legacy",
+        )
+
+        applied_order = self.wpm.project_settings["tree_order"]
+        self.assertEqual(applied_order["메인/원고/1권"], local_order["메인/원고/1권"])
+        self.assertEqual(applied_order["메인/원고/2권"], local_order["메인/원고/2권"])
+        self.assertEqual(applied_order["메인/원고/3권"], remote_order["메인/원고/3권"])
+        self.assertEqual(applied_order["메인/원고/4권"], remote_order["메인/원고/4권"])
+        self.assertTrue(self.manager._identity_audit_is_clean())
+        self.assertEqual(self.store.counts(self.context["local_key"]), before_counts)
+        counts = self.store.counts(self.context["local_key"])
+        self.assertEqual(counts["pending"], 34)
+        self.assertEqual(counts["total"], 34)
+        self.assertTrue(any(
+            change.get("new_local_path", "").startswith("메인/원고/4권/")
+            for change in changes
+        ))
+
+    def test_tree_order_conflict_does_not_guess_through_reorder_and_addition(self):
+        content = self.manager._tree_order_content
+        merged = self.manager._merge_tree_order_conflict(
+            content({"메인/메모장": ["A", "B"]}),
+            content({"메인/메모장": ["B", "A"]}),
+            content({"메인/메모장": ["A", "C", "B"]}),
+        )
+        self.assertIsNone(merged)
+
+    def test_unsafe_tree_order_conflict_settles_on_the_server_order(self):
+        content = self.manager._tree_order_content
+        base_content = content({"메인/메모장": ["A", "B"]})
+        local_order = {"메인/메모장": ["B", "A"]}
+        remote_content = content({"메인/메모장": ["A", "C", "B"]})
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            base_content,
+            1,
+        )
+        operation = self.manager.record_tree_order(local_order, retry=False)
+        client = _FakeClient()
+        real_rpc = client.rpc
+
+        def conflict_rpc(name, params):
+            if name == "commit_document":
+                return SimpleNamespace(
+                    execute=MagicMock(side_effect=RuntimeError("REVISION_CONFLICT"))
+                )
+            return real_rpc(name, params)
+
+        client.rpc = conflict_rpc
+        self.manager.supabase = client
+        with patch.object(
+            self.manager,
+            "_fetch_remote_document",
+            return_value={
+                "document_id": self.tree_document_id,
+                "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                "content": remote_content,
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ):
+            result = self.manager._process_v2_operation(
+                operation["operation_id"]
+            )
+
+        # Binder order has no editor to resolve a conflict in, and one queued
+        # conflict closes the project's pull gate. Settling on the server's
+        # order is what keeps the project syncing at all.
+        self.assertEqual(result["kind"], "auto_merged")
+        self.assertEqual(result["merged_content"], remote_content)
+        document = self.store.get_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
+        )
+        self.assertNotEqual(document["sync_state"], "conflict")
+        self.assertEqual(document["revision"], 2)
+        self.assertEqual(document["base_content"], remote_content)
+        self.assertEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+
+    def test_a_manuscript_conflict_still_waits_for_the_writer(self):
+        """자동 해소는 순서표에만 적용된다. 원고는 작가가 골라야 한다."""
+        path = "메인/원고/001화.txt"
+        self.store.apply_remote_snapshot(
+            self.context, str(uuid.uuid4()), path, "서버 기준본", 1
+        )
+        operation = self.store.enqueue(self.context, path, "로컬 편집본")
+        client = _FakeClient()
+        real_rpc = client.rpc
+
+        def conflict_rpc(name, params):
+            if name == "commit_document":
+                return SimpleNamespace(
+                    execute=MagicMock(side_effect=RuntimeError("REVISION_CONFLICT"))
+                )
+            return real_rpc(name, params)
+
+        client.rpc = conflict_rpc
+        self.manager.supabase = client
+        with patch.object(
+            self.manager,
+            "_fetch_remote_document",
+            return_value={
+                "document_id": operation["document_id"],
+                "relative_path": path,
+                "content": "서버가 따로 고친 본문",
+                "revision": 2,
+                "is_deleted": False,
+            },
+        ):
+            result = self.manager._process_v2_operation(
+                operation["operation_id"]
+            )
+
+        self.assertEqual(result["kind"], "conflict")
+
+    def test_a_binder_order_conflict_from_an_older_build_is_retired(self):
+        """이미 굳은 충돌은 재시도 대상이 아니라, pull 이 직접 풀어야 한다."""
+        content = self.manager._tree_order_content
+        base_content = content({"메인/메모장": ["A", "B"]})
+        remote_content = content({"메인/메모장": ["A", "C", "B"]})
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            base_content,
+            1,
+        )
+        operation = self.manager.record_tree_order(
+            {"메인/메모장": ["B", "A"]}, retry=False
+        )
+        self.store.mark_conflict(
+            operation["operation_id"],
+            2,
+            TREE_ORDER_DOCUMENT_PATH,
+            remote_content,
+            operation["content"],
+            operation["content"],
+            error_message="TREE_ORDER_CONFLICT",
+        )
+        self.assertNotEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+
+        retired = self.manager._retire_stuck_tree_order_conflict(
+            self.tree_document_id, remote_content, 2
+        )
+
+        self.assertEqual(retired, 1)
+        self.assertEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+        document = self.store.get_document(
+            self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
+        )
+        self.assertNotEqual(document["sync_state"], "conflict")
+        self.assertEqual(document["base_content"], remote_content)
+
+    def _stick_a_tree_order_conflict(self, remote_content):
+        """Leave the queue in the state an older build could not get out of."""
+        operation = self.manager.record_tree_order(
+            {"메인/메모장": ["B", "A"]}, retry=False
+        )
+        self.store.mark_conflict(
+            operation["operation_id"],
+            2,
+            TREE_ORDER_DOCUMENT_PATH,
+            remote_content,
+            operation["content"],
+            operation["content"],
+            error_message="TREE_ORDER_CONFLICT",
+        )
+        return operation
+
+    def test_a_stuck_conflict_is_retired_from_the_fetched_snapshot(self):
+        """적용을 건너뛰는 pull 도 충돌을 회수할 수 있어야 한다.
+
+        충돌은 활성 intent 로 세어지고, 활성 intent 가 있으면 baseline pull 이
+        적용을 통째로 건너뛴다. 회수를 적용 안에만 두면 그 둘이 서로를
+        영원히 살려둔다 — 실제로 그렇게 멈춰 있었다.
+        """
+        content = self.manager._tree_order_content
+        remote_content = content({"메인/메모장": ["A", "C", "B"]})
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            content({"메인/메모장": ["A", "B"]}),
+            1,
+        )
+        self._stick_a_tree_order_conflict(remote_content)
+        local_key = self.context["local_key"]
+        self.assertTrue(self.store.has_outstanding_structure_intent(local_key))
+
+        retired = self.manager._retire_stuck_tree_order_conflict_from_snapshot([
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": "메인/원고/001화.txt",
+                "content": "원고",
+                "revision": 3,
+            },
+            {
+                "document_id": self.tree_document_id,
+                "relative_path": TREE_ORDER_DOCUMENT_PATH,
+                "content": remote_content,
+                "revision": 2,
+            },
+        ])
+
+        self.assertEqual(retired, 1)
+        self.assertEqual(
+            self.store.conflicted_operations(self.tree_document_id), []
+        )
+        # The successor is a live intent the drain can publish, which is what
+        # lets the queue move again instead of standing still.
+        self.assertIsNotNone(self.store.next_ready_operation(local_key))
+
+    def test_a_snapshot_without_the_order_document_retires_nothing(self):
+        retired = self.manager._retire_stuck_tree_order_conflict_from_snapshot([
+            {
+                "document_id": str(uuid.uuid4()),
+                "relative_path": "메인/원고/001화.txt",
+                "content": "원고",
+                "revision": 3,
+            },
+        ])
+
+        self.assertEqual(retired, 0)
+
+    def test_retiring_finds_nothing_when_there_is_no_conflict(self):
+        self.assertEqual(
+            self.manager._retire_stuck_tree_order_conflict(
+                self.tree_document_id, "{}", 1
+            ),
+            0,
+        )
+
+    def test_second_rapid_volume_skeleton_runs_before_waiting_chapters(self):
+        baseline = {"<root>": ["원고"], "메인/원고": []}
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            self.manager._tree_order_content(baseline),
+            1,
+        )
+        first_tree = self.manager.record_tree_order(
+            {
+                **baseline,
+                "메인/원고": ["1권"],
+                "메인/원고/1권": [],
+            },
+            retry=False,
+        )
+        chapter = self.store.enqueue(
+            self.context,
+            "메인/원고/1권/001화.txt",
+            "",
+            "메인/원고/1권/001화.txt",
+        )
+        second_tree = self.manager.record_tree_order(
+            {
+                **baseline,
+                "메인/원고": ["1권", "2권"],
+                "메인/원고/1권": [],
+                "메인/원고/2권": [],
+            },
+            retry=False,
+        )
+        self.assertIsNone(second_tree["base_revision"])
+        self.assertEqual(
+            self.store.next_ready_operation(self.context["local_key"])[
+                "operation_id"
+            ],
+            first_tree["operation_id"],
+        )
+
+        self.store.mark_attempt(first_tree["operation_id"])
+        self.store.mark_success(first_tree["operation_id"], {"revision": 2})
+
+        next_operation = self.store.next_ready_operation(
+            self.context["local_key"]
+        )
+        self.assertEqual(next_operation["relative_path"], TREE_ORDER_DOCUMENT_PATH)
+        self.assertNotEqual(next_operation["operation_id"], chapter["operation_id"])
+        self.assertEqual(
+            json.loads(next_operation["content"])["tree_order"]["메인/원고"],
+            ["1권", "2권"],
+        )
 
     def test_add_volume_durably_queues_tree_and_all_chapters_immediately(self):
         chapter_names = [f"{number:03d}화.txt" for number in range(1, 26)]
@@ -3555,20 +6041,22 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         panel.defer_tree_order_until_operations.assert_called_once()
         retry.assert_called_once_with()
         self.assertEqual(
-            self.store.counts(self.context["local_key"])["pending"], 25
+            self.store.counts(self.context["local_key"])["pending"], 26
         )
         self.assertIsNotNone(self.store.tree_order_barrier(
             self.context["local_key"]
         ))
-        self.assertIsNone(self.store.get_document(
+        skeleton_document = self.store.get_document(
             self.context["local_key"], TREE_ORDER_DOCUMENT_PATH
-        ))
+        )
+        self.assertIsNotNone(skeleton_document)
         first_operation = self.store.next_ready_operation(
             self.context["local_key"]
         )
-        self.assertEqual(
-            first_operation["relative_path"], "메인/원고/1권/001화.txt"
-        )
+        self.assertEqual(first_operation["relative_path"], TREE_ORDER_DOCUMENT_PATH)
+        skeleton_order = json.loads(first_operation["content"])["tree_order"]
+        self.assertEqual(skeleton_order["메인/원고"], ["1권"])
+        self.assertEqual(skeleton_order["메인/원고/1권"], [])
         chapter_documents = [
             document
             for document in self.store.list_documents(self.context["local_key"])
@@ -3594,10 +6082,11 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             self.store.mark_success(queued["operation_id"], dispatched["result"])
             self.manager._release_ready_tree_order_barrier()
 
-        self.assertEqual(len(dispatched_paths), 26)
+        self.assertEqual(len(dispatched_paths), 27)
+        self.assertEqual(dispatched_paths[0], TREE_ORDER_DOCUMENT_PATH)
         self.assertEqual(dispatched_paths[-1], TREE_ORDER_DOCUMENT_PATH)
         self.assertEqual(
-            set(dispatched_paths[:-1]),
+            set(dispatched_paths[1:-1]),
             {
                 f"메인/원고/1권/{number:03d}화.txt"
                 for number in range(1, 26)
@@ -4013,6 +6502,268 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             "is_deleted": False,
         }
 
+    def _prepare_duplicate_tombstone_recovery(self, *, trash_content=None):
+        folder_path = "메인/설정집/중복복구"
+        live_path = f"{folder_path}/원본.txt"
+        folder = create_item_at_path(
+            self._project_root(), "메인/설정집", "중복복구", True
+        )["nodes"][-1]
+        document = create_item_at_path(
+            self._project_root(), folder_path, "원본", False
+        )["nodes"][-1]
+        content = "UUID와 revision까지 일치할 때만 보존할 본문"
+        Path(self.wpm.writing_root_path, live_path).write_text(
+            content, encoding="utf-8"
+        )
+        self.store.replace_folder_snapshots(
+            self.context["local_key"],
+            [{
+                "folder_id": folder["uuid"],
+                "parent_folder_id": folder.get("parent_uuid"),
+                "local_path": folder_path,
+                "name": "중복복구",
+                "revision": 1,
+                "is_deleted": False,
+            }],
+        )
+        self.store.apply_remote_snapshot(
+            self.context, document["uuid"], live_path, content, 2,
+            parent_folder_id=folder["uuid"], name="원본",
+        )
+        tombstone_operation = self.store.enqueue(
+            self.context, live_path, content,
+            relative_path=live_path, is_deleted=True,
+        )
+        self.store.mark_attempt(tombstone_operation["operation_id"])
+        self.store.mark_success(tombstone_operation["operation_id"], {
+            "revision": 3,
+            "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "status": "committed",
+        })
+        trash_path = self.wpm.materialize_remote_tombstone(
+            live_path,
+            content if trash_content is None else trash_content,
+            "2026-08-31T03:12:31+09:00",
+            document["uuid"],
+        )
+        remote = {
+            "document_id": document["uuid"],
+            "relative_path": live_path,
+            "content": content,
+            "revision": 3,
+            "is_deleted": True,
+            "deleted_at": "2026-08-31T03:12:31+09:00",
+            "parent_folder_id": folder["uuid"],
+            "name": "원본",
+        }
+        return {
+            "folder": folder,
+            "document": document,
+            "live_path": live_path,
+            "trash_path": trash_path,
+            "content": content,
+            "remote": remote,
+            "tombstone_operation": tombstone_operation,
+        }
+
+    def _prepare_completed_pathless_tree_removal(self, case):
+        folder_path = case["live_path"].rsplit("/", 1)[0]
+        folder_name = folder_path.rsplit("/", 1)[-1]
+        old_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": [folder_name],
+            folder_path: ["원본.txt"],
+        }
+        new_order = {
+            "<root>": ["설정집"],
+            "메인/설정집": [],
+        }
+        old_payload = json.loads(self.manager._tree_order_content(old_order))
+        old_payload.pop("folder_paths", None)
+        pathless_base = json.dumps(
+            old_payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.store.apply_remote_snapshot(
+            self.context,
+            self.tree_document_id,
+            TREE_ORDER_DOCUMENT_PATH,
+            pathless_base,
+            28,
+            local_path=TREE_ORDER_DOCUMENT_PATH,
+        )
+        tree_operation = self.manager.record_tree_order(
+            new_order, retry=False
+        )
+        self.store.mark_attempt(tree_operation["operation_id"])
+        self.store.mark_success(tree_operation["operation_id"], {
+            "revision": 29,
+            "content_hash": hashlib.sha256(
+                tree_operation["content"].encode("utf-8")
+            ).hexdigest(),
+            "status": "committed",
+        })
+        self.wpm.project_settings["tree_order"] = copy.deepcopy(new_order)
+        self.assertTrue(self.wpm.save_settings())
+        return new_order, tree_operation
+
+    def test_same_uuid_revision_and_hash_converge_duplicate_tombstone_once(self):
+        case = self._prepare_duplicate_tombstone_recovery()
+
+        changes = self.manager._apply_v2_remote_documents(
+            [case["remote"]], strict=True
+        )
+
+        self.assertEqual(len(changes), 1)
+        self.assertFalse(Path(
+            self.wpm.writing_root_path, case["live_path"]
+        ).exists())
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, case["trash_path"]).read_text(
+                encoding="utf-8"
+            ),
+            case["content"],
+        )
+        self.assertIsNone(self._identity_node(case["live_path"]))
+        self.assertEqual(
+            self._identity_node(case["trash_path"])["uuid"],
+            case["document"]["uuid"],
+        )
+        stored = self.store.get_document_by_id(case["document"]["uuid"])
+        self.assertEqual(stored["revision"], 3)
+        self.assertTrue(stored["is_deleted"])
+        self.assertEqual(stored["local_path"], case["trash_path"])
+
+        repeated = self.manager._apply_v2_remote_documents(
+            [case["remote"]], strict=True
+        )
+        self.assertEqual(repeated, [])
+        matching = [
+            item for item in self.wpm.list_trash_items()
+            if item["document_id"] == case["document"]["uuid"]
+        ]
+        self.assertEqual(len(matching), 1)
+        self._assert_project_still_opens()
+
+    def test_different_duplicate_body_blocks_without_deleting_or_overwriting(self):
+        case = self._prepare_duplicate_tombstone_recovery(
+            trash_content="휴지통에서 별도로 편집된 다른 본문"
+        )
+        live_before = Path(
+            self.wpm.writing_root_path, case["live_path"]
+        ).read_bytes()
+        trash_before = Path(
+            self.wpm.writing_root_path, case["trash_path"]
+        ).read_bytes()
+
+        changes = self.manager._apply_v2_remote_documents(
+            [case["remote"]], strict=False
+        )
+
+        self.assertEqual(changes, [])
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, case["live_path"]).read_bytes(),
+            live_before,
+        )
+        self.assertEqual(
+            Path(self.wpm.writing_root_path, case["trash_path"]).read_bytes(),
+            trash_before,
+        )
+        self.assertEqual(
+            self._identity_node(case["live_path"])["uuid"],
+            case["document"]["uuid"],
+        )
+        self.assertIsNone(self._identity_node(case["trash_path"]))
+        self.assertEqual(
+            [
+                item["trash_path"] for item in self.wpm.list_trash_items()
+                if item["document_id"] == case["document"]["uuid"]
+            ],
+            [case["trash_path"]],
+        )
+        self.assertTrue(self.manager._v2_last_pull_apply_blocked)
+        self.assertEqual(self.manager.current_sync_state, "conflict")
+
+    def test_proven_partial_commit_reuses_completed_document_tombstone_for_repair(self):
+        case = self._prepare_duplicate_tombstone_recovery()
+        new_order, completed_tree = self._prepare_completed_pathless_tree_removal(
+            case
+        )
+        folder_path = case["live_path"].rsplit("/", 1)[0]
+
+        recovery = self.manager.prepare_legacy_folder_delete_recovery(
+            folder_path, new_order, retry=False
+        )
+
+        intent = recovery["intent"]
+        tree_operation = recovery["tree_operation"]
+        self.assertEqual(intent["folder_id"], case["folder"]["uuid"])
+        self.assertEqual(intent["base_revision"], 1)
+        self.assertEqual(
+            intent["dependent_documents"],
+            [{
+                "document_id": case["document"]["uuid"],
+                "tombstone_operation_id": case["tombstone_operation"][
+                    "operation_id"
+                ],
+            }],
+        )
+        self.assertNotEqual(
+            tree_operation["operation_id"], completed_tree["operation_id"]
+        )
+        self.assertEqual(tree_operation["base_revision"], 29)
+        pending = self.store.next_ready_operation(self.context["local_key"])
+        self.assertEqual(
+            pending["document_id"],
+            self.tree_document_id,
+            "복구가 이미 완료된 문서 tombstone을 새로 만들면 안 된다",
+        )
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 1
+        )
+
+        client = _FolderAwareClient([{
+            "folder_id": case["folder"]["uuid"],
+            "parent_folder_id": case["folder"]["parent_uuid"],
+            "name": "중복복구",
+            "revision": 1,
+            "is_deleted": False,
+        }])
+        self.manager.supabase = client
+        self.store.mark_attempt(tree_operation["operation_id"])
+        result = self.manager._process_v2_operation(
+            tree_operation["operation_id"]
+        )
+        self.assertEqual(result["kind"], "committed")
+        calls = [name for name, _params in client.calls]
+        self.assertLess(calls.index("commit_folder"), calls.index("commit_document"))
+
+    def test_partial_commit_recovery_refuses_different_body_before_queue_write(self):
+        case = self._prepare_duplicate_tombstone_recovery(
+            trash_content="별도로 편집된 휴지통 본문"
+        )
+        new_order, _completed_tree = self._prepare_completed_pathless_tree_removal(
+            case
+        )
+        folder_path = case["live_path"].rsplit("/", 1)[0]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "LEGACY_FOLDER_DELETE_RECOVERY_CONTENT_MISMATCH"
+        ):
+            self.manager.prepare_legacy_folder_delete_recovery(
+                folder_path, new_order, retry=False
+            )
+
+        self.assertEqual(
+            self.store.pending_folder_delete_intents(
+                self.context["local_key"]
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.store.counts(self.context["local_key"])["total"], 0
+        )
+
     def _apply(self, tree_order, live_documents=None, revision=1, strict=True):
         documents = [self._tree_remote(tree_order, revision)]
         documents.extend(live_documents or [])
@@ -4348,7 +7099,7 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.assertEqual(changes[-1]["kind"], "tree_order")
 
-    def test_ipad_partial_folder_projection_keeps_tree_parent_folders(self):
+    def test_ipad_partial_folder_projection_defers_unidentified_tree_folders(self):
         main_id = str(uuid.uuid4())
         manuscript_id = str(uuid.uuid4())
         third_volume_id = str(uuid.uuid4())
@@ -4376,9 +7127,9 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             "revision": 13,
             "is_deleted": False,
         }
-        # Older Windows-created volumes have no stable folder rows. Newer iPad
-        # folders do. The tree parent keys are still authoritative evidence that
-        # all four volume paths are directories.
+        # A partial projection cannot prove the identities of 1권 and 2권.
+        # Tree parent keys may order known folders, but may no longer create
+        # missing directories with locally minted replacement UUIDs.
         folder_rows = [
             {
                 "folder_id": main_id,
@@ -4426,19 +7177,21 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
 
         changes = self.manager._apply_v2_remote_documents(
             [remote_tree, self._live_remote(document_path)],
-            strict=True,
+            strict=False,
             folder_rows=folder_rows,
         )
 
         root = Path(self.wpm.writing_root_path)
         for volume in ("1권", "2권", "3권", "4권"):
-            self.assertTrue(Path(root, "메인", "원고", volume).is_dir())
-        self.assertTrue(Path(root, "메인", "팯-빈폴더").is_dir())
+            self.assertFalse(Path(root, "메인", "원고", volume).exists())
+        self.assertFalse(Path(root, "메인", "팯-빈폴더").exists())
         self.assertTrue(Path(root, document_path).is_file())
         self.assertFalse(Path(root, "메인", "팯-든폴더", "팯-문서").exists())
         stored_tree = self.store.get_document_by_id(self.tree_document_id)
-        self.assertEqual(stored_tree["revision"], 13)
-        self.assertEqual(changes[-1]["kind"], "tree_order")
+        self.assertIsNone(stored_tree)
+        self.assertFalse(any(
+            change.get("kind") == "tree_order" for change in changes
+        ))
 
     def test_ipad_document_alias_conflicting_with_stable_folder_is_rejected(self):
         main_id = str(uuid.uuid4())
@@ -4496,8 +7249,12 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertFalse(Path(root, parent_path, "팯-문서").exists())
         self.assertIsNone(self.store.get_document_by_id(self.tree_document_id))
 
-    def test_modern_tree_payload_marks_empty_folders_explicitly(self):
+    def test_folder_projection_does_not_materialize_tree_only_empty_folder(self):
         empty_folder = "메인/메모장/윈_빈폴더"
+        original = create_item_at_path(
+            self._project_root(), "메인/메모장", "윈_빈폴더", True
+        )["nodes"][-1]
+        trash_path = self.wpm.move_to_trash(empty_folder)
         tree_order = {
             "<root>": ["메모장"],
             "메인/메모장": ["윈_빈폴더"],
@@ -4508,17 +7265,28 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.assertIn("folder_paths", payload)
         self.assertIn(empty_folder, payload["folder_paths"])
 
-        change = self.manager._apply_remote_tree_order_document(
-            self.tree_document_id,
-            json.dumps(payload, ensure_ascii=False),
-            1,
-            remote_folder_paths=set(),
-            has_remote_folder_projection=True,
-        )
+        with self.assertRaisesRegex(
+            RuntimeError, "REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE"
+        ):
+            self.manager._apply_remote_tree_order_document(
+                self.tree_document_id,
+                json.dumps(payload, ensure_ascii=False),
+                1,
+                remote_folder_paths=set(),
+                has_remote_folder_projection=True,
+            )
 
-        self.assertEqual(change["kind"], "tree_order")
-        self.assertTrue(Path(
+        self.assertFalse(Path(
             self.wpm.writing_root_path, empty_folder
+        ).exists())
+        self.assertIsNone(node_for_path(self._project_root(), empty_folder))
+        preserved = next(
+            node for node in read_identity(self._project_root())["nodes"]
+            if node["uuid"] == original["uuid"]
+        )
+        self.assertEqual(preserved["legacy_path"], trash_path)
+        self.assertTrue(Path(
+            self.wpm.writing_root_path, trash_path
         ).is_dir())
 
     def test_stable_folder_identity_can_materialize_folder_named_txt(self):
@@ -5183,9 +7951,12 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         operation = self._persist_local_empty_folder_rename(
             "새 폴더F", "새 폴더H", local_order
         )
-        main_id = str(uuid.uuid4())
-        memo_id = str(uuid.uuid4())
-        folder_id = str(uuid.uuid4())
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        main_id = node_for_path(project_root, "메인")["uuid"]
+        memo_id = node_for_path(project_root, "메인/메모장")["uuid"]
+        folder_id = node_for_path(
+            project_root, "메인/메모장/새 폴더F"
+        )["uuid"]
         self.manager.supabase = _FolderAwareClient([
             {
                 "folder_id": main_id,
@@ -5242,9 +8013,12 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         operation = self._persist_local_empty_folder_rename(
             "새 폴더F", "새 폴더H", local_order
         )
-        main_id = str(uuid.uuid4())
-        memo_id = str(uuid.uuid4())
-        folder_id = str(uuid.uuid4())
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        main_id = node_for_path(project_root, "메인")["uuid"]
+        memo_id = node_for_path(project_root, "메인/메모장")["uuid"]
+        folder_id = node_for_path(
+            project_root, "메인/메모장/새 폴더F"
+        )["uuid"]
         client = _FolderAwareClient([
             {
                 "folder_id": main_id, "parent_folder_id": None,
@@ -5287,15 +8061,18 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         )
         self.wpm.project_settings["tree_order"] = current_order
         self.assertTrue(self.wpm.save_settings())
+        project_root = str(Path(self.wpm.writing_root_path).parent)
+        created = create_item_at_path(
+            project_root, "메인", "아팯_빈폴더_윈", True
+        )["nodes"][-1]
         old_folder = Path(self.wpm.writing_root_path, old_path)
         new_folder = Path(self.wpm.writing_root_path, new_path)
-        old_folder.mkdir(parents=True)
         os.rename(old_folder, new_folder)
         self.manager.record_folder_rename_intent(old_path, new_path)
 
         operation = self.manager.record_tree_order(current_order, retry=False)
-        main_id = str(uuid.uuid4())
-        folder_id = str(uuid.uuid4())
+        main_id = node_for_path(project_root, "메인")["uuid"]
+        folder_id = created["uuid"]
         client = _FolderAwareClient([
             {
                 "folder_id": main_id, "parent_folder_id": None,
@@ -6846,6 +9623,44 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
             },
         )
 
+    def test_pending_local_folder_rename_is_not_uuid_divergence(self):
+        """서버 old path와 로컬 new path는 전송 전의 정상적인 한 상태다."""
+        old_name = "공용-검증06"
+        new_name = "공용-검증06-윈도우"
+        old_path = f"메인/메모장/{old_name}"
+        new_path = f"메인/메모장/{new_name}"
+        folder_id, rows = self._new_folder_rows(old_name)
+        self.manager._apply_v2_remote_documents(
+            [self._tree_remote({
+                "<root>": ["메모장"],
+                "메인/메모장": [old_name],
+                old_path: [],
+            })],
+            strict=True,
+            folder_rows=rows,
+        )
+        self.assertEqual(self._identity_node(old_path)["uuid"], folder_id)
+
+        self.assertTrue(self.wpm.rename_item(old_path, new_path))
+        intent = self.manager.record_folder_rename_intent(old_path, new_path)
+        self.assertEqual(self._identity_node(new_path)["uuid"], folder_id)
+        self.assertEqual(
+            self.store.get_folder_by_id(folder_id)["local_path"], old_path
+        )
+
+        # The pending intent is the durable proof that both paths describe the
+        # same UUID before commit_folder advances the server projection.
+        self.assertEqual(self.manager._identity_uuid_divergences(), [])
+        self.assertTrue(self.manager._identity_audit_is_clean())
+
+        # Tooth: once that proof is terminal, the same split is a real
+        # divergence again and must close the pull.
+        self.store.complete_folder_rename_intent(intent["intent_id"])
+        self.assertEqual(
+            self.manager._identity_uuid_divergences(), [old_path]
+        )
+        self.assertFalse(self.manager._identity_audit_is_clean())
+
     def test_a_failed_identity_adoption_never_finishes_the_pull(self):
         """채택이 실패하면 sync_folders 만 앞서간 채 성공으로 끝나면 안 된다."""
         name = "채택 실패 폴더"
@@ -7251,6 +10066,10 @@ class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
             "folders": [],
             "folder_versions": [],
             "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy",
+                "folder_paths": None,
+            },
         }
 
     def _pull_handler(self):
@@ -7273,7 +10092,7 @@ class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
         with patch("sync_manager.V2PullWorker", _Worker), patch.object(
             self.manager, "_start_worker"
         ), patch.object(
-            type(self.manager), "supabase", SimpleNamespace(), create=True
+            self.manager, "supabase", SimpleNamespace()
         ), patch("sync_manager.is_forced_offline", return_value=False):
             self.manager.pull_remote_changes_async()
         return captured
@@ -7345,6 +10164,441 @@ class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
         )
 
         self.assertEqual(applied, [])
+
+
+class UploadDrainPullCoordinatorTestCase(unittest.TestCase):
+    """일반 pull 은 작품별 durable upload drain 뒤에서만 시작한다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = SyncV2Store(str(Path(self.temp.name, "sync.sqlite3")))
+        root = Path(self.temp.name, "writing")
+        root.mkdir()
+        self.wpm = SimpleNamespace(
+            writing_root_path=str(root),
+            project_settings={},
+        )
+        self.manager = SyncManager()
+        self.previous = {
+            name: getattr(self.manager, name)
+            for name in (
+                "_v2_store", "_v2_context", "_v2_wpm", "_v2_device_id",
+                "_v2_pull_worker", "_v2_pull_worker_identity",
+                "_v2_structure_authority", "_v2_structure_authority_identity",
+                "_v2_pull_coordinators", "supabase",
+            )
+        }
+        self.addCleanup(self._restore)
+        self.manager._v2_pull_worker = None
+        self.manager._v2_pull_worker_identity = None
+        self.manager._v2_pull_coordinators = {}
+        self.manager.configure_v2(
+            self.wpm,
+            "작품",
+            str(uuid.uuid4()),
+            store=self.store,
+            recover_local_changes=False,
+        )
+        self.manager.supabase = object()
+        self.workers = []
+
+        workers = self.workers
+
+        class Signal:
+            def __init__(self):
+                self.callbacks = []
+
+            def connect(self, callback):
+                self.callbacks.append(callback)
+
+            def emit(self, *args):
+                for callback in list(self.callbacks):
+                    callback(*args)
+
+        class PullWorker:
+            def __init__(worker_self, _manager, project_id=None):
+                worker_self.project_id = project_id
+                worker_self.resultReady = Signal()
+                worker_self.finished = Signal()
+                workers.append(worker_self)
+
+            def isRunning(worker_self):
+                return True
+
+            def deleteLater(worker_self):
+                return None
+
+        self.patches = [
+            patch("sync_manager.V2PullWorker", PullWorker),
+            patch("sync_manager.is_forced_offline", return_value=False),
+            patch.object(self.manager, "_start_worker"),
+            patch.object(self.manager, "_apply_v2_remote_documents", return_value=[]),
+            patch.object(self.manager, "_identity_audit_is_clean", return_value=True),
+            patch.object(
+                self.manager, "_recover_untracked_local_files_after_pull",
+                return_value=0,
+            ),
+        ]
+        for active_patch in self.patches:
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+
+    def _restore(self):
+        for name, value in self.previous.items():
+            setattr(self.manager, name, value)
+
+    @property
+    def coordinator(self):
+        return self.manager._current_pull_coordinator()
+
+    def _accept_current_authority(self):
+        self.manager._accept_structure_authority(STRUCTURE_AUTHORITY_LEGACY)
+        self.coordinator["baseline_validated"] = True
+        self.coordinator["pull_pending"] = False
+
+    def _enqueue(self, number):
+        return self.store.enqueue(
+            self.manager._v2_context,
+            f"메인/원고/1권/{number:03d}화.txt",
+            f"본문 {number}",
+        )
+
+    def _enqueue_tree_order(self, content='{"tree_order": {}}'):
+        return self.store.enqueue(
+            self.manager._v2_context,
+            "__antigravity__/tree-order.json",
+            content,
+        )
+
+    def _finish_pull(self, worker):
+        worker.resultReady.emit(True, {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {"kind": "legacy", "folder_paths": None},
+        })
+        worker.finished.emit()
+
+    def test_first_generation_baseline_bypasses_pending_but_general_pull_does_not(self):
+        self._enqueue(1)
+
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        self.assertEqual(len(self.workers), 1)
+        self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_restart_baseline_does_not_restore_server_tree_over_pending_delete(self):
+        self._enqueue_tree_order(
+            '{"tree_order":{"메인/원고":[]}}'
+        )
+
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        baseline = self.workers[0]
+        with patch.object(self.manager, "retry_pending_syncs") as retry:
+            self._finish_pull(baseline)
+
+        self.manager._apply_v2_remote_documents.assert_not_called()
+        self.assertTrue(self.coordinator["baseline_validated"])
+        self.assertTrue(self.coordinator["pull_pending"])
+        self.assertIsNone(
+            self.coordinator["applied_snapshot_fingerprint"]
+        )
+        retry.assert_called_once_with(manual=True)
+
+    def test_fifty_uploads_coalesce_timer_requests_until_the_drain_boundary(self):
+        self._accept_current_authority()
+        operations = [self._enqueue(number) for number in range(1, 51)]
+
+        for _ in range(20):
+            self.assertFalse(self.manager.pull_remote_changes_async())
+        self.assertEqual(len(self.workers), 0)
+        self.assertTrue(self.coordinator["pull_pending"])
+
+        for operation in operations:
+            self.store.mark_attempt(operation["operation_id"])
+            self.store.mark_success(operation["operation_id"], {
+                "revision": 1,
+                "content_hash": "hash",
+                "status": "committed",
+            })
+
+        self.assertTrue(self.manager._maybe_start_deferred_pull())
+        self.assertEqual(len(self.workers), 1)
+        self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_baseline_then_drain_schedules_one_final_pull(self):
+        operations = [self._enqueue(number) for number in range(1, 4)]
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        baseline = self.workers[0]
+
+        with patch.object(self.manager, "retry_pending_syncs") as retry:
+            self._finish_pull(baseline)
+        retry.assert_called_once_with(manual=True)
+        self.assertTrue(self.coordinator["baseline_validated"])
+        self.assertTrue(self.coordinator["pull_pending"])
+
+        for operation in operations:
+            self.store.mark_attempt(operation["operation_id"])
+            self.store.mark_success(operation["operation_id"], {
+                "revision": 1, "content_hash": "hash", "status": "committed",
+            })
+        self.assertTrue(self.manager._maybe_start_deferred_pull())
+        self.assertEqual(len(self.workers), 2)
+        self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_rapid_local_delete_gap_defers_only_the_final_pull(self):
+        self._accept_current_authority()
+        self.coordinator["pull_pending"] = True
+        self.coordinator["last_local_structure_monotonic"] = 100.0
+
+        with patch("sync_manager.time.monotonic", return_value=100.5), patch.object(
+            self.manager, "_schedule_v2_retry", return_value=True
+        ) as schedule:
+            self.assertTrue(self.manager._maybe_start_deferred_pull())
+
+        self.assertEqual(self.workers, [])
+        self.assertTrue(self.coordinator["pull_pending"])
+        delay_ms = schedule.call_args.args[0]
+        self.assertGreaterEqual(delay_ms, 999)
+        self.assertLessEqual(delay_ms, 1001)
+
+        operation = self._enqueue_tree_order()
+        with patch.object(self.manager, "_launch_v2_operation") as launch:
+            self.assertTrue(self.manager.retry_pending_syncs())
+        self.assertEqual(
+            launch.call_args.args[0]["operation_id"],
+            operation["operation_id"],
+        )
+
+    def test_final_pull_waits_while_local_structure_is_still_durable(self):
+        self._accept_current_authority()
+        self.coordinator["pull_pending"] = True
+        self.manager._local_structure_callbacks["accepted-delete"] = None
+        self.addCleanup(
+            self.manager._local_structure_callbacks.pop,
+            "accepted-delete",
+            None,
+        )
+
+        with patch.object(self.manager, "_schedule_v2_retry") as schedule:
+            self.assertFalse(self.manager._maybe_start_deferred_pull())
+
+        schedule.assert_not_called()
+        self.assertEqual(self.workers, [])
+        self.assertFalse(
+            self.manager._ordinary_pull_gate_is_open(self.coordinator)
+        )
+
+    def test_final_pull_starts_after_local_structure_quiet_window(self):
+        self._accept_current_authority()
+        self.coordinator["pull_pending"] = True
+        self.coordinator["last_local_structure_monotonic"] = 100.0
+
+        with patch("sync_manager.time.monotonic", return_value=101.6):
+            self.assertTrue(self.manager._maybe_start_deferred_pull())
+
+        self.assertEqual(len(self.workers), 1)
+        self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_successful_baseline_caches_snapshot_for_silent_noop_pull(self):
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        baseline = self.workers[0]
+        payload = {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy", "folder_paths": None
+            },
+            "snapshot_fingerprint": "stable-snapshot",
+        }
+        baseline.resultReady.emit(True, payload)
+        baseline.finished.emit()
+
+        self.assertEqual(
+            self.coordinator["applied_snapshot_fingerprint"],
+            "stable-snapshot",
+        )
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        noop = self.workers[1]
+        self.assertEqual(
+            noop.cached_snapshot_fingerprint, "stable-snapshot"
+        )
+        self.assertEqual(
+            self.manager.sync_activity_snapshot()["pull_visible"], 0
+        )
+        noop.resultReady.emit(True, {
+            **payload,
+            "background_apply": {
+                "kind": "unchanged",
+                "changes": [],
+                "recovered_count": 0,
+            },
+        })
+
+        self.assertEqual(
+            self.manager._apply_v2_remote_documents.call_count, 1
+        )
+
+    def test_no_pull_fits_between_one_completion_and_the_next_claim(self):
+        self._accept_current_authority()
+        first = self._enqueue(1)
+        second = self._enqueue(2)
+        self.coordinator["pull_pending"] = True
+
+        self.store.mark_attempt(first["operation_id"])
+        self.store.mark_success(first["operation_id"], {
+            "revision": 1, "content_hash": "a", "status": "committed",
+        })
+        self.store.mark_attempt(second["operation_id"])
+
+        self.assertFalse(self.manager._maybe_start_deferred_pull())
+        self.assertEqual(self.store.counts(self.manager._v2_context["local_key"])["inflight"], 1)
+        self.assertEqual(self.workers, [])
+
+    def test_request_during_pull_creates_exactly_one_follow_up_pull(self):
+        self._accept_current_authority()
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        first = self.workers[0]
+
+        for _ in range(10):
+            self.assertFalse(self.manager.pull_remote_changes_async())
+        self.assertTrue(self.coordinator["pull_pending"])
+
+        self._finish_pull(first)
+        self.assertEqual(len(self.workers), 2)
+        self.assertFalse(self.coordinator["pull_pending"])
+
+    def test_changed_generation_discards_fetched_plan_without_ui_wait(self):
+        self._accept_current_authority()
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        worker = self.workers[0]
+
+        with self.manager.local_structure_mutation():
+            pass
+        worker.resultReady.emit(True, {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy", "folder_paths": None
+            },
+            "snapshot_fingerprint": "newer-server-reading",
+        })
+
+        self.assertTrue(self.coordinator["pull_pending"])
+        self.manager._apply_v2_remote_documents.assert_not_called()
+
+    def test_unchanged_worker_result_cannot_cache_a_later_generation(self):
+        self._accept_current_authority()
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        worker = self.workers[0]
+
+        with self.manager.local_structure_mutation():
+            pass
+        worker.resultReady.emit(True, {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {
+                "kind": "legacy", "folder_paths": None
+            },
+            "snapshot_fingerprint": "old-generation-snapshot",
+            "background_apply": {
+                "kind": "unchanged",
+                "changes": [],
+                "recovered_count": 0,
+            },
+        })
+
+        self.assertTrue(self.coordinator["pull_pending"])
+        self.assertIsNone(
+            self.coordinator["applied_snapshot_fingerprint"]
+        )
+
+    def test_retry_wait_conflict_and_blocked_each_keep_the_general_gate_closed(self):
+        self._accept_current_authority()
+        operation = self._enqueue(1)
+        self.store.mark_attempt(operation["operation_id"])
+        self.store.mark_retry(operation["operation_id"], "network timeout")
+        self.assertFalse(self.manager.pull_remote_changes_async())
+
+        counts = self.store.counts(self.manager._v2_context["local_key"])
+        self.assertEqual(counts["retry_wait"], 1)
+        self.assertEqual(self.workers, [])
+
+        for guarded_state in ("conflict", "blocked"):
+            with self.subTest(guarded_state=guarded_state), patch.object(
+                self.manager,
+                "_v2_activity_counts",
+                return_value={
+                    "pending": 0, "inflight": 0, "retry_wait": 0,
+                    "conflict": int(guarded_state == "conflict"),
+                    "blocked": int(guarded_state == "blocked"),
+                },
+            ):
+                self.assertFalse(
+                    self.manager._ordinary_pull_gate_is_open(self.coordinator)
+                )
+
+    def test_rebind_requires_a_new_baseline_and_project_a_does_not_block_b(self):
+        self._accept_current_authority()
+        self._enqueue(1)
+        self.assertFalse(self.manager.pull_remote_changes_async())
+
+        other_root = Path(self.temp.name, "other")
+        other_root.mkdir()
+        other_wpm = SimpleNamespace(
+            writing_root_path=str(other_root), project_settings={}
+        )
+        self.manager.configure_v2(
+            other_wpm,
+            "다른 작품",
+            str(uuid.uuid4()),
+            store=self.store,
+            recover_local_changes=False,
+        )
+
+        self.assertFalse(self.manager._current_pull_coordinator()["baseline_validated"])
+        self.assertTrue(self.manager.pull_remote_changes_async())
+        self.assertEqual(len(self.workers), 1)
+
+    def test_disabling_the_queue_gate_is_caught_by_the_pending_work_test(self):
+        self._accept_current_authority()
+        self._enqueue(1)
+
+        with patch.object(
+            self.manager, "_ordinary_pull_gate_is_open", return_value=True
+        ):
+            self.assertTrue(self.manager.pull_remote_changes_async())
+
+        self.assertEqual(len(self.workers), 1, "이 assertion 이 관문의 이빨이다")
+
+    def test_revision_conflict_read_first_never_starts_a_project_pull(self):
+        operation = {"document_id": str(uuid.uuid4())}
+        remote = {"document_id": operation["document_id"], "revision": 2}
+        client = object()
+        with patch.object(
+            self.manager, "_fetch_remote_document", return_value=remote
+        ) as fetch, patch.object(
+            self.manager,
+            "pull_remote_changes_async",
+            side_effect=AssertionError("일반 pull 이 충돌 해소 경로에 들어왔다"),
+        ):
+            result = self.manager._revision_conflict_read_first(
+                operation, client=client
+            )
+
+        self.assertEqual(result, remote)
+        fetch.assert_called_once_with(operation["document_id"], client)
 
 
 class WritingManualSaveTestCase(unittest.TestCase):

@@ -1,15 +1,18 @@
+import base64
 import copy
+import io
 import json
 import os
 import sqlite3
 import sys
+import unicodedata
 import tempfile
 import unittest
 import uuid
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sync_contract import (
     CANONICAL_CONTRACT_BYTES,
@@ -22,12 +25,21 @@ from sync_contract import (
     build_atomic_structure_request,
     build_document_commit_request,
     normalize_storage_name,
+    read_handshake_compatibility,
     require_server_compatibility,
     safe_trace,
     validate_atomic_structure_response,
     validate_document_commit_response,
 )
-from sync_manager import SyncManager
+from sync_manager import (
+    LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS,
+    STRUCTURE_AUTHORITY_BLOCKED,
+    STRUCTURE_AUTHORITY_CONTRACT,
+    STRUCTURE_AUTHORITY_LEGACY,
+    STRUCTURE_AUTHORITY_UNKNOWN,
+    SyncManager,
+    V2PullWorker,
+)
 from sync_v2_store import STAGE8_USER_VERSION, SyncV2Store
 from unicode15_casefold import (
     MAPPING_COUNT,
@@ -44,6 +56,116 @@ from unicode15_casefold import (
 PROJECT_ID = "00000000-0000-4000-8000-000000000201"
 DEVICE_ID = "60000000-0000-4000-8000-000000000201"
 BATCH_ID = "10000000-0000-4000-8000-000000000201"
+OTHER_PROJECT_ID = "00000000-0000-4000-8000-000000000202"
+DEFAULT_SUBJECT = "00000000-0000-4000-8000-000000000203"
+
+
+LIVE_PROJECT_ID = "01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2"
+
+# Recorded from staging on 2026-08-23, before the 0.2.0 allowlist row was
+# switched on.
+LIVE_INACTIVE_REPLY = (
+    '{"supported":false,"project_id":"01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2",'
+    '"migration_epoch":0,"contract_version":null,"project_sync_mode":"LEGACY",'
+    '"server_capabilities":[],"server_contract_sha256":null,'
+    '"server_protocol_version":null,"canonical_contract_sha256":null,'
+    '"supported_protocol_versions":[]}'
+)
+
+# Recorded from the same project after the row was switched on. Note the mode:
+# an allowlisted contract does not move a project off LEGACY, and epoch stays 0.
+LIVE_ACTIVE_REPLY = (
+    '{"supported":true,"project_id":"01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2",'
+    '"migration_epoch":0,"contract_version":"0.2.0",'
+    '"project_sync_mode":"LEGACY","server_capabilities":'
+    '["atomic_structure_commit","contract_allowlist_validation",'
+    '"project_mode_migration_lock","folder_tombstones","id_tree_validation",'
+    '"legacy_epoch_zero_adapter","storage_name_v1","document_commit_v1"],'
+    '"server_contract_sha256":'
+    '"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",'
+    '"server_protocol_version":3,"canonical_contract_sha256":'
+    '"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",'
+    '"supported_protocol_versions":[3]}'
+)
+
+
+def live_reply(raw, project_id=PROJECT_ID, **overrides):
+    """One of the recorded replies, readdressed to the fixture's project."""
+    handshake = json.loads(raw)
+    handshake["project_id"] = project_id
+    handshake.update(overrides)
+    return handshake
+
+
+def supported_handshake(project_id=PROJECT_ID, **overrides):
+    """The reply the server sends with the 0.2.0 allowlist row switched on."""
+    return live_reply(LIVE_ACTIVE_REPLY, project_id, **overrides)
+
+
+def unsupported_handshake(project_id=PROJECT_ID, **overrides):
+    """The reply the server sends with no allowlist row for this client."""
+    return live_reply(LIVE_INACTIVE_REPLY, project_id, **overrides)
+
+
+def access_token_with_subject(subject=DEFAULT_SUBJECT):
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"sub": subject}, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def arm_contract_handshake(
+    manager, outcome="supported", subject=DEFAULT_SUBJECT
+):
+    """Leave behind an explicitly synthetic fresh handshake reading."""
+    if manager.supabase is None:
+        manager.supabase = SimpleNamespace()
+    manager.supabase._antigravity_access_token = (
+        access_token_with_subject(subject) if subject is not None else "not-a-jwt"
+    )
+    identity = manager._contract_identity()
+    project = manager._v2_store.get_project(manager._v2_context["local_key"])
+    manager._contract_handshake = {
+        "generation": manager._v2_context_generation,
+        "context_key": manager._contract_context_key(),
+        "project_id": manager._v2_context["project_id"],
+        "identity": identity,
+        "contract_sha256": CANONICAL_CONTRACT_SHA256,
+        "observed_at": "",
+        "outcome": outcome,
+        "project_sync_mode": project["project_sync_mode"],
+        "migration_epoch": project["migration_epoch"],
+    }
+    manager._contract_handshake_attempt = manager._contract_context_key()
+
+
+class _HandshakeClient:
+    """A Supabase stand-in that answers get_sync_handshake and counts calls."""
+
+    def __init__(
+        self, reply, email="writer@example.invalid", subject=DEFAULT_SUBJECT
+    ):
+        self.reply = reply
+        self.calls = []
+        # ``ensure_session_valid`` leaves a client with no auth alone, which is
+        # what keeps these cases off the token refresh path entirely.
+        self.auth = None
+        self._antigravity_email = email
+        self._antigravity_access_token = access_token_with_subject(subject)
+        self._antigravity_authenticated = True
+
+    def rpc(self, name, params):
+        self.calls.append((name, dict(params)))
+        if name == "get_project_status":
+            return SimpleNamespace(execute=lambda: SimpleNamespace(data={
+                "project_id": params["p_project_id"], "state": "active",
+            }))
+        return SimpleNamespace(execute=self._answer)
+
+    def _answer(self):
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return SimpleNamespace(data=self.reply)
 
 
 def contract_root():
@@ -339,6 +461,7 @@ class ContractStoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _activate_id_based(self):
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
         self.store.activate_contract_project(
             self.context["local_key"],
             project_sync_mode="MIGRATING",
@@ -362,6 +485,9 @@ class ContractStoreTests(unittest.TestCase):
         manager._v2_store = self.store
         manager._v2_context = {**self.context, **project}
         manager._v2_device_id = DEVICE_ID
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_CONTRACT
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        arm_contract_handshake(manager)
         manager._v2_wpm = SimpleNamespace(
             writing_root_path=str(Path(self.temp.name) / "writing"),
             read_text_file=lambda _path: None,
@@ -976,6 +1102,7 @@ class ContractStoreTests(unittest.TestCase):
             server_contract_sha256=CANONICAL_CONTRACT_SHA256,
             server_capabilities=SERVER_CAPABILITIES,
         )
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
         manager = SyncManager()
         manager._v2_store = self.store
         manager._v2_context = {**self.context, **project}
@@ -986,6 +1113,7 @@ class ContractStoreTests(unittest.TestCase):
             project_settings={"tree_order": {}},
             save_settings=lambda: True,
         )
+        arm_contract_handshake(manager)
         parent = self._folder_snapshot("메인/메모장")
         self.store.replace_folder_snapshots(
             self.context["local_key"], [parent]
@@ -1125,6 +1253,739 @@ class ContractStoreTests(unittest.TestCase):
                 "메인/휴지통": ["로컬 보관본.txt"],
             },
         )
+
+    def test_contract_tree_order_is_the_only_source_when_legacy_is_stale(self):
+        manager = self._contract_manager()
+        root = self._folder_snapshot("메인")
+        parent = self._folder_snapshot(
+            "메인/메모장", parent_id=root["folder_id"]
+        )
+        children = [
+            self._folder_snapshot(
+                f"메인/메모장/계약경로검증{suffix}",
+                parent_id=parent["folder_id"],
+            )
+            for suffix in ("", "2", "3", "4")
+        ]
+        previous_rows = [root, parent, *children[:3]]
+        self.store.replace_folder_snapshots(
+            self.context["local_key"], previous_rows
+        )
+        for item in previous_rows:
+            Path(manager._v2_wpm.writing_root_path, item["local_path"]).mkdir(
+                parents=True, exist_ok=True
+            )
+        manager._v2_wpm.project_settings["tree_order"] = {
+            "메인/메모장": [item["name"] for item in children[:3]]
+        }
+        legacy_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/메모장": []},
+            }),
+            "revision": 1,
+            "is_deleted": False,
+        }
+        contract_rows = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [item["folder_id"] for item in children],
+            "revision": 4,
+        }]
+        folder_rows = [root, parent, *children]
+
+        decision = manager._select_remote_structure_authority(
+            [legacy_document],
+            folder_rows,
+            contract_rows,
+        )
+        changes = manager._apply_v2_remote_documents(
+            [legacy_document],
+            strict=True,
+            folder_rows=folder_rows,
+            folder_versions=[],
+            tree_order_rows=contract_rows,
+            structure_authority=decision["kind"],
+            authoritative_folder_paths=decision["folder_paths"],
+        )
+
+        self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_CONTRACT)
+        self.assertTrue(
+            Path(
+                manager._v2_wpm.writing_root_path,
+                "메인/메모장/계약경로검증4",
+            ).is_dir()
+        )
+        self.assertEqual(
+            manager._v2_wpm.project_settings["tree_order"]["메인/메모장"],
+            [item["name"] for item in children],
+        )
+        self.assertEqual(
+            self.store.get_tree_order(
+                self.context["local_key"], "메인/메모장"
+            )["revision"],
+            4,
+        )
+        self.assertIsNone(
+            self.store.get_document(
+                self.context["local_key"],
+                "__antigravity__/tree-order.json",
+            ),
+            "the selected contract pull applied the stale legacy document",
+        )
+        self.assertTrue(any(item.get("kind") == "tree_order" for item in changes))
+
+    def test_zero_contract_rows_selects_a_valid_legacy_snapshot(self):
+        manager = self._contract_manager()
+        legacy_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/메모장": []},
+            }),
+            "revision": 1,
+            "is_deleted": False,
+        }
+
+        decision = manager._select_remote_structure_authority(
+            [legacy_document], [], []
+        )
+
+        self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_LEGACY)
+        self.assertEqual(decision["folder_paths"], ["메인/메모장"])
+
+    def test_new_project_selects_empty_legacy_baseline_before_first_commit(self):
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = self.context
+
+        decision = manager._select_remote_structure_authority([], [], [])
+
+        self.assertEqual(decision, {
+            "kind": STRUCTURE_AUTHORITY_LEGACY,
+            "folder_paths": [],
+        })
+
+    def test_empty_projection_after_acknowledged_commit_stays_blocked(self):
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = self.context
+        self.store.apply_remote_snapshot(
+            self.context,
+            str(uuid.uuid4()),
+            "메인/메모장/서버승인.txt",
+            "server body",
+            revision=1,
+        )
+
+        with self.assertRaises(SyncContractError) as raised:
+            manager._select_remote_structure_authority([], [], [])
+
+        self.assertEqual(raised.exception.code, "INVALID_TREE_ORDER_RESPONSE")
+
+    def test_tree_order_revision_counts_as_acknowledged_commit(self):
+        tree_order_id = str(uuid.uuid4())
+        with self.store._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sync_tree_orders (
+                    tree_order_id, local_key, parent_folder_id, parent_path,
+                    children_json, revision, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?)
+                """,
+                (
+                    tree_order_id,
+                    self.context["local_key"],
+                    "<root>",
+                    "[]",
+                    "2026-08-30T00:00:00+00:00",
+                    "2026-08-30T00:00:00+00:00",
+                ),
+            )
+
+        self.assertTrue(
+            self.store.has_server_acknowledged_commit(self.context["local_key"])
+        )
+
+    def test_valid_empty_contract_row_is_not_mistaken_for_absence(self):
+        manager = self._contract_manager()
+        root = self._folder_snapshot("메인")
+        parent = self._folder_snapshot(
+            "메인/메모장", parent_id=root["folder_id"]
+        )
+        contract_rows = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [],
+            "revision": 1,
+        }]
+
+        decision = manager._select_remote_structure_authority(
+            [], [root, parent], contract_rows
+        )
+
+        self.assertEqual(decision["kind"], STRUCTURE_AUTHORITY_CONTRACT)
+
+    def test_pull_worker_proves_contract_absence_even_with_write_gate_closed(self):
+        calls = []
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: calls.append("handshake"),
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: [],
+            _documents_with_content=lambda _project_id, rows: rows,
+            _fetch_v2_project_folders=lambda _client, project_id=None: [],
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: (
+                calls.append("tree_orders") or []
+            ),
+            _legacy_structure_snapshot_in_flight=lambda *_args: False,
+            _report_legacy_structure_settle_wait=lambda: (_ for _ in ()).throw(
+                AssertionError("a coherent empty legacy snapshot waited")
+            ),
+            _select_remote_structure_authority=lambda _documents, _folders, rows: {
+                "kind": STRUCTURE_AUTHORITY_LEGACY,
+                "folder_paths": [],
+                "observed_rows": len(rows),
+            },
+            _uses_contract_structure=lambda: (_ for _ in ()).throw(
+                AssertionError("the local write gate suppressed the read")
+            ),
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(lambda success, payload: results.append(
+            (success, payload)
+        ))
+
+        worker.run()
+
+        self.assertEqual(calls, ["handshake", "tree_orders"])
+        self.assertTrue(results[0][0])
+        self.assertEqual(
+            results[0][1]["structure_authority"]["observed_rows"], 0
+        )
+
+    def test_legacy_pull_waits_for_peer_tree_order_then_uses_one_coherent_read(self):
+        old_time = "2026-08-27T04:43:04+00:00"
+        new_time = "2026-08-27T04:43:07+00:00"
+        root_id = str(uuid.uuid4())
+        manuscript_id = str(uuid.uuid4())
+        volume_id = str(uuid.uuid4())
+        stale_tree = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/원고": []},
+            }),
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }
+        fresh_tree = {
+            **stale_tree,
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {
+                    "메인/원고": ["3권"],
+                    "메인/원고/3권": ["051화.txt"],
+                },
+            }),
+            "revision": 2,
+            "updated_at": new_time,
+        }
+        peer_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "메인/원고/3권/051화.txt",
+            "content": "peer content",
+            "revision": 1,
+            "updated_at": new_time,
+            "is_deleted": False,
+        }
+        folders = [{
+            "folder_id": root_id,
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": manuscript_id,
+            "parent_folder_id": root_id,
+            "name": "원고",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": volume_id,
+            "parent_folder_id": manuscript_id,
+            "name": "3권",
+            "revision": 1,
+            "updated_at": new_time,
+            "is_deleted": False,
+        }]
+        document_reads = [
+            [stale_tree, peer_document],
+            [fresh_tree, peer_document],
+        ]
+        calls = []
+        waits = []
+        decision_manager = self._contract_manager()
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: calls.append("handshake"),
+            _documents_with_content=lambda _project_id, rows: rows,
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: (
+                calls.append("documents") or document_reads.pop(0)
+            ),
+            _fetch_v2_project_folders=lambda _client, project_id=None: (
+                calls.append("folders") or folders
+            ),
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: (
+                calls.append("tree_orders") or []
+            ),
+            _legacy_structure_snapshot_in_flight=(
+                SyncManager._legacy_structure_snapshot_in_flight
+            ),
+            _report_legacy_structure_settle_wait=lambda: waits.append("wait"),
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _select_remote_structure_authority=lambda documents, folders, rows: (
+                SyncManager._select_remote_structure_authority(
+                    decision_manager, documents, folders, rows
+                )
+            ),
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(
+            lambda success, payload: results.append((success, payload))
+        )
+
+        with patch("sync_manager.time.sleep") as sleep:
+            worker.run()
+
+        self.assertEqual(waits, ["wait"])
+        sleep.assert_called_once_with(
+            LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS[0]
+        )
+        self.assertEqual(calls.count("documents"), 2)
+        self.assertEqual(calls.count("folders"), 2)
+        self.assertEqual(calls.count("tree_orders"), 2)
+        self.assertTrue(results[0][0])
+        self.assertEqual(
+            results[0][1]["structure_authority"]["kind"],
+            STRUCTURE_AUTHORITY_LEGACY,
+        )
+        self.assertEqual(
+            results[0][1]["structure_authority"]["folder_paths"],
+            ["메인/원고", "메인/원고/3권"],
+        )
+
+    def test_legacy_pull_exhaustion_keeps_fail_closed_and_never_applies(self):
+        old_time = "2026-08-27T04:43:04+00:00"
+        new_time = "2026-08-27T04:43:07+00:00"
+        root_id = str(uuid.uuid4())
+        manuscript_id = str(uuid.uuid4())
+        stale_tree = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/원고": []},
+            }),
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }
+        folders = [{
+            "folder_id": root_id,
+            "parent_folder_id": None,
+            "name": "메인",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": manuscript_id,
+            "parent_folder_id": root_id,
+            "name": "원고",
+            "revision": 1,
+            "updated_at": old_time,
+            "is_deleted": False,
+        }, {
+            "folder_id": str(uuid.uuid4()),
+            "parent_folder_id": manuscript_id,
+            "name": "3권",
+            "revision": 1,
+            "updated_at": new_time,
+            "is_deleted": False,
+        }]
+        select = Mock(side_effect=AssertionError(
+            "an unstable projection reached authority selection"
+        ))
+        waits = []
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: None,
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: [stale_tree],
+            _documents_with_content=lambda _project_id, rows: rows,
+            _fetch_v2_project_folders=lambda _client, project_id=None: folders,
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: [],
+            _legacy_structure_snapshot_in_flight=(
+                SyncManager._legacy_structure_snapshot_in_flight
+            ),
+            _report_legacy_structure_settle_wait=lambda: waits.append("wait"),
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _select_remote_structure_authority=select,
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(
+            lambda success, payload: results.append((success, payload))
+        )
+
+        with patch("sync_manager.time.sleep") as sleep:
+            worker.run()
+
+        self.assertEqual(
+            waits, ["wait"] * len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS)
+        )
+        self.assertEqual(
+            sleep.call_count, len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS)
+        )
+        select.assert_not_called()
+        self.assertEqual(
+            results,
+            [(False, "LEGACY_STRUCTURE_SNAPSHOT_UNSTABLE")],
+        )
+
+    def test_contract_structure_error_is_not_retried_as_legacy_settle(self):
+        decision_manager = self._contract_manager()
+        manager = SimpleNamespace(
+            _ensure_contract_handshake=lambda: None,
+            _fetch_v2_project_documents=lambda project_id=None, **kwargs: [],
+            _documents_with_content=lambda _project_id, rows: rows,
+            _fetch_v2_project_folders=lambda _client, project_id=None: [],
+            _fetch_v2_project_tree_orders=lambda _client, project_id=None: [{
+                "tree_order_id": str(uuid.uuid4()),
+                "parent_folder_id": None,
+                "children": [],
+                "revision": 0,
+            }],
+            _legacy_structure_snapshot_in_flight=(
+                SyncManager._legacy_structure_snapshot_in_flight
+            ),
+            _report_legacy_structure_settle_wait=lambda: (_ for _ in ()).throw(
+                AssertionError("contract corruption entered legacy wait")
+            ),
+            _needs_folder_history=lambda _rows: False,
+            _fetch_v2_project_folder_versions=lambda _client, project_id=None: [],
+            _select_remote_structure_authority=lambda documents, folders, rows: (
+                SyncManager._select_remote_structure_authority(
+                    decision_manager, documents, folders, rows
+                )
+            ),
+            supabase=SimpleNamespace(),
+        )
+        worker = V2PullWorker(manager, project_id=PROJECT_ID)
+        results = []
+        worker.resultReady.connect(
+            lambda success, payload: results.append((success, payload))
+        )
+
+        with patch("sync_manager.time.sleep") as sleep:
+            worker.run()
+
+        sleep.assert_not_called()
+        self.assertEqual(results, [(False, "INVALID_TREE_ORDER_RESPONSE")])
+
+    def test_invalid_contract_never_falls_back_to_valid_legacy(self):
+        manager = self._contract_manager()
+        root = self._folder_snapshot("메인")
+        parent = self._folder_snapshot(
+            "메인/메모장", parent_id=root["folder_id"]
+        )
+        child = self._folder_snapshot(
+            "메인/메모장/계약경로검증4",
+            parent_id=parent["folder_id"],
+        )
+        legacy_document = {
+            "document_id": str(uuid.uuid4()),
+            "relative_path": "__antigravity__/tree-order.json",
+            "content": json.dumps({
+                "version": 1,
+                "tree_order": {"메인/메모장": ["계약경로검증4"]},
+            }),
+            "revision": 99,
+            "is_deleted": False,
+        }
+        invalid_contract = [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent["folder_id"],
+            "children": [child["folder_id"]],
+            "revision": 0,
+        }]
+
+        with self.assertRaises(SyncContractError) as raised:
+            manager._select_remote_structure_authority(
+                [legacy_document],
+                [root, parent, child],
+                invalid_contract,
+            )
+
+        self.assertEqual(raised.exception.code, "INVALID_TREE_ORDER_RESPONSE")
+        self.assertEqual(
+            manager._v2_wpm.project_settings["tree_order"], {}
+        )
+        self.assertIsNone(
+            self.store.get_folder_by_id(child["folder_id"])
+        )
+
+    def test_unknown_or_blocked_authority_stops_upload_dispatch_with_teeth(self):
+        legacy_context = self.store.configure_project(
+            str(Path(self.temp.name) / "legacy-writing"),
+            "Legacy dispatch gate",
+            OTHER_PROJECT_ID,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = legacy_context
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._v2_pull_worker = None
+        manager._active_server_syncs = 0
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        operation = self.store.enqueue(
+            legacy_context,
+            "메인/원고/대기.txt",
+            "본문",
+            relative_path="메인/원고/대기.txt",
+        )
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+
+        with patch.object(manager, "_launch_v2_operation") as launch:
+            self.assertFalse(manager.retry_pending_syncs())
+            launch.assert_not_called()
+
+            # This is the tooth check: disabling only the authority guard lets
+            # the exact same queued document reach the dispatcher.
+            manager._v2_structure_authority = STRUCTURE_AUTHORITY_LEGACY
+            self.assertTrue(manager.retry_pending_syncs())
+            launch.assert_called_once()
+        self.assertEqual(
+            self.store.operation(operation["operation_id"])["status"],
+            "pending",
+        )
+
+    def test_blocked_authority_stops_the_five_second_pull_entrypoint(self):
+        manager = self._contract_manager()
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker",
+            side_effect=AssertionError("blocked timer built a new pull worker"),
+        ) as worker:
+            self.assertFalse(manager.pull_remote_changes_async())
+        worker.assert_not_called()
+
+    def test_manual_retry_reselects_authority_before_dispatching_pending_write(self):
+        context = self.store.configure_project(
+            str(Path(self.temp.name) / "manual-retry-writing"),
+            "Manual retry",
+            OTHER_PROJECT_ID,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = context
+        manager._v2_device_id = DEVICE_ID
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._active_server_syncs = 0
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
+        manager._v2_last_pull_apply_blocked = False
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        operation = self.store.enqueue(
+            context,
+            "메인/원고/수동재시도.txt",
+            "로컬 본문",
+            relative_path="메인/원고/수동재시도.txt",
+        )
+        callbacks = {"finished": []}
+
+        class _Worker:
+            resultReady = SimpleNamespace(
+                connect=lambda callback: callbacks.setdefault("result", callback)
+            )
+            finished = SimpleNamespace(
+                connect=lambda callback: callbacks["finished"].append(callback)
+            )
+
+            def __init__(self, _manager, project_id=None):
+                self.project_id = project_id
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker", _Worker
+        ), patch.object(manager, "_start_worker"), patch.object(
+            manager, "_apply_v2_remote_documents", return_value=[]
+        ) as apply, patch.object(
+            manager, "_identity_audit_is_clean", return_value=True
+        ), patch.object(
+            manager, "_recover_untracked_local_files_after_pull", return_value=0
+        ), patch.object(
+            manager, "_launch_contract_structure_batch"
+        ) as structure_launch, patch.object(
+            manager, "_launch_v2_operation"
+        ) as launch:
+            self.assertTrue(manager.retry_pending_syncs(manual=True))
+            self.assertEqual(
+                manager._v2_structure_authority,
+                STRUCTURE_AUTHORITY_UNKNOWN,
+            )
+            launch.assert_not_called()
+
+            callbacks["result"](
+                True,
+                {
+                    "documents": [],
+                    "folders": [],
+                    "folder_versions": [],
+                    "tree_orders": [],
+                    "structure_authority": {
+                        "kind": STRUCTURE_AUTHORITY_LEGACY,
+                        "folder_paths": [],
+                    },
+                },
+            )
+            apply.assert_called_once()
+            launch.assert_not_called()
+            self.assertIsNotNone(
+                self.store.next_ready_operation(context["local_key"])
+            )
+            for callback in callbacks["finished"]:
+                callback()
+
+        structure_launch.assert_not_called()
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[0]["operation_id"], operation["operation_id"])
+
+    def test_manual_retry_that_cannot_reselect_authority_never_dispatches(self):
+        context = self.store.configure_project(
+            str(Path(self.temp.name) / "failed-manual-retry-writing"),
+            "Failed manual retry",
+            OTHER_PROJECT_ID,
+        )
+        manager = SyncManager()
+        manager._v2_store = self.store
+        manager._v2_context = context
+        manager._v2_device_id = DEVICE_ID
+        manager._v2_worker = None
+        manager._v2_structure_worker = None
+        manager._v2_pull_worker = None
+        manager._active_server_syncs = 0
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
+        manager._v2_last_pull_apply_blocked = False
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+        manager._v2_structure_authority_identity = manager._v2_pull_identity()
+        self.store.enqueue(
+            context,
+            "메인/원고/계속대기.txt",
+            "로컬 본문",
+            relative_path="메인/원고/계속대기.txt",
+        )
+        callbacks = {"finished": []}
+
+        class _Worker:
+            resultReady = SimpleNamespace(
+                connect=lambda callback: callbacks.setdefault("result", callback)
+            )
+            finished = SimpleNamespace(
+                connect=lambda callback: callbacks["finished"].append(callback)
+            )
+
+            def __init__(self, _manager, project_id=None):
+                self.project_id = project_id
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker", _Worker
+        ), patch.object(manager, "_start_worker"), patch.object(
+            manager, "_launch_v2_operation"
+        ) as launch:
+            self.assertTrue(manager.retry_pending_syncs(manual=True))
+            callbacks["result"](False, "INVALID_TREE_ORDER_RESPONSE")
+            for callback in callbacks["finished"]:
+                callback()
+
+        self.assertEqual(
+            manager._v2_structure_authority,
+            STRUCTURE_AUTHORITY_BLOCKED,
+        )
+        launch.assert_not_called()
+
+    def test_failed_contract_selection_blocks_apply_upload_and_timer_reentry(self):
+        manager = self._contract_manager()
+        manager.supabase = SimpleNamespace()
+        manager._v2_structure_authority = STRUCTURE_AUTHORITY_LEGACY
+        callbacks = {}
+
+        class _Worker:
+            resultReady = SimpleNamespace(
+                connect=lambda callback: callbacks.setdefault("result", callback)
+            )
+            finished = SimpleNamespace(connect=lambda _callback: None)
+
+            def __init__(self, _manager, project_id=None):
+                self.project_id = project_id
+                callbacks["worker"] = self
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                return None
+
+        with patch("sync_manager.is_forced_offline", return_value=False), patch(
+            "sync_manager.V2PullWorker", _Worker
+        ), patch.object(manager, "_start_worker"):
+            self.assertTrue(manager.pull_remote_changes_async())
+            self.assertEqual(
+                manager._v2_structure_authority,
+                STRUCTURE_AUTHORITY_UNKNOWN,
+            )
+            callbacks["result"](False, "INVALID_TREE_ORDER_RESPONSE")
+
+        self.assertEqual(
+            manager._v2_structure_authority, STRUCTURE_AUTHORITY_BLOCKED
+        )
+        with patch.object(manager, "_apply_v2_remote_documents") as apply, patch.object(
+            manager, "_launch_v2_operation"
+        ) as upload:
+            self.assertFalse(manager.retry_pending_syncs())
+            self.assertFalse(manager.pull_remote_changes_async())
+        apply.assert_not_called()
+        upload.assert_not_called()
 
     def test_pending_contract_tree_order_is_detected_before_remote_projection(self):
         manager = self._contract_manager()
@@ -1272,6 +2133,8 @@ class ContractStoreTests(unittest.TestCase):
 
             def rpc(inner_self, name, params):
                 inner_self.calls.append((name, params))
+                if name == "get_project_status":
+                    return RpcCall({"project_id": PROJECT_ID, "state": "active"})
                 return RpcCall({"project_id": PROJECT_ID} if name == "ensure_project" else response)
 
         manager = SyncManager()
@@ -1279,7 +2142,12 @@ class ContractStoreTests(unittest.TestCase):
         manager._v2_context = dict(self.context)
         manager._v2_device_id = DEVICE_ID
         manager.supabase = Client()
+        arm_contract_handshake(manager)
+        manager._auth_retry_blocked = False
+        manager._shutting_down = False
         self.store.mark_attempt(operation["operation_id"])
+        manager._accept_structure_authority(STRUCTURE_AUTHORITY_CONTRACT)
+        manager.mark_project_server_state(PROJECT_ID, "active")
         result = manager._process_v2_operation(operation["operation_id"])
         self.assertEqual(result["kind"], "committed")
         self.assertEqual(
@@ -1327,7 +2195,7 @@ class ContractStoreTests(unittest.TestCase):
         reopened.mark_attempt(operation["operation_id"])
         result = manager._process_v2_operation(operation["operation_id"])
         self.assertEqual(result["kind"], "committed")
-        self.assertEqual([name for name, _ in manager.supabase.calls], ["ensure_project"])
+        self.assertEqual([name for name, _ in manager.supabase.calls], [])
 
     def test_contract_document_partial_response_is_not_recorded_or_applied(self):
         self._activate_id_based()
@@ -1491,6 +2359,9 @@ class ContractStoreTests(unittest.TestCase):
 
             def rpc(inner_self, name, params):
                 inner_self.calls.append((name, params))
+                if name == "get_project_status":
+                    return SimpleNamespace(execute=lambda: SimpleNamespace(data={
+                        "project_id": PROJECT_ID, "state": "active"}))
                 return RpcCall()
 
         manager = SyncManager()
@@ -1505,12 +2376,18 @@ class ContractStoreTests(unittest.TestCase):
             manager._v2_context = dict(self.context)
             manager._v2_device_id = DEVICE_ID
             manager.supabase = Client()
+            arm_contract_handshake(manager)
+            manager._auth_retry_blocked = False
+            manager._shutting_down = False
+            manager._accept_structure_authority(STRUCTURE_AUTHORITY_CONTRACT)
+            manager.mark_project_server_state(PROJECT_ID, "active")
             result = manager._process_contract_structure_batch(BATCH_ID)
 
             self.assertEqual(result, response)
             self.assertEqual(
                 manager.supabase.calls,
-                [("atomic_structure_commit", {"p_request": request})],
+                [("get_project_status", {"p_project_id": PROJECT_ID}),
+                 ("atomic_structure_commit", {"p_request": request})],
             )
         finally:
             (
@@ -1625,6 +2502,1802 @@ class LegacyMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(db_path)) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], STAGE8_USER_VERSION)
                 self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+
+class ContractHandshakeGateTests(unittest.TestCase):
+    """The handshake reports; only a local decision opens the write path."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = SyncV2Store(str(Path(self.temp.name) / "sync.sqlite3"))
+        self.context = self.store.configure_project(
+            str(Path(self.temp.name) / "writing"), "Handshake", PROJECT_ID
+        )
+        self.manager = SyncManager()
+        self.manager._v2_store = self.store
+        self.manager._v2_context = dict(self.context)
+        self.manager._v2_device_id = DEVICE_ID
+        self.manager._v2_wpm = SimpleNamespace(
+            writing_root_path=str(Path(self.temp.name) / "writing"),
+            read_text_file=lambda _path: None,
+            project_settings={"tree_order": {}},
+            save_settings=lambda: True,
+        )
+        Path(self.manager._v2_wpm.writing_root_path).mkdir(
+            parents=True, exist_ok=True
+        )
+        # One manager serves the whole process, so a reading left by an earlier
+        # case would otherwise arm this one.
+        self.manager._forget_contract_handshake()
+        self.manager._contract_handshake_error = ""
+
+    def tearDown(self):
+        self.manager._forget_contract_handshake()
+        self.manager.supabase = None
+        self.manager._v2_context = None
+        self.manager._v2_store = None
+        self.manager._v2_device_id = None
+        self.manager._v2_wpm = None
+        self.temp.cleanup()
+
+    def _attach(self, reply):
+        client = _HandshakeClient(reply)
+        self.manager.supabase = client
+        return client
+
+    def _project(self):
+        return self.store.get_project(self.context["local_key"])
+
+    def test_supported_handshake_alone_does_not_open_the_contract_path(self):
+        """The gate is the whole point: server assent is not local consent."""
+        self._attach(supported_handshake())
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertTrue(self.manager.contract_handshake_is_fresh())
+        # The server state was recorded in full ...
+        project = self._project()
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        self.assertEqual(project["server_protocol_version"], 3)
+        self.assertEqual(
+            project["active_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+        # ... and the write path is still the legacy one.
+        self.assertFalse(project["contract_path_enabled"])
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_open_gate_with_a_fresh_handshake_turns_the_path_on(self):
+        client = self._attach(supported_handshake())
+        project = self.manager.enable_contract_path()
+
+        self.assertTrue(project["contract_path_enabled"])
+        self.assertTrue(project["contract_path_enabled_at"])
+        self.assertTrue(self.manager._uses_contract_structure())
+        self.assertEqual(client.calls[-1][0], "get_sync_handshake")
+        self.assertEqual(client.calls[-1][1], {
+            "p_project_id": PROJECT_ID,
+            "p_contract_sha256": CANONICAL_CONTRACT_SHA256,
+        })
+
+    def test_activation_takes_its_own_handshake_and_never_a_stored_one(self):
+        """A positive from earlier in the session cannot stand in for now."""
+        self._attach(supported_handshake())
+        self.manager.perform_contract_handshake()
+        self.assertTrue(self.manager.contract_handshake_is_fresh())
+
+        # The server withdrew support between the reading and the activation.
+        client = self._attach(unsupported_handshake())
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.enable_contract_path()
+
+        self.assertEqual(raised.exception.code, "CONTRACT_NOT_ALLOWED")
+        self.assertEqual(client.calls[-1][0], "get_sync_handshake")
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_open_gate_without_a_fresh_reading_keeps_the_path_closed(self):
+        """Both halves are required, in the other direction too."""
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+        self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="MIGRATING",
+            migration_epoch=1,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.assertTrue(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_unsupported_reply_stores_nothing_and_arms_nothing(self):
+        self._attach(unsupported_handshake())
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "unsupported")
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        project = self._project()
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        self.assertIsNone(project["server_protocol_version"])
+        self.assertIsNone(project["active_contract_sha256"])
+        self.assertIsNone(project["server_capabilities_json"])
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_digest_protocol_and_capability_faults_are_each_refused(self):
+        cases = (
+            # A server on a different contract, answering consistently about it.
+            ({"server_contract_sha256": "0" * 64,
+              "canonical_contract_sha256": "0" * 64,
+              "contract_version": None}, "CONTRACT_DIGEST_MISMATCH"),
+            # A server that has not reached protocol 3 yet.
+            ({"server_protocol_version": 2,
+              "supported_protocol_versions": [2]}, "PROTOCOL_TOO_OLD"),
+            ({"server_capabilities": list(SERVER_CAPABILITIES[:-1])},
+             "CAPABILITY_MISMATCH"),
+            # LEGACY is the mode the live reply carries, and it owns epoch 0.
+            ({"migration_epoch": 1}, "STALE_MIGRATION_EPOCH"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                self.manager._forget_contract_handshake()
+                self._attach(supported_handshake(**overrides))
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(raised.exception.code, expected)
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self._project()["contract_path_enabled"])
+                self.assertEqual(
+                    self._project()["project_sync_mode"], "LEGACY"
+                )
+
+    def test_malformed_compatibility_fields_normalize_to_invalid_argument(self):
+        """A null protocol version is the shape the live reply already has."""
+        cases = (
+            ("server_protocol_version", None),
+            ("server_protocol_version", ""),
+            ("server_protocol_version", "3"),
+            ("server_protocol_version", True),
+            ("server_contract_sha256", None),
+            ("server_contract_sha256", CANONICAL_CONTRACT_SHA256.upper()),
+            ("server_contract_sha256", CANONICAL_CONTRACT_SHA256[:32]),
+            ("server_capabilities", None),
+            ("server_capabilities", "atomic_structure_commit"),
+            ("server_capabilities", [1, 2, 3]),
+            ("project_sync_mode", None),
+            ("project_sync_mode", "ID_BASED_V2"),
+            ("migration_epoch", None),
+            ("migration_epoch", "1"),
+            ("migration_epoch", -1),
+            ("supported_protocol_versions", 3),
+            ("supported_protocol_versions", "3"),
+            ("supported_protocol_versions", [None]),
+            ("supported_protocol_versions", ["3"]),
+            ("supported_protocol_versions", [True]),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=repr(value)):
+                self.manager._forget_contract_handshake()
+                self._attach(supported_handshake(**{field: value}))
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_require_server_compatibility_never_raises_a_bare_type_error(self):
+        """The contract error is the only thing callers have to catch."""
+        common = {
+            "project_sync_mode": "MIGRATING",
+            "migration_epoch": 1,
+            "server_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "server_capabilities": SERVER_CAPABILITIES,
+        }
+        for value in (None, "", "three", [], {}, 3.5):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(SyncContractError) as raised:
+                    require_server_compatibility(
+                        server_protocol_version=value, **common
+                    )
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        for value in (None, "folders", 7):
+            with self.subTest(capabilities=repr(value)):
+                candidate = dict(common, server_capabilities=value)
+                with self.assertRaises(SyncContractError):
+                    require_server_compatibility(
+                        server_protocol_version=3, **candidate
+                    )
+
+    def test_read_handshake_compatibility_rejects_a_non_mapping(self):
+        for reply in (None, [], "supported", 3):
+            with self.subTest(reply=repr(reply)):
+                with self.assertRaises(SyncContractError) as raised:
+                    read_handshake_compatibility(reply)
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+
+    def test_a_reply_about_another_project_is_refused(self):
+        self._attach(supported_handshake(project_id=OTHER_PROJECT_ID))
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.perform_contract_handshake()
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(self._project()["project_sync_mode"], "LEGACY")
+
+    def test_server_and_network_failures_leave_the_legacy_path_working(self):
+        failures = (
+            RuntimeError("FORBIDDEN"),
+            RuntimeError("INVALID_ARGUMENT"),
+            RuntimeError("NETWORK_UNAVAILABLE"),
+            RuntimeError("permission denied for function get_sync_handshake"),
+        )
+        for failure in failures:
+            with self.subTest(failure=str(failure)):
+                self.manager._forget_contract_handshake()
+                self.manager._contract_handshake_attempt = None
+                self._attach(failure)
+                # The quiet, once-per-project call swallows every one of these.
+                self.assertIsNone(self.manager._ensure_contract_handshake())
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+                # And the legacy queue still takes work.
+                operation = self.store.enqueue(
+                    self.manager._v2_context,
+                    "failure.txt",
+                    str(failure),
+                    relative_path="failure.txt",
+                )
+                self.assertEqual(operation["status"], "pending")
+                self.assertEqual(operation["relative_path"], "failure.txt")
+
+    def test_a_withdrawn_answer_disarms_the_session(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        # Any later call that comes back with one of the withdrawing codes
+        # drops the reading, and the gate alone cannot hold the path open.
+        with self.assertRaises(RuntimeError):
+            self.manager._call_with_session(
+                lambda: (_ for _ in ()).throw(RuntimeError("FORBIDDEN")),
+                self.manager.supabase,
+            )
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertTrue(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_signing_in_as_somebody_else_drops_the_reading(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        # Keep the email unchanged: the stable account subject, not a private
+        # supabase-py address attribute, owns cache invalidation.
+        self.manager.supabase._antigravity_access_token = (
+            access_token_with_subject(
+                "00000000-0000-4000-8000-000000000204"
+            )
+        )
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_an_unreadable_subject_cannot_arm_the_contract_path(self):
+        client = self._attach(supported_handshake())
+        client._antigravity_access_token = "not-a-jwt"
+
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.enable_contract_path()
+
+        self.assertEqual(raised.exception.code, "AUTH_REQUIRED")
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_two_empty_identity_markers_never_make_a_reading_fresh(self):
+        client = self._attach(supported_handshake())
+        client._antigravity_access_token = "not-a-jwt"
+        arm_contract_handshake(self.manager, subject=None)
+
+        self.assertEqual(self.manager._contract_handshake["identity"], "")
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_releasing_the_project_drops_the_reading(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        self.manager.release_v2()
+        self.assertIsNone(self.manager._contract_handshake)
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+
+    def _rewrite_stored_state(self, column, value):
+        """Move one column of the row the third condition reads.
+
+        Deliberately not through the manager. The point being tested is that
+        the store is a separate source of truth from the reading held in
+        memory, so the change has to arrive the way a real divergence would --
+        from outside this session.
+        """
+        with closing(sqlite3.connect(
+            str(Path(self.temp.name) / "sync.sqlite3")
+        )) as connection:
+            connection.execute(
+                f"UPDATE sync_projects SET {column} = ? WHERE local_key = ?",
+                (value, self.context["local_key"]),
+            )
+            connection.commit()
+
+    def test_a_stored_server_state_that_stops_matching_closes_the_path(self):
+        """The third condition, watched closing the path on its own.
+
+        An open gate and a fresh reading are the first two conditions and both
+        stay true throughout. The row beside the gate is read from the store on
+        every use, so it is the only thing left that can close the path. Every
+        other test here closes it by dropping the reading or shutting the gate,
+        which means this condition could be deleted and they would all still
+        pass.
+
+        Restoring each column afterwards and watching the path reopen is what
+        says the closure came from that column and not from something else
+        drifting along the way.
+        """
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+        healthy = dict(self.store.get_project(self.context["local_key"]))
+
+        cases = (
+            ("active_contract_sha256", "0" * 64),
+            ("server_protocol_version", 2),
+            (
+                "server_capabilities_json",
+                json.dumps(sorted(SERVER_CAPABILITIES)[1:]),
+            ),
+            # No mode or epoch case, and not by oversight: a trigger on
+            # sync_projects allows only an unchanged pair, LEGACY/0 ->
+            # MIGRATING/1, or MIGRATING/>=1 -> ID_BASED. Every other move
+            # aborts with INVALID_PROJECT_MODE_TRANSITION, so that axis cannot
+            # be made to diverge through the store at all. The third
+            # condition's STALE_MIGRATION_EPOCH branch guards a row that
+            # arrived some other way.
+            # Not a contract error at all: json.loads raises ValueError, and
+            # closing on that is what keeps one fail-closed answer instead of
+            # an interpreter error reaching the caller.
+            ("server_capabilities_json", "{"),
+        )
+        for column, value in cases:
+            with self.subTest(column=column, value=repr(value)[:32]):
+                self._rewrite_stored_state(column, value)
+
+                self.assertTrue(self.manager.contract_path_enabled())
+                self.assertTrue(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+
+                self._rewrite_stored_state(column, healthy[column])
+                self.assertTrue(self.manager._uses_contract_structure())
+
+    def test_the_handshake_is_asked_once_per_opened_project(self):
+        client = self._attach(supported_handshake())
+        for _ in range(4):
+            self.manager._ensure_contract_handshake()
+        self.assertEqual(len(client.calls), 1)
+
+        # A new generation is a new project binding, and that asks again.
+        self.manager._v2_context_generation += 1
+        self.manager._ensure_contract_handshake()
+        self.assertEqual(len(client.calls), 2)
+
+    def test_closing_the_gate_by_hand_stops_using_the_contract_path(self):
+        self._attach(supported_handshake())
+        self.manager.enable_contract_path()
+        self.assertTrue(self.manager._uses_contract_structure())
+
+        project = self.manager.disable_contract_path()
+        self.assertFalse(project["contract_path_enabled"])
+        self.assertIsNone(project["contract_path_enabled_at"])
+        self.assertFalse(self.manager._uses_contract_structure())
+        # The server reading it was carrying stays on the row as the last
+        # observation. It is diagnostic now, and it opens nothing.
+        self.assertEqual(project["server_protocol_version"], 3)
+        self.assertEqual(
+            project["active_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+
+    def test_the_recorded_active_reply_is_read_exactly_as_the_server_sent_it(self):
+        """The live answer is LEGACY at epoch 0, and it must stay that way."""
+        self._attach(live_reply(LIVE_ACTIVE_REPLY))
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertEqual(reading["project_sync_mode"], "LEGACY")
+        self.assertEqual(reading["migration_epoch"], 0)
+        project = self._project()
+        # An allowlisted contract does not promote the project. Mode and epoch
+        # are exactly where they were, and only the server facts were written.
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        self.assertEqual(project["server_protocol_version"], 3)
+        self.assertEqual(
+            project["active_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+        self.assertEqual(
+            json.loads(project["server_capabilities_json"]),
+            sorted(SERVER_CAPABILITIES),
+        )
+        # And the write path is still closed, which is the whole arrangement.
+        self.assertFalse(project["contract_path_enabled"])
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_the_recorded_inactive_reply_writes_nothing(self):
+        self._attach(live_reply(LIVE_INACTIVE_REPLY))
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "unsupported")
+        project = self._project()
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertIsNone(project["server_protocol_version"])
+        self.assertIsNone(project["active_contract_sha256"])
+        self.assertFalse(self.manager._uses_contract_structure())
+
+    def test_the_recorded_active_reply_opens_the_path_once_the_gate_is_open(self):
+        self._attach(live_reply(LIVE_ACTIVE_REPLY))
+        project = self.manager.enable_contract_path()
+
+        self.assertTrue(project["contract_path_enabled"])
+        self.assertEqual(project["project_sync_mode"], "LEGACY")
+        self.assertEqual(project["migration_epoch"], 0)
+        # LEGACY at epoch 0 is a contract-capable state through the epoch-zero
+        # adapter, so the path is genuinely live without any promotion.
+        self.assertTrue(self.manager._uses_contract_structure())
+
+    def test_a_server_that_has_dropped_this_protocol_is_refused(self):
+        """server_protocol_version is a ceiling; the set is the real answer."""
+        self._attach(supported_handshake(
+            server_protocol_version=4, supported_protocol_versions=[4]
+        ))
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.perform_contract_handshake()
+
+        self.assertEqual(raised.exception.code, "PROTOCOL_TOO_OLD")
+        self.assertFalse(self.manager.contract_handshake_is_fresh())
+        self.assertEqual(self._project()["project_sync_mode"], "LEGACY")
+        self.assertIsNone(self._project()["server_protocol_version"])
+
+    def test_a_server_that_still_accepts_this_protocol_is_taken(self):
+        self._attach(supported_handshake(
+            server_protocol_version=4, supported_protocol_versions=[3, 4]
+        ))
+        reading = self.manager.perform_contract_handshake()
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertEqual(self._project()["server_protocol_version"], 4)
+
+    def test_a_scalar_outside_the_servers_own_set_is_refused(self):
+        self._attach(supported_handshake(
+            server_protocol_version=9, supported_protocol_versions=[3]
+        ))
+        with self.assertRaises(SyncContractError) as raised:
+            self.manager.perform_contract_handshake()
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+
+    def test_a_reply_that_disagrees_with_itself_about_the_contract_is_refused(self):
+        cases = (
+            {"canonical_contract_sha256": "0" * 64},
+            {"contract_version": "0.3.0"},
+            {"contract_version": "0.1.0"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                self.manager._forget_contract_handshake()
+                self._attach(supported_handshake(**overrides))
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(
+                    raised.exception.code, "CONTRACT_DIGEST_MISMATCH"
+                )
+                self.assertFalse(self.manager._uses_contract_structure())
+                self.assertEqual(
+                    self._project()["project_sync_mode"], "LEGACY"
+                )
+
+    def test_each_absent_coherence_field_is_refused(self):
+        """No missing fact may silently become agreement with the client pin."""
+        for field in (
+            "contract_version",
+            "canonical_contract_sha256",
+            "supported_protocol_versions",
+        ):
+            with self.subTest(field=field):
+                self.manager._forget_contract_handshake()
+                reply = supported_handshake()
+                reply.pop(field)
+                self._attach(reply)
+                with self.assertRaises(SyncContractError) as raised:
+                    self.manager.perform_contract_handshake()
+                self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+                self.assertFalse(self.manager.contract_handshake_is_fresh())
+                self.assertFalse(self.manager._uses_contract_structure())
+
+    def _server_moved_the_project_to_migrating(self):
+        """Exactly what a handshake records once the server promotes a project.
+
+        The gate is never touched here. Recording server state is all a
+        handshake is allowed to do.
+        """
+        return self.store.activate_contract_project(
+            self.context["local_key"],
+            project_sync_mode="MIGRATING",
+            migration_epoch=1,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+
+    def test_a_promoted_project_still_writes_legacy_while_the_gate_is_closed(self):
+        """The write shape follows the gate, not the mode the server reported.
+
+        project_sync_mode is the server's to move. If a document write read it
+        alone, the server could put this client on contract-native commits by
+        promoting the project, and the gate would never be consulted.
+        """
+        self._server_moved_the_project_to_migrating()
+        self.assertFalse(self.store.contract_path_enabled(self.context["local_key"]))
+
+        operation = self.store.enqueue(
+            self.manager._v2_context, "가.txt", "본문", relative_path="가.txt"
+        )
+        self.assertEqual(operation["provenance_kind"], "LEGACY_EPOCH_0")
+        self.assertEqual(operation["sync_protocol_version"], 2)
+        self.assertIsNone(operation["batch_id"])
+        self.assertIsNone(operation["contract_version"])
+        self.assertIsNone(operation["canonical_contract_sha256"])
+
+    def test_a_closed_gate_limits_the_write_and_never_edits_the_observation(self):
+        """Holding a write back is not the same as rewriting what was observed.
+
+        The mode and epoch on the project row are the server's answer. They stay
+        exactly as the handshake recorded them, and remain readable for
+        diagnosis, while the gate governs only the shape of the write.
+        """
+        self._server_moved_the_project_to_migrating()
+        before = self._project()
+
+        for name in ("가.txt", "나.txt", "다.txt"):
+            self.store.enqueue(
+                self.manager._v2_context, name, "본문", relative_path=name
+            )
+
+        after = self._project()
+        for column in (
+            "project_sync_mode", "migration_epoch", "server_protocol_version",
+            "active_contract_sha256", "server_capabilities_json",
+        ):
+            with self.subTest(column=column):
+                self.assertEqual(after[column], before[column])
+        # The observation is intact and still says MIGRATING ...
+        self.assertEqual(after["project_sync_mode"], "MIGRATING")
+        self.assertEqual(after["migration_epoch"], 1)
+        # ... while the gate it does not control is still shut.
+        self.assertFalse(after["contract_path_enabled"])
+
+    def test_a_promoted_project_writes_contract_batches_once_the_gate_opens(self):
+        self._server_moved_the_project_to_migrating()
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+
+        operation = self.store.enqueue(
+            self.manager._v2_context, "나.txt", "본문", relative_path="나.txt"
+        )
+        self.assertEqual(operation["provenance_kind"], "CONTRACT_BATCH")
+        self.assertEqual(operation["sync_protocol_version"], 3)
+        self.assertTrue(operation["batch_id"])
+        self.assertEqual(operation["contract_version"], CONTRACT_VERSION)
+        self.assertEqual(
+            operation["canonical_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+
+    def test_a_structure_batch_is_refused_while_the_gate_is_closed(self):
+        """The store checks the gate too, so a forgetful caller cannot skip it."""
+        self._server_moved_the_project_to_migrating()
+        intents = [{
+            "entity_kind": "folder",
+            "entity_id": str(uuid.uuid4()),
+            "intent_kind": "create",
+            "base_revision": 0,
+            "payload": {"name": "메모장"},
+        }]
+        with self.assertRaises(SyncContractError) as raised:
+            self.store.create_structure_batch(
+                self.manager._v2_context, DEVICE_ID, intents
+            )
+        self.assertEqual(raised.exception.code, "CONTRACT_NOT_ALLOWED")
+
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+        request = self.store.create_structure_batch(
+            self.manager._v2_context, DEVICE_ID, intents
+        )
+        self.assertEqual(request["project_sync_mode"], "MIGRATING")
+
+    def test_the_gate_defaults_to_closed_on_a_fresh_project(self):
+        self.assertFalse(self._project()["contract_path_enabled"])
+        self.assertIsNone(self._project()["contract_path_enabled_at"])
+        self.assertFalse(self.manager.contract_path_enabled())
+        self.assertFalse(self.manager._uses_contract_structure())
+
+
+def _preflight_module():
+    """Load the preflight script, which lives outside any package."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "contract_path_preflight.py"
+    spec = importlib.util.spec_from_file_location("contract_path_preflight", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ContractPreflightVerdictTests(unittest.TestCase):
+    """The preflight decides STOP or proceed, so its verdicts are load-bearing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def _verdict(self, reply, project_id=LIVE_PROJECT_ID):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            self.preflight.print_handshake(project_id, reply)
+        lines = [
+            line.split("=", 1)[1]
+            for line in stream.getvalue().splitlines()
+            if line.startswith("verdict=")
+        ]
+        self.assertEqual(len(lines), 1, stream.getvalue())
+        return lines[0]
+
+    def test_the_recorded_active_reply_clears_the_preflight(self):
+        verdict = self._verdict(json.loads(LIVE_ACTIVE_REPLY))
+        self.assertNotIn("STOP", verdict)
+        self.assertIn("LEGACY/0", verdict)
+
+    def test_the_recorded_inactive_reply_offers_nothing_to_open(self):
+        verdict = self._verdict(json.loads(LIVE_INACTIVE_REPLY))
+        self.assertNotIn("STOP", verdict)
+        self.assertIn("does not support", verdict)
+
+    def test_a_promoted_project_stops_the_preflight(self):
+        """A promotion is a separate approval, so seeing one has to halt this."""
+        for mode, epoch in (("MIGRATING", 1), ("ID_BASED", 1), ("MIGRATING", 2)):
+            with self.subTest(mode=mode, epoch=epoch):
+                reply = json.loads(LIVE_ACTIVE_REPLY)
+                reply["project_sync_mode"] = mode
+                reply["migration_epoch"] = epoch
+                verdict = self._verdict(reply)
+                self.assertIn("STOP", verdict)
+                self.assertIn(f"{mode}/{epoch}", verdict)
+
+    def test_literals_that_do_not_match_the_pin_stop_the_preflight(self):
+        cases = (
+            ({"server_protocol_version": 4,
+              "supported_protocol_versions": [4]}, "PROTOCOL_TOO_OLD"),
+            ({"canonical_contract_sha256": "0" * 64},
+             "CONTRACT_DIGEST_MISMATCH"),
+            ({"contract_version": "0.3.0"}, "CONTRACT_DIGEST_MISMATCH"),
+            ({"server_contract_sha256": "0" * 64,
+              "canonical_contract_sha256": "0" * 64,
+              "contract_version": None}, "CONTRACT_DIGEST_MISMATCH"),
+            ({"server_capabilities": list(SERVER_CAPABILITIES[:-1])},
+             "CAPABILITY_MISMATCH"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                reply = json.loads(LIVE_ACTIVE_REPLY)
+                reply.update(overrides)
+                verdict = self._verdict(reply)
+                self.assertIn("STOP", verdict)
+                self.assertIn(expected, verdict)
+
+    def test_a_reply_about_another_project_stops_the_preflight(self):
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["project_id"] = OTHER_PROJECT_ID
+        self.assertIn("STOP", self._verdict(reply))
+
+    def test_an_unreadable_reply_stops_the_preflight(self):
+        for reply in (None, [], "supported", 3):
+            with self.subTest(reply=repr(reply)):
+                self.assertIn("STOP", self._verdict(reply))
+
+    def test_an_empty_project_row_is_not_reported_as_a_bad_server_answer(self):
+        """Nothing recorded yet is a different thing from a refused handshake."""
+        self.assertEqual(
+            self.preflight.stored_compatibility({
+                "project_sync_mode": "LEGACY",
+                "migration_epoch": 0,
+                "server_protocol_version": None,
+                "active_contract_sha256": None,
+                "server_capabilities_json": None,
+            }),
+            "NOT RECORDED",
+        )
+        self.assertEqual(
+            self.preflight.stored_compatibility({
+                "project_sync_mode": "LEGACY",
+                "migration_epoch": 0,
+                "server_protocol_version": 3,
+                "active_contract_sha256": CANONICAL_CONTRACT_SHA256,
+                "server_capabilities_json": json.dumps(list(SERVER_CAPABILITIES)),
+            }),
+            "PASS",
+        )
+
+    def test_the_preflight_prints_nothing_a_cp949_console_cannot_render(self):
+        """It is run from a Windows console, where a stray dash aborts the run."""
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts" / "contract_path_preflight.py"
+        )
+        source = path.read_text(encoding="utf-8")
+        offenders = sorted({character for character in source if ord(character) > 127})
+        self.assertEqual(offenders, [])
+
+
+class _AuthenticatedClient(_HandshakeClient):
+    """A stand-in that create_supabase_client can hand back, ready to call."""
+
+    def rpc(self, name, params):
+        self.calls.append((name, dict(params)))
+        reply = self.reply
+        if isinstance(reply, dict):
+            # The real server answers about whichever project was asked for.
+            reply = dict(reply, project_id=params["p_project_id"])
+        return SimpleNamespace(execute=lambda: SimpleNamespace(data=reply))
+
+
+class CredentialLockCheckTests(unittest.TestCase):
+    """The mode that exists so the lock can be tested without a run that might
+    reach the server if the test fails."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def _run(self, lease_result):
+        released = []
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "acquire_auth_lease", staticmethod(lambda: lease_result)
+        ), patch.object(
+            SyncManager, "release_auth_lease",
+            staticmethod(lambda: released.append(True)),
+        ), patch.object(
+            self.preflight, "run_handshakes"
+        ) as handshakes, patch.object(
+            self.preflight, "run_application_handshake"
+        ) as application, patch.object(
+            self.preflight, "read_projects"
+        ) as read_projects, patch.object(
+            sys, "argv", ["contract_path_preflight.py", "--credential-lock-check"]
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.main()
+        return status, stream.getvalue(), handshakes, application, read_projects, released
+
+    def test_a_free_lock_is_reported_and_handed_straight_back(self):
+        status, output, handshakes, application, _read, released = self._run(True)
+
+        self.assertEqual(status, 0)
+        self.assertIn("acquired=true", output)
+        self.assertIn("the credential is free", output)
+        # Reporting is all it does. Holding on would make the check itself the
+        # thing that blocks the next run.
+        self.assertEqual(released, [True])
+        handshakes.assert_not_called()
+        application.assert_not_called()
+
+    def test_a_held_lock_stops_with_a_non_zero_exit(self):
+        status, output, handshakes, application, _read, _released = self._run(False)
+
+        self.assertEqual(status, 1)
+        self.assertIn("acquired=false", output)
+        self.assertIn("STOP", output)
+        handshakes.assert_not_called()
+        application.assert_not_called()
+
+    def test_a_lock_that_cannot_be_taken_at_all_stops_too(self):
+        status, output, _h, _a, _read, _released = self._run(None)
+
+        self.assertEqual(status, 1)
+        self.assertIn("unavailable", output)
+        self.assertIn("STOP", output)
+
+    def test_it_reaches_no_network_and_not_even_the_database(self):
+        """Whatever the answer, nothing that could send a request is entered."""
+        for lease_result in (True, False, None):
+            with self.subTest(lease=repr(lease_result)):
+                _status, output, handshakes, application, read_projects, _r = (
+                    self._run(lease_result)
+                )
+                handshakes.assert_not_called()
+                application.assert_not_called()
+                read_projects.assert_not_called()
+                self.assertIn("network_used=false", output)
+
+
+CANARY_ID = "4df996c8-6443-4429-9dad-8fe3573af3d1"
+BYSTANDER_ID = "00000000-0000-4000-8000-0000000009a1"
+
+
+class ContractPathActivationTests(unittest.TestCase):
+    """Opening one gate, and being able to say afterwards that it was one.
+
+    Every case runs against a throwaway database and a stand-in server. The
+    machine's own database and login are never involved.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.live = Path(self.temp.name) / "sync_v2.sqlite3"
+        self.store = SyncV2Store(str(self.live))
+        self.context = self.store.configure_project(
+            str(Path(self.temp.name) / "canary"), "Canary", CANARY_ID
+        )
+        # A second project, so "one gate moved" is a claim with something to be
+        # wrong about.
+        self.bystander = self.store.configure_project(
+            str(Path(self.temp.name) / "bystander"), "Bystander", BYSTANDER_ID
+        )
+
+    def tearDown(self):
+        manager = SyncManager()
+        manager.release_v2()
+        manager.supabase = None
+        manager._v2_store = None
+        manager._v2_device_id = None
+        self.temp.cleanup()
+
+    def _run(self, reply=None, apply_change=False, project_id=CANARY_ID,
+             confirm_id=None):
+        client = _AuthenticatedClient(
+            json.loads(LIVE_ACTIVE_REPLY) if reply is None else reply
+        )
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "create_supabase_client",
+            staticmethod(lambda config=None: client),
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.run_activation(
+                    self.live,
+                    project_id,
+                    project_id if confirm_id is None else confirm_id,
+                    apply_change,
+                )
+        return status, stream.getvalue(), client
+
+    def _gate(self, project_id):
+        row = self.store.get_project_by_id(project_id)
+        return bool(row["contract_path_enabled"])
+
+    @staticmethod
+    def _value(output, key):
+        for line in output.splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+        return None
+
+    def test_a_dry_run_checks_everything_and_writes_nothing(self):
+        status, output, client = self._run(apply_change=False)
+
+        self.assertEqual(status, 0, output)
+        self.assertIn("dry run", self._value(output, "mode"))
+        self.assertNotIn("=FAIL", output)
+        self.assertIn("re-run with --apply", self._value(output, "verdict"))
+        # The handshake really ran, and the gate really did not move.
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(self._gate(CANARY_ID))
+        self.assertFalse(self._gate(BYSTANDER_ID))
+
+    def test_activation_dry_run_labels_the_fresh_server_answer(self):
+        status, output, client = self._run(apply_change=False)
+
+        self.assertEqual(status, 0, output)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("[fresh handshake]", output)
+        self.assertIn("the server supports this client=PASS", output)
+        self.assertIn("it answered LEGACY at epoch 0=PASS", output)
+        self.assertNotIn("the stored server state supports this client", output)
+        self.assertNotIn("the stored server state is LEGACY at epoch 0", output)
+
+    def test_applying_opens_that_gate_and_only_that_gate(self):
+        status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(status, 0, output)
+        self.assertTrue(self._gate(CANARY_ID))
+        self.assertFalse(self._gate(BYSTANDER_ID))
+        self.assertEqual(self._value(output, "gate_rows_changed"), "1")
+        self.assertTrue(self._value(output, "gate_opened_at"))
+        self.assertNotIn("=FAIL", output)
+
+    def test_the_handshake_happens_exactly_once(self):
+        _status, _output, client = self._run(apply_change=True)
+
+        self.assertEqual([name for name, _params in client.calls],
+                         ["get_sync_handshake"])
+        self.assertEqual(
+            client.calls[0][1]["p_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+
+    def test_opening_the_gate_queues_no_work(self):
+        _status, output, _client = self._run(apply_change=True)
+
+        self.assertIn("opening it queued nothing=PASS", output)
+        self.assertEqual(self._value(output, "queued_operations"), "0")
+        self.assertEqual(self._value(output, "contract_batches"), "0")
+
+    def test_mode_and_epoch_are_left_alone(self):
+        self._run(apply_change=True)
+        row = self.store.get_project_by_id(CANARY_ID)
+
+        self.assertEqual(row["project_sync_mode"], "LEGACY")
+        self.assertEqual(row["migration_epoch"], 0)
+
+    def test_two_ids_that_differ_stop_before_anything_is_read(self):
+        status, output, client = self._run(
+            apply_change=True, confirm_id=BYSTANDER_ID
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("do not match", self._value(output, "verdict"))
+        self.assertEqual(client.calls, [])
+        self.assertFalse(self._gate(CANARY_ID))
+        self.assertFalse(self._gate(BYSTANDER_ID))
+
+    def test_a_project_that_is_not_here_stops(self):
+        status, output, client = self._run(
+            apply_change=True, project_id="00000000-0000-4000-8000-0000000009ff"
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("no such project", self._value(output, "verdict"))
+        self.assertEqual(client.calls, [])
+
+    def test_a_gate_that_is_already_open_stops(self):
+        self.store.set_contract_path_enabled(self.context["local_key"], True)
+        status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("STOP", self._value(output, "verdict"))
+        self.assertIn("its gate is shut to begin with=FAIL", output)
+
+    def test_work_still_owed_stops(self):
+        """A write queued under the old shape must not be overtaken by the new."""
+        self.store.enqueue(
+            self.context, "1화.txt", "본문", relative_path="1화.txt"
+        )
+        status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("nothing is still owed on it=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_a_server_that_does_not_support_this_client_stops(self):
+        status, output, _client = self._run(
+            reply=json.loads(LIVE_INACTIVE_REPLY), apply_change=True
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("the server supports this client=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_a_promoted_project_stops(self):
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["project_sync_mode"] = "MIGRATING"
+        reply["migration_epoch"] = 1
+        status, output, _client = self._run(reply=reply, apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("it answered LEGACY at epoch 0=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_literals_that_do_not_match_the_pin_stop(self):
+        cases = (
+            ({"server_contract_sha256": "0" * 64,
+              "canonical_contract_sha256": "0" * 64,
+              "contract_version": None}, "the digest is the one"),
+            ({"server_protocol_version": 2,
+              "supported_protocol_versions": [2]}, "the protocol is one"),
+            ({"server_capabilities": list(SERVER_CAPABILITIES[:-1])},
+             "every capability this client needs"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=sorted(overrides)):
+                self.setUp()
+                try:
+                    reply = json.loads(LIVE_ACTIVE_REPLY)
+                    reply.update(overrides)
+                    status, output, _client = self._run(
+                        reply=reply, apply_change=True
+                    )
+                    self.assertEqual(status, 1)
+                    self.assertIn(expected, output)
+                    self.assertFalse(self._gate(CANARY_ID))
+                finally:
+                    self.tearDown()
+
+    def test_a_handshake_that_cannot_complete_stops(self):
+        error = RuntimeError("Invalid Refresh Token: Already Used")
+        error.status = 400
+        status, output, _client = self._run(reply=error, apply_change=True)
+
+        self.assertEqual(status, 1)
+        self.assertIn("the handshake completed=FAIL", output)
+        self.assertFalse(self._gate(CANARY_ID))
+
+    def test_the_report_says_how_many_other_projects_were_left_alone(self):
+        _status, output, _client = self._run(apply_change=True)
+
+        self.assertEqual(self._value(output, "other_projects"), "1")
+        self.assertIn("the other gates are where they were=PASS", output)
+
+
+class PreflightOutputIntegrityTests(unittest.TestCase):
+    """The output is kept as the record of what a run found."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def _shown(self, key, value):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            self.preflight.show(key, value)
+        return stream.getvalue()
+
+    def test_a_value_cannot_add_lines_that_read_like_results(self):
+        """The profile arrives from the environment; the rest of this is a record.
+
+        Without folding it, a profile name carrying newlines writes its own
+        verdict into the record, and whoever reads it afterwards sees a run that
+        passed when it did not.
+        """
+        rendered = self._shown(
+            "profile", "evil\nacquired=true\nverdict=the credential is free"
+        )
+
+        self.assertEqual(len(rendered.splitlines()), 1)
+        self.assertNotIn("\nacquired=true", rendered)
+        self.assertIn("\\x0a", rendered)
+
+    def test_nothing_that_can_end_a_line_survives(self):
+        """splitlines is how any reader of this record will parse it.
+
+        NEL, U+2028 and U+2029 all end a line there, so escaping the C0 range
+        alone still leaves three ways to write an extra result into the record.
+        """
+        for label, value in (
+            ("LF", "a\nb"),
+            ("CR", "a\rb"),
+            ("NEL", "a\x85b"),
+            ("line separator", "a\u2028b"),
+            ("paragraph separator", "a\u2029b"),
+            ("vertical tab", "a\x0bb"),
+            ("form feed", "a\x0cb"),
+            ("file separator", "a\x1cb"),
+        ):
+            with self.subTest(character=label):
+                rendered = self._shown("profile", value)
+                self.assertEqual(len(rendered.splitlines()), 1, label)
+
+    def test_nothing_invisible_or_reordering_survives(self):
+        """A line break is not the whole risk.
+
+        A control sequence rewrites the screen, and a bidi override reorders
+        what is on the line, so a reader is shown something other than what the
+        run wrote.
+        """
+        for label, value in (
+            ("escape", "a\x1b[2Jb"),
+            ("C1 control sequence introducer", "a\x9b2Jb"),
+            ("backspace", "a\bb"),
+            ("null", "a\x00b"),
+            ("delete", "a\x7fb"),
+            ("right-to-left override", "a\u202eb"),
+            ("zero width space", "a\u200bb"),
+            ("byte order mark", "a\ufeffb"),
+        ):
+            with self.subTest(character=label):
+                rendered = self._shown("profile", value).rstrip("\n")
+                self.assertEqual(len(rendered.splitlines()), 1, label)
+                for character in rendered:
+                    self.assertNotIn(
+                        unicodedata.category(character),
+                        ("Cc", "Cf", "Cs", "Zl", "Zp"),
+                        f"{label} left {character!r} in the record",
+                    )
+
+    def test_an_escape_says_which_character_it_replaced(self):
+        """A record that hides what was there is only half a record."""
+        self.assertIn("x0a", self._shown("profile", "a\nb"))
+        self.assertIn("u2028", self._shown("profile", "a\u2028b"))
+
+    def test_ordinary_values_are_left_exactly_as_they_are(self):
+        for value in (
+            "(default)",
+            "Global\\AntigravityWriterSupabaseAuth-0123456789abcdef",
+            "C:\\Users\\writer\\AppData\\Local\\AntigravityWriter\\sync_v2.sqlite3",
+            "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+            "[3]",
+            "D:/안티그래비티/작가님 힘내세요",
+            "메인/메모장/1화.txt",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self._shown("k", value), f"k={value}\n")
+
+
+class ContractApplicationHandshakeTests(unittest.TestCase):
+    """The end-to-end check: the real client path, driven against a copy.
+
+    The RPC preflight proves what the server answers. These prove the wiring:
+    that perform_contract_handshake records what it should, and that the gate
+    holds afterwards against a write.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.live = Path(self.temp.name) / "sync_v2.sqlite3"
+        store = SyncV2Store(str(self.live))
+        store.configure_project(
+            str(Path(self.temp.name) / "writing"), "Preflight", PROJECT_ID
+        )
+
+    def tearDown(self):
+        manager = SyncManager()
+        manager.release_v2()
+        manager.supabase = None
+        manager._v2_store = None
+        manager._v2_device_id = None
+        self.temp.cleanup()
+
+    def _run(self, reply):
+        client = _AuthenticatedClient(reply)
+        digest_before = self.preflight.file_sha256(self.live)
+        stream = io.StringIO()
+        with patch.object(
+            SyncManager, "create_supabase_client", staticmethod(lambda config=None: client)
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.run_application_handshake(self.live, "")
+        output = stream.getvalue()
+        # Whatever else happened, the live database is not what was worked on.
+        self.assertEqual(self.preflight.file_sha256(self.live), digest_before)
+        return status, output, client
+
+    @staticmethod
+    def _checks(output):
+        return dict(
+            line.split("=", 1)
+            for line in output.splitlines()
+            if "=PASS" in line or "=FAIL" in line.split("=", 1)[-1][:4]
+        )
+
+    @staticmethod
+    def _value(output, key):
+        for line in output.splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+        return None
+
+    def test_the_recorded_active_reply_runs_the_wiring_and_the_gate_holds(self):
+        status, output, client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+
+        self.assertEqual(status, 0, output)
+        self.assertEqual(client.calls[0][0], "get_sync_handshake")
+        self.assertEqual(
+            client.calls[0][1]["p_contract_sha256"], CANONICAL_CONTRACT_SHA256
+        )
+        # The real client call ran and recorded a supported reading ...
+        self.assertEqual(self._value(output, "outcome"), "supported")
+        self.assertEqual(self._value(output, "handshake_is_fresh"), "true")
+        self.assertEqual(
+            self._value(output, "observed_project_sync_mode"), "LEGACY"
+        )
+        self.assertEqual(self._value(output, "observed_migration_epoch"), "0")
+        # ... and the write path is still shut behind it.
+        self.assertEqual(self._value(output, "uses_contract_structure"), "false")
+        self.assertNotIn("=FAIL", output)
+        self.assertIn("wiring held", self._value(output, "verdict"))
+
+    def test_the_observation_is_recorded_but_the_gate_is_not_touched(self):
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+
+        # The server facts land on the row ...
+        self.assertIn("project.1.server_protocol_version", output)
+        self.assertIn("project.1.active_contract_sha256", output)
+        self.assertIn("project.1.server_capabilities_json", output)
+        # ... and the two gate columns are not among what changed.
+        self.assertNotIn("project.1.contract_path_enabled=", output)
+        self.assertNotIn("project.1.contract_path_enabled_at=", output)
+
+    def test_the_handshake_queues_no_work_of_any_kind(self):
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+        for counter in (
+            "operations_total", "operations_protocol_3",
+            "operations_with_batch_id", "operations_contract_batch",
+            "contract_batches",
+        ):
+            with self.subTest(counter=counter):
+                self.assertIn(f"handshake_queued_nothing.{counter}=PASS", output)
+
+    def test_a_write_through_the_closed_gate_still_comes_out_legacy(self):
+        """The probe is the part that proves the stored state opens nothing."""
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+
+        self.assertEqual(self._value(output, "probe.1.provenance_kind"), "LEGACY_EPOCH_0")
+        self.assertEqual(self._value(output, "probe.1.sync_protocol_version"), "2")
+        self.assertEqual(self._value(output, "probe.1.batch_id"), "(none)")
+        self.assertEqual(self._value(output, "probe.1.contract_version"), "(none)")
+        self.assertIn("probe_write_is_legacy[1]=PASS", output)
+        self.assertIn("probe_created_no_contract_batch=PASS", output)
+        self.assertIn("probe_created_no_protocol_3_operation=PASS", output)
+
+    def test_a_promoted_project_stops_the_run_but_the_gate_still_holds(self):
+        """Two things at once: the promotion halts it, and nothing leaked."""
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["project_sync_mode"] = "MIGRATING"
+        reply["migration_epoch"] = 1
+        status, output, _client = self._run(reply)
+
+        self.assertEqual(status, 1)
+        self.assertIn("observed_mode_is_legacy_epoch_0[1]=FAIL", output)
+        self.assertIn("STOP", self._value(output, "verdict"))
+        # The observation was recorded honestly, exactly as the server sent it.
+        self.assertIn("project.1.project_sync_mode='LEGACY' -> 'MIGRATING'", output)
+        # And the gate held anyway, which is the fix this run exists to prove.
+        self.assertEqual(self._value(output, "uses_contract_structure"), "false")
+        self.assertIn("gate_still_closed[1]=PASS", output)
+        self.assertIn("probe_write_is_legacy[1]=PASS", output)
+        self.assertEqual(self._value(output, "probe.1.provenance_kind"), "LEGACY_EPOCH_0")
+
+    def test_the_recorded_inactive_reply_records_nothing_and_passes(self):
+        status, output, _client = self._run(json.loads(LIVE_INACTIVE_REPLY))
+
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self._value(output, "outcome"), "unsupported")
+        self.assertEqual(self._value(output, "handshake_is_fresh"), "false")
+        self.assertEqual(self._value(output, "project.1.changed"), "(nothing)")
+        self.assertIn("nothing to activate", self._value(output, "verdict"))
+
+    def test_a_server_that_dropped_this_protocol_stops_the_run(self):
+        reply = json.loads(LIVE_ACTIVE_REPLY)
+        reply["server_protocol_version"] = 4
+        reply["supported_protocol_versions"] = [4]
+        status, output, _client = self._run(reply)
+
+        self.assertEqual(status, 1)
+        self.assertIn("handshake_completed[1]=FAIL PROTOCOL_TOO_OLD", output)
+        self.assertEqual(self._value(output, "project.1.changed"), "(nothing)")
+
+    def _unauthenticated_run(self, stored_session, restore_error_kind=""):
+        """A client that came back signed out, over a stand-in credential store.
+
+        The real store is never read here: whether a session happens to be
+        saved on this machine must not decide what these cases assert.
+        """
+        client = _AuthenticatedClient(json.loads(LIVE_ACTIVE_REPLY))
+        client._antigravity_authenticated = False
+        if restore_error_kind:
+            client._antigravity_restore_error_kind = restore_error_kind
+        keyring = SimpleNamespace(
+            get_supabase_session=lambda: (
+                ("access", "refresh") if stored_session else ("", "")
+            ),
+        )
+        stream = io.StringIO()
+        with patch("security_manager.SecurityManager", keyring), patch.object(
+            SyncManager, "create_supabase_client",
+            staticmethod(lambda config=None: client),
+        ):
+            with redirect_stdout(stream):
+                status = self.preflight.run_application_handshake(self.live, "")
+        return status, stream.getvalue(), client
+
+    def test_nobody_signed_in_stops_the_run(self):
+        status, output, client = self._unauthenticated_run(stored_session=False)
+
+        self.assertEqual(status, 1)
+        self.assertIn("NO STORED SESSION", output)
+        self.assertIn("stored_session_present=false", output)
+        self.assertEqual(client.calls, [])
+
+    def test_a_kept_session_that_would_not_restore_stops_the_run_and_says_why(self):
+        """Signed out because the restore failed is a different thing entirely.
+
+        The session is still saved, so this is a bad minute rather than a
+        logout, and the reason has to reach whoever is reading.
+        """
+        status, output, client = self._unauthenticated_run(
+            stored_session=True, restore_error_kind="timeout"
+        )
+
+        self.assertEqual(status, 1)
+        self.assertIn("RESTORE FAILED", output)
+        self.assertIn("stored_session_present=true", output)
+        self.assertIn("restore_error_kind=timeout", output)
+        self.assertEqual(client.calls, [])
+
+    def test_the_run_prints_nothing_that_looks_like_a_credential(self):
+        _status, output, _client = self._run(json.loads(LIVE_ACTIVE_REPLY))
+        lowered = output.lower()
+        for marker in (
+            "access_token", "refresh_token", "apikey", "api_key", "bearer",
+            "authorization", "eyj", "@", "http://", "https://",
+        ):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, lowered)
+
+
+class StructureWritePreflightReadingTests(unittest.TestCase):
+    """The readings the structure-write mode decides on.
+
+    Each of these stands for a way the mode got a real run wrong before it was
+    written this way: a revision of zero read as no folder at all, a parent
+    reordered down to the one child the probe had just made, and a batch
+    already sent counted as one still waiting.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.preflight = _preflight_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp.name) / "sync.sqlite3"
+        self.store = SyncV2Store(str(self.db_path))
+        self.context = self.store.configure_project(
+            str(Path(self.temp.name) / "writing"), "Structure", PROJECT_ID
+        )
+        self.local_key = self.context["local_key"]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _snapshot(self, path, folder_id, *, parent_id=None, revision=1):
+        return {
+            "folder_id": folder_id,
+            "parent_folder_id": parent_id,
+            "local_path": path,
+            "name": path.rsplit("/", 1)[-1],
+            "revision": revision,
+            "is_deleted": False,
+        }
+
+    def test_a_folder_the_server_has_never_seen_reads_as_revision_zero(self):
+        """Revision zero is falsy, and it is the value that matters here.
+
+        Read with an ``or`` default it comes back as absence, and a run that
+        cannot tell an unproven folder from a missing one refuses to dispatch
+        the batch it just built.
+        """
+        parent_id = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(
+            self.local_key, [self._snapshot("메인/메모장", parent_id)]
+        )
+        self.store.ensure_local_folder(
+            self.local_key, "메인/메모장/새 폴더", parent_folder_id=parent_id
+        )
+
+        self.assertEqual(
+            self.preflight.folder_revision(
+                self.store, self.local_key, "메인/메모장/새 폴더"
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.preflight.folder_revision(
+                self.store, self.local_key, "메인/메모장"
+            ),
+            1,
+        )
+        self.assertIsNone(
+            self.preflight.folder_revision(
+                self.store, self.local_key, "메인/메모장/없는 폴더"
+            )
+        )
+
+    def test_the_child_list_keeps_the_siblings_the_order_already_held(self):
+        """The application sends a parent's whole child list, not the delta.
+
+        Naming only the folder just made reorders the parent down to that one
+        child, which is a silent delete of every sibling in the binder.
+        """
+        parent_id = str(uuid.uuid4())
+        first = str(uuid.uuid4())
+        second = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(self.local_key, [
+            self._snapshot("메인/메모장", parent_id),
+            self._snapshot("메인/메모장/먼저", first, parent_id=parent_id),
+            self._snapshot("메인/메모장/나중", second, parent_id=parent_id),
+        ])
+        self.store.replace_tree_order_snapshots(self.local_key, [{
+            "tree_order_id": str(uuid.uuid4()),
+            "parent_folder_id": parent_id,
+            "parent_path": "메인/메모장",
+            "children": [second, first],
+            "revision": 1,
+        }])
+
+        children = self.preflight.binder_children(
+            self.store, self.local_key, "메인/메모장", extra="새 폴더"
+        )
+
+        # The order the binder already holds, then what it does not mention.
+        self.assertEqual(children, ["나중", "먼저", "새 폴더"])
+
+    def test_a_child_list_asked_for_twice_does_not_grow(self):
+        parent_id = str(uuid.uuid4())
+        existing = str(uuid.uuid4())
+        self.store.replace_folder_snapshots(self.local_key, [
+            self._snapshot("메인/메모장", parent_id),
+            self._snapshot("메인/메모장/있던 것", existing, parent_id=parent_id),
+        ])
+
+        self.assertEqual(
+            self.preflight.binder_children(
+                self.store, self.local_key, "메인/메모장", extra="있던 것"
+            ),
+            ["있던 것"],
+        )
+
+    def test_a_batch_counts_as_waiting_only_until_it_has_an_answer(self):
+        """A batch already sent is not one to resume, and one never sent is."""
+        parent_id = str(uuid.uuid4())
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.store.replace_folder_snapshots(
+            self.local_key, [self._snapshot("메인/메모장", parent_id)]
+        )
+        folder = self.store.ensure_local_folder(
+            self.local_key, "메인/메모장/새 폴더", parent_folder_id=parent_id
+        )
+        request = self.store.create_structure_batch(
+            self.context, DEVICE_ID, [{
+                "entity_kind": "folder",
+                "entity_id": folder["folder_id"],
+                "intent_kind": "create",
+                "base_revision": 0,
+                "payload": {
+                    "name": "새 폴더", "parent_folder_id": parent_id,
+                },
+            }],
+            batch_id=BATCH_ID,
+        )
+
+        waiting = self.preflight.unanswered_batch_for_folder(
+            self.db_path, self.local_key, folder["folder_id"]
+        )
+        self.assertIsNotNone(waiting)
+        self.assertEqual(waiting["batch_id"], BATCH_ID)
+        self.assertEqual(
+            self.preflight.unanswered_contract_batches(
+                self.db_path, self.local_key
+            ),
+            1,
+        )
+
+        intent = request["ordered_intents"][0]
+        self.store.mark_structure_batch_attempt(BATCH_ID)
+        self.store.record_structure_batch_response(BATCH_ID, {
+            "kind": "atomic_structure_commit_success",
+            "batch_id": BATCH_ID,
+            "batch_payload_sha256": request["batch"]["batch_payload_sha256"],
+            "status": "committed",
+            "applied": True,
+            "results": [{
+                "sequence": intent["sequence"],
+                "operation_id": intent["operation_id"],
+                "entity_id": intent["entity_id"],
+                "result_revision": 1,
+            }],
+        })
+
+        self.assertIsNone(
+            self.preflight.unanswered_batch_for_folder(
+                self.db_path, self.local_key, folder["folder_id"]
+            )
+        )
+        self.assertEqual(
+            self.preflight.unanswered_contract_batches(
+                self.db_path, self.local_key
+            ),
+            0,
+        )
+
+    def test_a_manuscript_rewritten_in_place_is_not_read_as_untouched(self):
+        """The whole point of the reading is that a refused batch changed
+        nothing, and a file count cannot see a file rewritten at the same
+        length under the same name."""
+        root = Path(self.temp.name) / "writing"
+        (root / "메인" / "원고").mkdir(parents=True)
+        page = root / "메인" / "원고" / "001화.txt"
+        page.write_text("before", encoding="utf-8")
+
+        before = self.preflight.writing_root_fingerprint(root)
+        self.assertEqual(
+            self.preflight.writing_root_fingerprint(root), before
+        )
+
+        page.write_text("after!", encoding="utf-8")
+        after = self.preflight.writing_root_fingerprint(root)
+
+        self.assertEqual(after["folders"], before["folders"])
+        self.assertNotEqual(after["documents"], before["documents"])
+
+    def test_an_unreadable_manuscript_fails_closed_even_if_both_reads_match(self):
+        root = Path(self.temp.name) / "writing"
+        (root / "메인" / "원고").mkdir(parents=True)
+        page = root / "메인" / "원고" / "001화.txt"
+        page.write_text("before", encoding="utf-8")
+
+        with patch.object(
+            self.preflight, "file_sha256", side_effect=OSError("locked")
+        ):
+            before = self.preflight.writing_root_fingerprint(root)
+            page.write_text("the whole manuscript changed", encoding="utf-8")
+            after = self.preflight.writing_root_fingerprint(root)
+
+        self.assertEqual(before["documents"], {})
+        self.assertEqual(before["unreadable"], ["메인/원고/001화.txt"])
+        self.assertEqual(after, before)
+        self.assertFalse(
+            self.preflight.manuscript_bytes_unchanged(before, after)
+        )
+        self.assertFalse(
+            self.preflight.manuscript_evidence_available(before)
+        )
+
+    def test_an_empty_writing_root_is_not_manuscript_evidence(self):
+        root = Path(self.temp.name) / "empty-writing"
+        root.mkdir()
+
+        snapshot = self.preflight.writing_root_fingerprint(root)
+
+        self.assertEqual(snapshot["documents"], {})
+        self.assertEqual(snapshot["unreadable"], [])
+        self.assertFalse(
+            self.preflight.manuscript_evidence_available(snapshot)
+        )
+
+    def test_structure_target_rejects_traversal_drive_and_real_unc_names(self):
+        root = Path(self.temp.name) / "writing"
+        root.mkdir()
+        unc_name = "\\\\" + "server\\share\\escape"
+        self.assertEqual(unc_name[:2], "\\\\")
+
+        hostile = (
+            "..",
+            "..\\..\\..\\escape",
+            "C:\\Windows\\Temp\\escape",
+            "C:drive-relative",
+            unc_name,
+            "folder/child",
+        )
+        for name in hostile:
+            with self.subTest(name=repr(name)), self.assertRaises(ValueError):
+                self.preflight.structure_target_directory(
+                    root, "메인/메모장", name
+                )
+
+        self.assertEqual(list(root.iterdir()), [])
+        target = self.preflight.structure_target_directory(
+            root, "메인/메모장", "안전한 폴더"
+        )
+        self.assertEqual(
+            target, (root / "메인" / "메모장" / "안전한 폴더").resolve()
+        )
+
+    def test_dry_run_manager_is_armed_without_a_client_or_rpc(self):
+        self.store.set_contract_path_enabled(self.local_key, True)
+        project = self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        manager = self.preflight.build_manager(
+            self.store, project, DEVICE_ID, allow_client=False
+        )
+        self.assertIsNone(manager.supabase)
+
+        with patch.object(
+            manager,
+            "perform_contract_handshake",
+            side_effect=AssertionError("dry run made an RPC"),
+        ):
+            reading = self.preflight.arm_manager_from_stored_contract(
+                manager, project
+            )
+
+        self.assertEqual(reading["outcome"], "supported")
+        self.assertTrue(manager.contract_handshake_is_fresh())
+        self.assertTrue(manager._uses_contract_structure())
+
+    def test_structure_dry_run_builds_a_batch_without_client_or_live_write(self):
+        parent_id = str(uuid.uuid4())
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.store.replace_folder_snapshots(
+            self.local_key,
+            [self._snapshot("메인/메모장", parent_id)],
+        )
+        before = self.preflight.file_sha256(self.db_path)
+        output = io.StringIO()
+
+        with patch.object(
+            SyncManager,
+            "create_supabase_client",
+            side_effect=AssertionError("dry run built a client"),
+        ), patch.object(
+            SyncManager,
+            "perform_contract_handshake",
+            side_effect=AssertionError("dry run made an RPC"),
+        ), redirect_stdout(output):
+            status = self.preflight.run_structure_write(
+                self.db_path,
+                PROJECT_ID,
+                PROJECT_ID,
+                "",
+                "메인/메모장",
+                "dry-run-folder",
+                False,
+            )
+
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertEqual(self.preflight.file_sha256(self.db_path), before)
+        self.assertIn(
+            "[stored contract state; no client and no request]",
+            output.getvalue(),
+        )
+        self.assertNotIn("[fresh handshake]", output.getvalue())
+        self.assertIn(
+            "the stored server state supports this client=PASS",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "the stored server state is LEGACY at epoch 0=PASS",
+            output.getvalue(),
+        )
+        self.assertNotIn(
+            "the server supports this client=PASS", output.getvalue()
+        )
+        self.assertNotIn(
+            "it answered LEGACY at epoch 0=PASS", output.getvalue()
+        )
+        self.assertIsNone(
+            self.store.get_folder_by_path(
+                self.local_key, "메인/메모장/dry-run-folder"
+            )
+        )
+
+    def test_apply_stops_before_client_or_mkdir_when_no_manuscript_exists(self):
+        writing_root = Path(self.temp.name) / "writing"
+        writing_root.mkdir()
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        before = self.preflight.file_sha256(self.db_path)
+        output = io.StringIO()
+
+        with patch.object(
+            SyncManager,
+            "create_supabase_client",
+            side_effect=AssertionError("empty evidence built a client"),
+        ), redirect_stdout(output):
+            status = self.preflight.run_structure_write(
+                self.db_path,
+                PROJECT_ID,
+                PROJECT_ID,
+                str(writing_root),
+                "메인/메모장",
+                "must-not-appear",
+                True,
+            )
+
+        self.assertEqual(status, 1, output.getvalue())
+        self.assertIn(
+            "a manuscript exists for the no-damage check=FAIL",
+            output.getvalue(),
+        )
+        self.assertEqual(self.preflight.file_sha256(self.db_path), before)
+        self.assertFalse((writing_root / "메인").exists())
+
+    def test_structure_dry_run_main_takes_no_credential_lock(self):
+        parent_id = str(uuid.uuid4())
+        self.store.set_contract_path_enabled(self.local_key, True)
+        self.store.activate_contract_project(
+            self.local_key,
+            project_sync_mode="LEGACY",
+            migration_epoch=0,
+            server_protocol_version=3,
+            server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+            server_capabilities=SERVER_CAPABILITIES,
+        )
+        self.store.replace_folder_snapshots(
+            self.local_key,
+            [self._snapshot("메인/메모장", parent_id)],
+        )
+        argv = [
+            "contract_path_preflight.py",
+            "--database", str(self.db_path),
+            "--structure-write",
+            "--project-id", PROJECT_ID,
+            "--confirm-project-id", PROJECT_ID,
+            "--parent-path", "메인/메모장",
+            "--folder-name", "main-dry-run-folder",
+        ]
+        output = io.StringIO()
+
+        with patch.object(sys, "argv", argv), patch.object(
+            SyncManager,
+            "acquire_auth_lease",
+            side_effect=AssertionError("dry run took the credential lock"),
+        ), patch.object(
+            SyncManager,
+            "create_supabase_client",
+            side_effect=AssertionError("dry run built a client"),
+        ), redirect_stdout(output):
+            status = self.preflight.main()
+
+        self.assertEqual(status, 0, output.getvalue())
+        self.assertNotIn("[credential lock]", output.getvalue())
+        self.assertIn("unchanged=true", output.getvalue())
+
+    def test_a_name_this_console_cannot_encode_is_escaped_not_raised(self):
+        """The folder name is named on the command line and echoed back.
+
+        A console whose codepage has no room for it would otherwise raise
+        partway through the line, ending the run holding a record that stops
+        mid-sentence.
+        """
+        with patch.object(sys, "stdout", SimpleNamespace(encoding="cp949")):
+            rendered = self.preflight._one_line("메모\U0001f600장")
+
+        self.assertEqual(rendered, "메모\\u1f600장")
+
+    def test_a_name_the_console_can_encode_is_left_alone(self):
+        with patch.object(sys, "stdout", SimpleNamespace(encoding="utf-8")):
+            self.assertEqual(
+                self.preflight._one_line("메인/메모장"), "메인/메모장"
+            )
 
 
 if __name__ == "__main__":

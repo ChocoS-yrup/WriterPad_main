@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 
 from project_creation_v1 import identity_uuid_for_writing_path
 from project_identity_v1 import KIND_DOCUMENT, KIND_FOLDER
+from contract_preparation import ContractPreparationStoreMixin
+from reviewed_contract_sender import ReviewedExecutionStoreMixin
+from contract_http_zero_recovery import HttpZeroRecoveryStoreMixin, install_schema as install_http_zero_schema
+from contract_post_coordination_resume import ResumeLedger, install_schema as install_resume_schema
 from sync_contract import (
     CANONICAL_CONTRACT_SHA256,
     CLIENT_CAPABILITIES,
@@ -35,7 +39,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8006
+STAGE8_USER_VERSION = 8012
 
 
 def _utc_now():
@@ -54,7 +58,7 @@ def _normalize_path(path):
 FOLDER_TOMBSTONE_PREFIX = "__folder_tombstone__"
 
 
-class SyncV2Store:
+class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, HttpZeroRecoveryStoreMixin):
     """SQLite-backed identity, revision and durable operation queue for sync v2."""
 
     def __init__(self, db_path=None):
@@ -67,6 +71,7 @@ class SyncV2Store:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._schema_lock = threading.Lock()
         self._transaction_state = threading.local()
+        self._reader_state = threading.local()
         self._initialize()
 
     def _connect(self):
@@ -97,7 +102,60 @@ class SyncV2Store:
             connection.close()
 
     @contextmanager
+    def reader_session(self):
+        """Pin one read connection for a burst of lookups on this thread.
+
+        ``sqlite3.connect`` costs about 1.2 ms per call on Windows, and one
+        remote apply performs hundreds of document lookups on the GUI thread.
+        Reusing a single connection for that burst removes the churn without
+        changing what a lookup sees: the connection stays in autocommit, so
+        every statement still opens and closes its own read transaction.
+
+        The connection is closed when the outermost session exits.  No handle
+        outlives the burst, so a caller may still delete the database file
+        right afterwards.
+        """
+        state = self._reader_state
+        depth = int(getattr(state, "session_depth", 0))
+        if depth == 0:
+            state.connection = self._connect()
+        state.session_depth = depth + 1
+        try:
+            yield
+        finally:
+            state.session_depth = depth
+            if depth == 0:
+                connection = getattr(state, "connection", None)
+                state.connection = None
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+
+    @contextmanager
     def _reader(self):
+        pinned = getattr(self._reader_state, "connection", None)
+        if pinned is not None:
+            # End any read transaction a previous statement on this pinned
+            # connection may still hold, so this lookup observes writes the
+            # same thread committed on its separate transaction connection.
+            try:
+                pinned.rollback()
+            except sqlite3.Error:
+                pass
+            try:
+                yield pinned
+            except sqlite3.Error:
+                # A broken connection must not be handed to the rest of the
+                # session. Drop it; later lookups fall back to their own.
+                self._reader_state.connection = None
+                try:
+                    pinned.close()
+                except sqlite3.Error:
+                    pass
+                raise
+            return
         connection = self._connect()
         try:
             yield connection
@@ -226,6 +284,7 @@ class SyncV2Store:
                     intent_id TEXT PRIMARY KEY,
                     local_key TEXT NOT NULL
                         REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    folder_id TEXT,
                     old_path TEXT NOT NULL,
                     new_path TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending'
@@ -254,6 +313,59 @@ class SyncV2Store:
                 CREATE INDEX IF NOT EXISTS sync_folder_rename_intent_events_idx
                     ON sync_folder_rename_intent_events(
                         intent_id, event_sequence
+                    );
+
+                CREATE TABLE IF NOT EXISTS sync_folder_delete_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    local_key TEXT NOT NULL
+                        REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                    folder_id TEXT NOT NULL,
+                    parent_folder_id TEXT,
+                    name TEXT NOT NULL,
+                    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+                    pre_delete_path TEXT NOT NULL,
+                    trash_path TEXT,
+                    folder_operation_id TEXT NOT NULL UNIQUE,
+                    tree_operation_id TEXT,
+                    tree_order_content TEXT,
+                    tree_order_payload_sha256 TEXT,
+                    folder_result_revision INTEGER,
+                    status TEXT NOT NULL DEFAULT 'prepared'
+                        CHECK (status IN (
+                            'prepared', 'documents_pending', 'folder_pending',
+                            'folder_committed', 'tree_pending', 'completed',
+                            'blocked', 'cancelled'
+                        )),
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    sync_folder_delete_intents_active_folder_idx
+                    ON sync_folder_delete_intents(local_key, folder_id)
+                    WHERE status NOT IN ('completed', 'cancelled');
+                CREATE INDEX IF NOT EXISTS sync_folder_delete_intents_pending_idx
+                    ON sync_folder_delete_intents(local_key, status, created_at);
+                CREATE INDEX IF NOT EXISTS
+                    sync_folder_delete_intents_tree_operation_idx
+                    ON sync_folder_delete_intents(tree_operation_id)
+                    WHERE tree_operation_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS sync_folder_delete_intent_documents (
+                    intent_id TEXT NOT NULL REFERENCES
+                        sync_folder_delete_intents(intent_id) ON DELETE CASCADE,
+                    document_id TEXT NOT NULL,
+                    server_path TEXT NOT NULL,
+                    base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+                    tombstone_operation_id TEXT,
+                    PRIMARY KEY(intent_id, document_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS
+                    sync_folder_delete_intent_documents_operation_idx
+                    ON sync_folder_delete_intent_documents(
+                        tombstone_operation_id
                     );
                 """
             )
@@ -299,6 +411,14 @@ class SyncV2Store:
             "active_contract_sha256 TEXT",
             "server_capabilities_json TEXT",
             "contract_validated_at TEXT",
+            # The local gate for the contract write path. A handshake proves what
+            # the server supports; this column records that a person decided to
+            # use it. It stays off until somebody turns it on, and it sits in the
+            # project row so the decision is visible next to the server state it
+            # applies to.
+            "contract_path_enabled INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (contract_path_enabled IN (0, 1))",
+            "contract_path_enabled_at TEXT",
         ):
             self._add_column(connection, "sync_projects", definition)
 
@@ -329,6 +449,7 @@ class SyncV2Store:
             self._add_column(connection, "sync_documents", definition)
 
         self._add_column(connection, "sync_folders", "storage_name_key TEXT")
+        self._add_column(connection, "sync_folder_rename_intents", "folder_id TEXT")
 
         connection.executescript(
             """
@@ -786,6 +907,58 @@ class SyncV2Store:
             END;
             """
         )
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS sync_contract_preparations (
+                preparation_id TEXT PRIMARY KEY,
+                local_key TEXT NOT NULL REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                purpose TEXT NOT NULL,
+                envelope_json TEXT NOT NULL,
+                envelope_sha256 TEXT NOT NULL,
+                UNIQUE(local_key, purpose)
+            );
+            CREATE TRIGGER IF NOT EXISTS sync_contract_preparations_no_update
+            BEFORE UPDATE ON sync_contract_preparations
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_CONTRACT_PREPARATION'); END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_preparations_no_delete
+            BEFORE DELETE ON sync_contract_preparations
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_CONTRACT_PREPARATION'); END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_preparations_no_dispatch
+            BEFORE INSERT ON sync_contract_batches
+            WHEN EXISTS (SELECT 1 FROM sync_contract_preparations WHERE preparation_id = NEW.batch_id)
+            BEGIN SELECT RAISE(ABORT, 'REVIEW_ONLY_CONTRACT_PREPARATION'); END;
+        """)
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS sync_reviewed_executions (
+                preparation_id TEXT PRIMARY KEY REFERENCES sync_contract_preparations(preparation_id) ON DELETE CASCADE,
+                request_sha256 TEXT NOT NULL,
+                approval_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('preparing','attempted','committed','rejected','uncertain','stopped')),
+                http_attempts INTEGER NOT NULL DEFAULT 0 CHECK(http_attempts IN (0,1)),
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                response_json TEXT,
+                response_sha256 TEXT,
+                owner_token TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS sync_reviewed_executions_no_reset
+            BEFORE UPDATE ON sync_reviewed_executions
+            WHEN NEW.preparation_id<>OLD.preparation_id OR NEW.request_sha256<>OLD.request_sha256
+              OR NEW.approval_json<>OLD.approval_json OR NEW.started_at<>OLD.started_at OR NEW.owner_token<>OLD.owner_token
+              OR NOT ((OLD.state='preparing' AND NEW.state IN ('attempted','stopped'))
+                   OR (OLD.state='attempted' AND NEW.state IN ('committed','rejected','uncertain')))
+              OR NEW.http_attempts<>CASE WHEN NEW.state IN ('attempted','committed','rejected','uncertain') THEN 1 ELSE 0 END
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_REVIEWED_EXECUTION'); END;
+            CREATE TRIGGER IF NOT EXISTS sync_reviewed_executions_no_delete
+            BEFORE DELETE ON sync_reviewed_executions
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_REVIEWED_EXECUTION'); END;
+        """)
+        self.recover_reviewed_executions(connection)
+        install_http_zero_schema(connection)
+        self.recover_http_zero_rounds(connection)
+        install_resume_schema(connection)
+        ResumeLedger(self).recover_http_zero_rounds(connection)
         connection.execute(f"PRAGMA user_version = {STAGE8_USER_VERSION}")
         self._recover_interrupted_dispatches(connection)
 
@@ -1170,6 +1343,43 @@ class SyncV2Store:
             ).fetchone()
             return dict(row) if row else None
 
+    def set_contract_path_enabled(self, local_key, enabled):
+        """Record the local decision to use the contract write path.
+
+        Storing server state and opening this gate are separate acts on
+        purpose. A handshake can be replayed by the server turning an allowlist
+        row on; this row only changes when somebody asks for it here.
+        """
+        enabled = bool(enabled)
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT local_key FROM sync_projects WHERE local_key = ?",
+                (local_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(local_key)
+            connection.execute(
+                """
+                UPDATE sync_projects
+                SET contract_path_enabled = ?, contract_path_enabled_at = ?,
+                    updated_at = ?
+                WHERE local_key = ?
+                """,
+                (1 if enabled else 0, now if enabled else None, now, local_key),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
+            ).fetchone())
+
+    def contract_path_enabled(self, local_key):
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT contract_path_enabled FROM sync_projects WHERE local_key = ?",
+                (local_key,),
+            ).fetchone()
+            return bool(row and row["contract_path_enabled"])
+
     def activate_contract_project(
         self,
         local_key,
@@ -1385,9 +1595,12 @@ class SyncV2Store:
                 UNION ALL
                 SELECT 1 FROM sync_folders
                 WHERE local_key = ? AND revision > 0
+                UNION ALL
+                SELECT 1 FROM sync_tree_orders
+                WHERE local_key = ? AND revision > 0
                 LIMIT 1
                 """,
-                (local_key, local_key),
+                (local_key, local_key, local_key),
             ).fetchone()
             return row is not None
 
@@ -1896,6 +2109,82 @@ class SyncV2Store:
         with self._reader() as connection:
             return self._has_active_connection(connection, document_id)
 
+    def conflicted_operations(self, document_id):
+        """Return this document's operation ids that stopped at a conflict.
+
+        A conflict is an active state, so one that nothing can resolve keeps
+        the document's work queued for good. The caller needs the ids to
+        retire them.
+        """
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT operation_id FROM sync_operations WHERE document_id = ?"
+                " ORDER BY queue_id",
+                (document_id,),
+            ).fetchall()
+            return [
+                row["operation_id"]
+                for row in rows
+                if self._derived_state(connection, row["operation_id"]) == "conflict"
+            ]
+
+    def active_document_server_paths(self, local_key):
+        """Return server paths whose document work has not reached a terminal state.
+
+        Folder tombstones are a separate RPC from document tombstones.  A tree
+        snapshot queued for an earlier local edit must not retire a folder while
+        one of its descendants is still being deleted or restored.  The server
+        path is stable while the local copy moves through trash, so it is the
+        only path suitable for that ordering decision.
+        """
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT o.operation_id, d.server_path
+                FROM sync_operations AS o
+                JOIN sync_documents AS d ON d.document_id = o.document_id
+                WHERE o.local_key = ? AND d.server_path IS NOT NULL
+                """,
+                (local_key,),
+            ).fetchall()
+            return sorted({
+                row["server_path"]
+                for row in rows
+                if row["server_path"]
+                and self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+            })
+
+    def active_local_document_creates(self, local_key):
+        """Return distinct local creates that the server has not accepted yet."""
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT queue_id, operation_id, document_id, local_path,
+                       relative_path, base_revision, is_deleted, intent_kind
+                FROM sync_operations
+                WHERE local_key = ?
+                  AND entity_kind = 'document'
+                  AND intent_kind = 'create'
+                  AND is_deleted = 0
+                  AND COALESCE(base_revision, 0) = 0
+                ORDER BY queue_id
+                """,
+                (local_key,),
+            ).fetchall()
+            active = []
+            seen = set()
+            for row in rows:
+                if (
+                    row["document_id"] in seen
+                    or self._derived_state(connection, row["operation_id"])
+                    not in CONTRACT_ACTIVE_STATES
+                ):
+                    continue
+                seen.add(row["document_id"])
+                active.append(dict(row))
+            return active
+
     def has_nonempty_active_content(self, document_id):
         """Return whether the newest queued live snapshot contains text."""
         with self._reader() as connection:
@@ -2278,7 +2567,16 @@ class SyncV2Store:
         ).fetchone()
         if project is None:
             raise KeyError(context["local_key"])
-        mode = project["project_sync_mode"] or "LEGACY"
+        observed_mode = project["project_sync_mode"] or "LEGACY"
+        # project_sync_mode is the server's to move, and a handshake records
+        # whatever it reports. The gate is not the server's to move. So the
+        # observed value stays on the project row untouched, as the last thing
+        # the server said, and only the shape of this write is held back: a
+        # branch that read the observed mode alone would emit a contract batch
+        # for a path nobody opened here.
+        effective_write_mode = (
+            observed_mode if project["contract_path_enabled"] else "LEGACY"
+        )
         payload = self._payload_for_document(
             local_path, relative_path, base_content, content, is_deleted
         )
@@ -2293,11 +2591,11 @@ class SyncV2Store:
             "delete" if is_deleted else
             "create" if int(base_revision or 0) == 0 else "update"
         )
-        if mode != "LEGACY" and base_revision is None:
+        if effective_write_mode != "LEGACY" and base_revision is None:
             provenance = "LOCAL_DEFERRED"
             protocol_version = SYNC_PROTOCOL_VERSION
             capabilities_json = canonical_json(list(CLIENT_CAPABILITIES))
-        elif mode != "LEGACY":
+        elif effective_write_mode != "LEGACY":
             provenance = "CONTRACT_BATCH"
             protocol_version = SYNC_PROTOCOL_VERSION
             contract_version = CONTRACT_VERSION
@@ -2318,7 +2616,7 @@ class SyncV2Store:
                 intent_kind = "update"
             request = build_document_commit_request(
                 project_id=context["project_id"],
-                project_sync_mode=mode,
+                project_sync_mode=effective_write_mode,
                 migration_epoch=int(project["migration_epoch"] or 0),
                 writer_device_id=context.get("writer_device_id") or uuid.uuid4(),
                 document_id=document["document_id"],
@@ -2352,7 +2650,7 @@ class SyncV2Store:
                     batch["sync_protocol_version"], batch["contract_version"],
                     batch["canonical_contract_sha256"],
                     canonical_json(batch["client_capabilities"]),
-                    batch["batch_payload_sha256"], mode,
+                    batch["batch_payload_sha256"], effective_write_mode,
                     int(project["migration_epoch"] or 0), canonical_json(request),
                     json_sha256(request), _utc_now(),
                 ),
@@ -2499,6 +2797,25 @@ class SyncV2Store:
                     "pending", "retry_wait"
                 }:
                     continue
+                ready_operations = connection.execute(
+                    """
+                    SELECT operation_id FROM sync_operations
+                    WHERE document_id = ? AND base_revision IS NOT NULL
+                    ORDER BY queue_id
+                    """,
+                    (row["document_id"],),
+                ).fetchall()
+                if any(
+                    self._derived_state(connection, item["operation_id"])
+                    in {"pending", "inflight", "retry_wait"}
+                    for item in ready_operations
+                ):
+                    # A successor inserted during this pass has a later queue
+                    # id than the immutable dependent it replaces.  Looking
+                    # only at earlier rows would therefore promote every
+                    # dependent onto the same revision.  Keep exactly one
+                    # dispatchable operation per document until it commits.
+                    continue
                 predecessors = connection.execute(
                     """
                     SELECT operation_id FROM sync_operations
@@ -2554,12 +2871,41 @@ class SyncV2Store:
                 f"SELECT * FROM sync_operations WHERE {where} ORDER BY queue_id",
                 params,
             ).fetchall()
+            ready = []
             for row in rows:
                 if self._derived_state(connection, row["operation_id"]) in {
                     "pending", "retry_wait"
                 }:
-                    return self._operation_dict(connection, row)
-            return None
+                    ready.append(row)
+            if not ready:
+                return None
+            selected = next(
+                (
+                    row for row in ready
+                    if self._is_volume_folder_skeleton(row)
+                ),
+                ready[0],
+            )
+            return self._operation_dict(connection, selected)
+
+    @staticmethod
+    def _is_volume_folder_skeleton(operation):
+        """Whether a hidden tree snapshot advertises volumes but no chapters."""
+        if operation["relative_path"] != "__antigravity__/tree-order.json":
+            return False
+        try:
+            payload = json.loads(operation["content"] or "{}")
+            tree_order = payload.get("tree_order")
+            volume_names = tree_order.get("메인/원고")
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(volume_names, list) or not volume_names:
+            return False
+        for volume_name in volume_names:
+            children = tree_order.get(f"메인/원고/{volume_name}")
+            if children != []:
+                return False
+        return True
 
     def mark_attempt(self, operation_id):
         with self._transaction() as connection:
@@ -2640,6 +2986,99 @@ class SyncV2Store:
             )
             return self._operation_dict(connection, row)
 
+    def mark_blocked_and_promote_dependent(self, operation_id, error_code):
+        """Block an unsafe snapshot and resume from its next durable edit.
+
+        A LEGACY tree-order snapshot can discover that one of its folder rows
+        was refused by the server.  That exact snapshot must never be sent,
+        but a corrected snapshot may already be queued behind the in-flight
+        operation with ``base_revision IS NULL``.  Promote one such dependent
+        against the document's last accepted server revision atomically, so a
+        fast local correction cannot become stranded behind the refusal.
+        """
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = self._operation_row(connection, operation_id)
+            if row is None:
+                return {"blocked": None, "successor": None}
+            state = self._derived_state(connection, operation_id)
+            if state != "blocked" and state not in TERMINAL_STATES:
+                self._finish_attempt(
+                    connection, operation_id, "blocked", error_code=error_code
+                )
+                self._append_event(
+                    connection, operation_id, "blocked", error_code=error_code
+                )
+            if state in TERMINAL_STATES:
+                return {
+                    "blocked": self._operation_dict(connection, row),
+                    "successor": None,
+                }
+
+            dependent = next((
+                candidate for candidate in connection.execute(
+                    """
+                    SELECT * FROM sync_operations
+                    WHERE document_id = ? AND base_revision IS NULL
+                    ORDER BY queue_id
+                    """,
+                    (row["document_id"],),
+                ).fetchall()
+                if self._derived_state(
+                    connection, candidate["operation_id"]
+                ) in {"pending", "retry_wait"}
+            ), None)
+            if dependent is None:
+                return {
+                    "blocked": self._operation_dict(connection, row),
+                    "successor": None,
+                }
+
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (row["document_id"],),
+            ).fetchone()
+            successor = self._insert_document_operation(
+                connection,
+                context={
+                    "local_key": dependent["local_key"],
+                    "project_id": dependent["project_id"],
+                },
+                document=document,
+                local_path=dependent["local_path"],
+                relative_path=dependent["relative_path"],
+                base_revision=int(document["revision"] or 0),
+                base_content=document["base_content"],
+                content=dependent["content"],
+                is_deleted=bool(dependent["is_deleted"]),
+                supersedes_operation_id=dependent["operation_id"],
+            )
+            for superseded_id in (
+                operation_id, dependent["operation_id"]
+            ):
+                self._append_event(
+                    connection,
+                    superseded_id,
+                    "superseded",
+                    related_operation_id=successor["operation_id"],
+                    detail={
+                        "successor_operation_id": successor["operation_id"],
+                        "source": "blocked_folder_lifecycle",
+                    },
+                )
+            connection.execute(
+                """
+                UPDATE sync_documents
+                SET sync_state = 'pending', last_error = '', updated_at = ?
+                WHERE document_id = ?
+                """,
+                (now, row["document_id"]),
+            )
+            return {
+                "blocked": self._operation_dict(connection, row),
+                "successor": successor,
+            }
+
     def mark_success(self, operation_id, result):
         now = _utc_now()
         with self._transaction() as connection:
@@ -2701,17 +3140,31 @@ class SyncV2Store:
                     operation["document_id"],
                 ),
             )
-            dependent = connection.execute(
+            if operation["relative_path"] == "__antigravity__/tree-order.json":
+                connection.execute(
+                    """
+                    UPDATE sync_folder_delete_intents
+                    SET status = 'completed', last_error = '', updated_at = ?
+                    WHERE tree_operation_id = ?
+                      AND status IN (
+                          'folder_committed', 'tree_pending'
+                      )
+                    """,
+                    (now, operation_id),
+                )
+            dependent = next((
+                row for row in connection.execute(
                 """
                 SELECT * FROM sync_operations
                 WHERE document_id = ? AND base_revision IS NULL
-                ORDER BY queue_id LIMIT 1
+                ORDER BY queue_id
                 """,
                 (operation["document_id"],),
-            ).fetchone()
-            if dependent and self._derived_state(
-                connection, dependent["operation_id"]
-            ) in {"pending", "retry_wait"}:
+                ).fetchall()
+                if self._derived_state(connection, row["operation_id"])
+                in {"pending", "retry_wait"}
+            ), None)
+            if dependent:
                 context = {
                     "local_key": dependent["local_key"],
                     "project_id": dependent["project_id"],
@@ -3059,6 +3512,34 @@ class SyncV2Store:
                     conflicts.append(dict(occupant))
             return conflicts
 
+    def contract_queue_authority_stamp(self, local_key):
+        """Fingerprint durable entries into AND exits from blocked/conflict.
+
+        Ordinary enqueue/attempt/retry events do not revoke a valid baseline.
+        The existing append-only journal makes an intervening block observable
+        even if it was resolved before the next check, across store instances.
+        No schema change, manuscript read or mutation is needed.
+        """
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                WITH project_operations AS (
+                    SELECT operation_id FROM sync_operations WHERE local_key = ?
+                    UNION
+                    SELECT operation_id FROM sync_structure_operations WHERE local_key = ?
+                )
+                SELECT e.event_id FROM sync_operation_events e
+                JOIN project_operations o ON o.operation_id = e.operation_id
+                LEFT JOIN sync_operation_events previous
+                  ON previous.operation_id = e.operation_id
+                 AND previous.event_sequence = e.event_sequence - 1
+                WHERE e.event_type IN ('blocked', 'conflict_detected')
+                   OR previous.event_type IN ('blocked', 'conflict_detected')
+                ORDER BY e.event_id
+                """, (local_key, local_key),
+            ).fetchall()
+        return hashlib.sha256("\n".join(row[0] for row in rows).encode("ascii")).hexdigest()
+
     def counts(self, local_key=None):
         with self._reader() as connection:
             params = []
@@ -3093,6 +3574,35 @@ class SyncV2Store:
         result["total"] = sum(result.values())
         result["documents"] = len(outstanding_documents)
         return result
+
+    def has_outstanding_structure_intent(self, local_key):
+        """Whether an unsuperseded local operation still owns structure.
+
+        A restart baseline may inspect the server to choose an authority, but
+        it must not apply an older server tree over a durable local tree-order
+        or atomic structure intent that has not reached a terminal event yet.
+        """
+        with self._reader() as connection:
+            legacy_rows = connection.execute(
+                """
+                SELECT operation_id FROM sync_operations
+                WHERE local_key = ? AND relative_path = ?
+                ORDER BY queue_id
+                """,
+                (local_key, "__antigravity__/tree-order.json"),
+            ).fetchall()
+            contract_rows = connection.execute(
+                """
+                SELECT operation_id FROM sync_structure_operations
+                WHERE local_key = ? ORDER BY queue_id
+                """,
+                (local_key,),
+            ).fetchall()
+            return any(
+                self._derived_state(connection, row["operation_id"])
+                in CONTRACT_ACTIVE_STATES
+                for row in (*legacy_rows, *contract_rows)
+            )
 
     def conflict_documents(self, local_key=None):
         """Return every document waiting for the writer to pick a version."""
@@ -3148,6 +3658,34 @@ class SyncV2Store:
             return self._operation_dict(
                 connection, self._operation_row(connection, operation_id)
             )
+
+    def completed_document_operations(self, document_id):
+        """Return immutable completed document operations with result revisions."""
+        document_id = str(uuid.UUID(str(document_id)))
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_operations WHERE document_id = ? "
+                "ORDER BY queue_id DESC",
+                (document_id,),
+            ).fetchall()
+            completed = []
+            for row in rows:
+                if self._derived_state(connection, row["operation_id"]) != "completed":
+                    continue
+                result = self._operation_dict(connection, row)
+                attempt = connection.execute(
+                    "SELECT result_revision FROM sync_operation_attempts "
+                    "WHERE operation_id = ? AND outcome IN ('committed', 'replayed') "
+                    "ORDER BY attempt_number DESC LIMIT 1",
+                    (row["operation_id"],),
+                ).fetchone()
+                result["result_revision"] = (
+                    int(attempt["result_revision"])
+                    if attempt and attempt["result_revision"] is not None
+                    else None
+                )
+                completed.append(result)
+            return completed
 
     def latest_active_structure_operation(self, entity_id):
         entity_id = str(uuid.UUID(str(entity_id)))
@@ -3207,6 +3745,11 @@ class SyncV2Store:
             ).fetchone()
             if project is None:
                 raise KeyError(context["local_key"])
+            if not project["contract_path_enabled"]:
+                # The caller is expected to have consulted the gate already.
+                # Checking again here means a future caller that forgets cannot
+                # put a contract batch on the queue.
+                raise SyncContractError("CONTRACT_NOT_ALLOWED")
             capabilities = json.loads(project["server_capabilities_json"] or "[]")
             require_server_compatibility(
                 project_sync_mode=project["project_sync_mode"],
@@ -3759,6 +4302,332 @@ class SyncV2Store:
             )
 
     @staticmethod
+    def _folder_delete_intent_dict(connection, row):
+        if row is None:
+            return None
+        result = dict(row)
+        dependencies = connection.execute(
+            """
+            SELECT document_id, tombstone_operation_id
+            FROM sync_folder_delete_intent_documents
+            WHERE intent_id = ? ORDER BY document_id
+            """,
+            (result["intent_id"],),
+        ).fetchall()
+        result["dependent_documents"] = [
+            {
+                "document_id": item["document_id"],
+                "tombstone_operation_id": item["tombstone_operation_id"],
+            }
+            for item in dependencies
+        ]
+        return result
+
+    def record_folder_delete_intent(
+        self,
+        local_key,
+        *,
+        folder_id,
+        parent_folder_id,
+        name,
+        base_revision,
+        pre_delete_path,
+        dependent_documents,
+        tree_order_content=None,
+    ):
+        """Pin one LEGACY folder deletion before its filesystem move begins."""
+        folder_id = str(uuid.UUID(str(folder_id)))
+        parent_folder_id = (
+            str(uuid.UUID(str(parent_folder_id))) if parent_folder_id else None
+        )
+        name = str(name or "")
+        pre_delete_path = _normalize_path(pre_delete_path)
+        base_revision = int(base_revision or 0)
+        if not name or not pre_delete_path or base_revision < 0:
+            raise ValueError("invalid folder delete intent")
+        normalized_dependencies = []
+        for dependency in dependent_documents or []:
+            document_id = str(uuid.UUID(str(dependency["document_id"])))
+            server_path = _normalize_path(dependency.get("server_path"))
+            document_revision = int(dependency.get("base_revision") or 0)
+            if not server_path or document_revision < 0:
+                raise ValueError("invalid folder delete dependency")
+            normalized_dependencies.append((
+                document_id, server_path, document_revision,
+            ))
+        if len({item[0] for item in normalized_dependencies}) != len(
+            normalized_dependencies
+        ):
+            raise ValueError("duplicate folder delete dependency")
+        now = _utc_now()
+        tree_hash = (
+            hashlib.sha256(tree_order_content.encode("utf-8")).hexdigest()
+            if tree_order_content is not None else None
+        )
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intents
+                WHERE local_key = ? AND folder_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                ORDER BY created_at, intent_id LIMIT 1
+                """,
+                (local_key, folder_id),
+            ).fetchone()
+            if existing is not None:
+                pinned = (
+                    existing["parent_folder_id"], existing["name"],
+                    int(existing["base_revision"]),
+                    existing["pre_delete_path"],
+                )
+                supplied = (
+                    parent_folder_id, name, base_revision, pre_delete_path,
+                )
+                if pinned != supplied:
+                    raise ValueError("folder delete identity changed")
+                if tree_order_content is not None:
+                    connection.execute(
+                        """
+                        UPDATE sync_folder_delete_intents
+                        SET tree_order_content = COALESCE(tree_order_content, ?),
+                            tree_order_payload_sha256 = COALESCE(
+                                tree_order_payload_sha256, ?
+                            ), updated_at = ?
+                        WHERE intent_id = ?
+                        """,
+                        (
+                            tree_order_content, tree_hash, now,
+                            existing["intent_id"],
+                        ),
+                    )
+                return self._folder_delete_intent_dict(
+                    connection,
+                    connection.execute(
+                        "SELECT * FROM sync_folder_delete_intents "
+                        "WHERE intent_id = ?",
+                        (existing["intent_id"],),
+                    ).fetchone(),
+                )
+
+            intent_id = str(uuid.uuid4())
+            folder_operation_id = str(uuid.uuid5(
+                uuid.UUID(intent_id), "folder-tombstone"
+            ))
+            connection.execute(
+                """
+                INSERT INTO sync_folder_delete_intents (
+                    intent_id, local_key, folder_id, parent_folder_id, name,
+                    base_revision, pre_delete_path, folder_operation_id,
+                    tree_order_content, tree_order_payload_sha256,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+                """,
+                (
+                    intent_id, local_key, folder_id, parent_folder_id, name,
+                    base_revision, pre_delete_path, folder_operation_id,
+                    tree_order_content, tree_hash, now, now,
+                ),
+            )
+            for document_id, server_path, document_revision in sorted(
+                normalized_dependencies
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO sync_folder_delete_intent_documents (
+                        intent_id, document_id, server_path, base_revision,
+                        tombstone_operation_id
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        intent_id, document_id, server_path,
+                        document_revision,
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM sync_folder_delete_intents WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+            return self._folder_delete_intent_dict(connection, row)
+
+    def bind_folder_delete_document_operations(
+        self, intent_id, operation_ids, *, trash_path=None
+    ):
+        operation_ids = {
+            str(uuid.UUID(str(document_id))): str(uuid.UUID(str(operation_id)))
+            for document_id, operation_id in (operation_ids or {}).items()
+        }
+        now = _utc_now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_folder_delete_intents WHERE intent_id = ?",
+                (str(intent_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(intent_id)
+            dependencies = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intent_documents
+                WHERE intent_id = ? ORDER BY document_id
+                """,
+                (str(intent_id),),
+            ).fetchall()
+            expected = {item["document_id"] for item in dependencies}
+            if expected != set(operation_ids):
+                raise ValueError("folder delete dependencies are incomplete")
+            for dependency in dependencies:
+                supplied = operation_ids[dependency["document_id"]]
+                existing = dependency["tombstone_operation_id"]
+                if existing and existing != supplied:
+                    raise ValueError("folder delete tombstone operation changed")
+                connection.execute(
+                    """
+                    UPDATE sync_folder_delete_intent_documents
+                    SET tombstone_operation_id = ?
+                    WHERE intent_id = ? AND document_id = ?
+                    """,
+                    (supplied, str(intent_id), dependency["document_id"]),
+                )
+            connection.execute(
+                """
+                UPDATE sync_folder_delete_intents
+                SET trash_path = COALESCE(?, trash_path),
+                    status = 'documents_pending', last_error = '',
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    _normalize_path(trash_path) if trash_path else None,
+                    now, str(intent_id),
+                ),
+            )
+            return self._folder_delete_intent_dict(
+                connection,
+                connection.execute(
+                    "SELECT * FROM sync_folder_delete_intents "
+                    "WHERE intent_id = ?",
+                    (str(intent_id),),
+                ).fetchone(),
+            )
+
+    def attach_folder_delete_tree_operation(
+        self, intent_ids, tree_operation_id, tree_order_content
+    ):
+        intent_ids = [str(item) for item in intent_ids or []]
+        if not intent_ids:
+            return []
+        tree_operation_id = str(uuid.UUID(str(tree_operation_id)))
+        tree_hash = hashlib.sha256(
+            tree_order_content.encode("utf-8")
+        ).hexdigest()
+        now = _utc_now()
+        with self._transaction() as connection:
+            attached = []
+            for intent_id in intent_ids:
+                row = connection.execute(
+                    "SELECT * FROM sync_folder_delete_intents "
+                    "WHERE intent_id = ?",
+                    (intent_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(intent_id)
+                existing_operation = row["tree_operation_id"]
+                existing_hash = row["tree_order_payload_sha256"]
+                if existing_operation and existing_operation != tree_operation_id:
+                    raise ValueError("folder delete tree operation changed")
+                if existing_hash and existing_hash != tree_hash:
+                    raise ValueError("folder delete tree payload changed")
+                connection.execute(
+                    """
+                    UPDATE sync_folder_delete_intents
+                    SET tree_operation_id = ?, tree_order_content = ?,
+                        tree_order_payload_sha256 = ?, updated_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (
+                        tree_operation_id, tree_order_content, tree_hash,
+                        now, intent_id,
+                    ),
+                )
+                attached.append(self._folder_delete_intent_dict(
+                    connection,
+                    connection.execute(
+                        "SELECT * FROM sync_folder_delete_intents "
+                        "WHERE intent_id = ?",
+                        (intent_id,),
+                    ).fetchone(),
+                ))
+            return attached
+
+    def pending_folder_delete_intents(self, local_key):
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intents
+                WHERE local_key = ? AND status NOT IN ('completed', 'cancelled')
+                ORDER BY created_at, intent_id
+                """,
+                (local_key,),
+            ).fetchall()
+            return [
+                self._folder_delete_intent_dict(connection, row) for row in rows
+            ]
+
+    def folder_delete_intents_for_tree_operation(self, operation_id):
+        with self._reader() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM sync_folder_delete_intents
+                WHERE tree_operation_id = ?
+                  AND status NOT IN ('completed', 'cancelled')
+                ORDER BY created_at, intent_id
+                """,
+                (str(operation_id),),
+            ).fetchall()
+            return [
+                self._folder_delete_intent_dict(connection, row) for row in rows
+            ]
+
+    def set_folder_delete_intent_status(
+        self, intent_id, status, *, error="", folder_result_revision=None
+    ):
+        allowed = {
+            "prepared", "documents_pending", "folder_pending",
+            "folder_committed", "tree_pending", "completed", "blocked",
+            "cancelled",
+        }
+        if status not in allowed:
+            raise ValueError("invalid folder delete intent status")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_folder_delete_intents WHERE intent_id = ?",
+                (str(intent_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE sync_folder_delete_intents
+                SET status = ?, last_error = ?,
+                    folder_result_revision = COALESCE(
+                        ?, folder_result_revision
+                    ), updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    status, str(error or ""), folder_result_revision,
+                    _utc_now(), str(intent_id),
+                ),
+            )
+            return self._folder_delete_intent_dict(
+                connection,
+                connection.execute(
+                    "SELECT * FROM sync_folder_delete_intents "
+                    "WHERE intent_id = ?",
+                    (str(intent_id),),
+                ).fetchone(),
+            )
+
+    @staticmethod
     def _folder_rename_intent_events_for(connection, intent_id):
         return connection.execute(
             """
@@ -3831,10 +4700,13 @@ class SyncV2Store:
             (event_id,),
         ).fetchone())
 
-    def record_folder_rename_intent(self, local_key, old_path, new_path):
+    def record_folder_rename_intent(
+        self, local_key, old_path, new_path, folder_id=None
+    ):
         """Durably record an explicit local folder rename, coalescing chains."""
         old_path = _normalize_path(old_path)
         new_path = _normalize_path(new_path)
+        folder_id = str(uuid.UUID(str(folder_id))) if folder_id else None
         if not old_path or not new_path or old_path == new_path:
             raise ValueError("invalid folder rename intent")
         now = _utc_now()
@@ -3853,19 +4725,32 @@ class SyncV2Store:
                 ) == "pending"
             ), None)
             if previous:
+                previous_folder_id = previous["folder_id"]
+                if (
+                    previous_folder_id
+                    and folder_id
+                    and str(previous_folder_id) != folder_id
+                ):
+                    raise ValueError("folder rename identity changed")
+                anchored_folder_id = previous_folder_id or folder_id
                 connection.execute(
                     """
                     UPDATE sync_folder_rename_intents
-                    SET new_path = ?, updated_at = ? WHERE intent_id = ?
+                    SET folder_id = ?, new_path = ?, updated_at = ?
+                    WHERE intent_id = ?
                     """,
-                    (new_path, now, previous["intent_id"]),
+                    (anchored_folder_id, new_path, now, previous["intent_id"]),
                 )
                 intent_id = previous["intent_id"]
                 self._append_folder_rename_intent_event(
                     connection,
                     intent_id,
                     "retargeted",
-                    detail={"old_path": old_path, "new_path": new_path},
+                    detail={
+                        "folder_id": anchored_folder_id,
+                        "old_path": old_path,
+                        "new_path": new_path,
+                    },
                 )
             else:
                 existing = next((
@@ -3883,29 +4768,44 @@ class SyncV2Store:
                 ), None)
                 if existing:
                     intent_id = existing["intent_id"]
+                    existing_folder_id = existing["folder_id"]
+                    if (
+                        existing_folder_id
+                        and folder_id
+                        and str(existing_folder_id) != folder_id
+                    ):
+                        raise ValueError("folder rename identity changed")
                     connection.execute(
                         """
-                        UPDATE sync_folder_rename_intents SET updated_at = ?
+                        UPDATE sync_folder_rename_intents
+                        SET folder_id = ?, updated_at = ?
                         WHERE intent_id = ?
                         """,
-                        (now, intent_id),
+                        (existing_folder_id or folder_id, now, intent_id),
                     )
                 else:
                     intent_id = str(uuid.uuid4())
                     connection.execute(
                         """
                         INSERT INTO sync_folder_rename_intents (
-                            intent_id, local_key, old_path, new_path, status,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                            intent_id, local_key, folder_id, old_path, new_path,
+                            status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                         """,
-                        (intent_id, local_key, old_path, new_path, now, now),
+                        (
+                            intent_id, local_key, folder_id, old_path, new_path,
+                            now, now,
+                        ),
                     )
                     self._append_folder_rename_intent_event(
                         connection,
                         intent_id,
                         "recorded",
-                        detail={"old_path": old_path, "new_path": new_path},
+                        detail={
+                            "folder_id": folder_id,
+                            "old_path": old_path,
+                            "new_path": new_path,
+                        },
                     )
             row = connection.execute(
                 "SELECT * FROM sync_folder_rename_intents WHERE intent_id = ?",

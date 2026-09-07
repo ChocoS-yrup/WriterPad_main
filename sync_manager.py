@@ -1,4 +1,6 @@
+import base64
 import copy
+import hashlib
 import os
 import json
 import re
@@ -8,22 +10,27 @@ import threading
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from PyQt6.QtCore import (
     QObject, QThread, pyqtSignal, pyqtSlot, QMutex, QMutexLocker, QTimer,
     QMetaObject, Qt,
 )
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from cloud_config import (
+    CLOUD_CREDENTIAL_BUSY_MESSAGE,
     CLOUD_INVALID_MESSAGE,
     classify_cloud_error,
     load_cloud_client_config,
 )
 from runtime_profile import is_forced_offline
-from sync_contract import SyncContractError, require_server_compatibility
+from sync_contract import (
+    CANONICAL_CONTRACT_SHA256,
+    SyncContractError,
+    require_server_compatibility,
+)
 from binder_order import (
     ROOT_STORAGE_NAMES,
     canonical_manuscript_children,
@@ -33,7 +40,11 @@ from binder_order import (
 )
 from project_paths import LocalProjectPathError, validate_local_project_name
 from sync_diagnostics import SyncDiagnosticLog, format_diagnostic_report
+from contract_preparation import ContractPreparationManagerMixin
+from reviewed_contract_sender import ReviewedSenderManagerMixin
 from sync_v2_store import SyncV2Store
+from handshake_lifecycle import HandshakeLifecycleMixin, ContractDispatchPaused
+from network_recovery import NetworkRecoveryMixin
 from three_way_merge import three_way_merge
 
 
@@ -52,9 +63,37 @@ PERMANENT_FOLDER_ERROR_CODES = frozenset({
     "INVALID_ARGUMENT",
 })
 TREE_ORDER_DOCUMENT_PATH = "__antigravity__/tree-order.json"
+STRUCTURE_AUTHORITY_UNKNOWN = "unknown"
+STRUCTURE_AUTHORITY_CONTRACT = "contract"
+STRUCTURE_AUTHORITY_LEGACY = "legacy"
+STRUCTURE_AUTHORITY_BLOCKED = "blocked"
+# Legacy folder/document commits and the final tree-order document are separate
+# requests.  A peer can therefore be healthy while a pull briefly sees the
+# first two ahead of the last one.  Re-read only that proven transition; every
+# other malformed structure response keeps the ordinary fail-closed path.
+LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 TRASH_PURGE_DOCUMENT_PATH = "__antigravity__/trash-purge.json"
 LEASE_CONFLICT_RETRY_DELAYS_MS = (3000, 5000, 10000, 30000)
 NETWORK_RETRY_DELAYS_MS = (5000, 15000, 30000, 60000)
+# An unchanged server snapshot can bypass the expensive local projection for a
+# while.  A periodic full pass still repairs out-of-process filesystem changes
+# that do not advance this process's structure generation.
+REMOTE_SNAPSHOT_FULL_APPLY_SECONDS = 300.0
+# A confirmation dialog makes rapid delete clicks arrive roughly one second
+# apart.  Starting the expensive final snapshot pull in every gap makes the
+# next durable delete wait behind that pull and look permanently stalled.
+# Uploads still dispatch immediately; only the queue-empty final pull waits for
+# this short project-scoped quiet window.
+LOCAL_STRUCTURE_PULL_QUIET_MS = 1500
+# A tree-order entry the server projections do not confirm is usually a commit
+# that has not reached them yet, and it clears by itself. One that never clears
+# is a different thing: the binder order from the writer's other devices stops
+# arriving and nothing says so. Neither can be told apart from a single refusal,
+# only from the same entry refusing for a while, so the two are separated by
+# time rather than by the reason code. The attempt floor keeps the burst a pull
+# makes on open from escalating in seconds.
+TREE_ORDER_STALL_ATTEMPTS = 3
+TREE_ORDER_STALL_SECONDS = 900.0
 # 종료는 하나의 예산 안에서만 원격 작업을 시도한다. 예산이 끝나면 새 요청을
 # 만들지 않고 다음 실행으로 미룬다.
 SHUTDOWN_BUDGET_MS = 5000
@@ -75,6 +114,66 @@ class RemoteRenameSkipped(Exception):
     Raised from inside the identity transaction so the journal is dropped and
     identity stays exactly where the unmoved directory is.
     """
+
+
+class _MeasuredReentrantLock:
+    """RLock wrapper that reports only outermost wait and hold durations.
+
+    Structure mutations deliberately remain one serial commit boundary. The
+    wrapper makes contention observable without retaining manuscript paths.
+    """
+
+    def __init__(self, observer):
+        self._lock = threading.RLock()
+        self._observer = observer
+        self._local = threading.local()
+
+    def acquire(self, blocking=True, timeout=-1):
+        depth = int(getattr(self._local, "depth", 0))
+        started = time.perf_counter()
+        if timeout == -1:
+            acquired = self._lock.acquire(blocking)
+        else:
+            acquired = self._lock.acquire(blocking, timeout)
+        waited_ms = (time.perf_counter() - started) * 1000.0
+        if not acquired:
+            return False
+        if depth == 0:
+            self._local.hold_started = time.perf_counter()
+            try:
+                self._observer("wait", waited_ms)
+            except Exception:
+                pass
+        self._local.depth = depth + 1
+        return True
+
+    def release(self):
+        depth = int(getattr(self._local, "depth", 0))
+        if depth <= 0:
+            raise RuntimeError("cannot release un-acquired structure lock")
+        report_ms = None
+        if depth == 1:
+            held_ms = (
+                time.perf_counter()
+                - float(getattr(self._local, "hold_started", time.perf_counter()))
+            ) * 1000.0
+            report_ms = held_ms
+            self._local.hold_started = None
+        self._local.depth = depth - 1
+        self._lock.release()
+        if report_ms is not None:
+            try:
+                self._observer("hold", report_ms)
+            except Exception:
+                pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+        return False
 
 
 def supabase_config_dir():
@@ -371,7 +470,9 @@ class V2QueueWorker(QThread):
 
     def run(self):
         try:
-            result = self.sync_manager._process_v2_operation(self.operation_id)
+            context = getattr(self, "dispatch_context", None)
+            result = (self.sync_manager._process_v2_operation(self.operation_id, context)
+                      if context is not None else self.sync_manager._process_v2_operation(self.operation_id))
             kind = result.get("kind")
             self.resultReady.emit(
                 kind in {"committed", "auto_merged", "conflict", "blocked"},
@@ -392,7 +493,9 @@ class V2StructureBatchWorker(QThread):
 
     def run(self):
         try:
-            result = self.sync_manager._process_contract_structure_batch(self.batch_id)
+            result = self.sync_manager._process_contract_structure_batch(
+                self.batch_id, getattr(self, "dispatch_context", None)
+            )
             self.resultReady.emit(
                 result.get("kind") in {
                     "atomic_structure_commit_success",
@@ -411,23 +514,126 @@ class V2StructureBatchWorker(QThread):
 class V2PullWorker(QThread):
     resultReady = pyqtSignal(bool, object)
 
-    def __init__(self, sync_manager, project_id=None):
+    def __init__(
+        self,
+        sync_manager,
+        project_id=None,
+        *,
+        pull_identity=None,
+        expected_structure_generation=None,
+        cached_snapshot_fingerprint=None,
+        cached_index_fingerprint=None,
+    ):
         super().__init__()
         self.sync_manager = sync_manager
         # The manager is shared and its context can be swapped while this
         # request is in the air. Ask about the project this pull was started
         # for, not whichever one is open when the reply is being built.
         self.project_id = project_id
+        self.pull_identity = pull_identity
+        self.expected_structure_generation = expected_structure_generation
+        self.cached_snapshot_fingerprint = cached_snapshot_fingerprint
+        self.cached_index_fingerprint = cached_index_fingerprint
+
+    def _unchanged_payload(self, probe, authority):
+        """Report a shape that did not move, exactly as a full fetch would.
+
+        The same staleness checks under the same gate: a reply is only allowed
+        to say nothing changed about the project and generation it was started
+        for. The snapshot fingerprint is restated so the caller's cache stays
+        the one it already validated.
+        """
+        payload = {
+            "documents": [],
+            "folders": [],
+            "folder_versions": [],
+            "tree_orders": [],
+            "structure_authority": {"kind": authority, "folder_paths": None},
+            "snapshot_fingerprint": self.cached_snapshot_fingerprint,
+            "index_fingerprint": probe["fingerprint"],
+        }
+        with self.sync_manager._structure_mutation_gate:
+            if (
+                self.pull_identity is not None
+                and self.sync_manager._v2_pull_identity() != self.pull_identity
+            ):
+                kind = "stale_project"
+            elif (
+                self.expected_structure_generation is not None
+                and self.sync_manager.local_structure_generation
+                != self.expected_structure_generation
+            ):
+                kind = "stale_generation"
+            else:
+                kind = "unchanged"
+            payload["background_apply"] = {
+                "kind": kind, "changes": [], "recovered_count": 0
+            }
+        return payload
 
     def run(self):
         try:
             project_id = self.project_id
-            documents = self.sync_manager._fetch_v2_project_documents(
-                project_id=project_id
-            )
-            folders = self.sync_manager._fetch_v2_project_folders(
-                self.sync_manager.supabase, project_id=project_id
-            )
+            # The pull for an opened project is where the handshake happens: it
+            # is off the UI thread, a connection is already assumed, and asking
+            # once per session/project is enough after a definitive answer.
+            # Transient failures retry on this worker with bounded backoff.
+            self.sync_manager._ensure_contract_handshake()
+            # Ask for the shape first. Only a project whose shape moved is
+            # worth moving the manuscript for, and most pulls find it has not:
+            # the timer runs every five seconds and a writer changes something
+            # far less often than that. Taken only with both baselines in
+            # hand, so the settle loop and the authority selection below have
+            # already run once on a snapshot that applied cleanly.
+            if self.cached_index_fingerprint and self.cached_snapshot_fingerprint:
+                authority = self.sync_manager._index_probe_authority()
+                if authority:
+                    probe = self.sync_manager._probe_remote_index(
+                        project_id, self.cached_index_fingerprint
+                    )
+                    if probe and probe["unchanged"]:
+                        self.resultReady.emit(
+                            True, self._unchanged_payload(probe, authority)
+                        )
+                        return
+            documents = []
+            folders = []
+            tree_orders = []
+            for settle_attempt in range(
+                len(LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS) + 1
+            ):
+                # The shape of every document, then bodies only for the ones
+                # that moved. What this returns is what a full fetch returned;
+                # the difference is how much of it travelled.
+                documents = self.sync_manager._documents_with_content(
+                    project_id,
+                    self.sync_manager._fetch_v2_project_documents(
+                        project_id=project_id, include_content=False
+                    ),
+                )
+                folders = self.sync_manager._fetch_v2_project_folders(
+                    self.sync_manager.supabase, project_id=project_id
+                )
+                # Zero rows only means "contract absent" after this query
+                # itself succeeded. Gate/handshake state controls writes, not
+                # whether an existing contract projection may disappear.
+                tree_orders = self.sync_manager._fetch_v2_project_tree_orders(
+                    self.sync_manager.supabase, project_id=project_id
+                )
+                if not self.sync_manager._legacy_structure_snapshot_in_flight(
+                    documents, folders, tree_orders
+                ):
+                    break
+                if settle_attempt >= len(
+                    LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS
+                ):
+                    raise SyncContractError(
+                        "LEGACY_STRUCTURE_SNAPSHOT_UNSTABLE"
+                    )
+                self.sync_manager._report_legacy_structure_settle_wait()
+                time.sleep(
+                    LEGACY_STRUCTURE_SETTLE_DELAYS_SECONDS[settle_attempt]
+                )
             folder_versions = (
                 self.sync_manager._fetch_v2_project_folder_versions(
                     self.sync_manager.supabase, project_id=project_id
@@ -435,21 +641,86 @@ class V2PullWorker(QThread):
                 if self.sync_manager._needs_folder_history(folders)
                 else []
             )
-            tree_orders = (
-                self.sync_manager._fetch_v2_project_tree_orders(
-                    self.sync_manager.supabase, project_id=project_id
+            structure_authority = (
+                self.sync_manager._select_remote_structure_authority(
+                    documents,
+                    folders,
+                    tree_orders,
                 )
-                if self.sync_manager._uses_contract_structure()
-                else []
             )
-            self.resultReady.emit(True, {
+            if (
+                self.pull_identity is None
+                and self.expected_structure_generation is None
+                and self.cached_snapshot_fingerprint is None
+            ):
+                # A directly constructed worker is the longstanding fetch-only
+                # seam used by contract tests and compatibility callers. The
+                # production coordinator always supplies identity/generation
+                # before start and therefore takes the fingerprint fast-path.
+                self.resultReady.emit(True, {
+                    "documents": documents,
+                    "folders": folders,
+                    "folder_versions": folder_versions,
+                    "tree_orders": tree_orders,
+                    "structure_authority": structure_authority,
+                })
+                return
+            snapshot_fingerprint = self.sync_manager._remote_snapshot_fingerprint(
+                documents,
+                folders,
+                folder_versions,
+                tree_orders,
+                structure_authority,
+            )
+            payload = {
                 "documents": documents,
                 "folders": folders,
                 "folder_versions": folder_versions,
                 "tree_orders": tree_orders,
-            })
+                "structure_authority": structure_authority,
+                "snapshot_fingerprint": snapshot_fingerprint,
+                "index_fingerprint": (
+                    self.sync_manager._remote_index_fingerprint(
+                        documents, folders, tree_orders
+                    )
+                ),
+            }
+            if (
+                self.cached_snapshot_fingerprint
+                and snapshot_fingerprint == self.cached_snapshot_fingerprint
+            ):
+                with self.sync_manager._structure_mutation_gate:
+                    if (
+                        self.pull_identity is not None
+                        and self.sync_manager._v2_pull_identity()
+                        != self.pull_identity
+                    ):
+                        kind = "stale_project"
+                    elif (
+                        self.expected_structure_generation is not None
+                        and self.sync_manager.local_structure_generation
+                        != self.expected_structure_generation
+                    ):
+                        kind = "stale_generation"
+                    else:
+                        kind = "unchanged"
+                    payload["background_apply"] = {
+                        "kind": kind,
+                        "changes": [],
+                        "recovered_count": 0,
+                    }
+                self.resultReady.emit(True, payload)
+                return
+
+            # A changed response is intentionally handed back for foreground
+            # apply. The editor protection set must be sampled at the exact
+            # apply boundary; taking it before network I/O would allow a user
+            # who started typing during fetch to be overwritten.
+            self.resultReady.emit(True, payload)
         except Exception as error:
-            self.resultReady.emit(False, str(error))
+            self.resultReady.emit(False, (
+                error if SyncManager._transient_handshake_error(error) else str(error)
+            ))
 
 
 class ServerActionWorker(QThread):
@@ -467,7 +738,149 @@ class ServerActionWorker(QThread):
         except Exception as error:
             self.resultReady.emit(False, error)
 
-class SyncManager(QObject):
+
+class LocalStructureQueueWorker(QThread):
+    """Drain accepted local durable mutations on one serial worker."""
+
+    resultReady = pyqtSignal(str, bool, object, str)
+
+    def __init__(self, sync_manager):
+        super().__init__()
+        self.sync_manager = sync_manager
+
+    def run(self):
+        while True:
+            entry = self.sync_manager._take_local_structure_action()
+            if entry is None:
+                return
+            operation_id, action = entry
+            try:
+                result = action()
+                self.resultReady.emit(operation_id, True, result, "")
+            except Exception as error:
+                self.resultReady.emit(
+                    operation_id, False, None, str(error)
+                )
+
+class SupabaseAuthLease:
+    """The exclusive right to exchange one profile's stored session.
+
+    The application and the preflight are both clients of one credential, and
+    an exchange retires whatever the other is holding. Checking that the other
+    is not running is a guess that goes stale the moment it is made; holding one
+    lock for as long as the work lasts does not.
+
+    Which credential that is comes from runtime_profile.credential_lease_name(),
+    the one place the name is built. A stored session belongs to one Windows
+    account and one profile, so the lock does too: two holders that could never
+    retire each other's token have nothing to gain by waiting on each other,
+    and a single fixed name only stopped work that was never in danger.
+
+    One namespace, and no falling back to another. A fallback would put the two
+    holders in different rooms, each certain it was alone.
+    """
+
+    _ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, name=None):
+        # Resolved when the lock is taken, not when this is built. SyncManager
+        # holds one of these as a class attribute, so construction happens at
+        # import -- before anything has said which profile is running, and in
+        # processes where the name cannot be built at all. That is a stop when
+        # somebody asks for the lock, not an import that fails.
+        self._name = name
+        self._handle = None
+
+    @property
+    def name(self):
+        if self._name is not None:
+            return self._name
+        from runtime_profile import credential_lease_name
+
+        return credential_lease_name()
+
+    @property
+    def held(self):
+        return bool(self._handle)
+
+    def acquire(self):
+        """True when held, False when somebody else holds it, None when the
+        lock itself is unavailable on this machine."""
+        if self._handle:
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # Including the name. Without it there is no object to open, and
+            # carrying on under some other name would be the fallback this
+            # deliberately does not have.
+            name = self.name
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CreateMutexW.argtypes = [
+                wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR
+            ]
+        except Exception:
+            return None
+        handle = kernel32.CreateMutexW(None, True, name)
+        error = ctypes.get_last_error()
+        if not handle:
+            return None
+        if error == self._ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self._handle = handle
+        return True
+
+    def release(self):
+        if not self._handle:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.ReleaseMutex(self._handle)
+            kernel32.CloseHandle(self._handle)
+        except Exception:
+            pass
+        self._handle = None
+
+
+def auth_error_facts(error, classified):
+    """The safe shape of an auth failure: what kind, from what, with what status.
+
+    Enough to tell a refused credential from a bad minute without recording the
+    message, the address it came from, or anything the token said.
+    """
+    chain = []
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
+    status = next(
+        (
+            value
+            for item in chain
+            for attribute in ("status_code", "status")
+            for value in [getattr(item, attribute, None)]
+            if isinstance(value, int) and not isinstance(value, bool)
+        ),
+        None,
+    )
+    return {
+        "exception_class": type(error).__name__,
+        "auth_error_status": "" if status is None else status,
+        "classified_kind": getattr(classified, "kind", ""),
+    }
+
+
+class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPreparationManagerMixin, ReviewedSenderManagerMixin, QObject):
+    reviewedPullReleased = pyqtSignal(object)
     syncStateChanged = pyqtSignal(str, str, int)  # state, detail, pending retry count
     conflictDetected = pyqtSignal(object)
     autoMergeApplied = pyqtSignal(object)
@@ -475,6 +888,31 @@ class SyncManager(QObject):
 
     _instance = None
     _mutex = QMutex()
+    # Guards reading, exchanging and storing the saved session. Class level:
+    # create_supabase_client is a staticmethod and can run before, or without,
+    # any manager instance existing. Reentrant because persisting happens while
+    # the restore that produced the session still holds it.
+    _session_restore_lock = threading.RLock()
+    # Bumped whenever somebody signs in or out. Every client records the
+    # generation it was built in, so a callback from a client that belongs to a
+    # session the writer has already ended cannot write to the store.
+    _session_generation = 0
+    # How many token exchanges are somewhere between asking the server and
+    # writing the answer down. The store lock alone does not cover this: the
+    # server retires the old token the moment it answers, and the write that
+    # records the new one starts afterwards. Closing in that gap leaves a spent
+    # token behind, so shutdown waits on the count, not on the lock.
+    # One holder at a time may exchange the stored session, across processes.
+    # Held for as long as this process might do so, not merely checked.
+    _auth_lease = SupabaseAuthLease()
+    # Why the last attempt to build a client came back empty, when the reason
+    # was something other than the configuration being unusable.
+    _client_refusal = ""
+    _session_exchanges = 0
+    # Starts set. Nothing is in flight before anything has run, and a
+    # shutdown that never saw an exchange must not wait out its budget.
+    _session_exchanges_idle = threading.Event()
+    _session_exchanges_idle.set()
 
     def __new__(cls, *args, **kwargs):
         with QMutexLocker(cls._mutex):
@@ -487,6 +925,7 @@ class SyncManager(QObject):
         if self._initialized:
             return
         super().__init__()
+        self.reviewedPullReleased.connect(self._resume_pull_after_review, Qt.ConnectionType.QueuedConnection)
         self._initialized = True
         self.active_workers = set()
         self._retry_queue = {}
@@ -496,9 +935,33 @@ class SyncManager(QObject):
         self._last_sync_error = ""
         self._last_failure_offline = False
         self.current_sync_state = "saved"
+        # Held in memory on purpose. A restart is a fair reason to assume the
+        # projections have caught up, and nothing here belongs in the durable
+        # queue.
+        self._tree_order_stall = {}
+        self._tree_order_stall_identity = None
+        self._last_published_sync_activity = {
+            "transfer_pending": 0,
+            "transferring": 0,
+            "retry_wait": 0,
+            "conflict": 0,
+            "blocked": 0,
+            "pull_pending": 0,
+            "pulling": 0,
+            "pull_visible": 0,
+            "local_structure": 0,
+        }
         self._v2_store = None
         self._v2_context = None
         self._v2_context_generation = 0
+        # The last handshake reading, and the generation it was asked for.
+        # Both live in memory only: restarting the app is one of the events
+        # that has to make an old reading stop counting.
+        self._init_handshake_lifecycle()
+        self._auth_context_generation = 0
+        self._contract_handshake = None
+        self._contract_handshake_attempt = None
+        self._contract_handshake_error = ""
         self._v2_wpm = None
         self._v2_device_id = None
         self._v2_worker = None
@@ -508,6 +971,13 @@ class SyncManager(QObject):
         self._v2_conflict_callbacks = {}
         self._v2_leases = {}
         self._v2_pull_worker = None
+        self._v2_pull_worker_identity = None
+        # Pull requests are coordinated per durable project key.  The manager
+        # is process-wide and can be rebound while an old worker is finishing,
+        # so a single global "pending" bit would let project A stall project B.
+        # These flags are intentionally memory-only: every bind creates a new
+        # generation whose baseline must be read again.
+        self._v2_pull_coordinators = {}
         self._v2_protected_paths_provider = None
         self._v2_active_paths_provider = None
         self._v2_retry_timer = QTimer(self)
@@ -531,12 +1001,39 @@ class SyncManager(QObject):
         self._rename_workers = []
         self._retention_worker = None
         self._session_refresh_lock = threading.Lock()
-        self._structure_mutation_gate = threading.RLock()
+        self._structure_timing_lock = threading.Lock()
+        self._structure_timing = {
+            "wait_max_ms": 0.0,
+            "hold_max_ms": 0.0,
+            "slow_wait_count": 0,
+            "slow_hold_count": 0,
+        }
+        self._structure_mutation_gate = _MeasuredReentrantLock(
+            self._record_structure_timing
+        )
         self._local_structure_generation = 0
+        self._local_structure_queue = []
+        self._local_structure_queue_lock = threading.Lock()
+        self._local_structure_worker = None
+        self._local_structure_callbacks = {}
+        self._local_structure_dedupe = {}
+        self.background_local_structure_enabled = True
         self._v2_untracked_recovery_paths = set()
+        # ``None`` means no configured v2 project. configure_v2() changes it
+        # to unknown, and no server write may start until one complete pull has
+        # selected exactly one structure authority for that project generation.
+        self._v2_structure_authority = None
+        self._v2_structure_authority_error = ""
+        self._v2_structure_authority_identity = None
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
+        # LEGACY / epoch 0 publishes folder rows through commit_folder before
+        # any live child document.  This cache is only an optimization: it is
+        # reset on every project attachment, so a restart always proves the
+        # server projection again from durable identity before sending text.
+        self._legacy_live_folder_fingerprint = None
+        self._legacy_confirmed_live_folder_paths = frozenset()
         self._auth_refresh_generation = 0
         self._auth_retry_blocked = False
         self._shutting_down = False
@@ -566,7 +1063,317 @@ class SyncManager(QObject):
             self._v2_context_generation,
             str(context.get("project_id") or ""),
             str(context.get("local_key") or ""),
+            self._auth_context_generation,
         )
+
+    def _current_pull_coordinator(self, create=True):
+        """Return the coordinator for the currently bound project generation."""
+        identity = self._v2_pull_identity()
+        local_key = identity[2]
+        if not local_key:
+            return None
+        coordinator = self._v2_pull_coordinators.get(local_key)
+        if coordinator is None or coordinator.get("identity") != identity:
+            if not create:
+                return None
+            coordinator = {
+                "identity": identity,
+                "baseline_validated": False,
+                "pull_pending": True,
+                "pulling": False,
+                "pull_visible": False,
+                "applied_snapshot_fingerprint": None,
+                "applied_index_fingerprint": None,
+                "applied_structure_generation": None,
+                "last_full_apply_monotonic": 0.0,
+                "last_local_structure_monotonic": 0.0,
+            }
+            self._v2_pull_coordinators[local_key] = coordinator
+        return coordinator
+
+    def _v2_activity_counts(self, local_key=None):
+        """Classify durable work without calling a queued write a conflict."""
+        counts = {
+            "pending": 0,
+            "inflight": 0,
+            "retry_wait": 0,
+            "blocked": 0,
+            "conflict": 0,
+        }
+        if self._v2_store is not None:
+            key = local_key or (self._v2_context or {}).get("local_key")
+            if key:
+                stored = self._v2_store.counts(key)
+                for name in counts:
+                    counts[name] = max(0, int(stored.get(name, 0) or 0))
+        return counts
+
+    def sync_activity_snapshot(self):
+        """User-facing, mutually named sources of outstanding sync work."""
+        counts = self._v2_activity_counts() if self.is_v2_enabled else {
+            "pending": 0, "inflight": 0, "retry_wait": 0,
+            "blocked": 0, "conflict": 0,
+        }
+        coordinator = self._current_pull_coordinator(create=False)
+        with self._local_structure_queue_lock:
+            local_structure = len(self._local_structure_callbacks)
+        return {
+            "transfer_pending": counts["pending"],
+            "transferring": counts["inflight"],
+            "retry_wait": counts["retry_wait"],
+            "conflict": counts["conflict"],
+            "blocked": counts["blocked"],
+            "pull_pending": int(bool(coordinator and coordinator["pull_pending"])),
+            "pulling": int(bool(coordinator and coordinator["pulling"])),
+            "pull_visible": int(bool(
+                coordinator
+                and coordinator["pulling"]
+                and coordinator.get("pull_visible")
+            )),
+            "local_structure": local_structure,
+        }
+
+    def display_sync_activity_snapshot(self):
+        """Return the last published activity without querying SQLite on the UI thread."""
+        return dict(self._last_published_sync_activity)
+
+    @staticmethod
+    def _remote_snapshot_fingerprint(
+        documents,
+        folders,
+        folder_versions,
+        tree_orders,
+        structure_authority,
+    ):
+        """Hash one fetched wire snapshot without touching the UI thread."""
+        def canonical_rows(rows):
+            # PostgREST does not promise row order without an explicit order()
+            # clause.  The rows are sets, while a tree-order row's ``children``
+            # list is semantic and therefore remains untouched inside the row.
+            return sorted(
+                list(rows or []),
+                key=lambda item: json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )
+
+        authority = dict(structure_authority or {})
+        if isinstance(authority.get("folder_paths"), list):
+            authority["folder_paths"] = sorted(
+                str(path) for path in authority["folder_paths"]
+            )
+        canonical = json.dumps(
+            {
+                "documents": canonical_rows(documents),
+                "folders": canonical_rows(folders),
+                "folder_versions": canonical_rows(folder_versions),
+                "tree_orders": canonical_rows(tree_orders),
+                "structure_authority": authority,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _remote_index_fingerprint(cls, documents, folders, tree_orders):
+        """Hash a snapshot's shape without its manuscript.
+
+        The same canonicalisation the full fingerprint uses, over rows that
+        carry no content. Two projects that hash alike here differ in nothing
+        a pull would apply: content never moves without revision moving too.
+        """
+        # Projected explicitly so a full fetch and a shape-only fetch hash
+        # alike. The full pull seeds this baseline; without that the probe
+        # could never take over from it.
+        columns = tuple(cls._DOCUMENT_INDEX_COLUMNS.split(","))
+        projected = [
+            {column: row.get(column) for column in columns}
+            for row in (documents or [])
+            if isinstance(row, dict)
+        ]
+        return cls._remote_snapshot_fingerprint(
+            projected, folders, [], tree_orders, {"kind": "index"}
+        )
+
+    def _documents_with_content(self, project_id, index_rows):
+        """Complete the shape with content, taking what it can from the ledger.
+
+        The ledger's ``base_content`` is by definition the content the server
+        gave for that document at that revision -- both are written by the
+        same statement and never drift apart. So a row whose revision has not
+        moved can be filled from disk instead of from the network, and only
+        the rows that actually moved are asked for.
+
+        What comes back is the same list a full fetch returns. Nothing
+        downstream can tell the difference, which is the point: classification
+        keeps seeing every document, and the manuscript stops crossing the
+        wire to say it did not change.
+        """
+        rows = [dict(row) for row in (index_rows or []) if isinstance(row, dict)]
+        known = {}
+        try:
+            for stored in self._v2_store.list_documents(
+                self._v2_context["local_key"]
+            ):
+                known[str(stored.get("document_id"))] = stored
+        except (AttributeError, KeyError, TypeError):
+            known = {}
+        active = self._active_v2_paths()
+        wanted = []
+        for row in rows:
+            stored = known.get(str(row.get("document_id")))
+            path = str(row.get("relative_path") or "").replace("\\", "/")
+            reusable = (
+                stored is not None
+                and int(stored.get("revision") or 0) == int(row.get("revision") or 0)
+                # A path the ledger disagrees about is the UUID adoption case,
+                # which compares the file against the server's own bytes.
+                and str(stored.get("local_path") or "") == path
+                and str(stored.get("server_path") or "") == path
+                and path not in active
+            )
+            if reusable:
+                row["content"] = stored.get("base_content") or ""
+            else:
+                wanted.append(row)
+        if wanted:
+            fetched = {
+                str(item.get("document_id")): item
+                for item in self._fetch_v2_project_documents(
+                    project_id=project_id,
+                    document_ids=[row.get("document_id") for row in wanted],
+                )
+            }
+            for row in wanted:
+                served = fetched.get(str(row.get("document_id")))
+                if served is None:
+                    # The row moved again between the two queries. Saying so is
+                    # the only safe answer: an absent body must never be read
+                    # as an empty chapter.
+                    raise RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+                row["content"] = served.get("content") or ""
+        return rows
+
+    def _index_probe_authority(self):
+        """The authority a shape-only pull may report, or None to fetch fully.
+
+        Two things make the manuscript worth downloading even when nothing
+        changed. An authority that was never settled cannot be restated from
+        memory, and a pull that skips the rows cannot retire a stuck order
+        conflict, because that is retired from the rows themselves.
+        """
+        authority = self._v2_structure_authority
+        if authority not in {
+            STRUCTURE_AUTHORITY_CONTRACT, STRUCTURE_AUTHORITY_LEGACY
+        }:
+            return None
+        checker = getattr(
+            self._v2_store, "has_outstanding_structure_intent", None
+        )
+        if not callable(checker):
+            return None
+        try:
+            if checker((self._v2_context or {}).get("local_key")):
+                return None
+        except Exception:
+            return None
+        return authority
+
+    def _probe_remote_index(self, project_id, cached_index_fingerprint):
+        """Ask what the project looks like now, without downloading it.
+
+        Returns the fingerprint of the shape and whether it still matches the
+        one a previous pull applied. A caller with no baseline gets ``None``
+        and must fetch in full.
+        """
+        if not cached_index_fingerprint:
+            return None
+        documents = self._fetch_v2_project_documents(
+            project_id=project_id, include_content=False
+        )
+        folders = self._fetch_v2_project_folders(
+            self.supabase, project_id=project_id
+        )
+        tree_orders = self._fetch_v2_project_tree_orders(
+            self.supabase, project_id=project_id
+        )
+        fingerprint = self._remote_index_fingerprint(
+            documents, folders, tree_orders
+        )
+        return {
+            "fingerprint": fingerprint,
+            "unchanged": fingerprint == cached_index_fingerprint,
+        }
+
+    @staticmethod
+    def _outbound_work_count(counts):
+        return sum(int(counts.get(name, 0) or 0) for name in (
+            "pending", "inflight", "retry_wait"
+        ))
+
+    def _ordinary_pull_gate_is_open(self, coordinator):
+        """Evaluate queue-empty and pull-start as one main-thread transition."""
+        if coordinator is None or not coordinator["baseline_validated"]:
+            return False
+        with self._local_structure_queue_lock:
+            if self._local_structure_callbacks:
+                return False
+        counts = self._v2_activity_counts(coordinator["identity"][2])
+        return (
+            self._outbound_work_count(counts) == 0
+            and counts["conflict"] == 0
+            and counts["blocked"] == 0
+            and self._structure_authority_allows_dispatch()
+        )
+
+    def _maybe_start_deferred_pull(self):
+        coordinator = self._current_pull_coordinator(create=False)
+        if not coordinator or not coordinator["pull_pending"]:
+            return False
+        with self._local_structure_queue_lock:
+            if self._local_structure_callbacks:
+                # The completion callback is the durable wake-up.  Starting a
+                # pull here would put network snapshot work in front of the
+                # accepted binder operation.
+                return False
+        last_activity = float(
+            coordinator.get("last_local_structure_monotonic") or 0.0
+        )
+        if last_activity:
+            elapsed_ms = (time.monotonic() - last_activity) * 1000.0
+            remaining_ms = LOCAL_STRUCTURE_PULL_QUIET_MS - elapsed_ms
+            if remaining_ms > 0:
+                return self._schedule_v2_retry(int(remaining_ms) + 1)
+        return self.pull_remote_changes_async(reason="general")
+
+    def _queue_pull_after_review(self):
+        """Called with _contract_lock held; queued wake-up carries no authority."""
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator and coordinator.get('pull_pending') and not self._shutting_down:
+            self.reviewedPullReleased.emit((self._v2_pull_identity(), self._contract_identity(), coordinator))
+
+    @pyqtSlot(object)
+    def _resume_pull_after_review(self, ticket):
+        with self._contract_lock:
+            identity, account, coordinator = ticket
+            if (self._shutting_down or getattr(self, '_review_execution_busy', False)
+                    or identity != self._v2_pull_identity() or account != self._contract_identity()
+                    or coordinator is not self._current_pull_coordinator(create=False)
+                    or not coordinator.get('pull_pending')):
+                return
+        self.pull_remote_changes_async(_expected_pull=ticket)
+
+    def _note_local_structure_activity(self):
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator is not None:
+            coordinator["last_local_structure_monotonic"] = time.monotonic()
 
     def release_v2(self):
         """Serve no project at all until something valid is attached.
@@ -578,15 +1385,23 @@ class SyncManager(QObject):
         afterwards finds nothing to apply.
         """
         self._cancel_scheduled_v2_retry(reset_backoff=True)
-        self._v2_context = None
-        # Every request already in the air belongs to the generation that is
-        # ending here. None of them may land on whatever is attached next.
-        self._v2_context_generation += 1
+        with self._contract_lock:
+            self._v2_context = None
+            # Every request already in the air belongs to the generation that is
+            # ending here. None of them may land on whatever is attached next.
+            self._v2_context_generation += 1
+            self._forget_contract_handshake()
+            self._v2_structure_authority = None
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = None
+            self._note_authority_transition('release')
         self._v2_wpm = None
         self._v2_untracked_recovery_paths = set()
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
+        self._legacy_live_folder_fingerprint = None
+        self._legacy_confirmed_live_folder_paths = frozenset()
 
     def configure_v2(
         self,
@@ -614,19 +1429,31 @@ class SyncManager(QObject):
                 "열 수 없는 프로젝트는 동기화에 연결하지 않습니다."
             )
         self._cancel_scheduled_v2_retry(reset_backoff=True)
-        self._v2_store = store or self._v2_store or SyncV2Store()
-        self._v2_wpm = wpm
-        self._v2_device_id = str(device_id)
-        local_key = self._v2_store.local_key_for(writing_root_path)
-        project_was_configured = self._v2_store.get_project(local_key) is not None
-        selected_project_id = project_id or forced_project_id() or None
-        self._v2_context = self._v2_store.configure_project(
-            wpm.writing_root_path, project_name, selected_project_id
-        )
-        self._v2_context["writer_device_id"] = self._v2_device_id
-        # A new project is a new generation, even when the one before it was
-        # released first: a reply from the old one must not pass for this one.
-        self._v2_context_generation += 1
+        with self._contract_lock:
+            self._forget_contract_handshake()
+            self._v2_store = store or self._v2_store or SyncV2Store()
+            self._v2_wpm = wpm
+            self._v2_device_id = str(device_id)
+            local_key = self._v2_store.local_key_for(writing_root_path)
+            project_was_configured = self._v2_store.get_project(local_key) is not None
+            selected_project_id = project_id or forced_project_id() or None
+            self._v2_context = self._v2_store.configure_project(
+                wpm.writing_root_path, project_name, selected_project_id
+            )
+            self._v2_context["writer_device_id"] = self._v2_device_id
+            # A new project is a new generation, even when the one before it was
+            # released first: a reply from the old one must not pass for this one.
+            self._v2_context_generation += 1
+            self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._note_authority_transition('configure')
+        self._v2_last_pull_apply_blocked = False
+        self._v2_identity_apply_failed = False
+        self._v2_identity_uuid_conflicts = []
+        self._legacy_live_folder_fingerprint = None
+        self._legacy_confirmed_live_folder_paths = frozenset()
+        self._current_pull_coordinator()
         deterministic_ids = bool(forced_project_id() and not project_id)
         root = getattr(wpm, "writing_root_path", None)
         self._v2_untracked_recovery_paths = set()
@@ -881,15 +1708,297 @@ class SyncManager(QObject):
         with self._structure_mutation_gate:
             return self._local_structure_generation
 
+    def _record_structure_timing(self, phase, elapsed_ms):
+        """Keep bounded contention metrics and log only actionable stalls."""
+        elapsed_ms = max(0.0, float(elapsed_ms or 0.0))
+        key = f"{phase}_max_ms"
+        count_key = f"slow_{phase}_count"
+        threshold_ms = 16.0 if phase == "wait" else 50.0
+        with self._structure_timing_lock:
+            self._structure_timing[key] = max(
+                float(self._structure_timing.get(key, 0.0)), elapsed_ms
+            )
+            if elapsed_ms >= threshold_ms:
+                self._structure_timing[count_key] = (
+                    int(self._structure_timing.get(count_key, 0)) + 1
+                )
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None and elapsed_ms >= threshold_ms:
+            diagnostics.record(
+                "structure_timing",
+                state=f"{phase}:{elapsed_ms:.1f}ms",
+                pending_count=self.pending_retry_count,
+            )
+
+    def _retire_stuck_tree_order_conflict_from_snapshot(self, documents):
+        """Retire a stuck order conflict using the tree order a pull just read.
+
+        The apply is where the server's order is normally in hand, but a pull
+        that defers its apply never gets there. The fetched rows carry the
+        same order, so the conflict can be retired from them instead.
+        """
+        for remote in documents or []:
+            try:
+                path = self._safe_relative_path(remote.get("relative_path"))
+            except ValueError:
+                continue
+            if path != TREE_ORDER_DOCUMENT_PATH:
+                continue
+            try:
+                document_id = str(uuid.UUID(str(remote.get("document_id"))))
+            except (TypeError, ValueError):
+                return 0
+            return self._retire_stuck_tree_order_conflict(
+                document_id,
+                remote.get("content") or "",
+                int(remote.get("revision") or 0),
+            )
+        return 0
+
+    def _retire_stuck_tree_order_conflict(self, document_id, content, revision):
+        """Clear a binder-order conflict queued before automatic resolution.
+
+        A conflict on this document is not one the writer can resolve, and a
+        single conflict closes the project's ordinary pull gate, so one
+        already sitting in the queue would stay there for good. Retire it the
+        way a new one is now resolved: onto the server's order.
+        """
+        lister = getattr(self._v2_store, "conflicted_operations", None)
+        if not callable(lister):
+            return 0
+        retired = 0
+        for operation_id in lister(document_id):
+            self._v2_store.rebase_clean_merge(
+                operation_id, revision, content, content
+            )
+            retired += 1
+        if retired:
+            self._diagnostics.record(
+                "sync_tree_order_server_wins",
+                state=f"retired={retired};revision={revision}",
+                pending_count=self.pending_retry_count,
+            )
+        return retired
+
+    def _record_tree_deferral(self, scope, error):
+        """Record a skipped tree-order apply and, when known, which entry.
+
+        The reason code alone says a snapshot could not be classified but not
+        what stopped it, which left the same refusal repeating with nothing to
+        act on. The entry is recorded as a separate event because the state
+        field is short and the reason line already fills it.
+        """
+        code = self._stable_error_code(error) or type(error).__name__
+        self._diagnostics.record(
+            "sync_tree_deferred",
+            state=f"{scope};reason={code}",
+            pending_count=self.pending_retry_count,
+        )
+        fingerprint = getattr(error, "tree_entry_fingerprint", "")
+        if fingerprint:
+            self._diagnostics.record(
+                "sync_tree_unresolved_entry",
+                state=str(fingerprint),
+                pending_count=self.pending_retry_count,
+            )
+            self._note_tree_order_stall(str(fingerprint))
+
+    def _note_tree_order_stall(self, fingerprint):
+        """Count how long one entry has gone unconfirmed, and escalate once.
+
+        Returns whether this observation is the one that escalated.
+        """
+        identity = self._v2_pull_identity()
+        if self._tree_order_stall_identity != identity:
+            self._tree_order_stall_identity = identity
+            self._tree_order_stall = {}
+        now = time.monotonic()
+        entry = self._tree_order_stall.setdefault(
+            fingerprint, {"first_seen": now, "attempts": 0, "escalated": False}
+        )
+        entry["attempts"] += 1
+        if entry["escalated"]:
+            return False
+        if (
+            entry["attempts"] < TREE_ORDER_STALL_ATTEMPTS
+            or now - entry["first_seen"] < TREE_ORDER_STALL_SECONDS
+        ):
+            return False
+        entry["escalated"] = True
+        self._diagnostics.record(
+            "sync_tree_order_stalled",
+            state=fingerprint,
+            pending_count=self.pending_retry_count,
+        )
+        self._publish_sync_state()
+        return True
+
+    def _clear_tree_order_stall(self):
+        """Forget the watch once an order snapshot applies without refusing."""
+        if not self._tree_order_stall:
+            return False
+        escalated = self._tree_order_stalled()
+        self._tree_order_stall = {}
+        if escalated:
+            self._publish_sync_state()
+        return escalated
+
+    def _tree_order_stalled(self):
+        identity = self._v2_pull_identity()
+        if self._tree_order_stall_identity != identity:
+            return False
+        return any(
+            entry.get("escalated") for entry in self._tree_order_stall.values()
+        )
+
+    def record_binder_timing(self, phase, elapsed_ms):
+        """Record slow UI-side binder work without retaining project paths."""
+        elapsed_ms = max(0.0, float(elapsed_ms or 0.0))
+        if elapsed_ms < 50.0:
+            return
+        self._diagnostics.record(
+            "binder_timing",
+            state=f"{str(phase)[:24]}:{elapsed_ms:.1f}ms",
+            pending_count=self.pending_retry_count,
+        )
+
+    def structure_timing_snapshot(self):
+        with self._structure_timing_lock:
+            return dict(self._structure_timing)
+
+    def _store_reader_session(self):
+        """Pin one SQLite read connection for a burst of store lookups.
+
+        A remote apply asks the store about every document it received. Each
+        of those lookups used to open its own connection, which is about
+        1.2 ms on Windows and is what made the foreground apply hold the
+        structure gate — and the GUI thread — for hundreds of milliseconds.
+        """
+        session = getattr(self._v2_store, "reader_session", None)
+        if callable(session):
+            return session()
+        return nullcontext()
+
     @contextmanager
-    def local_structure_mutation(self):
+    def local_structure_mutation(self, blocking=True, advance_generation=True):
         """Serialize local filesystem/tree/queue changes with remote tree apply."""
-        with self._structure_mutation_gate:
-            self._local_structure_generation += 1
+        acquired = self._structure_mutation_gate.acquire(blocking=blocking)
+        if not acquired:
+            yield False
+            return
+        try:
+            if advance_generation:
+                self._local_structure_generation += 1
             try:
                 yield self._local_structure_generation
             finally:
-                self._local_structure_generation += 1
+                if advance_generation:
+                    self._local_structure_generation += 1
+        finally:
+            self._structure_mutation_gate.release()
+
+    def notify_local_structure_queue(self, pending_count):
+        """Expose accepted UI structure work without pretending it was lost."""
+        pending_count = max(0, int(pending_count or 0))
+        if pending_count:
+            self._set_sync_state(
+                "local_waiting",
+                "바인더 작업이 안전한 구조 커밋 경계를 기다리고 있습니다.",
+                pending_count,
+            )
+            self._diagnostics.record(
+                "local_structure_queued",
+                state=f"pending:{pending_count}",
+                pending_count=pending_count,
+            )
+        else:
+            self._publish_sync_state()
+
+    def submit_local_structure_action(
+        self, action, callback=None, *, dedupe_key=None
+    ):
+        """Accept one durable binder mutation on the project serial executor.
+
+        ``action`` must not touch Qt widgets.  Completion callbacks are invoked
+        on this manager's UI thread.  Distinct creates intentionally have no
+        dedupe key; delete/restore callers may name the entity so a double-click
+        cannot schedule the same destructive mutation twice.
+        """
+        if self._shutting_down:
+            return None
+        with self._local_structure_queue_lock:
+            if dedupe_key:
+                existing = self._local_structure_dedupe.get(str(dedupe_key))
+                if existing:
+                    return existing
+            operation_id = str(uuid.uuid4())
+            self._local_structure_queue.append((operation_id, action))
+            self._local_structure_callbacks[operation_id] = callback
+            if dedupe_key:
+                self._local_structure_dedupe[str(dedupe_key)] = operation_id
+            pending_count = len(self._local_structure_callbacks)
+        self._note_local_structure_activity()
+        self.notify_local_structure_queue(pending_count)
+        self._start_local_structure_worker()
+        return operation_id
+
+    def _take_local_structure_action(self):
+        with self._local_structure_queue_lock:
+            if not self._local_structure_queue:
+                return None
+            return self._local_structure_queue.pop(0)
+
+    def _start_local_structure_worker(self):
+        worker = self._local_structure_worker
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    return worker
+            except RuntimeError:
+                pass
+        with self._local_structure_queue_lock:
+            if not self._local_structure_queue:
+                return None
+        worker = LocalStructureQueueWorker(self)
+        self._local_structure_worker = worker
+        worker.resultReady.connect(
+            self._handle_local_structure_result,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+        def finished():
+            if self._local_structure_worker is worker:
+                self._local_structure_worker = None
+            worker.deleteLater()
+            self._start_local_structure_worker()
+
+        worker.finished.connect(finished, Qt.ConnectionType.QueuedConnection)
+        return self._start_worker(worker)
+
+    @pyqtSlot(str, bool, object, str)
+    def _handle_local_structure_result(
+        self, operation_id, success, result, error_message
+    ):
+        self._note_local_structure_activity()
+        with self._local_structure_queue_lock:
+            callback = self._local_structure_callbacks.pop(operation_id, None)
+            for key, value in list(self._local_structure_dedupe.items()):
+                if value == operation_id:
+                    self._local_structure_dedupe.pop(key, None)
+            pending_count = len(self._local_structure_callbacks)
+        try:
+            if callback:
+                callback(bool(success), result, str(error_message or ""))
+        except Exception as callback_error:
+            self._diagnostics.record(
+                "local_structure_callback_failed",
+                state=type(callback_error).__name__,
+                pending_count=pending_count,
+            )
+        finally:
+            with self._local_structure_queue_lock:
+                pending_count = len(self._local_structure_callbacks)
+            self.notify_local_structure_queue(pending_count)
 
     def record_structure_recovery(
         self, old_rel_path, new_rel_path, error_code="RECOVERY_FAILED"
@@ -905,11 +2014,135 @@ class SyncManager(QObject):
         self._publish_sync_state()
         return recovery_id
 
+    # The answers that mean a handshake taken earlier in this session no longer
+    # describes the server: access was lost, the pin stopped matching, or the
+    # project moved out from under the reading.
+    _CONTRACT_HANDSHAKE_INVALIDATING = frozenset({
+        "AUTH_REQUIRED", "AUTH_EXPIRED", "FORBIDDEN",
+        "CONTRACT_NOT_ALLOWED", "CONTRACT_DIGEST_MISMATCH",
+        "PROTOCOL_TOO_OLD", "CAPABILITY_MISMATCH", "STALE_MIGRATION_EPOCH",
+    })
+
+    def _contract_identity(self):
+        """A short, one-way marker for whoever is signed in.
+
+        A handshake answers for one account's membership, so a reading has to
+        stop counting when somebody else signs in. ``sub`` is decoded from the
+        access token without verifying the token and is therefore only a cache
+        invalidation marker. It is never identity proof or an authorization
+        decision; the server still owns both of those.
+        """
+        if not getattr(self.supabase, "_antigravity_authenticated", True):
+            return ""
+        try:
+            token = str(
+                getattr(self.supabase, "_antigravity_access_token", "") or ""
+            )
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(
+                base64.urlsafe_b64decode(payload).decode("utf-8")
+            )
+            subject = claims.get("sub")
+        except Exception:
+            return ""
+        if not isinstance(subject, str) or not subject:
+            return ""
+        return hashlib.sha256(subject.encode("utf-8")).hexdigest()[:16]
+
+    def _forget_stale_contract_handshake(self, error):
+        """Drop the reading when a server answer has overtaken it."""
+        if self._stable_error_code(error) in self._CONTRACT_HANDSHAKE_INVALIDATING:
+            self._forget_contract_handshake()
+
+    def _contract_handshake_reading(self):
+        """The last handshake, but only while it still describes what is open."""
+        reading = self._contract_handshake
+        if not isinstance(reading, dict) or not self.is_v2_enabled:
+            return None
+        if reading.get("context_key") != self._contract_context_key():
+            return None
+        if reading.get("generation") != self._v2_context_generation:
+            return None
+        if reading.get("project_id") != self._v2_context.get("project_id"):
+            return None
+        if reading.get("contract_sha256") != CANONICAL_CONTRACT_SHA256:
+            return None
+        current_identity = self._contract_identity()
+        if (
+            not current_identity
+            or not reading.get("identity")
+            or reading.get("identity") != current_identity
+        ):
+            return None
+        return reading
+
+    def contract_handshake_is_fresh(self):
+        """True only while a supported reading for this exact context stands."""
+        reading = self._contract_handshake_reading()
+        return bool(reading and reading.get("outcome") == "supported")
+
+    def contract_handshake_state(self):
+        """The last reading, for diagnostics. Never a reason to do anything."""
+        reading = self._contract_handshake_reading()
+        return {
+            "fresh": bool(reading and reading.get("outcome") == "supported"),
+            "observed_at": (reading or {}).get("observed_at", ""),
+            "outcome": (reading or {}).get("outcome", ""),
+            "last_error": self._contract_handshake_error,
+            "path_enabled": self.contract_path_enabled(),
+        }
+
+    def contract_path_enabled(self):
+        if not self.is_v2_enabled:
+            return False
+        return self._v2_store.contract_path_enabled(self._v2_context["local_key"])
+
+    def enable_contract_path(self):
+        """Open the local gate, against a handshake taken at this moment.
+
+        A reading from earlier in the session says what the server answered
+        then. Activation is the one point that has to be answered by the server
+        as it stands now, so this always calls out again instead of trusting
+        what is already stored.
+        """
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        reading = self.perform_contract_handshake(require_connection=True)
+        with self._contract_lock:
+            if (not reading or reading.get("outcome") != "supported"
+                    or reading != self._contract_handshake_reading()):
+                raise SyncContractError("CONTRACT_NOT_ALLOWED")
+            project = self._v2_store.set_contract_path_enabled(
+                self._v2_context["local_key"], True
+            )
+        self._publish_sync_state()
+        return project
+
+    def disable_contract_path(self):
+        """Close the local gate and drop the reading that armed it."""
+        if not self.is_v2_enabled:
+            raise RuntimeError("v2 project is not configured")
+        with self._contract_lock:
+            project = self._v2_store.set_contract_path_enabled(
+                self._v2_context["local_key"], False
+            )
+            self._forget_contract_handshake()
+        self._publish_sync_state()
+        return project
+
     def _uses_contract_structure(self):
         if not self.is_v2_enabled:
             return False
         project = self._v2_store.get_project(self._v2_context["local_key"])
         if not project:
+            return False
+        # Three separate things have to hold, and a server that switches an
+        # allowlist row on can only ever supply the first of them. Without the
+        # other two, turning the server side on moves nothing here.
+        if not project.get("contract_path_enabled"):
+            return False
+        if not self.contract_handshake_is_fresh():
             return False
         try:
             require_server_compatibility(
@@ -924,6 +2157,360 @@ class SyncManager(QObject):
         except (SyncContractError, TypeError, ValueError):
             return False
         return True
+
+    def _note_authority_transition(self, reason):
+        from contract_readiness_diagnostics import note_authority_transition
+        note_authority_transition(self, reason)
+
+    def _begin_structure_authority_selection(self, reason='selection'):
+        """Close every server-write exit while one pull chooses its source."""
+        with self._contract_lock:
+            if self.is_v2_enabled:
+                self._contract_write_epoch += 1
+                self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+                self._v2_structure_authority_error = ""
+                self._v2_structure_authority_identity = self._v2_pull_identity()
+                self._note_authority_transition(reason)
+
+    def _accept_structure_authority(self, authority):
+        if authority not in {
+            STRUCTURE_AUTHORITY_CONTRACT,
+            STRUCTURE_AUTHORITY_LEGACY,
+        }:
+            raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+        with self._contract_lock:
+            if (self._v2_structure_authority != authority
+                    or self._v2_structure_authority_identity != self._v2_pull_identity()):
+                self._contract_write_epoch += 1
+            self._v2_structure_authority = authority
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._note_authority_transition('accepted')
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator:
+            coordinator.pop('network_retry_after', None)
+            coordinator.pop('network_retry_count', None)
+
+    def _block_structure_authority(self, error):
+        """Keep pull apply and every queued upload closed after a bad choice."""
+        code = self._stable_error_code(error) or "STRUCTURE_AUTHORITY_UNRESOLVED"
+        with self._contract_lock:
+            self._contract_write_epoch += 1
+            self._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
+            self._v2_structure_authority_error = code
+            self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._note_authority_transition('blocked')
+        self._v2_last_pull_apply_blocked = True
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator:
+            coordinator.pop('network_retry_after', None)
+            coordinator.pop('network_retry_count', None)
+        self._set_sync_state(
+            "blocked",
+            "서버 구조 기준을 하나로 확정하지 못해 적용과 업로드를 "
+            "중단했습니다. 로컬 파일은 변경하지 않았습니다.",
+        )
+        return code
+
+    def _structure_authority_allows_dispatch(self):
+        # ``None`` is kept for old isolated tests and for a manager with no
+        # attached project. Every production configure_v2() starts at unknown.
+        if self._v2_structure_authority_identity != self._v2_pull_identity():
+            return True
+        return self._v2_structure_authority in {
+            None,
+            STRUCTURE_AUTHORITY_CONTRACT,
+            STRUCTURE_AUTHORITY_LEGACY,
+        }
+
+    @classmethod
+    def _validated_contract_structure_folder_paths(
+        cls, remote_documents, folder_rows, tree_order_rows
+    ):
+        """Validate one complete ID-based folder projection without writing.
+
+        Contract rows are authoritative once any row exists.  They may not be
+        repaired by the legacy name document. Fixed application roots predate
+        contract ordering and are the only live folders allowed outside an ID
+        order row; every user folder must be named exactly under its proven
+        parent.
+        """
+        if not isinstance(tree_order_rows, list) or not tree_order_rows:
+            raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+
+        live_folder_rows = [
+            row for row in (folder_rows or [])
+            if isinstance(row, dict) and not row.get("is_deleted")
+        ]
+        folders_by_id = {}
+        for row in live_folder_rows:
+            try:
+                folder_id = str(uuid.UUID(str(row.get("folder_id"))))
+                parent_id = row.get("parent_folder_id")
+                parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+                if int(row.get("revision") or 0) < 1:
+                    raise ValueError("invalid folder revision")
+            except (TypeError, ValueError, AttributeError):
+                raise SyncContractError("INVALID_FOLDER_RESPONSE")
+            if folder_id in folders_by_id:
+                raise SyncContractError("INVALID_FOLDER_RESPONSE")
+            folders_by_id[folder_id] = {**row, "parent_folder_id": parent_id}
+
+        resolved = cls._folder_rows_with_tree_paths(list(folders_by_id.values()))
+        if len(resolved) != len(folders_by_id):
+            raise SyncContractError("INVALID_FOLDER_RESPONSE")
+
+        documents_by_id = {}
+        for row in remote_documents or []:
+            if not isinstance(row, dict) or row.get("is_deleted"):
+                continue
+            try:
+                document_id = str(uuid.UUID(str(row.get("document_id"))))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            documents_by_id[document_id] = row
+
+        seen_order_ids = set()
+        children_by_parent = {}
+        seen_children = set()
+        for snapshot in tree_order_rows:
+            if not isinstance(snapshot, dict):
+                raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+            try:
+                order_id = str(uuid.UUID(str(snapshot.get("tree_order_id"))))
+                parent_id = snapshot.get("parent_folder_id")
+                parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+                revision = int(snapshot.get("revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+            children = snapshot.get("children")
+            if (
+                order_id in seen_order_ids
+                or parent_id in children_by_parent
+                or revision < 1
+                or not isinstance(children, list)
+                or (parent_id is not None and parent_id not in folders_by_id)
+            ):
+                raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+            seen_order_ids.add(order_id)
+
+            normalized_children = []
+            for value in children:
+                try:
+                    child_id = str(uuid.UUID(str(value)))
+                except (TypeError, ValueError, AttributeError):
+                    raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+                if child_id in seen_children:
+                    raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+                folder = folders_by_id.get(child_id)
+                document = documents_by_id.get(child_id)
+                if folder is None and document is None:
+                    raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+                actual_parent = (
+                    folder.get("parent_folder_id")
+                    if folder is not None
+                    else document.get("parent_folder_id")
+                )
+                if actual_parent:
+                    try:
+                        actual_parent = str(uuid.UUID(str(actual_parent)))
+                    except (TypeError, ValueError, AttributeError):
+                        raise SyncContractError("TREE_PARENT_MISMATCH")
+                else:
+                    actual_parent = None
+                if actual_parent != parent_id:
+                    raise SyncContractError("TREE_PARENT_MISMATCH")
+                normalized_children.append(child_id)
+                seen_children.add(child_id)
+            children_by_parent[parent_id] = normalized_children
+
+        fixed_root_keys = {
+            cls._tree_path_comparison_key(f"메인/{storage_name}")
+            for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+        }
+        for folder_id, item in resolved.items():
+            path = item["local_path"]
+            if (
+                path == "메인"
+                or cls._tree_path_comparison_key(path) in fixed_root_keys
+            ):
+                continue
+            parent_id = folders_by_id[folder_id].get("parent_folder_id")
+            if folder_id not in children_by_parent.get(parent_id, ()):
+                raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+
+        return {item["local_path"] for item in resolved.values()}
+
+    def _select_remote_structure_authority(
+        self,
+        remote_documents,
+        folder_rows,
+        tree_order_rows,
+    ):
+        """Choose contract or legacy once; never combine them or guess."""
+        if tree_order_rows:
+            folder_paths = self._validated_contract_structure_folder_paths(
+                remote_documents, folder_rows, tree_order_rows
+            )
+            return {
+                "kind": STRUCTURE_AUTHORITY_CONTRACT,
+                "folder_paths": sorted(folder_paths),
+            }
+
+        if self._can_bootstrap_empty_legacy_structure(
+            remote_documents, folder_rows, tree_order_rows
+        ):
+            # A new project has no server row until its first dispatch.  The
+            # empty snapshot is therefore a complete LEGACY baseline, not a
+            # missing tree-order document.  This exception stays closed after
+            # any server-acknowledged revision so a vanished projection can
+            # never be mistaken for a fresh project.
+            return {
+                "kind": STRUCTURE_AUTHORITY_LEGACY,
+                "folder_paths": [],
+            }
+
+        live_document_paths = set()
+        for item in remote_documents or []:
+            if not isinstance(item, dict) or item.get("is_deleted"):
+                continue
+            try:
+                path = self._safe_relative_path(item.get("relative_path"))
+            except ValueError:
+                continue
+            if is_live_document_path(path):
+                live_document_paths.add(path)
+        legacy_paths = self._remote_tree_folder_paths(
+            remote_documents, live_document_paths
+        )
+        if legacy_paths is None:
+            # A successful zero-row contract query permits legacy selection;
+            # a missing or malformed legacy snapshot does not.
+            raise SyncContractError("INVALID_TREE_ORDER_RESPONSE")
+        return {
+            "kind": STRUCTURE_AUTHORITY_LEGACY,
+            "folder_paths": sorted(legacy_paths),
+        }
+
+    def _can_bootstrap_empty_legacy_structure(
+        self, remote_documents, folder_rows, tree_order_rows
+    ):
+        if remote_documents or folder_rows or tree_order_rows:
+            return False
+        store = getattr(self, "_v2_store", None)
+        context = getattr(self, "_v2_context", None)
+        if not store or not context:
+            return False
+        checker = getattr(store, "has_server_acknowledged_commit", None)
+        if not callable(checker):
+            return False
+        try:
+            return not checker(context["local_key"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _server_timestamp(value):
+        try:
+            parsed = datetime.fromisoformat(
+                str(value or "").replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _legacy_structure_snapshot_in_flight(
+        cls, remote_documents, folder_rows, tree_order_rows
+    ):
+        """True only for a valid legacy tree visibly older than peer writes.
+
+        Legacy structure publication is deliberately folder/document first and
+        tree-order last.  During that bounded interval, a pull may see live
+        folder rows or live document rows that the newest valid tree document
+        does not name yet.  The timestamps prove which projection is behind;
+        missing/malformed timestamps, malformed trees, and contract rows are
+        never treated as transient.
+        """
+        if tree_order_rows:
+            return False
+        tree_rows = [
+            item for item in (remote_documents or [])
+            if isinstance(item, dict)
+            and not item.get("is_deleted")
+            and str(item.get("relative_path") or "").replace("\\", "/")
+            == TREE_ORDER_DOCUMENT_PATH
+        ]
+        if not tree_rows:
+            return False
+        try:
+            tree_row = max(
+                tree_rows, key=lambda item: int(item.get("revision") or 0)
+            )
+            payload = json.loads(tree_row.get("content") or "{}")
+            if payload.get("version") != 1:
+                return False
+            tree_order = cls._validated_remote_tree_order(
+                payload.get("tree_order")
+            )
+        except (TypeError, ValueError, OSError, json.JSONDecodeError):
+            return False
+        tree_updated_at = cls._server_timestamp(tree_row.get("updated_at"))
+        if tree_updated_at is None:
+            return False
+
+        named_paths = set()
+        for parent_path, child_names in tree_order.items():
+            if parent_path != "<root>":
+                named_paths.add(cls._tree_path_comparison_key(parent_path))
+            for child_name in child_names:
+                named_paths.add(cls._tree_path_comparison_key(
+                    cls._tree_order_child_path(parent_path, child_name)
+                ))
+
+        fixed_root_keys = {
+            cls._tree_path_comparison_key(f"메인/{storage_name}")
+            for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+        }
+        resolved_folders = cls._folder_rows_with_tree_paths(folder_rows or [])
+        for item in resolved_folders.values():
+            if item.get("is_deleted"):
+                continue
+            path = item.get("local_path") or ""
+            path_key = cls._tree_path_comparison_key(path)
+            if (
+                path == "메인"
+                or path_key in fixed_root_keys
+                or path_key in named_paths
+            ):
+                continue
+            updated_at = cls._server_timestamp(item.get("updated_at"))
+            if updated_at is not None and updated_at > tree_updated_at:
+                return True
+
+        for item in remote_documents or []:
+            if not isinstance(item, dict) or item.get("is_deleted"):
+                continue
+            try:
+                path = cls._safe_relative_path(item.get("relative_path"))
+            except ValueError:
+                continue
+            if not is_live_document_path(path):
+                continue
+            if cls._tree_path_comparison_key(path) in named_paths:
+                continue
+            updated_at = cls._server_timestamp(item.get("updated_at"))
+            if updated_at is not None and updated_at > tree_updated_at:
+                return True
+        return False
+
+    def _report_legacy_structure_settle_wait(self):
+        self._set_sync_state(
+            "syncing",
+            "다른 기기의 구조 갱신이 끝나기를 기다리는 중입니다.",
+        )
 
     @staticmethod
     def _path_before_local_change(path, aliases):
@@ -1071,6 +2658,255 @@ class SyncManager(QObject):
             self.retry_pending_syncs()
         return request
 
+    def prepare_folder_delete_intent(self, old_rel_path, tree_order=None):
+        """Persist the exact LEGACY folder identity before local deletion."""
+        if not self.is_v2_enabled or self._uses_contract_structure():
+            return None
+        old_rel_path = self._safe_relative_path(old_rel_path)
+        local_key = self._v2_context["local_key"]
+        folder = self._v2_store.get_folder_by_path(local_key, old_rel_path)
+        if folder is None:
+            return None
+        folder_id = str(folder["folder_id"])
+        identity_folders = self._publishable_identity_folders()
+        path_key = self._tree_path_comparison_key(old_rel_path)
+        node = next((
+            item for item in identity_folders
+            if self._tree_path_comparison_key(item.get("legacy_path"))
+            == path_key
+        ), None)
+        node_is_pre_delete = node is not None
+        if node is None:
+            node = next((
+                item for item in identity_folders
+                if str(item.get("uuid") or "") == folder_id
+            ), None)
+        if node is None:
+            # Pre-identity projects retain their document-only legacy path.
+            return None
+        if str(node.get("uuid") or "") != folder_id:
+            raise SyncContractError("FOLDER_DELETE_IDENTITY_CONFLICT")
+        parent_folder_id = node.get("parent_uuid")
+        name = old_rel_path.rsplit("/", 1)[-1]
+        if node_is_pre_delete:
+            if str(folder.get("parent_folder_id") or "") != str(
+                parent_folder_id or ""
+            ):
+                raise SyncContractError(
+                    "FOLDER_DELETE_PARENT_IDENTITY_CONFLICT"
+                )
+            if str(folder.get("name") or "") != name:
+                raise SyncContractError("FOLDER_DELETE_NAME_IDENTITY_CONFLICT")
+        else:
+            # Direct legacy callers may arrive after move_to_trash relocated
+            # identity. The old sync_folders row is then the immutable
+            # pre-delete snapshot; the UUID match plus a trash destination is
+            # the only permitted compatibility case.
+            if not node.get("wants_deleted"):
+                raise SyncContractError("FOLDER_DELETE_IDENTITY_CONFLICT")
+            parent_folder_id = folder.get("parent_folder_id")
+            name = str(folder.get("name") or "")
+            if not name:
+                raise SyncContractError("FOLDER_DELETE_NAME_IDENTITY_CONFLICT")
+        dependencies = []
+        for document in self._v2_store.list_documents(local_key):
+            local_path = self._safe_relative_path(document.get("local_path"))
+            if not local_path.startswith(old_rel_path + "/"):
+                continue
+            if (
+                int(document.get("revision") or 0) == 0
+                and not self._v2_store.has_active_operations(
+                    document["document_id"]
+                )
+            ):
+                continue
+            dependencies.append({
+                "document_id": document["document_id"],
+                "server_path": document["server_path"],
+                "base_revision": int(document.get("revision") or 0),
+            })
+        tree_order_content = (
+            self._tree_order_content(tree_order)
+            if isinstance(tree_order, dict) else None
+        )
+        return self._v2_store.record_folder_delete_intent(
+            local_key,
+            folder_id=folder_id,
+            parent_folder_id=parent_folder_id,
+            name=name,
+            base_revision=int(folder.get("revision") or 0),
+            pre_delete_path=old_rel_path,
+            dependent_documents=dependencies,
+            tree_order_content=tree_order_content,
+        )
+
+    def prepare_legacy_folder_delete_recovery(
+        self, folder_path, tree_order, retry=False
+    ):
+        """Queue a proven historical partial delete without touching its files."""
+        if not self.is_v2_enabled or self._uses_contract_structure():
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_MODE_REQUIRED")
+        folder_path = self._safe_relative_path(folder_path)
+        local_key = self._v2_context["local_key"]
+        folder = self._v2_store.get_folder_by_path(local_key, folder_path)
+        if folder is None or int(folder.get("revision") or 0) <= 0:
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_FOLDER_UNPROVEN")
+        identity = next((
+            item for item in self._publishable_identity_folders()
+            if str(item.get("uuid") or "") == str(folder["folder_id"])
+        ), None)
+        if (
+            identity is None
+            or identity.get("wants_deleted")
+            or self._safe_relative_path(identity.get("legacy_path")) != folder_path
+            or str(identity.get("parent_uuid") or "")
+            != str(folder.get("parent_folder_id") or "")
+            or folder_path.rsplit("/", 1)[-1] != str(folder.get("name") or "")
+        ):
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_IDENTITY_UNPROVEN")
+
+        tree_content = self._tree_order_content(tree_order)
+        explicit, live_keys = self._tree_folder_keys_from_content(tree_content)
+        folder_key = self._tree_path_comparison_key(folder_path)
+        if not explicit or folder_key in live_keys:
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_TREE_UNPROVEN")
+        tree_document_id = str(uuid.uuid5(
+            uuid.UUID(self._v2_context["project_id"]),
+            TREE_ORDER_DOCUMENT_PATH,
+        ))
+        tree_document = self._v2_store.get_document_by_id(tree_document_id)
+        if (
+            tree_document is None
+            or tree_document.get("base_content") != tree_content
+            or int(tree_document.get("revision") or 0) <= 0
+        ):
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_TREE_UNPROVEN")
+        completed_removal = next((
+            operation for operation in
+            self._v2_store.completed_document_operations(tree_document_id)
+            if operation.get("content") == tree_content
+            and operation.get("result_revision")
+            == int(tree_document["revision"])
+            and folder_key in self._tree_folder_keys_from_content(
+                operation.get("base_content")
+            )[1]
+            and folder_key not in self._tree_folder_keys_from_content(
+                operation.get("content")
+            )[1]
+        ), None)
+        if completed_removal is None:
+            raise RuntimeError("LEGACY_FOLDER_DELETE_RECOVERY_TREE_UNPROVEN")
+
+        dependencies = []
+        operation_ids = {}
+        for document in self._v2_store.list_documents(local_key):
+            try:
+                server_path = self._safe_relative_path(
+                    document.get("server_path")
+                )
+            except ValueError:
+                continue
+            if not server_path.startswith(folder_path + "/"):
+                continue
+            document_id = str(document["document_id"])
+            revision = int(document.get("revision") or 0)
+            content = str(document.get("base_content") or "")
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if (
+                not document.get("is_deleted")
+                or revision <= 0
+                or self._v2_store.has_active_operations(document_id)
+                or str(document.get("base_hash") or "") != content_hash
+            ):
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_DOCUMENT_UNPROVEN"
+                )
+            completed_tombstone = next((
+                operation for operation in
+                self._v2_store.completed_document_operations(document_id)
+                if operation.get("is_deleted")
+                and operation.get("relative_path") == server_path
+                and operation.get("content") == content
+                and operation.get("result_revision") == revision
+            ), None)
+            if completed_tombstone is None:
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_DOCUMENT_UNPROVEN"
+                )
+
+            trash_matches = [
+                item for item in self._v2_wpm.list_trash_items()
+                if str(item.get("document_id") or "") == document_id
+                and self._safe_relative_path(item.get("original_path"))
+                == server_path
+            ]
+            if len(trash_matches) != 1:
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_TRASH_UNPROVEN"
+                )
+            trash_path = self._safe_relative_path(
+                trash_matches[0].get("trash_path")
+            )
+            trash_content = self._v2_wpm.read_text_file(trash_path)
+            local_path = self._safe_relative_path(document.get("local_path"))
+            local_content = self._v2_wpm.read_text_file(local_path)
+            if (
+                trash_content is None
+                or local_content is None
+                or hashlib.sha256(trash_content.encode("utf-8")).hexdigest()
+                != content_hash
+                or hashlib.sha256(local_content.encode("utf-8")).hexdigest()
+                != content_hash
+            ):
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_CONTENT_MISMATCH"
+                )
+            identity_document = self._identity_node_by_uuid(
+                self._identity_project_root(), document_id
+            )
+            if (
+                identity_document is None
+                or identity_document.get("kind") != "document"
+                or self._safe_relative_path(
+                    identity_document.get("legacy_path")
+                ) != local_path
+            ):
+                raise RuntimeError(
+                    "LEGACY_FOLDER_DELETE_RECOVERY_IDENTITY_UNPROVEN"
+                )
+            dependencies.append({
+                "document_id": document_id,
+                "server_path": server_path,
+                "base_revision": revision,
+            })
+            operation_ids[document_id] = completed_tombstone["operation_id"]
+
+        intent = self._v2_store.record_folder_delete_intent(
+            local_key,
+            folder_id=folder["folder_id"],
+            parent_folder_id=folder.get("parent_folder_id"),
+            name=folder["name"],
+            base_revision=int(folder["revision"]),
+            pre_delete_path=folder_path,
+            dependent_documents=dependencies,
+            tree_order_content=tree_content,
+        )
+        intent = self._v2_store.bind_folder_delete_document_operations(
+            intent["intent_id"], operation_ids
+        )
+        tree_operation = self.record_tree_order(tree_order, retry=retry)
+        attached = self._v2_store.folder_delete_intents_for_tree_operation(
+            tree_operation["operation_id"]
+        )
+        return {
+            "intent": next(
+                item for item in attached
+                if item["intent_id"] == intent["intent_id"]
+            ),
+            "tree_operation": tree_operation,
+            "completed_tree_operation": completed_removal,
+        }
+
     def record_tree_order(self, tree_order, retry=True):
         """Persist project binder order as one hidden revisioned v2 document."""
         if not self.is_v2_enabled:
@@ -1099,10 +2935,16 @@ class SyncManager(QObject):
                     self._v2_context["local_key"]
                 )
             )
+            pending_folder_deletes = (
+                self._v2_store.pending_folder_delete_intents(
+                    self._v2_context["local_key"]
+                )
+            )
             if (
                 document.get("base_content") == content
                 and not self._v2_store.has_active_operations(document["document_id"])
                 and not pending_folder_renames
+                and not pending_folder_deletes
             ):
                 return None
             operation = self._v2_store.enqueue(
@@ -1111,6 +2953,30 @@ class SyncManager(QObject):
                 content,
                 relative_path=TREE_ORDER_DOCUMENT_PATH,
             )
+            try:
+                live_folder_paths = set(json.loads(content).get(
+                    "folder_paths", []
+                ))
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                live_folder_paths = set()
+            attached_intents = [
+                intent["intent_id"]
+                for intent in pending_folder_deletes
+                if intent.get("status") in {
+                    "prepared", "documents_pending", "folder_pending",
+                    "folder_committed", "tree_pending",
+                }
+                and intent.get("pre_delete_path") not in live_folder_paths
+                and (
+                    not intent.get("tree_operation_id")
+                    or intent.get("tree_operation_id")
+                    == operation["operation_id"]
+                )
+            ]
+            if attached_intents:
+                self._v2_store.attach_folder_delete_tree_operation(
+                    attached_intents, operation["operation_id"], content
+                )
         self._publish_sync_state()
         if retry:
             self.retry_pending_syncs()
@@ -1133,8 +2999,32 @@ class SyncManager(QObject):
         ):
             raise ValueError("INVALID_LOCAL_FOLDER_RENAME_INTENT")
         with self._structure_mutation_gate:
+            identity_nodes = [
+                node for node in self._publishable_identity_folders()
+                if not node.get("wants_deleted")
+            ]
+            matches = [
+                node for node in identity_nodes
+                if self._tree_path_comparison_key(node.get("legacy_path"))
+                == self._tree_path_comparison_key(new_path)
+            ]
+            if not matches:
+                # Some legacy callers record the durable intent immediately
+                # after the filesystem rename and update identity in the same
+                # enclosing mutation. The pre-rename identity is still a safe
+                # anchor here because the old name has not yet been reusable.
+                matches = [
+                    node for node in identity_nodes
+                    if self._tree_path_comparison_key(node.get("legacy_path"))
+                    == self._tree_path_comparison_key(old_path)
+                ]
+            if len(matches) != 1:
+                raise ValueError("FOLDER_RENAME_IDENTITY_NOT_FOUND")
             return self._v2_store.record_folder_rename_intent(
-                self._v2_context["local_key"], old_path, new_path
+                self._v2_context["local_key"],
+                old_path,
+                new_path,
+                folder_id=matches[0]["uuid"],
             )
 
     def record_created_document(self, relative_path, retry=True):
@@ -1361,11 +3251,10 @@ class SyncManager(QObject):
 
     @property
     def pending_retry_count(self):
-        persistent = 0
-        if self.is_v2_enabled:
-            counts = self._v2_store.counts(self._v2_context["local_key"])
-            persistent = counts.get("documents", counts["total"])
-        return len(self._retry_queue) + persistent
+        activity = self.sync_activity_snapshot()
+        return len(self._retry_queue) + sum(activity[name] for name in (
+            "transfer_pending", "transferring", "retry_wait"
+        ))
 
     def _absent_project_state(self):
         """Decide what a missing server row means for this project.
@@ -1392,20 +3281,31 @@ class SyncManager(QObject):
             self._v2_context.get("server_state") or "active"
         )
 
-    def mark_project_server_state(self, project_id, state):
+    def mark_project_server_state(self, project_id, state, *, expected_context=None,
+                                  expected_write_epoch=None):
         if state not in {"active", "trashed", "purged"}:
             return False
-        if self._v2_store is not None:
-            setter = getattr(
-                self._v2_store, "set_project_server_state", None
-            )
-            if callable(setter):
-                setter(project_id, state)
-        if (
-            self._v2_context
-            and self._v2_context.get("project_id") == str(project_id)
-        ):
-            self._v2_context["server_state"] = state
+        with self._contract_lock:
+            if (expected_context is not None
+                    and expected_context != self._contract_project_context()):
+                return False
+            if (expected_write_epoch is not None
+                    and expected_write_epoch != self._contract_write_epoch):
+                return False
+            current = bool(self._v2_context
+                           and self._v2_context.get("project_id") == str(project_id))
+            if current:
+                context = self._contract_project_context()
+                if (self._current_project_server_state() != state
+                        or self._contract_project_state_context != context):
+                    self._contract_write_epoch += 1
+                self._v2_context["server_state"] = state
+                self._contract_project_state_context = context
+            if self._v2_store is not None:
+                setter = getattr(self._v2_store, "set_project_server_state", None)
+                if callable(setter):
+                    setter(project_id, state)
+        if current:
             if state in {"trashed", "purged"}:
                 # Project trash removes leases on the server. Do not issue
                 # release RPCs after access has already been revoked.
@@ -1435,17 +3335,18 @@ class SyncManager(QObject):
                 )
         self.syncStateChanged.emit(state, detail, pending_count)
 
-    def _record_sync_success(self):
+    def _record_sync_success(self, record_diagnostic=True):
         # 전송이 한 번이라도 성공했다면 직전 실패 사유는 더 이상 현재 상태가
         # 아니다. 남겨두면 큐가 다시 돌고 있는데도 옛 오류가 계속 표시된다.
         self._last_sync_error = ""
         self._last_failure_offline = False
         self._auth_retry_blocked = False
-        self._diagnostics.record(
-            "sync_success",
-            state="saved",
-            pending_count=self.pending_retry_count,
-        )
+        if record_diagnostic:
+            self._diagnostics.record(
+                "sync_success",
+                state="saved",
+                pending_count=self.pending_retry_count,
+            )
 
     def diagnostic_snapshot(self):
         """Return a local-only, non-sensitive snapshot for the settings panel."""
@@ -1461,22 +3362,19 @@ class SyncManager(QObject):
             "login_state": login_state,
             "pending_count": self.pending_retry_count,
             "sync_state": self.current_sync_state,
+            "activity": self.sync_activity_snapshot(),
+            "structure_timing": self.structure_timing_snapshot(),
         }
 
     def diagnostic_report(self):
         return format_diagnostic_report(self.diagnostic_snapshot())
 
     def _publish_sync_state(self):
-        v2_counts = None
-        if self.is_v2_enabled:
-            v2_counts = self._v2_store.counts(
-                self._v2_context["local_key"]
-            )
-        persistent_count = (
-            v2_counts.get("documents", v2_counts["total"])
-            if v2_counts is not None else 0
-        )
-        pending_count = len(self._retry_queue) + persistent_count
+        activity = self.sync_activity_snapshot()
+        self._last_published_sync_activity = dict(activity)
+        pending_count = len(self._retry_queue) + sum(activity[name] for name in (
+            "transfer_pending", "transferring", "retry_wait"
+        ))
 
         def publish(state, detail):
             self._set_sync_state(
@@ -1502,12 +3400,45 @@ class SyncManager(QObject):
                     "다시 로그인하면 대기 작업이 이어서 전송됩니다."
                 ),
             )
-        elif self._active_server_syncs > 0:
+        elif self._session_restore_waiting() or (
+            (self._current_pull_coordinator(create=False) or {}).get('network_retry_after')
+        ):
+            publish('offline', '로컬 저장 완료. 서버 연결 복구를 기다리며 자동으로 다시 확인합니다.')
+        elif (
+            self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
+            and self._v2_structure_authority_identity == self._v2_pull_identity()
+        ):
+            publish(
+                "blocked",
+                "서버 구조 기준을 확정하지 못해 원격 적용과 업로드가 차단됐습니다.",
+            )
+        elif activity["local_structure"]:
+            publish(
+                "local_waiting",
+                "바인더 변경 사항을 안전하게 저장하는 중입니다.",
+            )
+        elif self._active_server_syncs > 0 and not self.is_v2_enabled:
             publish("syncing", "서버에 변경 내용을 올리는 중입니다.")
-        elif v2_counts is not None and v2_counts["conflict"]:
-            count = v2_counts["conflict"]
+        elif activity["conflict"]:
+            count = activity["conflict"]
             publish("conflict", f"자동 병합할 수 없는 문서 충돌이 {count}건 있습니다.")
-        elif v2_counts is not None and v2_counts["total"]:
+        elif activity["blocked"]:
+            count = activity["blocked"]
+            publish("blocked", f"서버 적용이 거부되거나 차단된 작업이 {count}건 있습니다.")
+        elif activity["transferring"] or activity["pull_visible"]:
+            detail = (
+                "서버의 최신 변경 내용을 확인하는 중입니다."
+                if activity["pull_visible"] and not activity["transferring"]
+                else "서버에 변경 내용을 올리는 중입니다."
+            )
+            publish("syncing", detail)
+        elif activity["retry_wait"]:
+            detail = (
+                self._v2_store.latest_error(self._v2_context["local_key"])
+                if self.is_v2_enabled else self._last_sync_error
+            )
+            publish("retry_wait", detail or "서버 전송을 다시 시도할 때까지 기다리는 중입니다.")
+        elif activity["transfer_pending"]:
             detail = self._v2_store.latest_error(self._v2_context["local_key"])
             if "LEASE_CONFLICT" in detail:
                 publish(
@@ -1524,20 +3455,35 @@ class SyncManager(QObject):
                     "대기 작업이 이어서 전송됩니다.",
                 )
                 return
-            # 오류 근거가 없으면 연결 문제라고 단정하지 않는다. 전송을 기다리는
-            # 상태이므로 재시도 버튼이 있는 failed 로 알린다.
+            if not detail:
+                # A chained snapshot can be durably queued while its
+                # predecessor is in flight.  That is ordinary progress, not a
+                # failed attempt, and must not emit sync_failure diagnostics.
+                publish("syncing", "서버 전송 순서를 기다리는 중입니다.")
+                return
             offline = bool(detail) and self._is_connectivity_error(detail)
             publish(
                 "offline" if offline else "failed",
-                detail or "서버 전송을 기다리는 로컬 변경 사항이 있습니다.",
+                detail,
             )
         elif self._retry_queue:
             pending = list(self._retry_queue.values())
             state = "offline" if any(item.get("_retry_offline", False) for item in pending) else "failed"
             detail = next((item.get("_retry_error") for item in pending if item.get("_retry_error")), self._last_sync_error)
             publish(state, detail)
+        elif activity["pull_pending"]:
+            publish("pull_pending", "업로드가 안정 지점에 도달하면 서버 변경을 확인합니다.")
         elif self._active_backups > 0:
             publish("backup", "로컬 자동백업을 만드는 중입니다.")
+        elif self._tree_order_stalled():
+            # Below every transfer state: documents are still syncing, and only
+            # the arrangement is not arriving. Saying nothing was worse -- the
+            # writer reorders on one device and watches the other never follow.
+            publish(
+                "tree_order_stalled",
+                "다른 기기가 보낸 바인더 순서가 서버 문서 목록과 맞지 않아 "
+                "적용하지 못하고 있습니다. 원고 자체는 계속 동기화됩니다.",
+            )
         else:
             publish("saved", "현재 로컬 변경 사항이 저장되어 있습니다.")
 
@@ -1556,7 +3502,7 @@ class SyncManager(QObject):
     def _v2_follow_up_delay_ms(
         kind, error_message="", lease_attempt=1, network_attempt=1
     ):
-        if kind in {"committed", "auto_merged", "conflict"}:
+        if kind in {"committed", "auto_merged", "conflict", "superseded"}:
             return 0
         if kind == "retry" and "LEASE_CONFLICT" in (error_message or ""):
             attempt_index = max(0, int(lease_attempt or 1) - 1)
@@ -1647,9 +3593,29 @@ class SyncManager(QObject):
         self._last_sync_error = payload["_retry_error"]
         self._last_failure_offline = bool(offline)
 
+    @pyqtSlot()
+    def _retry_pending_syncs_on_owner_thread(self):
+        """Run a background enqueue's drain request on this QObject's thread."""
+        self.retry_pending_syncs()
+
     def retry_pending_syncs(self, manual=False):
         """다른 서버 요청이 성공한 뒤 대기 중인 항목을 한 건씩 다시 전송한다."""
-        if self._auth_retry_blocked or self._shutting_down:
+        if (
+            not manual
+            and self.thread() is not None
+            and QThread.currentThread() != self.thread()
+        ):
+            # Binder structure actions persist their immutable operations on a
+            # serial worker. QTimer and the active-worker slots belong to the
+            # manager's UI thread, so touching them from that worker can lose
+            # the only wake-up while leaving the durable queue visibly stuck.
+            QMetaObject.invokeMethod(
+                self,
+                "_retry_pending_syncs_on_owner_thread",
+                Qt.ConnectionType.QueuedConnection,
+            )
+            return True
+        if self._auth_retry_blocked or self._shutting_down or getattr(self, '_review_execution_busy', False):
             self._publish_sync_state()
             return False
         if self._v2_retry_timer.isActive():
@@ -1657,6 +3623,26 @@ class SyncManager(QObject):
                 return False
             self._cancel_scheduled_v2_retry(reset_backoff=False)
         if self.is_v2_enabled:
+            if not self._structure_authority_allows_dispatch():
+                # A blocked pull is deliberately sticky for every automatic
+                # entrypoint.  The status dialog's explicit retry is the one
+                # place where the user can ask for a fresh, read-first
+                # authority decision.  The queued write remains untouched and
+                # cannot dispatch unless that pull validates and applies one
+                # complete structure projection.
+                if (
+                    manual
+                    and self._v2_structure_authority
+                    == STRUCTURE_AUTHORITY_BLOCKED
+                    and self._v2_structure_authority_identity
+                    == self._v2_pull_identity()
+                ):
+                    return self.pull_remote_changes_async(
+                        manual=True,
+                        retry_pending_after_pull=True,
+                    )
+                self._publish_sync_state()
+                return False
             if self._current_project_server_state() != "active":
                 self._publish_sync_state()
                 return False
@@ -1675,6 +3661,8 @@ class SyncManager(QObject):
                 else None
             )
             if structure_request:
+                if not self._contract_request_ready(structure_request):
+                    return False
                 self._launch_contract_structure_batch(
                     structure_request["batch"]["batch_id"]
                 )
@@ -1691,7 +3679,16 @@ class SyncManager(QObject):
                         self._v2_context["local_key"]
                     )
             if operation:
+                if operation.get("provenance_kind") == "CONTRACT_BATCH" and not self._contract_request_ready(
+                    self._v2_store.structure_batch_request(operation["batch_id"])
+                ):
+                    return False
                 self._launch_v2_operation(operation)
+                return True
+            # This is the serialized drain boundary: no ready, claimed, retry
+            # or structure work remains for this local_key, and no event-loop
+            # turn occurs between that observation and the pull decision.
+            if self._maybe_start_deferred_pull():
                 return True
         if self._retry_active_key is not None or self._active_server_syncs > 0 or not self._retry_queue:
             return False
@@ -1867,10 +3864,28 @@ class SyncManager(QObject):
         return server_success, effective_error
         
     @staticmethod
-    def create_supabase_client(config=None):
+    def create_supabase_client(config=None, *, restore_session=True):
         config = config or load_cloud_client_config(supabase_config_dir())
         if not config.is_ready:
             return None
+        lease = SyncManager.acquire_auth_lease()
+        if lease is not True:
+            # Nothing is handed back. A client that merely knows it is signed
+            # out is still a client, and the paths that reach for one check
+            # whether it exists rather than whether it may be used -- so it
+            # would open connections anyway. Without the credential there is
+            # nothing safe to return, so nothing is returned, and it is decided
+            # before a transport is built rather than after.
+            SyncManager._client_refusal = (
+                "auth_lease_unavailable" if lease is None
+                else "auth_lease_held_elsewhere"
+            )
+            print(
+                "Supabase client not built: another process holds the "
+                "credential."
+            )
+            return None
+        SyncManager._client_refusal = ""
         custom_httpx_client = None
         try:
             from supabase import create_client, ClientOptions
@@ -1880,7 +3895,14 @@ class SyncManager(QObject):
                 timeout=5.0,
                 limits=httpx.Limits(max_keepalive_connections=5),
             )
-            options = ClientOptions(httpx_client=custom_httpx_client)
+            # No client refreshes on a timer of its own. Five of them do it on
+            # five schedules against one credential, and each rotation retires
+            # the token the other four are holding. Refreshes go through
+            # ensure_session_valid instead, which serializes them and which
+            # shutdown can wait for; a timer inside the library is neither.
+            options = ClientOptions(
+                httpx_client=custom_httpx_client, auto_refresh_token=False
+            )
             client = create_client(
                 config.url,
                 config.publishable_key,
@@ -1888,41 +3910,97 @@ class SyncManager(QObject):
             )
             client._antigravity_httpx_client = custom_httpx_client
 
-            try:
-                from security_manager import SecurityManager
-                access_token, refresh_token = SecurityManager.get_supabase_session()
-            except Exception:
-                access_token, refresh_token = "", ""
-
             authenticated = False
-            try:
-                auth_response = None
-                if access_token and refresh_token:
-                    auth_response = client.auth.set_session(access_token, refresh_token)
-                session = getattr(auth_response, "session", None) if auth_response else None
-                if session:
-                    SyncManager._persist_supabase_session(session)
-                    authenticated = True
-                    user = getattr(session, "user", None)
-                    client._antigravity_email = getattr(user, "email", "") or ""
-            except Exception as auth_error:
-                classified = classify_cloud_error(auth_error)
-                client._antigravity_restore_error_kind = classified.kind
+            client._antigravity_restore_pending = False
+            client._antigravity_refresh_token = ""
+            client._antigravity_session_generation = SyncManager._session_generation
+            # A process can build several clients at once, and refresh tokens
+            # rotate the moment one is used. Two unserialized restores race, and
+            # the one that loses is told its token is invalid -- which looks
+            # exactly like the account's token having been revoked.
+            with SyncManager._session_restore_lock:
                 try:
                     from security_manager import SecurityManager
-                    SecurityManager.clear_supabase_session()
+                    access_token, refresh_token = (
+                        SecurityManager.get_supabase_session()
+                        if restore_session else ('', '')
+                    )
                 except Exception:
-                    pass
+                    access_token, refresh_token = "", ""
+
+                try:
+                    auth_response = None
+                    if access_token and refresh_token:
+                        with SyncManager._session_exchange_in_flight():
+                            auth_response = client.auth.set_session(
+                                access_token, refresh_token
+                            )
+                    session = (
+                        getattr(auth_response, "session", None)
+                        if auth_response else None
+                    )
+                    if session:
+                        SyncManager._persist_supabase_session(
+                            session,
+                            expected_previous=refresh_token,
+                            generation=client._antigravity_session_generation,
+                        )
+                        SyncManager._remember_client_session(client, session)
+                        authenticated = True
+                        user = getattr(session, "user", None)
+                        client._antigravity_email = getattr(user, "email", "") or ""
+                except Exception as auth_error:
+                    classified = classify_cloud_error(auth_error)
+                    facts = auth_error_facts(auth_error, classified)
+                    client._antigravity_restore_error_kind = classified.kind
+                    client._antigravity_restore_error_facts = facts
+                    client._antigravity_restore_pending = bool(
+                        access_token and refresh_token
+                        and SyncManager._transient_handshake_error(auth_error)
+                    )
+                    detail = (
+                        f"{facts['exception_class']}"
+                        f"/{facts['auth_error_status'] or 'no-status'}"
+                        f"/{facts['classified_kind']}"
+                    )
+                    if SyncManager._discard_rejected_session(
+                        classified, access_token, refresh_token
+                    ):
+                        print(f"Supabase session discarded: {detail}.")
+                    else:
+                        # Keeping the session is the right answer, but a silent
+                        # failed restore leaves somebody staring at a signed-out
+                        # app with nothing to read. These three say what happened
+                        # without recording the message, the address or the token.
+                        print(
+                            f"Supabase session restore failed: {detail}; "
+                            "the stored session was kept."
+                        )
 
             client._antigravity_authenticated = authenticated
 
             try:
                 def persist_auth_event(event, session):
+                    guard = getattr(client, '_antigravity_auth_callback_guard', None)
+                    if guard is not None and not guard():
+                        return
                     event_name = str(getattr(event, "value", event) or "").upper()
                     if session and event_name in {
                         "SIGNED_IN", "TOKEN_REFRESHED", "USER_UPDATED"
                     }:
-                        SyncManager._persist_supabase_session(session)
+                        if not SyncManager._persist_supabase_session(
+                            session,
+                            expected_previous=getattr(
+                                client, "_antigravity_refresh_token", ""
+                            ),
+                            generation=getattr(
+                                client, "_antigravity_session_generation", None
+                            ),
+                        ):
+                            # A refused write means this client is behind. It
+                            # must not claim the store's session as its own.
+                            return
+                        SyncManager._remember_client_session(client, session)
                         client._antigravity_authenticated = True
                         user = getattr(session, "user", None)
                         client._antigravity_email = getattr(user, "email", "") or ""
@@ -1940,15 +4018,243 @@ class SyncManager(QObject):
                     pass
             return None
 
+    # The only answer that means the stored session is worth nothing. A name
+    # that would not resolve, a request that timed out, a 5xx, or anything this
+    # code cannot recognize is the network or the server having a bad moment,
+    # and surviving those is the entire reason a refresh token is kept.
+    _SESSION_DISCARDING_ERROR_KINDS = frozenset({"authentication"})
+
     @staticmethod
-    def _persist_supabase_session(session):
+    def _discard_rejected_session(classified, access_token, refresh_token):
+        """Throw the stored session away only when the server refused it.
+
+        Deleting it on any failure turns a dropped connection into a logout the
+        writer has to notice and undo by hand, and it takes the refresh token
+        with it, so nothing can recover on its own afterwards.
+        """
+        if getattr(classified, "kind", "") not in SyncManager._SESSION_DISCARDING_ERROR_KINDS:
+            return False
+        try:
+            from security_manager import SecurityManager
+            stored_access, stored_refresh = SecurityManager.get_supabase_session()
+        except Exception:
+            return False
+        if (stored_access, stored_refresh) != (access_token, refresh_token):
+            # Something else refreshed while this attempt was in the air, so
+            # what the server rejected is a spent token rather than the
+            # account's. With rotating refresh tokens this is the ordinary
+            # outcome of two clients starting together, and clearing here would
+            # log the writer out of a session that is working.
+            return False
+        try:
+            from security_manager import SecurityManager
+            SecurityManager.clear_supabase_session()
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def acquire_auth_lease():
+        """Take the machine-wide right to exchange the stored session."""
+        return SyncManager._auth_lease.acquire()
+
+    @staticmethod
+    def release_auth_lease():
+        SyncManager._auth_lease.release()
+
+    @staticmethod
+    @contextmanager
+    def _session_exchange_in_flight():
+        """Mark a token exchange as running, from the ask to the write.
+
+        Everything between is a window where the server has already retired the
+        old token and nothing has recorded the new one yet.
+        """
+        with SyncManager._session_restore_lock:
+            SyncManager._session_exchanges += 1
+            SyncManager._session_exchanges_idle.clear()
+        try:
+            yield
+        finally:
+            with SyncManager._session_restore_lock:
+                SyncManager._session_exchanges = max(
+                    0, SyncManager._session_exchanges - 1
+                )
+                if not SyncManager._session_exchanges:
+                    SyncManager._session_exchanges_idle.set()
+
+    @staticmethod
+    def await_session_writes(timeout_ms=None):
+        """Wait for every exchange in flight to finish being written down.
+
+        Workers are drained by the time this runs, but a token exchange is not
+        one of them. Closing between the server answering and the answer being
+        stored leaves the spent token in place, and the next launch is refused
+        for a session nobody ended.
+        """
+        timeout = (
+            SHUTDOWN_GRACE_MS if timeout_ms is None else timeout_ms
+        ) / 1000.0
+        if not SyncManager._session_exchanges_idle.wait(timeout):
+            # Say so. A token exchange that outlived the budget means the store
+            # may hold a token the server has already retired, and the next
+            # launch being refused is otherwise unexplained.
+            print(
+                "Supabase token exchange still in flight at shutdown; "
+                "the stored session may be a step behind."
+            )
+            return False
+        if not SyncManager._session_restore_lock.acquire(timeout=timeout):
+            print(
+                "Supabase session store still busy at shutdown; "
+                "the stored session may be a step behind."
+            )
+            return False
+        SyncManager._session_restore_lock.release()
+        return True
+
+    # How long before a token actually expires this treats it as expired. A
+    # request that leaves inside this window can still be in flight when it
+    # lapses, and a write that comes back 401 has to be retried after the fact,
+    # which is the retry worth not needing.
+    SESSION_EXPIRY_LEEWAY_SECONDS = 90
+
+    @staticmethod
+    def _seconds_until_expiry(access_token):
+        """How long this token has left, read without verifying it.
+
+        Only ever asked about time. Which of two sessions is current is a
+        question about lineage and this cannot answer it: every token is issued
+        with the same lifetime, so two rotations a moment apart look identical
+        here.
+        """
+        try:
+            payload = str(access_token).split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+            expires_at = int(claims.get("exp") or 0)
+        except Exception:
+            return None
+        if not expires_at:
+            return None
+        return expires_at - int(time.time())
+
+    @staticmethod
+    def _session_is_near_expiry(access_token):
+        remaining = SyncManager._seconds_until_expiry(access_token)
+        if remaining is None:
+            # Unreadable says nothing either way, and refreshing on every call
+            # because of it would be its own problem.
+            return False
+        return remaining <= SyncManager.SESSION_EXPIRY_LEEWAY_SECONDS
+
+    def _adopt_stored_session(self, client):
+        """Take the session somebody else already refreshed, instead of racing.
+
+        There is one credential and several clients. A worker holding a stale
+        token usually needs no rotation of its own -- another client has done it
+        and written the result down. Refreshing anyway would retire that result
+        and leave every other client stale in turn.
+        """
+        auth = getattr(client, "auth", None)
+        if auth is None:
+            return None
+        context = self._contract_context_key()
+        try:
+            from security_manager import SecurityManager
+            with SyncManager._session_restore_lock:
+                access, refresh = SecurityManager.get_supabase_session()
+            if not (access and refresh):
+                return None
+            if refresh == getattr(client, "_antigravity_refresh_token", ""):
+                return None
+            with SyncManager._session_exchange_in_flight():
+                response = auth.set_session(access, refresh)
+                session = self._session_from_response(response)
+                if context != self._contract_context_key():
+                    raise ContractDispatchPaused()
+                if not getattr(session, "refresh_token", ""):
+                    return None
+                self._persist_supabase_session(
+                    session,
+                    expected_previous=refresh,
+                    generation=getattr(
+                        client, "_antigravity_session_generation", None
+                    ),
+                )
+                with self._contract_lock:
+                    if context != self._contract_context_key():
+                        raise ContractDispatchPaused()
+                    self._remember_client_session(client, session)
+                return session
+        except ContractDispatchPaused:
+            raise
+        except Exception:
+            return None
+
+    @staticmethod
+    def _remember_client_session(client, session):
+        """Record which session this client now holds.
+
+        The refresh token is what a later write is allowed to replace; the
+        access token is what says how long this client has left. Both belong to
+        the client, because both questions are about it and not about whatever
+        the credential store happens to hold for somebody else.
+        """
+        try:
+            client._antigravity_refresh_token = getattr(
+                session, "refresh_token", ""
+            ) or ""
+            client._antigravity_access_token = getattr(
+                session, "access_token", ""
+            ) or ""
+        except Exception:
+            pass
+
+    @staticmethod
+    def _persist_supabase_session(
+        session, expected_previous=None, generation=None
+    ):
+        """Store a session only if it descends from what is stored right now.
+
+        Several clients write to one credential slot, each spending the saved
+        refresh token and being issued another. Ordering the writes by anything
+        the token says about time does not work: two rotations a moment apart
+        carry the same expiry, and the later write wins the tie regardless of
+        which session is live. What does hold is lineage -- a client may replace
+        exactly the token it was given, and nothing else.
+        """
         access_token = getattr(session, "access_token", "")
         refresh_token = getattr(session, "refresh_token", "")
         if not (access_token and refresh_token):
             return False
         try:
             from security_manager import SecurityManager
-            SecurityManager.save_supabase_session(access_token, refresh_token)
+            with SyncManager._session_restore_lock:
+                if (
+                    generation is not None
+                    and generation != SyncManager._session_generation
+                ):
+                    # This client belongs to a session that has since been
+                    # ended or replaced by an explicit sign-in.
+                    return False
+                _stored_access, stored_refresh = (
+                    SecurityManager.get_supabase_session()
+                )
+                if stored_refresh and stored_refresh == refresh_token:
+                    # The same rotation arriving twice. Already done.
+                    return True
+                if (
+                    expected_previous
+                    and stored_refresh
+                    and stored_refresh != expected_previous
+                ):
+                    # Somebody else rotated after this client read the store, so
+                    # what is held here is a spent token. Writing it back would
+                    # leave the next restore presenting a token the server has
+                    # already retired.
+                    return False
+                SecurityManager.save_supabase_session(access_token, refresh_token)
             return True
         except Exception as error:
             # Keep the valid in-memory session alive even if Windows Credential
@@ -1961,7 +4267,10 @@ class SyncManager(QObject):
         return getattr(response, "session", None) or response
 
     def _mark_auth_required(self, error=None):
-        self._auth_retry_blocked = True
+        with self._contract_lock:
+            self._auth_retry_blocked = True
+            self._auth_context_generation += 1
+            self._forget_contract_handshake()
         # 로그인 만료는 오프라인이 아니다. offline 로 표시하면 네트워크를
         # 확인하라는 안내가 나가고 정작 필요한 재로그인은 안내되지 않는다.
         self._last_failure_offline = False
@@ -1988,41 +4297,118 @@ class SyncManager(QObject):
             return True
         if self._auth_retry_blocked and not force_refresh:
             raise RuntimeError("AUTH_REQUIRED")
+        if getattr(client, '_antigravity_restore_pending', False):
+            raise RuntimeError('NETWORK_UNAVAILABLE')
 
         observed_generation = self._auth_refresh_generation
+        # A session reply must not revive an account/project that was replaced
+        # while the auth SDK was waiting. Worker clients may differ from the
+        # main client, so bind to the manager's state at entry, not client == self.
+        session_context = self._contract_context_key()
+
+        def check_context():
+            if session_context != self._contract_context_key():
+                raise ContractDispatchPaused()
+
         with self._session_refresh_lock:
             try:
+                check_context()
+                session = None
                 if force_refresh and observed_generation == self._auth_refresh_generation:
-                    response = auth.refresh_session()
+                    # Somebody else may already have done this. Taking their
+                    # result costs one local exchange; refreshing anyway costs
+                    # every other client its token.
+                    session = self._adopt_stored_session(client)
+                    if session is None:
+                        with SyncManager._session_exchange_in_flight():
+                            response = auth.refresh_session()
+                            session = self._session_from_response(response)
+                            check_context()
+                            if not getattr(session, "access_token", "") or not getattr(
+                                session, "refresh_token", ""
+                            ):
+                                raise RuntimeError("AUTH_REQUIRED")
+                            self._persist_supabase_session(
+                                session,
+                                expected_previous=getattr(
+                                    client, "_antigravity_refresh_token", ""
+                                ),
+                                generation=getattr(
+                                    client, "_antigravity_session_generation", None
+                                ),
+                            )
+                            with self._contract_lock:
+                                check_context()
+                                self._remember_client_session(client, session)
                     self._auth_refresh_generation += 1
                 else:
                     response = auth.get_session()
-                session = self._session_from_response(response)
+                    session = self._session_from_response(response)
+                    check_context()
+                    if not getattr(session, "access_token", "") or not getattr(
+                        session, "refresh_token", ""
+                    ):
+                        raise RuntimeError("AUTH_REQUIRED")
+                    self._persist_supabase_session(
+                        session,
+                        expected_previous=getattr(
+                            client, "_antigravity_refresh_token", ""
+                        ),
+                        generation=getattr(
+                            client, "_antigravity_session_generation", None
+                        ),
+                    )
+                    with self._contract_lock:
+                        check_context()
+                        self._remember_client_session(client, session)
                 if not getattr(session, "access_token", "") or not getattr(
                     session, "refresh_token", ""
                 ):
                     raise RuntimeError("AUTH_REQUIRED")
-                self._persist_supabase_session(session)
-                client._antigravity_authenticated = True
-                self._auth_retry_blocked = False
+                with self._contract_lock:
+                    check_context()
+                    client._antigravity_authenticated = True
+                    self._auth_retry_blocked = False
                 return True
             except Exception as error:
+                if (isinstance(error, ContractDispatchPaused)
+                        or session_context != self._contract_context_key()
+                        or self._transient_handshake_error(error)):
+                    raise
                 self._mark_auth_required(error)
                 raise RuntimeError("AUTH_REQUIRED") from error
 
     def _call_with_session(self, action, client=None):
         """Execute one server action with at most one token recovery retry."""
         client = client or self.supabase
+        # Renew before sending rather than after being refused. A refused write
+        # has already been attempted, and retrying it means reasoning about
+        # whether the first attempt landed.
+        #
+        # Asked of the client, not of the credential store. What the store holds
+        # may belong to another client that refreshed a moment ago, and reading
+        # it here would make every call depend on machine-wide state that this
+        # request has nothing to do with.
+        held_access = getattr(client, "_antigravity_access_token", "")
+        if held_access and self._session_is_near_expiry(held_access):
+            try:
+                self.ensure_session_valid(client, force_refresh=True)
+            except Exception:
+                # Renewing early is an optimization. If it cannot be done, the
+                # ordinary path below still gets its one recovery attempt.
+                pass
         self.ensure_session_valid(client)
         try:
             return action()
         except Exception as error:
+            self._forget_stale_contract_handshake(error)
             if self._stable_error_code(error) != "AUTH_EXPIRED":
                 raise
         self.ensure_session_valid(client, force_refresh=True)
         try:
             return action()
         except Exception as error:
+            self._forget_stale_contract_handshake(error)
             if self._stable_error_code(error) in {"AUTH_EXPIRED", "AUTH_REQUIRED"}:
                 self._mark_auth_required(error)
                 raise RuntimeError("AUTH_REQUIRED") from error
@@ -2052,8 +4438,13 @@ class SyncManager(QObject):
         if old_client is not None and old_client is not self.supabase:
             self._close_supabase_client(old_client)
         if self._cloud_config.is_ready and not self.supabase:
-            self.cloud_config_state = "invalid"
-            self.cloud_config_message = CLOUD_INVALID_MESSAGE
+            if SyncManager._client_refusal:
+                # The configuration is fine. Somebody else is using the login.
+                self.cloud_config_state = "credential_busy"
+                self.cloud_config_message = CLOUD_CREDENTIAL_BUSY_MESSAGE
+            else:
+                self.cloud_config_state = "invalid"
+                self.cloud_config_message = CLOUD_INVALID_MESSAGE
 
     @property
     def cloud_network_enabled(self):
@@ -2069,6 +4460,10 @@ class SyncManager(QObject):
             self.init_supabase()
         if not self.cloud_network_enabled:
             return False, self.cloud_config_message or CLOUD_INVALID_MESSAGE
+        with self._contract_lock:
+            self._auth_retry_blocked = True
+            self._auth_context_generation += 1
+            self._forget_contract_handshake()
         try:
             response = self.supabase.auth.sign_in_with_password({
                 "email": email.strip(),
@@ -2077,15 +4472,28 @@ class SyncManager(QObject):
             session = getattr(response, "session", None)
             if not session:
                 return False, "로그인 세션을 받지 못했습니다."
-            self._persist_supabase_session(session)
-            try:
-                self.supabase._antigravity_authenticated = True
-            except Exception:
-                pass
-            self._auth_retry_blocked = False
+            # A deliberate sign-in outranks whatever any older client is still
+            # holding, and retires those clients' claim on the store.
+            with SyncManager._session_restore_lock:
+                SyncManager._session_generation += 1
+                generation = SyncManager._session_generation
+                self._persist_supabase_session(session, generation=generation)
+            with self._contract_lock:
+                try:
+                    self.supabase._antigravity_session_generation = generation
+                    self._remember_client_session(self.supabase, session)
+                    self.supabase._antigravity_authenticated = True
+                    self.supabase._antigravity_restore_pending = False
+                except Exception:
+                    pass
+                self._forget_contract_handshake()
+                self._auth_retry_blocked = False
+                self._begin_structure_authority_selection('sign_in')
             self._last_sync_error = ""
             self._last_failure_offline = False
             self._publish_sync_state()
+            QTimer.singleShot(0, self.request_contract_handshake_async)
+            QTimer.singleShot(0, self.pull_remote_changes_async)
             QTimer.singleShot(0, self.retry_pending_syncs)
             user = getattr(response, "user", None)
             signed_in_email = getattr(user, "email", None) or email.strip()
@@ -2097,13 +4505,23 @@ class SyncManager(QObject):
             return False, classified.message
 
     def sign_out(self):
+        with self._contract_lock:
+            self._auth_retry_blocked = True
+            self._auth_context_generation += 1
+            if self.supabase:
+                self.supabase._antigravity_restore_pending = False
+            self._forget_contract_handshake()
         try:
             if self.supabase:
                 self.supabase.auth.sign_out()
         except Exception:
             pass
         from security_manager import SecurityManager
-        SecurityManager.clear_supabase_session()
+        with SyncManager._session_restore_lock:
+            # Retire every client built before this point, so a callback still
+            # in flight cannot write the session back after it was ended.
+            SyncManager._session_generation += 1
+            SecurityManager.clear_supabase_session()
         try:
             if self.supabase:
                 self.supabase._antigravity_authenticated = False
@@ -2111,6 +4529,7 @@ class SyncManager(QObject):
         except Exception:
             pass
         self._auth_retry_blocked = True
+        self._forget_contract_handshake()
         self._publish_sync_state()
 
     def authenticated_email(self):
@@ -2139,7 +4558,7 @@ class SyncManager(QObject):
         if "permission denied for function" in lowered:
             return "SERVER_RPC_PERMISSION_DENIED"
         for code in (
-            "AUTH_REQUIRED", "FORBIDDEN", "INVALID_ARGUMENT",
+            "AUTH_REQUIRED", "AUTH_EXPIRED", "FORBIDDEN", "INVALID_ARGUMENT",
             "PROJECT_TRASHED", "PROJECT_PURGED", "PROJECT_NOT_FOUND",
             "DOCUMENT_NOT_FOUND", "DOCUMENT_ALREADY_EXISTS",
             # PARENT_FOLDER_NOT_FOUND must stay ahead of FOLDER_NOT_FOUND:
@@ -2172,19 +4591,24 @@ class SyncManager(QObject):
         }).execute()
         return self._response_data(response)
 
-    def _fetch_v2_project_status(self, require_connection=False):
+    def _fetch_v2_project_status(self, require_connection=False, project_id=None):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             if require_connection:
                 raise RuntimeError("NETWORK_UNAVAILABLE")
             return self._current_project_server_state()
-        project_id = self._v2_context["project_id"]
+        with self._contract_lock:
+            project_id = str(project_id or self._v2_context["project_id"])
+            expected_context = self._contract_project_context()
+            expected_write_epoch = self._contract_write_epoch
+            client = self.supabase
+            absent_state = self._absent_project_state()
         try:
             response = self._call_with_session(
-                lambda: self.supabase.rpc(
+                lambda: client.rpc(
                     "get_project_status",
                     {"p_project_id": project_id},
                 ).execute(),
-                self.supabase,
+                client,
             )
             data = self._response_data(response) or {}
         except Exception as status_error:
@@ -2195,15 +4619,15 @@ class SyncManager(QObject):
                 # The RPC answered. It is deployed, so the compatibility
                 # path below has nothing left to discover: the server
                 # simply holds no row for this project.
-                data = {"state": self._absent_project_state()}
+                data = {"state": absent_state}
             else:
                 # Compatibility path for a server that has the project-trash
                 # migration but has not deployed get_project_status yet.
                 trashed_response = self._call_with_session(
-                    lambda: self.supabase.rpc(
+                    lambda: client.rpc(
                         "list_trashed_projects", {}
                     ).execute(),
-                    self.supabase,
+                    client,
                 )
                 trashed_rows = getattr(trashed_response, "data", None)
                 if not isinstance(trashed_rows, list):
@@ -2215,12 +4639,12 @@ class SyncManager(QObject):
                     data = {"state": "trashed"}
                 else:
                     active_response = self._call_with_session(
-                        lambda: self.supabase.table("projects")
+                        lambda: client.table("projects")
                         .select("project_id")
                         .eq("project_id", project_id)
                         .limit(1)
                         .execute(),
-                        self.supabase,
+                        client,
                     )
                     active_rows = getattr(active_response, "data", None)
                     if not isinstance(active_rows, list):
@@ -2228,14 +4652,15 @@ class SyncManager(QObject):
                     data = {
                         "state": (
                             "active" if active_rows
-                            else self._absent_project_state()
+                            else absent_state
                         )
                     }
         state = str(data.get("state") or "")
         if state not in {"active", "trashed", "purged"}:
             raise RuntimeError("INVALID_RESPONSE")
         self.mark_project_server_state(
-            self._v2_context["project_id"], state
+            project_id, state, expected_context=expected_context,
+            expected_write_epoch=expected_write_epoch,
         )
         return state
 
@@ -2273,6 +4698,15 @@ class SyncManager(QObject):
         )
         rows = getattr(response, "data", None) or []
         return rows[0] if rows else None
+
+    def _revision_conflict_read_first(self, operation, client=None):
+        """The sole upload-drain exception: read the rejected document only.
+
+        This is deliberately narrower than a project snapshot pull. It cannot
+        apply unrelated remote structure between queued local uploads; it only
+        supplies the revision/base needed by the existing three-way merge.
+        """
+        return self._fetch_remote_document(operation["document_id"], client)
 
     def set_remote_protected_paths_provider(self, provider):
         self._v2_protected_paths_provider = provider
@@ -2373,9 +4807,23 @@ class SyncManager(QObject):
         """The project a request is about: the one it froze, or the one open."""
         return str(project_id or (self._v2_context or {}).get("project_id") or "")
 
+    # Every column the pull reads except the manuscript itself. Content is the
+    # whole weight of a snapshot -- a thousand chapters is tens of megabytes --
+    # and a commit that changes it always advances revision, which is here. So
+    # this is enough to tell an unchanged project from a changed one without
+    # moving the manuscript at all.
+    _DOCUMENT_INDEX_COLUMNS = (
+        "document_id,relative_path,revision,is_deleted,deleted_at,"
+        "parent_folder_id,name,structure_revision,updated_at"
+    )
+    _DOCUMENT_FULL_COLUMNS = (
+        "document_id,relative_path,content,revision,is_deleted,deleted_at,"
+        "parent_folder_id,name,structure_revision,updated_at"
+    )
+
     def _fetch_v2_project_documents(
         self, require_connection=False, check_project_status=True,
-        project_id=None,
+        project_id=None, include_content=True, document_ids=None,
     ):
         if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
             if require_connection:
@@ -2383,22 +4831,35 @@ class SyncManager(QObject):
             return []
         if check_project_status:
             state = self._fetch_v2_project_status(
-                require_connection=require_connection
+                require_connection=require_connection, project_id=project_id
             )
             if state == "trashed":
                 raise RuntimeError("PROJECT_TRASHED")
             if state == "purged":
                 raise RuntimeError("PROJECT_PURGED")
-        response = self._call_with_session(
-            lambda: self.supabase.table("documents")
-            .select(
-                "document_id,relative_path,content,revision,is_deleted,deleted_at,"
-                "parent_folder_id,name,structure_revision,updated_at"
-            )
-            .eq("project_id", self._pull_project_id(project_id))
-            .execute(),
-            self.supabase,
+        columns = (
+            self._DOCUMENT_FULL_COLUMNS
+            if include_content
+            else self._DOCUMENT_INDEX_COLUMNS
         )
+        wanted_ids = (
+            [str(item) for item in document_ids if item]
+            if document_ids is not None else None
+        )
+        if wanted_ids is not None and not wanted_ids:
+            return []
+
+        def query():
+            request = (
+                self.supabase.table("documents")
+                .select(columns)
+                .eq("project_id", self._pull_project_id(project_id))
+            )
+            if wanted_ids is not None:
+                request = request.in_("document_id", wanted_ids)
+            return request.execute()
+
+        response = self._call_with_session(query, self.supabase)
         data = getattr(response, "data", None)
         if data is None:
             if require_connection:
@@ -2561,6 +5022,132 @@ class SyncManager(QObject):
         if not isinstance(tree_order, dict):
             return None
         return cls._normalized_tree_order(tree_order)
+
+    @staticmethod
+    def _is_ordered_subsequence(required, candidate):
+        """Whether every required child remains in its original order."""
+        cursor = iter(candidate)
+        return all(any(value == wanted for value in cursor) for wanted in required)
+
+    @classmethod
+    def _merge_additive_child_orders(cls, base, local, remote):
+        """Merge two insertion-only edits, preserving both ordering constraints.
+
+        Removing or reordering a base child is deliberately outside this helper.
+        Those operations can mean delete, move or rename and need explicit user
+        resolution when both peers touched the same parent.
+        """
+        if not (
+            cls._is_ordered_subsequence(base, local)
+            and cls._is_ordered_subsequence(base, remote)
+        ):
+            return None
+
+        nodes = []
+        for sequence in (remote, local):
+            for value in sequence:
+                if value not in nodes:
+                    nodes.append(value)
+        edges = {value: set() for value in nodes}
+        incoming = {value: 0 for value in nodes}
+        for sequence in (remote, local):
+            for before, after in zip(sequence, sequence[1:]):
+                if after in edges[before]:
+                    continue
+                edges[before].add(after)
+                incoming[after] += 1
+
+        preference = {value: index for index, value in enumerate(nodes)}
+        merged = []
+        ready = [value for value in nodes if incoming[value] == 0]
+        while ready:
+            ready.sort(key=preference.__getitem__)
+            value = ready.pop(0)
+            merged.append(value)
+            for after in edges[value]:
+                incoming[after] -= 1
+                if incoming[after] == 0:
+                    ready.append(after)
+        return merged if len(merged) == len(nodes) else None
+
+    @classmethod
+    def _merge_tree_order_conflict(cls, base_content, local_content, remote_content):
+        """Return a safe three-way tree-order merge, or ``None`` to fail closed.
+
+        A one-sided edit is safe. Concurrent edits to one parent are automatic
+        only when both are insertion-only relative to the shared base. This is
+        the rapid cross-device volume-creation case: neither peer's new volume
+        may disappear merely because the other peer committed first.
+        """
+        def parse(content):
+            try:
+                payload = json.loads(content or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return None
+            raw_order = payload.get("tree_order")
+            if not isinstance(raw_order, dict):
+                return None
+            try:
+                return cls._validated_remote_tree_order(raw_order)
+            except (FileExistsError, TypeError, ValueError):
+                return None
+
+        base_order = parse(base_content)
+        local_order = parse(local_content)
+        remote_order = parse(remote_content)
+        if base_order is None or local_order is None or remote_order is None:
+            return None
+
+        missing = object()
+        merged_order = {}
+        parent_paths = sorted(
+            set(base_order) | set(local_order) | set(remote_order),
+            key=cls._tree_path_comparison_key,
+        )
+        for parent_path in parent_paths:
+            base = base_order.get(parent_path, missing)
+            local = local_order.get(parent_path, missing)
+            remote = remote_order.get(parent_path, missing)
+            if local == remote:
+                chosen = local
+            elif local == base:
+                chosen = remote
+            elif remote == base:
+                chosen = local
+            else:
+                has_missing = any(
+                    value is missing for value in (base, local, remote)
+                )
+                if has_missing:
+                    # The base may lack a parent that both peers independently
+                    # introduced. A missing parent on only one changed side is
+                    # a concurrent removal/move, which is not additive.
+                    if base is not missing and (
+                        local is missing or remote is missing
+                    ):
+                        return None
+                    base_children = [] if base is missing else base
+                    local_children = [] if local is missing else local
+                    remote_children = [] if remote is missing else remote
+                else:
+                    base_children = base
+                    local_children = local
+                    remote_children = remote
+                chosen = cls._merge_additive_child_orders(
+                    base_children, local_children, remote_children
+                )
+                if chosen is None:
+                    return None
+            if chosen is not missing:
+                merged_order[parent_path] = chosen
+
+        try:
+            cls._validated_remote_tree_order(merged_order)
+        except (FileExistsError, TypeError, ValueError):
+            return None
+        return cls._tree_order_content(merged_order)
 
     @classmethod
     def _infer_outbound_empty_folder_rename(cls, base_content, content):
@@ -2760,7 +5347,300 @@ class SyncManager(QObject):
             rpc_name="commit_folder",
         )
 
-    def _commit_outbound_folder_lifecycle(self, operation, client):
+    @classmethod
+    def _tree_folder_keys_from_content(cls, content):
+        """Return (explicit, keys) without treating missing legacy evidence as empty."""
+        try:
+            payload = json.loads(content or "{}")
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return False, set()
+            tree_order = cls._validated_remote_tree_order(
+                payload.get("tree_order")
+            )
+            explicit = cls._validated_remote_tree_folder_paths(
+                payload.get("folder_paths"), tree_order
+            )
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return False, set()
+        if explicit is not None:
+            return True, set(explicit)
+        inferred = {
+            cls._tree_path_comparison_key(parent_path)
+            for parent_path in tree_order
+            if parent_path != "<root>"
+            and parent_path != "메인/휴지통"
+            and not parent_path.startswith("메인/휴지통/")
+        }
+        return False, inferred
+
+    def _unproven_legacy_folder_deletions(self, operation, intents):
+        """Find path removals an immutable LEGACY tree operation cannot prove."""
+        base_explicit, base_keys = self._tree_folder_keys_from_content(
+            operation.get("base_content")
+        )
+        if base_explicit:
+            return set()
+        _live_explicit, live_keys = self._tree_folder_keys_from_content(
+            operation.get("content")
+        )
+        fixed_keys = {
+            self._tree_path_comparison_key("메인"),
+            *(
+                self._tree_path_comparison_key(f"메인/{storage_name}")
+                for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+            ),
+        }
+        removed = set(base_keys) - set(live_keys) - fixed_keys
+        authorized = {
+            self._tree_path_comparison_key(intent.get("pre_delete_path"))
+            for intent in intents
+            if intent.get("pre_delete_path")
+        }
+        local_key = operation.get("local_key") or self._v2_context["local_key"]
+        for intent in self._v2_store.pending_folder_rename_intents(local_key):
+            if intent.get("old_path"):
+                authorized.add(self._tree_path_comparison_key(
+                    intent["old_path"]
+                ))
+        return removed - authorized
+
+    def _block_folder_delete_tree(self, operation, intents, error_code):
+        for intent in intents:
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "blocked", error=error_code
+            )
+        self._v2_store.mark_blocked(operation["operation_id"], error_code)
+        return {
+            "kind": "blocked",
+            "error": error_code,
+            "operation": operation,
+        }
+
+    def _commit_durable_folder_deletions(self, operation, client):
+        """Complete pinned child and folder tombstones before tree publication."""
+        intents = self._v2_store.folder_delete_intents_for_tree_operation(
+            operation["operation_id"]
+        )
+        unproven = self._unproven_legacy_folder_deletions(operation, intents)
+        if unproven:
+            return self._block_folder_delete_tree(
+                operation, intents, "FOLDER_DELETION_SCOPE_UNPROVEN"
+            )
+        if not intents:
+            return None
+
+        for intent in intents:
+            for dependency in intent.get("dependent_documents") or []:
+                tombstone_id = dependency.get("tombstone_operation_id")
+                tombstone = (
+                    self._v2_store.operation(tombstone_id)
+                    if tombstone_id else None
+                )
+                if tombstone is None:
+                    return self._block_folder_delete_tree(
+                        operation, intents,
+                        "FOLDER_DELETE_DOCUMENT_OPERATION_MISSING",
+                    )
+                if tombstone.get("status") in {"blocked", "conflict"}:
+                    return self._block_folder_delete_tree(
+                        operation, intents,
+                        "FOLDER_DELETE_DOCUMENT_BLOCKED",
+                    )
+                if tombstone.get("status") != "completed":
+                    self._v2_store.set_folder_delete_intent_status(
+                        intent["intent_id"], "documents_pending"
+                    )
+                    return {
+                        "kind": "retry",
+                        "error": "FOLDER_DELETE_DOCUMENTS_PENDING",
+                        "operation": operation,
+                    }
+
+        try:
+            folder_rows = self._fetch_v2_project_folders(
+                client, operation["project_id"]
+            )
+        except Exception as error:
+            code = self._stable_error_code(error) or str(error)
+            for intent in intents:
+                self._v2_store.set_folder_delete_intent_status(
+                    intent["intent_id"], "folder_pending", error=code
+                )
+            return {"kind": "retry", "error": code, "operation": operation}
+
+        rows_by_id = {}
+        for row in folder_rows:
+            folder_id = str(row.get("folder_id") or "")
+            if folder_id in rows_by_id:
+                return self._block_folder_delete_tree(
+                    operation, intents, "DUPLICATE_FOLDER_ID"
+                )
+            rows_by_id[folder_id] = row
+
+        for intent in intents:
+            if intent.get("status") in {"folder_committed", "tree_pending"}:
+                continue
+            folder_id = str(intent["folder_id"])
+            row = rows_by_id.get(folder_id)
+            base_revision = int(intent["base_revision"])
+            if row is None:
+                if base_revision == 0:
+                    self._v2_store.set_folder_delete_intent_status(
+                        intent["intent_id"], "folder_committed",
+                        folder_result_revision=0,
+                    )
+                    continue
+                return self._block_folder_delete_tree(
+                    operation, intents, "FOLDER_DELETE_TARGET_NOT_FOUND"
+                )
+            if (
+                str(row.get("parent_folder_id") or "")
+                != str(intent.get("parent_folder_id") or "")
+                or str(row.get("name") or "") != str(intent["name"])
+            ):
+                return self._block_folder_delete_tree(
+                    operation, intents, "FOLDER_DELETE_IDENTITY_CONFLICT"
+                )
+            row_revision = int(row.get("revision") or 0)
+            if row.get("is_deleted"):
+                if row_revision <= base_revision:
+                    return self._block_folder_delete_tree(
+                        operation, intents,
+                        "FOLDER_DELETE_REVISION_NOT_ADVANCED",
+                    )
+                self._v2_store.set_folder_delete_intent_status(
+                    intent["intent_id"], "folder_committed",
+                    folder_result_revision=row_revision,
+                )
+                continue
+            if row_revision != base_revision:
+                return self._block_folder_delete_tree(
+                    operation, intents, "FOLDER_DELETE_REVISION_CONFLICT"
+                )
+
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "folder_pending"
+            )
+            try:
+                response = client.rpc("commit_folder", {
+                    "p_folder_id": folder_id,
+                    "p_project_id": operation["project_id"],
+                    "p_operation_id": intent["folder_operation_id"],
+                    "p_device_id": self._v2_device_id,
+                    "p_base_revision": base_revision,
+                    "p_parent_folder_id": intent.get("parent_folder_id"),
+                    "p_name": intent["name"],
+                    "p_is_deleted": True,
+                }).execute()
+            except Exception as error:
+                code = self._stable_error_code(error) or str(error)
+                self._v2_store.set_folder_delete_intent_status(
+                    intent["intent_id"], "folder_pending", error=code
+                )
+                if code in PERMANENT_FOLDER_ERROR_CODES:
+                    return self._block_folder_delete_tree(
+                        operation, intents, code
+                    )
+                return {"kind": "retry", "error": code, "operation": operation}
+            result = self._response_data(response) or {}
+            if (
+                str(result.get("folder_id") or "") != folder_id
+                or not result.get("is_deleted")
+                or int(result.get("revision") or 0) <= base_revision
+            ):
+                return self._block_folder_delete_tree(
+                    operation, intents, "INVALID_FOLDER_DELETE_RESPONSE"
+                )
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "folder_committed",
+                folder_result_revision=int(result["revision"]),
+            )
+
+        for intent in intents:
+            self._v2_store.set_folder_delete_intent_status(
+                intent["intent_id"], "tree_pending"
+            )
+        return None
+
+    def _legacy_folder_scope_for_operation(self, operation):
+        """Return the folder paths this immutable tree snapshot may publish.
+
+        The identity file keeps advancing while an older tree-order operation
+        is in flight. Publishing every identity visible at dispatch time lets
+        a future folder row overtake the tree snapshot that actually names it.
+        A pull then observes two structural moments and correctly fails closed.
+
+        Older payloads without explicit ``folder_paths`` retain the historical
+        behavior. Current payloads carry enough evidence to scope both live
+        publication and tombstones to the operation's own before/after images.
+        """
+        if str(operation.get("relative_path") or "") != TREE_ORDER_DOCUMENT_PATH:
+            return None
+
+        def explicit_keys(content):
+            try:
+                payload = json.loads(content or "{}")
+                if not isinstance(payload, dict) or payload.get("version") != 1:
+                    return None
+                tree_order = self._validated_remote_tree_order(
+                    payload.get("tree_order")
+                )
+                return self._validated_remote_tree_folder_paths(
+                    payload.get("folder_paths"), tree_order
+                )
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+        live_keys = explicit_keys(operation.get("content"))
+        if live_keys is None:
+            return None
+        base_keys = explicit_keys(operation.get("base_content")) or set()
+        fixed_keys = {
+            self._tree_path_comparison_key("메인"),
+            *(
+                self._tree_path_comparison_key(f"메인/{storage_name}")
+                for storage_name in set(TREE_ROOT_STORAGE_NAMES.values())
+            ),
+        }
+        scope = {
+            "live_keys": set(live_keys) | fixed_keys,
+            "deleted_keys": set(base_keys) - set(live_keys),
+            "expected_ids": {},
+        }
+        local_key = operation.get("local_key") or self._v2_context["local_key"]
+        identity_by_path = {
+            self._tree_path_comparison_key(node.get("legacy_path")): node
+            for node in self._publishable_identity_folders()
+            if not node.get("wants_deleted")
+        }
+        for intent in self._v2_store.pending_folder_rename_intents(local_key):
+            old_key = self._tree_path_comparison_key(intent.get("old_path"))
+            new_key = self._tree_path_comparison_key(intent.get("new_path"))
+            folder_id = str(intent.get("folder_id") or "")
+            if not folder_id:
+                # Databases upgraded from 8006 have path-only intents. Their
+                # current destination identity is the only safe compatibility
+                # anchor; absence or ambiguity leaves the operation scoped by
+                # path but never authorizes a guessed rename.
+                destination = identity_by_path.get(new_key)
+                folder_id = str(destination.get("uuid") or "") if destination else ""
+            if not folder_id:
+                continue
+            if old_key in scope["live_keys"] and new_key not in scope["live_keys"]:
+                scope["expected_ids"][old_key] = folder_id
+            if new_key in scope["live_keys"]:
+                scope["expected_ids"][new_key] = folder_id
+        return scope
+
+    def _commit_outbound_folder_lifecycle(
+        self,
+        operation,
+        client,
+        *,
+        publish_live_only=False,
+        candidates=None,
+        snapshot_scope=None,
+    ):
         """Make the server's folder rows agree with identity before tree-order.
 
         Identity says where a folder is, so it also says what the server should
@@ -2779,10 +5659,34 @@ class SyncManager(QObject):
         empty = {"created": [], "restored": [], "deleted": [], "blocked": []}
         if not self.is_v2_enabled or self._v2_wpm is None:
             return empty
-        candidates = self._publishable_identity_folders()
+        candidates = list(
+            candidates
+            if candidates is not None
+            else self._publishable_identity_folders()
+        )
+        if snapshot_scope is not None:
+            live_keys = set(snapshot_scope.get("live_keys") or ())
+            expected_ids = dict(snapshot_scope.get("expected_ids") or {})
+            candidates = [
+                node for node in candidates
+                if node["wants_deleted"]
+                or (
+                    self._tree_path_comparison_key(node["legacy_path"])
+                    in live_keys
+                    and (
+                        not expected_ids.get(self._tree_path_comparison_key(
+                            node["legacy_path"]
+                        ))
+                        or str(node["uuid"]) == expected_ids[
+                            self._tree_path_comparison_key(node["legacy_path"])
+                        ]
+                    )
+                )
+            ]
         if not candidates:
             return empty
 
+        local_key = self._v2_context["local_key"]
         live_by_id = {}
         deleted_by_id = {}
         live_by_slot = {}
@@ -2801,19 +5705,58 @@ class SyncManager(QObject):
             )] = folder_id
 
         result = {key: list(value) for key, value in empty.items()}
+        live_paths_by_id = self._folder_rows_with_tree_paths(
+            live_by_id.values()
+        )
+        active_document_paths = {
+            self._safe_relative_path(path)
+            for path in self._v2_store.active_document_server_paths(local_key)
+        }
 
-        # 휴지통 으로 간 폴더부터, 깊은 것에서 얕은 것 순으로 내린다.
-        for node in sorted(
-            (node for node in candidates if node["wants_deleted"]),
-            key=lambda node: node["legacy_path"].count("/"),
-            reverse=True,
-        ):
+        # A chapter preflight is allowed to publish live parents only. Folder
+        # deletions must keep their old ordering behind document tombstones and
+        # final tree-order, so they stay in the ordinary lifecycle pass.
+        delete_candidates = (
+            [] if publish_live_only else
+            sorted(
+                (node for node in candidates if node["wants_deleted"]),
+                key=lambda node: node["legacy_path"].count("/"),
+                reverse=True,
+            )
+        )
+        for node in delete_candidates:
             folder_id = str(node["uuid"])
             row = live_by_id.get(folder_id)
             if row is None:
                 # Never published, so there is nothing to tombstone. This is
                 # also what keeps a first upload from trying to create a folder
                 # that is already deleted, which the server refuses outright.
+                continue
+            server_folder = live_paths_by_id.get(folder_id)
+            server_path = (
+                self._safe_relative_path(server_folder.get("local_path"))
+                if server_folder else ""
+            )
+            if snapshot_scope is not None:
+                deleted_keys = set(
+                    snapshot_scope.get("deleted_keys") or ()
+                )
+                if (
+                    not server_path
+                    or self._tree_path_comparison_key(server_path)
+                    not in deleted_keys
+                ):
+                    continue
+            if server_path and any(
+                path == server_path or path.startswith(server_path + "/")
+                for path in active_document_paths
+            ):
+                # An older tree-order operation can run after a later local
+                # delete has moved identity into trash.  Do not let that older
+                # operation overtake the descendant tombstones.  The tree
+                # snapshot recorded by the delete itself is already queued
+                # after those document operations and will finish the folder
+                # lifecycle once they are terminal.
                 continue
             still_live_child = any(
                 str(other.get("parent_folder_id") or "") == folder_id
@@ -2849,7 +5792,6 @@ class SyncManager(QObject):
             deleted_by_id[folder_id] = {**row, **committed, "is_deleted": True}
             result["deleted"].append(node["legacy_path"])
 
-        local_key = self._v2_context["local_key"]
         for node in (node for node in candidates if not node["wants_deleted"]):
             folder_id = str(node["uuid"])
             if folder_id in live_by_id:
@@ -2896,7 +5838,71 @@ class SyncManager(QObject):
                 node["legacy_path"]
             )
 
+        result["confirmed_live_paths"] = sorted(
+            node["legacy_path"]
+            for node in candidates
+            if not node["wants_deleted"]
+            and str(node["uuid"]) in live_by_id
+        )
         return result
+
+    @staticmethod
+    def _identified_document_parent_path(relative_path):
+        """Return the live parent path that must exist before a document."""
+        normalized = str(relative_path or "").replace("\\", "/").strip("/")
+        if not is_live_document_path(normalized):
+            return None
+        parent_path, separator, _name = normalized.rpartition("/")
+        return parent_path if separator else None
+
+    def _publish_live_parents_before_legacy_document(self, operation, client):
+        """Prove an identified live parent before sending its child document.
+
+        Creation and restore both write identity before their document work.
+        Identity is therefore the restart-safe source of the parent UUIDs.
+        Whenever that live folder set changes, publish every live folder first
+        and cache only what the server projection actually confirmed.  A
+        missing requested parent keeps the document in retry instead of
+        letting path-only commit_document overtake it.
+        """
+        parent_path = self._identified_document_parent_path(
+            operation.get("relative_path")
+        )
+        if parent_path is None:
+            return None
+        candidates = self._publishable_identity_folders()
+        if not candidates:
+            # Pre-identity legacy projects retain their historical behavior.
+            return None
+        candidate_paths = {
+            item["legacy_path"] for item in candidates
+            if not item["wants_deleted"]
+        }
+        if parent_path not in candidate_paths:
+            return None
+        fingerprint = tuple(sorted(
+            (
+                str(item["uuid"]),
+                str(item.get("parent_uuid") or ""),
+                item["legacy_path"],
+                bool(item["wants_deleted"]),
+            )
+            for item in candidates
+        ))
+        if fingerprint != self._legacy_live_folder_fingerprint:
+            result = self._commit_outbound_folder_lifecycle(
+                operation,
+                client,
+                publish_live_only=True,
+                candidates=candidates,
+            )
+            self._legacy_live_folder_fingerprint = fingerprint
+            self._legacy_confirmed_live_folder_paths = frozenset(
+                result["confirmed_live_paths"]
+            )
+        if parent_path not in self._legacy_confirmed_live_folder_paths:
+            raise RuntimeError("PARENT_FOLDER_NOT_PUBLISHED")
+        return parent_path
 
     @staticmethod
     def _folder_slot(parent_folder_id, name):
@@ -2914,6 +5920,16 @@ class SyncManager(QObject):
         if self._v2_wpm is None:
             return None
         local_key = operation.get("local_key") or self._v2_context["local_key"]
+        identity_by_path = {}
+        for node in self._publishable_identity_folders():
+            if node.get("wants_deleted"):
+                continue
+            key = self._tree_path_comparison_key(node.get("legacy_path"))
+            if key in identity_by_path:
+                # Identity itself is ambiguous. No path-based rename may run.
+                identity_by_path[key] = None
+            else:
+                identity_by_path[key] = node
         rename_intent = None
         if intent is not None:
             rename_intent = self._v2_store.pending_folder_rename_intent(
@@ -2938,14 +5954,32 @@ class SyncManager(QObject):
                     new_parent, new_name = os.path.split(new_path)
                     sibling_key = "<root>" if old_parent == "메인" else old_parent
                     siblings = tree_order.get(sibling_key)
+                    old_identity = identity_by_path.get(
+                        self._tree_path_comparison_key(old_path)
+                    )
+                    new_identity = identity_by_path.get(
+                        self._tree_path_comparison_key(new_path)
+                    )
+                    old_name_was_reused = bool(
+                        old_identity
+                        and new_identity
+                        and str(old_identity.get("uuid"))
+                        != str(new_identity.get("uuid"))
+                    )
                     if (
                         old_parent == new_parent
                         and old_name
                         and new_name
                         and isinstance(siblings, list)
-                        and siblings.count(old_name) == 0
+                        and (
+                            siblings.count(old_name) == 0
+                            or old_name_was_reused
+                        )
                         and siblings.count(new_name) == 1
-                        and old_path not in tree_order
+                        and (
+                            old_path not in tree_order
+                            or old_name_was_reused
+                        )
                     ):
                         candidates.append((candidate, {
                             "old_relative_path": old_path,
@@ -2981,12 +6015,44 @@ class SyncManager(QObject):
         old_matches = self._folder_rows_by_tree_path(
             rows, intent["old_relative_path"]
         )
+        new_matches = self._folder_rows_by_tree_path(
+            rows, intent["new_relative_path"]
+        )
+        desired_identity = identity_by_path.get(
+            self._tree_path_comparison_key(intent["new_relative_path"])
+        )
+        desired_folder_id = (
+            str(rename_intent.get("folder_id") or "")
+            or (str(desired_identity.get("uuid")) if desired_identity else "")
+        )
+        if (
+            desired_folder_id
+            and len(new_matches) == 1
+            and str(new_matches[0].get("folder_id")) == desired_folder_id
+        ):
+            # The lifecycle pass may already have materialized the renamed
+            # identity at its destination. An old name can meanwhile belong to
+            # a newly-created UUID; its presence must not make us rename that
+            # replacement folder onto the occupied destination.
+            self._v2_store.complete_folder_rename_intent(
+                rename_intent["intent_id"]
+            )
+            return {"status": "already_applied", **new_matches[0]}
+
+        if desired_folder_id:
+            anchored_old_matches = [
+                row for row in old_matches
+                if str(row.get("folder_id")) == desired_folder_id
+            ]
+            if old_matches and len(anchored_old_matches) != 1:
+                self._report_folder_block(
+                    operation, desired_folder_id, "FOLDER_IDENTITY_MISMATCH"
+                )
+                return None
+            old_matches = anchored_old_matches
         if len(old_matches) != 1:
             # A prior replay may already have changed the projection. In that
             # case the desired identity is present and no second revision is needed.
-            new_matches = self._folder_rows_by_tree_path(
-                rows, intent["new_relative_path"]
-            )
             if len(old_matches) == 0 and len(new_matches) == 1:
                 self._v2_store.complete_folder_rename_intent(
                     rename_intent["intent_id"]
@@ -3186,6 +6252,36 @@ class SyncManager(QObject):
             raise FileExistsError("REMOTE_PATH_CONFLICT") from error
         return True
 
+    @staticmethod
+    def _tree_entry_fingerprint(kind, relative_path):
+        """Describe one unresolved tree-order entry without keeping its name.
+
+        Diagnostics deliberately never retain manuscript paths, so the log
+        gets the shape of the entry and a digest of it. The digest is a plain
+        SHA-256 of the same string the tree-order holds, so the machine that
+        recorded it can recompute the digests of its own tree-order and name
+        the entry locally. The log on its own reveals nothing.
+        """
+        path = str(relative_path or "")
+        digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
+        depth = path.count("/") + 1 if path else 0
+        suffix = "txt" if path.casefold().endswith(".txt") else "nam"
+        return f"{kind}:d{depth}:{suffix}:{digest}"
+
+    @classmethod
+    def _unresolved_tree_entry_error(cls, kind, relative_path):
+        """Refuse a tree-order entry while carrying which one it was.
+
+        The plan is built well below the manager's diagnostics, so the entry
+        travels on the exception and is recorded where the deferral already
+        is.
+        """
+        error = RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+        error.tree_entry_fingerprint = cls._tree_entry_fingerprint(
+            kind, relative_path
+        )
+        return error
+
     @classmethod
     def _build_remote_tree_folder_plan(
         cls,
@@ -3223,6 +6319,7 @@ class SyncManager(QObject):
             cls._tree_path_comparison_key(f"메인/{storage_name}")
             for storage_name in TREE_ROOT_STORAGE_NAMES.values()
         }
+        fixed_root_path_keys.add(cls._tree_path_comparison_key("메인"))
         candidate_paths = {}
         document_paths = {}
 
@@ -3291,7 +6388,7 @@ class SyncManager(QObject):
                 # authoritative. An unclassified leaf is normally a document
                 # whose commit has not reached the projection yet; never turn
                 # it into a real directory, regardless of its extension.
-                raise RuntimeError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+                raise cls._unresolved_tree_entry_error("leaf", child_path)
 
         if set(candidate_paths).intersection(live_path_keys):
             raise FileExistsError("REMOTE_PATH_CONFLICT")
@@ -3336,6 +6433,21 @@ class SyncManager(QObject):
             exists = existing_name is not None or os.path.lexists(full_path)
             if exists:
                 cls._safe_existing_tree_directory(root, relative_path)
+            elif (
+                has_remote_folder_projection
+                and cls._tree_path_comparison_key(relative_path)
+                not in folder_path_keys
+                and cls._tree_path_comparison_key(relative_path)
+                not in fixed_root_path_keys
+            ):
+                # A tree-order commit and the stable folder projection are
+                # separate server writes. The order can therefore name an
+                # empty folder before commit_folder has restored or created
+                # its UUID row. Materializing that name here would mint a new
+                # local UUID and turn one restored folder into two identities.
+                # Existing legacy directories are retained, but a missing
+                # directory needs the live folder row as its creation proof.
+                raise cls._unresolved_tree_entry_error("folder", relative_path)
             plan.append({
                 "relative_path": relative_path,
                 "full_path": full_path,
@@ -3826,6 +6938,152 @@ class SyncManager(QObject):
                     pending.add(child_path)
         return merged
 
+    def _preserve_active_local_creates_in_remote_order(
+        self, local_order, remote_order, remote_live_document_paths
+    ):
+        """Keep proven queued creates while a peer snapshot is caught up.
+
+        A legacy tree-order snapshot describes only server-visible children.
+        During a long add-volume upload it can therefore omit chapters that
+        already exist locally and have durable create operations.  Replacing a
+        present parent list with that partial server list makes identity audit
+        fail and closes both pull and the remaining uploads.
+
+        Two kinds of proven children are added: live server documents omitted
+        by a lagging legacy tree-order write, and outstanding local creates
+        absent from the server document set. Existing server order is never
+        rearranged, and a same-path server child that is not the local
+        operation's document is left for the normal UUID/path conflict guards
+        rather than guessed through here.
+        """
+        if not isinstance(local_order, dict):
+            return copy.deepcopy(remote_order)
+        try:
+            validated_local = self._validated_remote_tree_order(local_order)
+        except (TypeError, ValueError, OSError, FileExistsError):
+            return copy.deepcopy(remote_order)
+        merged = copy.deepcopy(remote_order)
+        remote_live_keys = {
+            self._tree_path_comparison_key(path)
+            for path in (remote_live_document_paths or set())
+            if path
+        }
+        root = os.path.abspath(self._v2_wpm.writing_root_path)
+        retained_by_parent = {}
+
+        # Legacy document commits and the hidden tree-order document are not
+        # atomic. A peer can therefore publish tree rev N while document
+        # commits that it had not yet observed land immediately afterward.
+        # The document rows are positive liveness evidence; retain their known
+        # local positions when that tree revision omits them.
+        for parent, local_children in validated_local.items():
+            if parent not in merged:
+                continue
+            remote_children = list(merged.get(parent) or [])
+            remote_keys = {
+                self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                )
+                for child in remote_children
+            }
+            for child in local_children:
+                path = self._tree_order_child_path(parent, child)
+                path_key = self._tree_path_comparison_key(path)
+                if path_key not in remote_live_keys or path_key in remote_keys:
+                    continue
+                try:
+                    full_path = os.path.abspath(os.path.join(root, path))
+                    if (
+                        os.path.commonpath([root, full_path]) != root
+                        or not os.path.isfile(full_path)
+                        or self._is_reparse_path(full_path)
+                    ):
+                        continue
+                except (OSError, ValueError):
+                    continue
+                retained_by_parent.setdefault(parent, {})[path_key] = child
+
+        for operation in self._v2_store.active_local_document_creates(
+            self._v2_context["local_key"]
+        ):
+            try:
+                path = self._safe_relative_path(operation.get("local_path"))
+            except ValueError:
+                continue
+            if not is_live_document_path(path):
+                continue
+            path_key = self._tree_path_comparison_key(path)
+            if path_key in remote_live_keys:
+                continue
+            parent, separator, name = path.rpartition("/")
+            if not separator or parent not in merged:
+                # A parent omitted wholesale is handled by the existing-order
+                # compatibility merge below this helper.
+                continue
+            try:
+                full_path = os.path.abspath(os.path.join(root, path))
+                if (
+                    os.path.commonpath([root, full_path]) != root
+                    or not os.path.isfile(full_path)
+                    or self._is_reparse_path(full_path)
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+            local_children = validated_local.get(parent)
+            if not isinstance(local_children, list):
+                continue
+            matching = [
+                child
+                for child in local_children
+                if self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                ) == path_key
+            ]
+            if len(matching) != 1:
+                continue
+            retained_by_parent.setdefault(parent, {})[path_key] = matching[0]
+
+        for parent, retained_names in retained_by_parent.items():
+            remote_children = list(merged.get(parent) or [])
+            remote_keys = {
+                self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                )
+                for child in remote_children
+            }
+            if remote_keys.intersection(retained_names):
+                raise SyncContractError("PATH_CONFLICT")
+            local_children = validated_local[parent]
+            candidate_keys = remote_keys.union(retained_names)
+            local_candidate = [
+                child
+                for child in local_children
+                if self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                ) in candidate_keys
+            ]
+            local_candidate_keys = {
+                self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                )
+                for child in local_candidate
+            }
+            base = [
+                child
+                for child in remote_children
+                if self._tree_path_comparison_key(
+                    self._tree_order_child_path(parent, child)
+                ) in local_candidate_keys
+            ]
+            combined = self._merge_additive_child_orders(
+                base, local_candidate, remote_children
+            )
+            if combined is None:
+                raise SyncContractError("TREE_ORDER_CONFLICT")
+            merged[parent] = combined
+        return merged
+
     def _apply_remote_tree_order_document(
         self,
         document_id,
@@ -3938,6 +7196,9 @@ class SyncManager(QObject):
                 )
             except (TypeError, ValueError, OSError, FileExistsError):
                 effective_order = remote_order
+        effective_order = self._preserve_active_local_creates_in_remote_order(
+            local_order, effective_order, remote_live_document_paths
+        )
         effective_order = self._merge_existing_orders_omitted_by_remote(
             local_order, effective_order
         )
@@ -4235,6 +7496,7 @@ class SyncManager(QObject):
         folder_versions,
         remote_documents,
         protected_paths,
+        authoritative_folder_paths=None,
     ):
         """Apply exact folder_id renames before any child document is moved.
 
@@ -4255,9 +7517,13 @@ class SyncManager(QObject):
                 continue
             if is_live_document_path(path):
                 live_document_paths.add(path)
-        remote_folders = self._remote_tree_folder_paths(
-            remote_documents,
-            live_document_paths,
+        remote_folders = (
+            set(authoritative_folder_paths)
+            if authoritative_folder_paths is not None
+            else self._remote_tree_folder_paths(
+                remote_documents,
+                live_document_paths,
+            )
         )
         if remote_folders is None:
             return {"blocked": True, "changes": []}
@@ -4657,6 +7923,7 @@ class SyncManager(QObject):
         remote_documents,
         remote_live_document_paths,
         protected_paths,
+        authoritative_folder_paths=None,
     ):
         """Move a complete clean folder once before applying its document rows.
 
@@ -4669,8 +7936,12 @@ class SyncManager(QObject):
         from project_creation_v1 import CreationError
         from project_identity_v1 import IdentityError
 
-        remote_folders = self._remote_tree_folder_paths(
-            remote_documents, remote_live_document_paths
+        remote_folders = (
+            set(authoritative_folder_paths)
+            if authoritative_folder_paths is not None
+            else self._remote_tree_folder_paths(
+                remote_documents, remote_live_document_paths
+            )
         )
         if remote_folders is None:
             return []
@@ -4817,20 +8088,98 @@ class SyncManager(QObject):
     def _apply_contract_tree_order_snapshots(self, snapshots):
         if not snapshots:
             return None
-        remote_order = self._contract_tree_order_from_snapshots(snapshots)
-        local_order = getattr(self._v2_wpm, "project_settings", {}).get(
-            "tree_order", {}
-        )
-        merged_order = copy.deepcopy(remote_order)
-        if isinstance(local_order, dict):
-            merged_order.update({
-                key: copy.deepcopy(value)
-                for key, value in local_order.items()
-                if key == "메인/휴지통" or key.startswith("메인/휴지통/")
-            })
-        if local_order == merged_order:
-            return None
-        self._save_remote_tree_order_settings(merged_order)
+        with self._structure_mutation_gate:
+            remote_order = self._contract_tree_order_from_snapshots(snapshots)
+            local_order = getattr(self._v2_wpm, "project_settings", {}).get(
+                "tree_order", {}
+            )
+            merged_order = copy.deepcopy(remote_order)
+            if isinstance(local_order, dict):
+                merged_order.update({
+                    key: copy.deepcopy(value)
+                    for key, value in local_order.items()
+                    if key == "메인/휴지통" or key.startswith("메인/휴지통/")
+                })
+
+            local_key = self._v2_context["local_key"]
+            folder_rows = [
+                item for item in self._v2_store.list_folders(local_key)
+                if not item.get("is_deleted")
+            ]
+            remote_folder_paths = {
+                item["local_path"] for item in folder_rows
+            }
+            remote_folder_ids = {
+                self._tree_path_comparison_key(item["local_path"]): item["folder_id"]
+                for item in folder_rows
+            }
+            remote_live_document_paths = {
+                item["local_path"]
+                for item in self._v2_store.list_documents(local_key)
+                if not item.get("is_deleted")
+                and is_live_document_path(item.get("local_path"))
+            }
+            folder_plan = self._build_remote_tree_folder_plan(
+                self._v2_wpm.writing_root_path,
+                remote_order,
+                remote_live_document_paths,
+                remote_folder_paths=remote_folder_paths,
+                has_remote_folder_projection=True,
+            )
+            if local_order == merged_order and all(
+                item["exists"] for item in folder_plan
+            ):
+                return None
+
+            had_tree_order = "tree_order" in self._v2_wpm.project_settings
+            previous_tree_order = copy.deepcopy(local_order)
+            adopted_nodes = []
+            created_paths = []
+            settings_save_attempted = False
+            try:
+                adopted_nodes = self._adopt_remote_tree_folders(
+                    folder_plan, [], remote_folder_ids
+                )
+                adopted_paths = {
+                    node["legacy_path"] for node in adopted_nodes
+                }
+                created_paths.extend(
+                    item["full_path"]
+                    for item in folder_plan
+                    if not item["exists"]
+                    and item["relative_path"] in adopted_paths
+                )
+                for item in folder_plan:
+                    if item["exists"]:
+                        continue
+                    try:
+                        os.mkdir(item["full_path"])
+                        created_paths.append(item["full_path"])
+                    except FileExistsError:
+                        if not self._safe_existing_tree_directory(
+                            self._v2_wpm.writing_root_path,
+                            item["relative_path"],
+                        ):
+                            raise
+                settings_save_attempted = True
+                self._save_remote_tree_order_settings(merged_order)
+            except Exception:
+                if had_tree_order:
+                    self._v2_wpm.project_settings["tree_order"] = previous_tree_order
+                else:
+                    self._v2_wpm.project_settings.pop("tree_order", None)
+                if settings_save_attempted:
+                    try:
+                        self._v2_wpm.save_settings()
+                    except Exception:
+                        pass
+                self._release_adopted_identity(
+                    adopted_nodes,
+                    lambda: self._rollback_remote_tree_folders(
+                        self._v2_wpm.writing_root_path, created_paths
+                    ),
+                )
+                raise
         return {
             "kind": "tree_order",
             "revision": max(int(item.get("revision") or 0) for item in snapshots),
@@ -4844,6 +8193,8 @@ class SyncManager(QObject):
         folder_rows=None,
         folder_versions=None,
         tree_order_rows=None,
+        structure_authority=None,
+        authoritative_folder_paths=None,
     ):
         if (
             not self.is_v2_enabled
@@ -4878,7 +8229,8 @@ class SyncManager(QObject):
         changes = []
         root = os.path.abspath(self._v2_wpm.writing_root_path)
         defer_contract_tree_order = bool(
-            tree_order_rows is not None
+            structure_authority != STRUCTURE_AUTHORITY_LEGACY
+            and tree_order_rows is not None
             and self._v2_store.has_active_structure_kind(
                 self._v2_context["local_key"], "tree_order"
             )
@@ -4900,6 +8252,7 @@ class SyncManager(QObject):
                     folder_versions,
                     remote_documents,
                     protected,
+                    authoritative_folder_paths=authoritative_folder_paths,
                 )
                 if (
                     not identity_result.get("blocked")
@@ -4940,6 +8293,15 @@ class SyncManager(QObject):
             for folder_id, item in resolved_folder_rows.items()
         }
 
+        # A live folder row is the stable proof that a tombstoned UUID was
+        # restored. Move that exact identity out of trash before documents or
+        # tree-order can materialize its destination. Doing this later makes
+        # the tree-created empty directory look like an occupied foreign slot,
+        # leaving the original in trash and a replacement UUID in the binder.
+        changes.extend(
+            self._apply_remote_folder_restores(folder_rows, protected, root)
+        )
+
         remote_live_document_paths = set()
         for remote in remote_documents or []:
             if bool(remote.get("is_deleted")):
@@ -4955,6 +8317,7 @@ class SyncManager(QObject):
             remote_documents,
             remote_live_document_paths,
             protected,
+            authoritative_folder_paths=authoritative_folder_paths,
         )
 
         def full_path(relative_path):
@@ -4998,11 +8361,22 @@ class SyncManager(QObject):
                 is_deleted = bool(remote.get("is_deleted"))
                 deleted_at = remote.get("deleted_at") or remote.get("updated_at")
                 if remote_path == TREE_ORDER_DOCUMENT_PATH:
+                    if structure_authority == STRUCTURE_AUTHORITY_CONTRACT:
+                        # Contract ID rows are the one chosen source. The stale
+                        # legacy document is retained on the server for old
+                        # clients but is neither applied nor used as evidence.
+                        continue
                     if defer_tree_order:
                         # A tree snapshot may lead one folder row during a rapid
                         # multi-rename batch. Never materialize that unconfirmed
                         # path, but do not withhold unrelated confirmed changes.
                         continue
+                    # A pull is the one place holding the server's order, so it
+                    # is where a conflict queued by an older build can finally
+                    # be retired.
+                    self._retire_stuck_tree_order_conflict(
+                        document_id, content, revision
+                    )
                     change = self._apply_remote_tree_order_document(
                         document_id,
                         content,
@@ -5014,6 +8388,10 @@ class SyncManager(QObject):
                         folder_rows is not None,
                         remote_folder_ids=remote_folder_ids,
                     )
+                    # Reached only when the plan classified every entry, which
+                    # includes the snapshot that changes nothing. The watch has
+                    # to end there too, or a resolved stall keeps warning.
+                    self._clear_tree_order_stall()
                     if change:
                         changes.append(change)
                         self._diagnostics.record(
@@ -5188,6 +8566,19 @@ class SyncManager(QObject):
                 if remote_path in protected or (old_path and old_path in protected):
                     if strict:
                         raise RuntimeError("REMOTE_DOCUMENT_PATH_IS_PROTECTED")
+                    continue
+
+                duplicate_recovery = self._repair_proven_duplicate_tombstone(
+                    document=document,
+                    document_id=document_id,
+                    old_path=old_path,
+                    remote_path=server_relative_path,
+                    content=content,
+                    revision=revision,
+                    deleted_at=deleted_at,
+                ) if is_deleted else None
+                if duplicate_recovery is not None:
+                    changes.append(duplicate_recovery)
                     continue
 
                 local_path = old_path or remote_path
@@ -5417,12 +8808,7 @@ class SyncManager(QObject):
                 if strict:
                     raise
                 if remote_path == TREE_ORDER_DOCUMENT_PATH:
-                    code = self._stable_error_code(error) or type(error).__name__
-                    self._diagnostics.record(
-                        "sync_tree_deferred",
-                        state=f"revision={revision};reason={code}",
-                        pending_count=self.pending_retry_count,
-                    )
+                    self._record_tree_deferral(f"revision={revision}", error)
                 if self._v2_identity_apply_failed or isinstance(
                     error, (CreationError, IdentityError)
                 ):
@@ -5432,7 +8818,11 @@ class SyncManager(QObject):
                     # stored has to say so instead of reporting nothing.
                     self._block_pull_with_conflict(error)
                 print(f"Failed to apply remote v2 document: {error}")
-        if tree_order_rows is not None and not defer_contract_tree_order:
+        if (
+            structure_authority != STRUCTURE_AUTHORITY_LEGACY
+            and tree_order_rows is not None
+            and not defer_contract_tree_order
+        ):
             try:
                 contract_tree_change = self._apply_contract_tree_order_snapshots(
                     tree_order_rows
@@ -5442,12 +8832,7 @@ class SyncManager(QObject):
             except Exception as error:
                 if strict:
                     raise
-                code = self._stable_error_code(error) or type(error).__name__
-                self._diagnostics.record(
-                    "sync_tree_deferred",
-                    state=f"contract;reason={code}",
-                    pending_count=self.pending_retry_count,
-                )
+                self._record_tree_deferral("contract", error)
         # Last, because the documents inside a folder deleted elsewhere have
         # just been tombstoned into 휴지통 on their own.
         changes.extend(
@@ -5633,6 +9018,33 @@ class SyncManager(QObject):
         by_uuid = {node["uuid"]: node for node in nodes}
 
         local_key = self._v2_context["local_key"]
+        pending_renames = self._v2_store.pending_folder_rename_intents(local_key)
+        rename_aliases = [
+            (item["new_path"], item["old_path"])
+            for item in pending_renames
+            if item.get("old_path") and item.get("new_path")
+        ]
+
+        def path_before_pending_renames(path):
+            """Rewind an identity path through durable local rename intents.
+
+            The server projection correctly keeps the old path until its
+            folder commit lands, while identity correctly follows the local
+            filesystem immediately.  That temporary split is not a UUID
+            divergence when an append-only pending intent proves every rename.
+            Chained renames are rewound newest first and bounded by the number
+            of durable intents, so malformed cycles cannot loop.
+            """
+            previous = str(path or "")
+            for _unused in rename_aliases:
+                current = previous
+                for alias in reversed(rename_aliases):
+                    current = self._path_before_local_change(current, [alias])
+                if current == previous:
+                    break
+                previous = current
+            return previous
+
         rows = [
             (str(row.get("folder_id")), row)
             for row in self._v2_store.list_folders(local_key)
@@ -5657,6 +9069,12 @@ class SyncManager(QObject):
                 continue
             at_uuid = by_uuid.get(entity_id)
             if at_uuid is not None and at_uuid["legacy_path"] != local_path:
+                if (
+                    at_path is None
+                    and path_before_pending_renames(at_uuid["legacy_path"])
+                    == local_path
+                ):
+                    continue
                 divergences.append(local_path)
         return sorted(set(divergences))
 
@@ -5799,6 +9217,173 @@ class SyncManager(QObject):
             return None
         legacy_path = node["legacy_path"]
         return legacy_path if is_live_document_path(legacy_path) else None
+
+    def _duplicate_tombstone_recovery_block(self, document_id, error_code):
+        error = RuntimeError(error_code)
+        self._record_identity_diagnostic(
+            "duplicate_tombstone_recovery_blocked",
+            entity_id=document_id,
+            error_code=error_code,
+        )
+        self._block_pull_with_conflict(error)
+        raise error
+
+    def _repair_proven_duplicate_tombstone(
+        self,
+        *,
+        document,
+        document_id,
+        old_path,
+        remote_path,
+        content,
+        revision,
+        deleted_at,
+    ):
+        """Converge only the exact live/trash duplicate left by a failed pull.
+
+        Equality of bytes alone is not authority. The synced tombstone row,
+        remote revision, identity UUID, original server path, and trash index
+        must all name the same document before the redundant live copy is
+        removed. Any contradictory proof leaves every byte untouched.
+        """
+        if not (
+            document
+            and document.get("is_deleted")
+            and old_path
+            and is_live_document_path(old_path)
+            and int(document.get("revision") or 0) == int(revision)
+            and self._safe_relative_path(document.get("server_path"))
+            == self._safe_relative_path(remote_path)
+        ):
+            return None
+
+        matches = []
+        for item in self._v2_wpm.list_trash_items():
+            try:
+                trash_path = self._safe_relative_path(item.get("trash_path"))
+                original_path = self._safe_relative_path(
+                    item.get("original_path")
+                )
+            except ValueError:
+                continue
+            if (
+                str(item.get("document_id") or "") == str(document_id)
+                and original_path == remote_path
+                and trash_path.startswith("메인/휴지통/")
+            ):
+                matches.append(trash_path)
+        if not matches:
+            return None
+        if len(set(matches)) != 1:
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_METADATA_AMBIGUOUS"
+            )
+        trash_path = matches[0]
+        root = os.path.abspath(self._v2_wpm.writing_root_path)
+        live_full = os.path.abspath(os.path.join(
+            root, old_path.replace("/", os.sep)
+        ))
+        trash_full = os.path.abspath(os.path.join(
+            root, trash_path.replace("/", os.sep)
+        ))
+        try:
+            if (
+                os.path.commonpath([root, live_full]) != root
+                or os.path.commonpath([root, trash_full]) != root
+                or not os.path.isfile(trash_full)
+                or self._is_reparse_path(trash_full)
+            ):
+                raise OSError("unsafe duplicate tombstone path")
+        except (OSError, ValueError):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_PATH_UNSAFE"
+            )
+
+        remote_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        live_content = self._v2_wpm.read_text_file(old_path)
+        trash_content = self._v2_wpm.read_text_file(trash_path)
+        if (
+            str(document.get("base_hash") or "") != remote_hash
+            or trash_content is None
+            or hashlib.sha256(trash_content.encode("utf-8")).hexdigest()
+            != remote_hash
+        ):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_CONTENT_MISMATCH"
+            )
+
+        project_root = self._identity_project_root()
+        identity_node = (
+            self._identity_node_by_uuid(project_root, document_id)
+            if project_root else None
+        )
+        if identity_node is None or identity_node.get("kind") != "document":
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_IDENTITY_MISSING"
+            )
+        identity_path = self._safe_relative_path(
+            identity_node.get("legacy_path")
+        )
+        from project_creation_v1 import node_for_path
+
+        target_node = node_for_path(project_root, trash_path) if project_root else None
+        if identity_path == old_path:
+            if (
+                live_content is None
+                or not os.path.isfile(live_full)
+                or self._is_reparse_path(live_full)
+                or hashlib.sha256(live_content.encode("utf-8")).hexdigest()
+                != remote_hash
+                or target_node is not None
+            ):
+                return self._duplicate_tombstone_recovery_block(
+                    document_id, "DUPLICATE_TOMBSTONE_CONTENT_MISMATCH"
+                )
+            self._relocate_remote_identity(
+                old_path, trash_path, lambda: os.remove(live_full)
+            )
+        elif identity_path == trash_path:
+            if os.path.lexists(live_full):
+                return self._duplicate_tombstone_recovery_block(
+                    document_id, "DUPLICATE_TOMBSTONE_IDENTITY_CONFLICT"
+                )
+        else:
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_IDENTITY_CONFLICT"
+            )
+
+        collision = self._v2_store.get_document(
+            self._v2_context["local_key"], trash_path
+        )
+        if collision and str(collision.get("document_id")) != str(document_id):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_STORE_CONFLICT"
+            )
+        applied = self._v2_store.relocate_deleted_document(
+            document_id, trash_path
+        )
+        if not applied.get("applied"):
+            return self._duplicate_tombstone_recovery_block(
+                document_id, "DUPLICATE_TOMBSTONE_STORE_REPAIR_FAILED"
+            )
+        self._v2_wpm.update_trash_metadata(
+            trash_path, deleted_at, document_id
+        )
+        self._record_identity_diagnostic(
+            "duplicate_tombstone_converged",
+            entity_id=document_id,
+            state=f"revision={revision}",
+        )
+        return {
+            "kind": "duplicate_tombstone_recovered",
+            "document_id": document_id,
+            "old_local_path": old_path,
+            "new_local_path": trash_path,
+            "remote_path": remote_path,
+            "content": content,
+            "revision": revision,
+            "is_deleted": True,
+        }
 
     def _release_adopted_document(self, adopted, local_path):
         """Give back the id and the placeholder of a document that never landed.
@@ -6008,9 +9593,6 @@ class SyncManager(QObject):
                 "entity_id": folder_id,
             })
 
-        changes.extend(
-            self._apply_remote_folder_restores(folder_rows, protected, root)
-        )
         return changes
 
     def _folder_move_is_safe(self, local_path, protected, root):
@@ -6057,9 +9639,28 @@ class SyncManager(QObject):
         that is already occupied is left alone and reported.
         """
         restored = []
-        for row in folder_rows or []:
-            if not isinstance(row, dict) or row.get("is_deleted"):
-                continue
+        resolved = self._folder_rows_with_tree_paths(folder_rows)
+        rows_by_id = {
+            str(row.get("folder_id")): row
+            for row in (folder_rows or [])
+            if isinstance(row, dict) and row.get("folder_id")
+        }
+        # Parents have to leave trash before their descendants can resolve a
+        # live destination parent. Stable paths also make the order independent
+        # of the server query's row order.
+        ordered_rows = sorted(
+            (
+                row for row in (folder_rows or [])
+                if isinstance(row, dict)
+                and not row.get("is_deleted")
+                and str(row.get("folder_id") or "") in resolved
+            ),
+            key=lambda row: (
+                resolved[str(row["folder_id"])]["local_path"].count("/"),
+                resolved[str(row["folder_id"])]["local_path"].casefold(),
+            ),
+        )
+        for row in ordered_rows:
             folder_id = str(row.get("folder_id") or "")
             node = self._identity_folder_by_uuid(folder_id) if folder_id else None
             if node is None:
@@ -6083,9 +9684,74 @@ class SyncManager(QObject):
             target_path = f"{parent_path}/{name}"
             if not self._folder_move_is_safe(trash_path, protected, root):
                 continue
-            if os.path.exists(os.path.abspath(
+            target_full = os.path.abspath(
                 os.path.join(root, target_path.replace("/", os.sep))
-            )):
+            )
+            if os.path.exists(target_full):
+                # Recovery for the exact divergence produced by older builds:
+                # tree-order recreated an empty slot under a replacement UUID
+                # while the original UUID stayed in trash. A corrected server
+                # snapshot proves both halves at once — the original is live,
+                # the replacement is tombstoned in the same parent/name slot.
+                # Preserve the replacement in trash, then restore the original.
+                from project_creation_v1 import node_for_path
+
+                project_root = self._identity_project_root()
+                occupying = (
+                    node_for_path(project_root, target_path)
+                    if project_root else None
+                )
+                occupying_id = str((occupying or {}).get("uuid") or "")
+                occupying_row = rows_by_id.get(occupying_id)
+                same_slot_retired_replacement = bool(
+                    occupying
+                    and occupying.get("kind") == "folder"
+                    and occupying_id != folder_id
+                    and occupying_row
+                    and occupying_row.get("is_deleted")
+                    and str(occupying_row.get("parent_folder_id") or "")
+                    == str(row.get("parent_folder_id") or "")
+                    and self._folder_slot(
+                        occupying_row.get("parent_folder_id"),
+                        occupying_row.get("name"),
+                    )
+                    == self._folder_slot(
+                        row.get("parent_folder_id"), row.get("name")
+                    )
+                )
+                target_is_empty = False
+                if same_slot_retired_replacement and self._folder_move_is_safe(
+                    target_path, protected, root
+                ):
+                    try:
+                        with os.scandir(target_full) as entries:
+                            target_is_empty = next(entries, None) is None
+                    except OSError:
+                        target_is_empty = False
+                if target_is_empty:
+                    replacement_trash = self._v2_wpm.move_to_trash(target_path)
+                    self._v2_store.move_local_path(
+                        self._v2_context["local_key"],
+                        target_path,
+                        replacement_trash,
+                    )
+                    restored.append({
+                        "kind": "folder_tombstone",
+                        "old_local_path": target_path,
+                        "new_local_path": replacement_trash,
+                        "entity_id": occupying_id,
+                        "reason": "shadowed_restore_recovery",
+                    })
+                    self._v2_store.record_diagnostic(
+                        self._v2_context["local_key"],
+                        "folder_restore_shadow_recovered",
+                        dedupe=True,
+                        entity_id=folder_id,
+                        replacement_entity_id=occupying_id,
+                        project_id=self._v2_context["project_id"],
+                    )
+
+            if os.path.exists(target_full):
                 self._v2_store.record_diagnostic(
                     self._v2_context["local_key"],
                     "folder_restore_blocked",
@@ -6122,22 +9788,191 @@ class SyncManager(QObject):
                 break
             current = os.path.dirname(current)
 
-    def pull_remote_changes_async(self):
-        if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
-            return False
-        if self._v2_pull_worker is not None:
-            try:
-                if self._v2_pull_worker.isRunning():
+    def pull_remote_changes_async(
+        self, *, manual=False, retry_pending_after_pull=False, reason=None, _expected_pull=None
+    ):
+        with self._contract_lock:
+            if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
+                return False
+            if _expected_pull is not None:
+                identity, account, expected_coordinator = _expected_pull
+                if (identity != self._v2_pull_identity() or account != self._contract_identity()
+                        or expected_coordinator is not self._current_pull_coordinator(create=False)):
                     return False
-            except RuntimeError:
-                self._v2_pull_worker = None
+            coordinator = self._current_pull_coordinator()
+            if coordinator is None:
+                return False
+            if reason not in {None, "baseline", "general"}:
+                raise ValueError(f"unknown pull reason: {reason}")
+            if getattr(self, '_review_execution_busy', False):
+                coordinator['pull_pending'] = True
+                coordinator['review_deferred_manual'] = bool(manual or coordinator.get('review_deferred_manual'))
+                coordinator['review_deferred_retry'] = bool(retry_pending_after_pull or coordinator.get('review_deferred_retry'))
+                coordinator['review_deferred_baseline'] = bool(reason == 'baseline' or coordinator.get('review_deferred_baseline'))
+                return False
+            manual = bool(manual or coordinator.get('review_deferred_manual'))
+            retry_pending_after_pull = bool(retry_pending_after_pull or coordinator.get('review_deferred_retry'))
+            if coordinator.get('review_deferred_baseline'):
+                reason = 'baseline'
+            self.request_contract_handshake_async()
+            if self._auth_retry_blocked or self._session_restore_waiting() or self._shutting_down:
+                self._publish_sync_state()
+                return False
+            coordinator = self._current_pull_coordinator()
+            if coordinator.get('network_retry_after') is not None:
+                if not manual and time.monotonic() < coordinator['network_retry_after']:
+                    return False
+                # Revalidate the baseline even with queued local edits. The normal
+                # outbound gate would otherwise prevent recovery indefinitely.
+                reason = 'baseline'
+            if reason is None:
+                reason = (
+                    "baseline"
+                    if not coordinator["baseline_validated"]
+                    else "general"
+                )
+            if reason not in {"baseline", "general"}:
+                raise ValueError(f"unknown pull reason: {reason}")
+            # Realtime, timer, reconnect and UI requests all collapse into this one
+            # bit. It is consumed immediately before a worker starts, never when
+            # that worker happens to finish.
+            coordinator["pull_pending"] = True
+            if (
+                self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
+                and self._v2_structure_authority_identity == self._v2_pull_identity()
+                and not manual
+            ):
+                # The five-second timer must not turn a fail-closed snapshot into
+                # an automatic retry loop. Reopening/reconfiguring starts one new
+                # selection generation deliberately.
+                return False
+            current_pull_worker = (
+                self._v2_pull_worker
+                if self._v2_pull_worker_identity == self._v2_pull_identity()
+                else None
+            )
+            if coordinator["pulling"] or current_pull_worker is not None:
+                try:
+                    if coordinator["pulling"] or current_pull_worker.isRunning():
+                        return False
+                except RuntimeError:
+                    self._v2_pull_worker = None
+                    self._v2_pull_worker_identity = None
 
-        started_for = self._v2_pull_identity()
+            if reason == "general" and not self._ordinary_pull_gate_is_open(
+                coordinator
+            ):
+                self._publish_sync_state()
+                return False
+
+            started_for = self._v2_pull_identity()
+            started_account = self._contract_identity()
+            started_coordinator = coordinator
+            coordinator["pull_pending"] = False
+            coordinator["pulling"] = True
+            reservation = object()
+            coordinator['pull_reservation'] = reservation
+            coordinator["pull_visible"] = bool(manual or reason == "baseline")
+            for flag in ('review_deferred_manual', 'review_deferred_retry', 'review_deferred_baseline'):
+                coordinator.pop(flag, None)
+            self._begin_structure_authority_selection('pull_start')
+        try:
+            return self._start_reserved_pull(started_for, started_account, started_coordinator,
+                                             manual, retry_pending_after_pull, reason, reservation=reservation)
+        except BaseException:
+            with self._contract_lock:
+                if started_coordinator.get('pull_reservation') is not reservation:
+                    raise
+                started_coordinator['pulling'] = False
+                started_coordinator['pull_visible'] = False
+                started_coordinator['pull_pending'] = True
+                started_coordinator.pop('pull_reservation', None)
+                started_coordinator['baseline_validated'] = False
+                started_coordinator['review_deferred_manual'] = bool(manual or started_coordinator.get('review_deferred_manual'))
+                started_coordinator['review_deferred_retry'] = bool(retry_pending_after_pull or started_coordinator.get('review_deferred_retry'))
+                started_coordinator['review_deferred_baseline'] = True
+                current = (started_for == self._v2_pull_identity()
+                           and started_account == self._contract_identity()
+                           and started_coordinator is self._current_pull_coordinator(create=False))
+                if current:
+                    self._begin_structure_authority_selection('pull_start_failed')
+                    worker = self._v2_pull_worker
+                    if worker is not None and self._v2_pull_worker_identity == started_for:
+                        try:
+                            running = worker.isRunning()
+                        except RuntimeError:
+                            running = False
+                        if not running:
+                            self._v2_pull_worker = None
+                            self._v2_pull_worker_identity = None
+            raise
+
+    def _start_reserved_pull(self, started_for, started_account, started_coordinator,
+                             manual, retry_pending_after_pull, reason, *, reservation):
+        try:
+            protected_paths = set(
+                (self._v2_protected_paths_provider or (lambda: set()))() or set()
+            )
+        except Exception:
+            protected_paths = set()
+        # This is an optimistic token only. Reading it must never make the UI
+        # timer wait behind an in-flight durable mutation; the worker validates
+        # it again after acquiring the structure gate.
+        expected_structure_generation = self._local_structure_generation
+        cache_is_fresh = bool(
+            started_coordinator.get("applied_snapshot_fingerprint")
+            and started_coordinator.get("applied_structure_generation")
+            == expected_structure_generation
+            and not protected_paths
+            and (
+                time.monotonic()
+                - float(started_coordinator.get("last_full_apply_monotonic") or 0.0)
+                < REMOTE_SNAPSHOT_FULL_APPLY_SECONDS
+            )
+        )
+        # Keep construction compatible with the deliberately tiny worker
+        # doubles used by contract tests; the production worker exposes these
+        # attributes with the same defaults.
         worker = V2PullWorker(self, project_id=started_for[1])
-        self._v2_pull_worker = worker
+        worker.pull_identity = started_for
+        worker.expected_structure_generation = expected_structure_generation
+        worker.cached_snapshot_fingerprint = (
+            started_coordinator.get("applied_snapshot_fingerprint")
+            if cache_is_fresh else None
+        )
+        # Handed over on the same condition. The periodic full apply is what
+        # repairs out-of-process changes to the files, and a shape-only pull
+        # would never reach it, so the shape baseline expires with the other.
+        worker.cached_index_fingerprint = (
+            started_coordinator.get("applied_index_fingerprint")
+            if cache_is_fresh else None
+        )
+        with self._contract_lock:
+            if (started_for != self._v2_pull_identity() or started_account != self._contract_identity()
+                    or started_coordinator is not self._current_pull_coordinator(create=False)
+                    or started_coordinator.get('pull_reservation') is not reservation):
+                if started_coordinator.get('pull_reservation') is reservation:
+                    started_coordinator['pulling'] = False
+                    started_coordinator['pull_visible'] = False
+                    started_coordinator.pop('pull_reservation', None)
+                worker.deleteLater()
+                return False
+            self._v2_pull_worker = worker
+            self._v2_pull_worker_identity = started_for
+        retry_after_success = {"value": False}
+        retry_pull_after_finish = {"value": False}
+        if manual:
+            self._set_sync_state(
+                "syncing",
+                "서버 구조 기준을 다시 확인한 뒤 대기 작업을 전송합니다.",
+            )
 
         def handle_result(success, payload):
-            if not self.is_v2_enabled or self._v2_pull_identity() != started_for:
+            if (not self.is_v2_enabled or self._v2_pull_identity() != started_for
+                    or self._contract_identity() != started_account
+                    or self._v2_pull_worker is not worker
+                    or started_coordinator.get('pull_reservation') is not reservation
+                    or started_coordinator is not self._current_pull_coordinator(create=False)):
                 # This reply belongs to the project that was open when the
                 # request went out. Releasing, or opening another project, ends
                 # that generation: nothing in the reply may be applied to
@@ -6149,43 +9984,240 @@ class SyncManager(QObject):
                     folder_rows = payload.get("folders") or []
                     folder_versions = payload.get("folder_versions") or []
                     tree_order_rows = payload.get("tree_orders") or []
+                    structure_decision = payload.get("structure_authority")
                 else:
-                    # Compatibility with an already-running/legacy worker.
+                    # A payload without a decision predates the authority gate
+                    # and cannot prove that a zero-row contract query happened.
                     documents = payload
                     folder_rows = []
                     folder_versions = []
                     tree_order_rows = []
-                changes = self._apply_v2_remote_documents(
-                    documents,
-                    folder_rows=folder_rows,
-                    folder_versions=folder_versions,
-                    tree_order_rows=tree_order_rows,
-                )
-                if self._v2_last_pull_apply_blocked:
-                    return
-                # A structure pull is audited whether or not it reported a
-                # change: the apply that quietly skipped its identity work is
-                # exactly the one that reports nothing.
-                audited = bool(changes or folder_rows or tree_order_rows)
-                if audited and not self._identity_audit_is_clean():
-                    # Something landed that identity cannot name. Reporting the
-                    # pull as applied would hide that until the next launch
-                    # refuses to open the project.
-                    self._v2_last_pull_apply_blocked = True
-                    self._set_sync_state(
-                        "conflict", self._identity_conflict_detail()
+                    structure_decision = None
+                if not isinstance(structure_decision, dict):
+                    self._block_structure_authority(
+                        "STRUCTURE_AUTHORITY_UNRESOLVED"
                     )
                     return
-                recovered_count = self._recover_untracked_local_files_after_pull(
-                    documents
+                authority = structure_decision.get("kind")
+                authoritative_folder_paths = structure_decision.get(
+                    "folder_paths"
                 )
-                self._record_sync_success()
+                if authority not in {
+                    STRUCTURE_AUTHORITY_CONTRACT,
+                    STRUCTURE_AUTHORITY_LEGACY,
+                }:
+                    self._block_structure_authority(
+                        "INVALID_TREE_ORDER_RESPONSE"
+                    )
+                    return
+                # Before that decision, not after it. A conflict counts as an
+                # outstanding intent, so a stuck order conflict defers the very
+                # apply that would have retired it, and the two keep each other
+                # alive: every later pull is an ordinary one, and one conflict
+                # closes that gate. Retiring it here breaks the ring, and the
+                # successor it leaves is a live intent the drain can publish.
+                self._retire_stuck_tree_order_conflict_from_snapshot(documents)
+                defer_baseline_apply = bool(
+                    reason == "baseline"
+                    and self._v2_store is not None
+                    and self._v2_store.has_outstanding_structure_intent(
+                        started_for[2]
+                    )
+                )
+                if defer_baseline_apply:
+                    # The fetched projection is complete enough to select the
+                    # server authority, but it predates a durable local tree
+                    # intent. Applying it now can resurrect folders before the
+                    # queued tombstones are published. Keep the local structure
+                    # untouched, drain the immutable queue, then require one
+                    # fresh general pull at the serialized drain boundary.
+                    self._accept_structure_authority(authority)
+                    started_coordinator["baseline_validated"] = True
+                    started_coordinator["pull_pending"] = True
+                    started_coordinator["applied_snapshot_fingerprint"] = None
+                    started_coordinator["applied_index_fingerprint"] = None
+                    started_coordinator["applied_structure_generation"] = None
+                    retry_after_success["value"] = bool(
+                        retry_pending_after_pull
+                    )
+                    return
+                background_apply = payload.get("background_apply")
+                foreground_cacheable = False
+                if isinstance(background_apply, dict):
+                    apply_kind = background_apply.get("kind")
+                    if apply_kind == "stale_project":
+                        return
+                    if apply_kind == "stale_generation":
+                        started_coordinator["pull_pending"] = True
+                        retry_pull_after_finish["value"] = True
+                        return
+                    # The worker checked under the structure gate before it
+                    # emitted, but its queued signal can wait behind a local
+                    # completion. Do not let that later generation inherit an
+                    # older snapshot fingerprint merely because the wire rows
+                    # themselves were unchanged.
+                    if (
+                        apply_kind == "unchanged"
+                        and self._local_structure_generation
+                        != expected_structure_generation
+                    ):
+                        started_coordinator["pull_pending"] = True
+                        retry_pull_after_finish["value"] = True
+                        return
+                    if apply_kind == "blocked":
+                        self._v2_last_pull_apply_blocked = True
+                        self._block_structure_authority(
+                            background_apply.get("error")
+                            or "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                        )
+                        return
+                    if apply_kind not in {"applied", "unchanged"}:
+                        self._block_structure_authority(
+                            "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                        )
+                        return
+                    changes = background_apply.get("changes") or []
+                    recovered_count = int(
+                        background_apply.get("recovered_count") or 0
+                    )
+                else:
+                    # A changed snapshot samples the editor protection set at
+                    # this exact foreground boundary. Only unchanged snapshots
+                    # take the worker fast-path above.
+                    with self._store_reader_session(), \
+                            self.local_structure_mutation(
+                                blocking=False, advance_generation=False
+                            ) as current_generation:
+                        if (
+                            current_generation is False
+                            or current_generation
+                            != expected_structure_generation
+                        ):
+                            started_coordinator["pull_pending"] = True
+                            retry_pull_after_finish["value"] = True
+                            return
+                        try:
+                            changes = self._apply_v2_remote_documents(
+                                documents,
+                                folder_rows=folder_rows,
+                                folder_versions=folder_versions,
+                                tree_order_rows=tree_order_rows,
+                                structure_authority=authority,
+                                authoritative_folder_paths=(
+                                    authoritative_folder_paths
+                                ),
+                            )
+                        except Exception as error:
+                            self._block_structure_authority(error)
+                            return
+                    if self._v2_last_pull_apply_blocked:
+                        self._block_structure_authority(
+                            "STRUCTURE_SNAPSHOT_APPLY_BLOCKED"
+                        )
+                        return
+                    # A structure pull is audited whether or not it reported a
+                    # change: the apply that quietly skipped its identity work is
+                    # exactly the one that reports nothing.
+                    audited = bool(changes or folder_rows or tree_order_rows)
+                    if audited and not self._identity_audit_is_clean():
+                        self._v2_last_pull_apply_blocked = True
+                        self._block_structure_authority(
+                            "STRUCTURE_IDENTITY_AUDIT_BLOCKED"
+                        )
+                        return
+                    recovered_count = self._recover_untracked_local_files_after_pull(
+                        documents
+                    )
+                    try:
+                        foreground_cacheable = not bool(
+                            set(
+                                (
+                                    self._v2_protected_paths_provider
+                                    or (lambda: set())
+                                )() or set()
+                            )
+                        )
+                    except Exception:
+                        foreground_cacheable = False
+                # Local structure, document snapshots and the identity audit
+                # have all landed. Only now may the 250 ms retry path or any
+                # later autosave dispatch queued server writes.
+                self._accept_structure_authority(authority)
+                started_coordinator["baseline_validated"] = True
+                snapshot_fingerprint = payload.get("snapshot_fingerprint")
+                cache_from_background = bool(
+                    isinstance(background_apply, dict)
+                    and (
+                        background_apply.get("kind") == "unchanged"
+                        or background_apply.get("cacheable")
+                    )
+                )
+                if (
+                    snapshot_fingerprint
+                    and (cache_from_background or foreground_cacheable)
+                ):
+                    started_coordinator["applied_snapshot_fingerprint"] = (
+                        snapshot_fingerprint
+                    )
+                    # Cached together, so a shape baseline can never outlive
+                    # the snapshot baseline it was taken beside.
+                    started_coordinator["applied_index_fingerprint"] = (
+                        payload.get("index_fingerprint")
+                        or started_coordinator.get("applied_index_fingerprint")
+                    )
+                    started_coordinator["applied_structure_generation"] = (
+                        self._local_structure_generation
+                    )
+                    if (
+                        foreground_cacheable
+                        or (
+                            isinstance(background_apply, dict)
+                            and background_apply.get("kind") == "applied"
+                        )
+                    ):
+                        started_coordinator["last_full_apply_monotonic"] = (
+                            time.monotonic()
+                        )
+                elif isinstance(background_apply, dict):
+                    started_coordinator["applied_snapshot_fingerprint"] = None
+                    started_coordinator["applied_index_fingerprint"] = None
+                    started_coordinator["applied_structure_generation"] = None
+                if self._outbound_work_count(
+                    self._v2_activity_counts(started_for[2])
+                ):
+                    # This snapshot protected local writes that arrived before
+                    # or during it. One final snapshot is still required after
+                    # all of them drain.
+                    started_coordinator["pull_pending"] = True
+                self._record_sync_success(
+                    record_diagnostic=not (
+                        isinstance(background_apply, dict)
+                        and background_apply.get("kind") == "unchanged"
+                        and not started_coordinator.get("pull_visible")
+                    )
+                )
+                retry_after_success["value"] = bool(retry_pending_after_pull)
                 if changes:
                     self.remoteDocumentsApplied.emit(changes)
                 if recovered_count:
                     self._schedule_v2_retry(0)
             else:
                 code = self._stable_error_code(payload)
+                if self._transient_handshake_error(payload):
+                    self._begin_structure_authority_selection('pull_retry')
+                    count = min(started_coordinator.get('network_retry_count', 0) + 1, 6)
+                    started_coordinator['network_retry_count'] = count
+                    started_coordinator['network_retry_after'] = time.monotonic() + min(60, 2 ** count)
+                    started_coordinator['baseline_validated'] = False
+                    started_coordinator['pull_pending'] = True
+                    self._publish_sync_state()
+                elif code in {'AUTH_REQUIRED', 'AUTH_EXPIRED'}:
+                    self._mark_auth_required(payload)
+                    self._publish_sync_state()
+                else:
+                    self._block_structure_authority(
+                        code or "STRUCTURE_AUTHORITY_UNRESOLVED"
+                    )
                 if code == "PROJECT_TRASHED":
                     self.mark_project_server_state(
                         self._v2_context["project_id"], "trashed"
@@ -6202,11 +10234,51 @@ class SyncManager(QObject):
                         self._v2_context["project_id"],
                         self._absent_project_state(),
                     )
-                print(f"Failed to pull v2 documents: {payload}")
+                print(f"Failed to pull v2 documents: {code or type(payload).__name__}")
 
         def handle_finished():
-            if self._v2_pull_worker is worker:
-                self._v2_pull_worker = None
+            with self._contract_lock:
+                if started_coordinator.get('pull_reservation') is not reservation:
+                    return
+                started_coordinator["pulling"] = False
+                started_coordinator["pull_visible"] = False
+                started_coordinator.pop('pull_reservation', None)
+                current = (self._v2_pull_worker is worker
+                           and self._v2_pull_identity() == started_for
+                           and self._contract_identity() == started_account
+                           and started_coordinator is self._current_pull_coordinator(create=False)
+                           and not self._shutting_down)
+                if self._v2_pull_worker is worker:
+                    self._v2_pull_worker = None
+                    self._v2_pull_worker_identity = None
+            if current:
+                if (
+                    retry_after_success["value"]
+                    or (
+                        started_coordinator["baseline_validated"]
+                        and self._v2_pull_identity() == started_for
+                        and self._outbound_work_count(
+                            self._v2_activity_counts(started_for[2])
+                        )
+                    )
+                ):
+                    # resultReady runs before QThread.finished.  Waiting until
+                    # this slot has cleared the pull worker keeps dispatch from
+                    # being rejected as concurrent work, while the accepted
+                    # authority still gates the write itself.
+                    self.retry_pending_syncs(manual=True)
+                elif self._v2_pull_identity() == started_for:
+                    if retry_pull_after_finish["value"]:
+                        from PyQt6.QtCore import QTimer
+                        QTimer.singleShot(
+                            0,
+                            lambda: self.pull_remote_changes_async(
+                                reason="baseline", _expected_pull=(started_for, started_account, started_coordinator)
+                            ),
+                        )
+                    else:
+                        self._maybe_start_deferred_pull()
+                self._publish_sync_state()
 
         worker.resultReady.connect(handle_result)
         worker.finished.connect(handle_finished)
@@ -6214,56 +10286,51 @@ class SyncManager(QObject):
         self._start_worker(worker)
         return True
 
-    def _process_contract_structure_batch(self, batch_id):
-        if is_forced_offline():
-            raise RuntimeError("테스트 오프라인 모드")
-        if not self.supabase:
-            raise RuntimeError("서버 연결 없음")
-        request = self._v2_store.structure_batch_request(batch_id)
-        if (
-            not request
-            or request.get("batch", {}).get("batch_id") != batch_id
-            or request.get("project_id") != self._v2_context["project_id"]
-        ):
-            raise RuntimeError("BATCH_NOT_READY")
-        response = self.supabase.rpc(
-            "atomic_structure_commit", {"p_request": request}
-        ).execute()
-        result = self._response_data(response)
-        return self._v2_store.record_structure_batch_response(batch_id, result)
+    def _process_contract_structure_batch(self, batch_id, dispatch_context=None):
+        context = dispatch_context or self._contract_dispatch_context()
+        store = context[1]
+        request = store.structure_batch_request(batch_id)
+        if not request or request.get("batch", {}).get("batch_id") != batch_id:
+            raise ContractDispatchPaused()
+        return self._send_contract_request("atomic_structure_commit", request, context)
 
     def _launch_contract_structure_batch(self, batch_id):
-        operation_ids = self._v2_store.mark_structure_batch_attempt(batch_id)
+        context = self._contract_dispatch_context()
+        store = context[1]
+        request = store.structure_batch_request(batch_id)
+        if not self._contract_request_ready(request):
+            return None
+        if self._v2_structure_worker is not None or self._active_server_syncs:
+            return None
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator and coordinator["baseline_validated"]:
+            coordinator["pull_pending"] = True
+        operation_ids = store.mark_structure_batch_attempt(batch_id)
         worker = V2StructureBatchWorker(self, batch_id)
+        worker.dispatch_context = context
         self._v2_structure_worker = worker
         self._active_server_syncs += 1
         self._publish_sync_state()
 
         def handle_result(success, error_message, payload):
             self._active_server_syncs = max(0, self._active_server_syncs - 1)
-            self._v2_structure_worker = None
+            if self._v2_structure_worker is worker:
+                self._v2_structure_worker = None
             if not success:
-                self._v2_store.mark_structure_batch_retry(batch_id, error_message)
-                self._v2_store.record_diagnostic(
-                    self._v2_context["local_key"],
-                    "structure_batch_retry",
-                    batch_id=batch_id,
-                    error_code=self._stable_error_code(error_message) or "CLIENT_ERROR",
-                )
-                self._last_sync_error = error_message
-                self._last_failure_offline = self._is_connectivity_error(error_message)
-            else:
-                self._last_sync_error = ""
-                self._last_failure_offline = False
-                self._v2_store.record_diagnostic(
-                    self._v2_context["local_key"],
-                    "structure_batch_result",
-                    batch_id=batch_id,
-                    state="completed" if payload.get("applied") else "blocked",
-                )
+                store.mark_structure_batch_retry(batch_id, error_message)
+            # Receipt persistence already happened against the captured store.
+            # Never publish an old account/project's completion into the new UI.
+            if context[0] != self._contract_context_key():
+                return
+            store.record_diagnostic(
+                context[0][4], "structure_batch_result" if success else "structure_batch_retry",
+                batch_id=batch_id,
+                state="completed" if success and payload.get("applied") else "blocked",
+            )
+            self._last_sync_error = "" if success else error_message
+            self._last_failure_offline = not success and self._is_connectivity_error(error_message)
             self._publish_sync_state()
             if success and payload.get("applied"):
-                from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, self.retry_pending_syncs)
 
         worker.resultReady.connect(handle_result)
@@ -6271,8 +10338,9 @@ class SyncManager(QObject):
         self._start_worker(worker)
         return {"worker": worker, "operation_ids": operation_ids}
 
-    def _process_v2_operation(self, operation_id):
-        operation = self._v2_store.operation(operation_id)
+    def _process_v2_operation(self, operation_id, dispatch_context=None):
+        context = dispatch_context or self._contract_dispatch_context()
+        operation = context[1].operation(operation_id)
         if not operation:
             return {"kind": "retry", "error": "대기 작업을 찾을 수 없습니다."}
         is_contract_document = (
@@ -6297,11 +10365,23 @@ class SyncManager(QObject):
             error_code = response["error"]["code"]
             if error_code in {"REVISION_CONFLICT", "DOCUMENT_ALREADY_EXISTS"}:
                 raise RuntimeError(error_code)
-            self._v2_store.mark_blocked(operation_id, error_code)
+            context[1].mark_blocked(operation_id, error_code)
             return {
                 "kind": "blocked", "error": error_code,
                 "operation": operation,
             }
+
+        if is_contract_document:
+            try:
+                cached = context[1].document_batch_response(operation["batch_id"])
+                if cached and cached.get("applied"):
+                    return contract_result(cached)
+                with self._contract_lock:
+                    self._check_contract_dispatch(
+                        context[1].structure_batch_request(operation["batch_id"]), context
+                    )
+            except ContractDispatchPaused:
+                return {"kind": "paused", "error": "CONTRACT_DISPATCH_PAUSED", "operation": operation}
 
         if is_forced_offline():
             error = "테스트 오프라인 모드"
@@ -6317,31 +10397,52 @@ class SyncManager(QObject):
                     self.ensure_session_valid(
                         client, force_refresh=bool(auth_attempt)
                     )
-                    self._ensure_remote_project(client)
                     if is_contract_document:
-                        cached = self._v2_store.document_batch_response(
-                            operation["batch_id"]
+                        request = context[1].structure_batch_request(operation["batch_id"])
+                        response = self._send_contract_request("document_commit", request, context)
+                        return contract_result(response)
+                    self._ensure_remote_project(client)
+                    if not operation["is_deleted"]:
+                        self._publish_live_parents_before_legacy_document(
+                            operation, client
                         )
-                        if cached:
-                            return contract_result(cached)
-                        request = self._v2_store.structure_batch_request(
-                            operation["batch_id"]
-                        )
-                        if not request:
-                            raise RuntimeError("CONTRACT_BATCH_NOT_FOUND")
-                        response = client.rpc(
-                            "document_commit", {"p_request": request}
-                        ).execute()
-                        wire_response = self._response_data(response) or {}
-                        wire_response = self._v2_store.record_document_batch_response(
-                            operation["batch_id"], wire_response
-                        )
-                        return contract_result(wire_response)
-
                     if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
-                        # Folder state settles first: a rename needs its folder,
-                        # and a child needs its parent, to already be there.
-                        self._commit_outbound_folder_lifecycle(operation, client)
+                        delete_gate = self._commit_durable_folder_deletions(
+                            operation, client
+                        )
+                        if delete_gate is not None:
+                            return delete_gate
+                        # Vacate a renamed slot before a newer identity reuses
+                        # its old name. A folder that was renamed before its
+                        # first publication will not exist yet, so the second
+                        # idempotent pass completes that intent after lifecycle
+                        # has created it directly at the desired path.
+                        self._commit_outbound_folder_rename(operation, client)
+                        lifecycle = self._commit_outbound_folder_lifecycle(
+                            operation,
+                            client,
+                            snapshot_scope=(
+                                self._legacy_folder_scope_for_operation(operation)
+                            ),
+                        )
+                        if lifecycle.get("blocked"):
+                            recovery = (
+                                self._v2_store
+                                .mark_blocked_and_promote_dependent(
+                                    operation_id,
+                                    "FOLDER_LIFECYCLE_BLOCKED",
+                                )
+                            )
+                            return {
+                                "kind": (
+                                    "superseded"
+                                    if recovery.get("successor")
+                                    else "blocked"
+                                ),
+                                "error": "FOLDER_LIFECYCLE_BLOCKED",
+                                "operation": operation,
+                                "blocked_paths": lifecycle["blocked"],
+                            }
                         self._commit_outbound_folder_rename(operation, client)
                     lease_token = None
                     if operation["base_revision"] > 0:
@@ -6379,6 +10480,10 @@ class SyncManager(QObject):
                         continue
                     raise
         except Exception as error:
+            if is_contract_document and (
+                isinstance(error, ContractDispatchPaused) or context[0] != self._contract_context_key()
+            ):
+                return {"kind": "paused", "error": "CONTRACT_DISPATCH_PAUSED", "operation": operation}
             code = self._stable_error_code(error)
             if code in {"AUTH_EXPIRED", "AUTH_REQUIRED"}:
                 self._mark_auth_required(error)
@@ -6405,25 +10510,49 @@ class SyncManager(QObject):
                     "operation": operation,
                 }
             if code in {"REVISION_CONFLICT", "DOCUMENT_ALREADY_EXISTS"}:
-                remote = self._fetch_remote_document(operation["document_id"], client)
+                remote = self._revision_conflict_read_first(operation, client)
                 if not remote:
                     message = "REVISION_CONFLICT: 서버 문서를 읽을 수 없습니다."
                     return {"kind": "retry", "error": message, "operation": operation}
                 if operation["relative_path"] == TREE_ORDER_DOCUMENT_PATH:
-                    # Binder order is one project preference snapshot. A later local
-                    # reorder rebases onto the newest server revision and becomes the
-                    # next atomic update instead of creating a manuscript conflict.
+                    merged_tree_content = self._merge_tree_order_conflict(
+                        operation.get("base_content", ""),
+                        operation.get("content", ""),
+                        remote.get("content", ""),
+                    )
+                    if merged_tree_content is None:
+                        # Binder order is display state and it has no editor,
+                        # so there is nowhere for the writer to resolve a
+                        # conflict on it. Queuing one instead stopped the
+                        # project syncing altogether: a single conflict closes
+                        # the ordinary pull gate, and the conflict resolver
+                        # could not clear this document -- picking a version
+                        # only wrote protocol state into the project tree and
+                        # left the operation exactly where it was.
+                        #
+                        # Take the server's order. It is the arrangement both
+                        # peers already hold, so it converges without asking,
+                        # and a writer who wants their own arrangement back
+                        # only has to drag the rows again. That is true of
+                        # order and of nothing else here, which is why no
+                        # other document resolves itself.
+                        merged_tree_content = remote.get("content", "")
+                        self._diagnostics.record(
+                            "sync_tree_order_server_wins",
+                            state=f"revision={remote['revision']}",
+                            pending_count=self.pending_retry_count,
+                        )
                     self._v2_store.rebase_clean_merge(
                         operation_id,
                         remote["revision"],
                         remote.get("content", ""),
-                        operation["content"],
+                        merged_tree_content,
                     )
                     return {
                         "kind": "auto_merged",
                         "operation": operation,
                         "remote": remote,
-                        "merged_content": operation["content"],
+                        "merged_content": merged_tree_content,
                         "old_local_path": TREE_ORDER_DOCUMENT_PATH,
                         "new_local_path": TREE_ORDER_DOCUMENT_PATH,
                     }
@@ -6533,12 +10662,23 @@ class SyncManager(QObject):
             return {"kind": "retry", "error": message, "operation": operation}
 
     def _launch_v2_operation(self, operation):
+        contract_context = None
+        if operation.get("provenance_kind") == "CONTRACT_BATCH":
+            contract_context = self._contract_dispatch_context()
+            request = contract_context[1].structure_batch_request(operation["batch_id"])
+            if not self._contract_request_ready(request):
+                return None
+        captured_store = self._v2_store
         # A manual retry or another successful operation may start before a
         # scheduled lease retry fires. Cancel that reservation so only one
         # retry chain can exist at a time.
         self._cancel_scheduled_v2_retry(reset_backoff=False)
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator and coordinator["baseline_validated"]:
+            coordinator["pull_pending"] = True
         self._v2_store.mark_attempt(operation["operation_id"])
         worker = V2QueueWorker(self, operation["operation_id"])
+        worker.dispatch_context = contract_context
         self._v2_worker = worker
         self._v2_workers.append(worker)
         self._active_server_syncs += 1
@@ -6546,8 +10686,17 @@ class SyncManager(QObject):
 
         def handle_finished(success, error_message, payload):
             self._active_server_syncs = max(0, self._active_server_syncs - 1)
-            self._v2_worker = None
+            if self._v2_worker is worker:
+                self._v2_worker = None
             kind = (payload or {}).get("kind", "retry")
+            if contract_context is not None and contract_context[0] != self._contract_context_key():
+                if kind == "committed":
+                    captured_store.mark_success(operation["operation_id"], payload["result"])
+                elif kind in {"retry", "paused"}:
+                    captured_store.mark_retry(operation["operation_id"], "CONTRACT_DISPATCH_PAUSED")
+                self._v2_callbacks.pop(operation["operation_id"], None)
+                self._v2_conflict_callbacks.pop(operation["operation_id"], None)
+                return
             original = (payload or {}).get("operation") or operation
             callback = self._v2_callbacks.pop(operation["operation_id"], None)
             conflict_callback = self._v2_conflict_callbacks.pop(operation["operation_id"], None)
@@ -6583,6 +10732,9 @@ class SyncManager(QObject):
                 self._last_failure_offline = False
                 if callback:
                     callback(False, self._last_sync_error, original["local_path"], None)
+            elif kind == "superseded":
+                self._last_sync_error = ""
+                self._last_failure_offline = False
             elif kind == "project_disabled":
                 self._last_sync_error = payload.get("error", "")
                 if callback:
@@ -7452,6 +11604,7 @@ class SyncManager(QObject):
             return []
         with self._structure_mutation_gate:
             folder_operation = None
+            folder_delete_intent = None
             contract_structure = self._uses_contract_structure()
             if contract_structure:
                 folder_operation = self._contract_folder_lifecycle_plan(
@@ -7460,6 +11613,13 @@ class SyncManager(QObject):
                     "contract_structure_intents": [],
                     "contract_path_change": None,
                 }
+            else:
+                # The binder records this before moving the folder. Keeping the
+                # fallback here also protects direct callers; identity still
+                # carries the exact UUID after the filesystem move.
+                folder_delete_intent = self.prepare_folder_delete_intent(
+                    old_rel_path
+                )
             # A previously deleted UUID may still reserve the same local trash path
             # even when its physical copy was removed. Relocate the new copy before
             # updating SQLite so repeated delete/restore cycles cannot violate the
@@ -7514,6 +11674,8 @@ class SyncManager(QObject):
                 moved = self._v2_store.move_local_path(
                     self._v2_context["local_key"], old_rel_path, trash_rel_path
                 )
+                queued_operations = []
+                document_operation_ids = {}
                 for document in moved:
                     # Keep a dependent tombstone behind an unfinished create.
                     if (
@@ -7525,13 +11687,23 @@ class SyncManager(QObject):
                         continue
                     content = self._v2_wpm.read_text_file(document["local_path"])
                     if content is not None:
-                        self._v2_store.enqueue(
+                        queued = self._v2_store.enqueue(
                             self._v2_context,
                             document["local_path"],
                             content,
                             relative_path=document["server_path"],
                             is_deleted=True,
                         )
+                        queued_operations.append(queued)
+                        document_operation_ids[document["document_id"]] = (
+                            queued["operation_id"]
+                        )
+                if folder_delete_intent is not None:
+                    self._v2_store.bind_folder_delete_document_operations(
+                        folder_delete_intent["intent_id"],
+                        document_operation_ids,
+                        trash_path=trash_rel_path,
+                    )
             if moved:
                 self._v2_wpm.update_trash_metadata(
                     trash_rel_path,
@@ -7542,7 +11714,9 @@ class SyncManager(QObject):
         self._publish_sync_state()
         if retry:
             self.retry_pending_syncs()
-        return ([folder_operation] if folder_operation else []) + moved
+        if contract_structure:
+            return ([folder_operation] if folder_operation else []) + moved
+        return queued_operations
 
     def record_restore(
         self, trash_rel_path, restored_rel_path,
@@ -7562,18 +11736,73 @@ class SyncManager(QObject):
                     "contract_structure_intents": [],
                     "contract_path_change": None,
                 }
+            all_documents = self._v2_store.list_documents(
+                self._v2_context["local_key"]
+            )
             source_documents = [
-                document for document in self._v2_store.list_documents(
-                    self._v2_context["local_key"]
-                )
+                document for document in all_documents
                 if document["local_path"] == trash_rel_path
                 or document["local_path"].startswith(trash_rel_path + "/")
             ]
+            detached_documents = []
+            restored_full = os.path.abspath(os.path.join(
+                self._v2_wpm.writing_root_path,
+                restored_rel_path.replace("/", os.sep),
+            ))
+            if original_rel_path and os.path.isdir(restored_full):
+                original_prefix = original_rel_path.rstrip("/") + "/"
+                for document in all_documents:
+                    try:
+                        server_path = self._safe_relative_path(
+                            document.get("server_path")
+                        )
+                        local_path = self._safe_relative_path(
+                            document.get("local_path")
+                        )
+                    except ValueError:
+                        continue
+                    if (
+                        not document.get("is_deleted")
+                        or not server_path.startswith(original_prefix)
+                        or not local_path.startswith("메인/휴지통/")
+                        or local_path == trash_rel_path
+                        or local_path.startswith(trash_rel_path + "/")
+                    ):
+                        continue
+                    if self._v2_store.has_active_operations(
+                        document["document_id"]
+                    ):
+                        raise RuntimeError(
+                            "RESTORE_RELATED_DOCUMENT_HAS_LOCAL_OPERATIONS"
+                        )
+                    detached_documents.append(document)
+
+            detached_restores = self._v2_wpm.restore_related_trash_documents(
+                original_rel_path,
+                restored_rel_path,
+                {
+                    document["document_id"]: document["server_path"]
+                    for document in detached_documents
+                },
+            ) if detached_documents else []
+            detached_by_id = {
+                str(document["document_id"]): document
+                for document in detached_documents
+            }
+            document_moves = [(
+                document,
+                restored_rel_path
+                + document["local_path"][len(trash_rel_path):],
+            ) for document in source_documents]
+            for restored in detached_restores:
+                document = detached_by_id.get(str(restored["document_id"]))
+                if document is None:
+                    raise RuntimeError("RESTORE_RELATED_DOCUMENT_NOT_FOUND")
+                document_moves.append((document, restored["restored_path"]))
+
             if contract_structure and folder_operation is not None:
                 document_changes = []
-                for document in source_documents:
-                    suffix = document["local_path"][len(trash_rel_path):]
-                    new_local_path = restored_rel_path + suffix
+                for document, new_local_path in document_moves:
                     content = self._v2_wpm.read_text_file(new_local_path)
                     if content is None:
                         continue
@@ -7589,13 +11818,18 @@ class SyncManager(QObject):
                 moved = [{
                     **document,
                     "old_local_path": document["local_path"],
-                    "local_path": restored_rel_path
-                    + document["local_path"][len(trash_rel_path):],
-                } for document in source_documents]
+                    "local_path": new_local_path,
+                } for document, new_local_path in document_moves]
             else:
                 moved = self._v2_store.move_local_path(
                     self._v2_context["local_key"], trash_rel_path, restored_rel_path
                 )
+                for restored in detached_restores:
+                    moved.extend(self._v2_store.move_local_path(
+                        self._v2_context["local_key"],
+                        restored["trash_path"],
+                        restored["restored_path"],
+                    ))
                 for document in moved:
                     content = self._v2_wpm.read_text_file(document["local_path"])
                     if content is not None:
@@ -7712,6 +11946,13 @@ class SyncManager(QObject):
             # 기다린 뒤 남은 작업은 다음 실행으로 넘긴다.
             drained = self.wait_all_workers(SHUTDOWN_GRACE_MS)
         self._diagnostics.flush(timeout_ms=SHUTDOWN_GRACE_MS)
+        # Workers are drained, but a token exchange is not one of them, and the
+        # window that loses a token is between the server answering and the
+        # answer being stored. Timing out here does not hold the shutdown up:
+        # the budget is spent, and refusing to close would be worse than closing
+        # with a session that is one rotation behind.
+        if not self.await_session_writes():
+            drained = False
         if drained and self.supabase is not None:
             # 워커가 아직 client 를 쓰고 있을 수 있으므로 완전히 비었을 때만 닫는다.
             self._close_supabase_client(self.supabase)

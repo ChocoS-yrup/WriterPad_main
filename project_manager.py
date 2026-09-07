@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import tempfile
 from PyQt6.QtCore import QMutex, QMutexLocker
 
 
@@ -249,10 +250,25 @@ class ProjectManager:
             
     def save_chapter_text(self, step_name, chapter, text, is_backup=False, backup_type="자동저장", timestamp=""):
         path = self.get_text_file_path(step_name, chapter, is_backup, backup_type, timestamp)
-        if path:
-            locker = QMutexLocker(self.mutex)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
+        if not path:
+            raise OSError("저장할 작품이 선택되지 않았습니다.")
+        # The old manuscript remains intact until the complete replacement has
+        # reached disk. Keep the temporary file on the same volume for replace.
+        with QMutexLocker(self.mutex):
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                    prefix=".writerpad-", suffix=".tmp", delete=False,
+                ) as file:
+                    temporary = file.name
+                    file.write(text)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.remove(temporary)
                 
     def load_chapter_text(self, step_name, chapter):
         path = self.get_text_file_path(step_name, chapter)

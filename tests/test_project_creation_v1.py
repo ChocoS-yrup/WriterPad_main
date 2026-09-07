@@ -913,6 +913,56 @@ class IdentityLivesOutsideTheSyncRootTestCase(unittest.TestCase):
         self.assertTrue(identity.is_file())
         self.assertNotIn(sync_root, identity.parents)
 
+    def _write_sync_internal_file(self):
+        """Drop the file the sync layer leaves when it materializes tree order."""
+        internal = (
+            Path(writing_root(self.project_root))
+            / "__antigravity__"
+            / "tree-order.json"
+        )
+        internal.parent.mkdir(parents=True, exist_ok=True)
+        internal.write_text('{"version":1}', encoding="utf-8")
+        return internal
+
+    def test_a_stray_sync_file_does_not_stop_the_project_opening(self):
+        """동기화 내부 파일 하나가 작품 전체를 못 열게 만들면 안 된다.
+
+        순서표는 원고가 아니라 프로토콜 상태다. 그것이 디스크에 남아도 identity
+        위반으로 세면, 작가는 볼 수도 없는 파일 때문에 작품을 잃는다.
+        """
+        self._write_sync_internal_file()
+
+        report = creation.audit(self.project_root)
+
+        self.assertEqual(report["missing_in_identity"], [])
+        self.assertEqual(report["missing_on_disk"], [])
+        self.assertEqual(
+            creation.prepare_open(self.project_root)["status"], creation.OPEN_OK
+        )
+
+    def test_identity_never_adopts_a_sync_internal_path_as_a_node(self):
+        """감사와 identity 재구성은 같은 목록을 읽는다. 둘이 어긋나면 안 된다."""
+        self._write_sync_internal_file()
+
+        entries = dict(creation.tracked_tree_entries(writing_root(self.project_root)))
+
+        self.assertNotIn("__antigravity__", entries)
+        self.assertNotIn("__antigravity__/tree-order.json", entries)
+
+    def test_nothing_here_creates_the_sync_internal_directory(self):
+        """제외 목록이지 생성 목록이 아니다.
+
+        UNTRACKED_FOLDERS 로 옮기면 동기화한 적 없는 작품에도 빈 폴더가 생긴다.
+        """
+        internal = Path(writing_root(self.project_root)) / "__antigravity__"
+        self.assertFalse(internal.exists())
+
+        creation.recover_project(self.project_root)
+
+        self.assertFalse(internal.exists())
+        for legacy_path in creation.UNTRACKED_FOLDERS:
+            self.assertNotIn("__antigravity__", legacy_path)
+
     def test_the_journal_directories_stay_outside_the_sync_root_too(self):
         sync_root = Path(writing_root(self.project_root)).resolve()
 

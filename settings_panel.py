@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QLabel, QSplitter, QTextBrowser,
     QStackedWidget, QComboBox, QMenu, QGraphicsDropShadowEffect, QScrollArea, QFrame, QMessageBox,
     QSizePolicy, QCheckBox, QDialog, QListWidget, QLineEdit, QRadioButton, QSpinBox, QButtonGroup,
-    QFontDialog, QTabWidget, QListWidgetItem, QGridLayout, QTabBar
+    QFontDialog, QTabWidget, QListWidgetItem, QGridLayout, QTabBar, QFileDialog
 )
 from PyQt6.QtGui import QFont, QTextCursor, QGuiApplication, QTextDocument
 from PyQt6.QtCore import (
@@ -375,6 +375,66 @@ class SettingsPanel(QWidget):
         diagnostic_actions.addWidget(self.btn_copy_sync_diagnostics)
         diagnostics_layout.addLayout(diagnostic_actions)
         cloud_layout.addWidget(diagnostics_card)
+        review_card, review_layout = self._create_card(
+            "역방향 계약 검토 · 최종검증03",
+            "원고 아래 빈 3권과 1권 → 2권 → 3권 순서의 검토 요청을 보관합니다. "
+            "준비·내보내기는 관문을 닫은 상태에서 사용하며 전송하지 않습니다. "
+            "실제 송신은 별도로 승인한 고정 배치 1회만 실행합니다.",
+        )
+        self.lbl_contract_review = QLabel("최종검증03의 일반 수신이 완료된 뒤 준비하세요.")
+        self.lbl_contract_review.setWordWrap(True)
+        review_layout.addWidget(self.lbl_contract_review)
+        review_actions = QHBoxLayout()
+        self.btn_prepare_contract_review = QPushButton("3권 검토 요청 준비")
+        self.btn_export_contract_review = QPushButton("저장된 요청 내보내기")
+        self.btn_prepare_contract_review.clicked.connect(self.prepare_contract_review)
+        self.btn_export_contract_review.clicked.connect(self.export_contract_review)
+        self.btn_send_contract_review = QPushButton("검토 배치 1회 송신")
+        self.btn_send_contract_review.clicked.connect(self.send_contract_review)
+        review_actions.addWidget(self.btn_prepare_contract_review)
+        review_actions.addWidget(self.btn_export_contract_review)
+        review_actions.addWidget(self.btn_send_contract_review)
+        review_layout.addLayout(review_actions)
+        readiness_actions = QHBoxLayout()
+        self.btn_read_contract_readiness = QPushButton('준비 상태 조회 · 송신 없음')
+        self.btn_export_contract_readiness = QPushButton('조회 결과 내보내기')
+        self.btn_read_contract_readiness.clicked.connect(self.read_contract_readiness)
+        self.btn_export_contract_readiness.clicked.connect(self.export_contract_readiness)
+        readiness_actions.addWidget(self.btn_read_contract_readiness)
+        readiness_actions.addWidget(self.btn_export_contract_readiness)
+        review_layout.addLayout(readiness_actions)
+        self.lbl_contract_readiness = QLabel('준비 상태 조회는 실행 기록이 있어도 사용할 수 있습니다. 송신하지 않습니다.')
+        self.lbl_contract_readiness.setWordWrap(True)
+        review_layout.addWidget(self.lbl_contract_readiness)
+        recovery_read_actions = QHBoxLayout()
+        self.btn_recovery_server_read = QPushButton('서버 원장 조회 · 회차 생성 없음')
+        self.btn_recovery_server_export = QPushButton('원장 조회 결과 내보내기')
+        self.btn_recovery_server_read.clicked.connect(self.read_recovery_server)
+        self.btn_recovery_server_export.clicked.connect(self.export_recovery_server)
+        recovery_read_actions.addWidget(self.btn_recovery_server_read)
+        recovery_read_actions.addWidget(self.btn_recovery_server_export)
+        review_layout.addLayout(recovery_read_actions)
+        self.lbl_recovery_server_read = QLabel('현재 로그인으로 원장만 조회합니다. 복구 회차를 만들지 않습니다.')
+        self.lbl_recovery_server_read.setWordWrap(True)
+        review_layout.addWidget(self.lbl_recovery_server_read)
+        self.btn_http_zero_recovery = QPushButton('HTTP 0 중단 · 별도 복구 승인')
+        self.btn_http_zero_recovery.clicked.connect(self.send_http_zero_recovery)
+        review_layout.addWidget(self.btn_http_zero_recovery)
+        resume_actions = QHBoxLayout()
+        self.btn_post_coordination_read = QPushButton('조정 후 원장 조회 · 회차 생성 없음')
+        self.btn_post_coordination_export = QPushButton('조정 후 원장 결과 내보내기')
+        self.btn_post_coordination_read.clicked.connect(lambda:self.read_recovery_server(post_coordination=True))
+        self.btn_post_coordination_export.clicked.connect(lambda:self.export_recovery_server(post_coordination=True))
+        resume_actions.addWidget(self.btn_post_coordination_read)
+        resume_actions.addWidget(self.btn_post_coordination_export)
+        review_layout.addLayout(resume_actions)
+        self.btn_post_coordination_resume = QPushButton('조정 후 고정 요청 · 추가 1회 승인')
+        self.btn_post_coordination_resume.clicked.connect(self.send_post_coordination_resume)
+        review_layout.addWidget(self.btn_post_coordination_resume)
+        cloud_layout.addWidget(review_card)
+        # Visibility only: this opt-in never grants execution or opens a gate.
+        review_card.setObjectName('ContractReviewDiagnosticsCard')
+        review_card.setVisible(os.environ.get('WRITERPAD_CONTRACT_REVIEW_UI') == '1')
         cloud_layout.addStretch()
         self.refresh_supabase_account_status()
         self.refresh_sync_diagnostics()
@@ -676,6 +736,222 @@ class SettingsPanel(QWidget):
         self.lbl_sync_diagnostics.setText(text)
         return text
 
+    def read_contract_readiness(self):
+        from sync_manager import SyncManager
+        from contract_readiness_diagnostics import format_readiness
+        try:
+            report = SyncManager().inspect_reviewed_contract_readiness()
+            self.lbl_contract_readiness.setText(format_readiness(report))
+            return report
+        except Exception:
+            self.lbl_contract_readiness.setText('준비 상태를 조회하지 못했습니다. 송신하지 않았습니다.')
+
+    def export_contract_readiness(self):
+        from sync_manager import SyncManager
+        path, _ = QFileDialog.getSaveFileName(self, '관찰한 준비 상태 내보내기',
+                                            'windows-contract-readiness.json', 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            report = SyncManager().export_reviewed_readiness(path)
+            self.lbl_contract_readiness.setText('기존 관찰 결과를 내보냈습니다. 새 조회나 송신은 하지 않았습니다.')
+            return report
+        except Exception:
+            self.lbl_contract_readiness.setText('내보내지 못했습니다. 먼저 상태를 조회하고 작품 밖에 JSON으로 저장하세요.')
+
+    def read_recovery_server(self, *, post_coordination=False):
+        from sync_manager import SyncManager
+        from contract_recovery_readonly import format_recovery_read
+        manager = SyncManager()
+        button = self.btn_post_coordination_read if post_coordination else self.btn_recovery_server_read
+        try:
+            worker = manager.launch_recovery_server_readonly(post_coordination=True) if post_coordination else manager.launch_recovery_server_readonly()
+            button.setEnabled(False)
+            self.lbl_recovery_server_read.setText('현재 로그인으로 서버 원장을 조회 중입니다. 복구 회차를 만들지 않습니다.')
+            worker.resultReady.connect(lambda report:self.lbl_recovery_server_read.setText(format_recovery_read(report)))
+            worker.finished.connect(lambda:button.setEnabled(True))
+            manager._start_worker(worker)
+        except Exception:
+            button.setEnabled(True)
+            self.lbl_recovery_server_read.setText('원장 조회를 시작하지 못했습니다. 실행 중인 조회와 로그인·작품 상태를 확인하세요.')
+
+    def export_recovery_server(self, *, post_coordination=False):
+        from sync_manager import SyncManager
+        path, _ = QFileDialog.getSaveFileName(self, '로그인 원장 조회 결과 내보내기',
+                                            'windows-post-coordination-readonly.json' if post_coordination else 'windows-recovery-readonly.json', 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            manager = SyncManager()
+            export = manager.export_post_coordination_server_readonly if post_coordination else manager.export_recovery_server_readonly
+            report = export(path)
+            self.lbl_recovery_server_read.setText('관찰한 원장 조회 결과를 내보냈습니다. 복구 회차·송신·새 조회 없음.')
+            return report
+        except Exception:
+            self.lbl_recovery_server_read.setText('내보내지 못했습니다. 먼저 원장을 조회하고 작품 밖에 JSON으로 저장하세요.')
+
+    def send_http_zero_recovery(self):
+        from sync_manager import SyncManager
+        from reviewed_contract_sender import REVIEWED_BATCH, REVIEWED_REQUEST_SHA256, now
+        from contract_http_zero_recovery import (APPROVAL_KIND, ORIGINAL_EXECUTION_ROWS_SHA256,
+                                                ORIGINAL_PREPARATION_ROWS_SHA256)
+        import uuid
+        manager = SyncManager()
+        try:
+            report = manager.inspect_reviewed_contract_readiness()
+            if report['stale'] or not report['http_zero_recovery']['local_candidate']:
+                self.lbl_contract_readiness.setText('별도 복구 후보가 아닙니다. 기존 기록을 확인하세요.')
+                return
+            answer = QMessageBox.question(
+                self, 'HTTP 0 중단 요청의 별도 복구 승인',
+                '최종검증03: 빈 3권 생성과 원고 순서 갱신의 원요청을 사용합니다.\n'
+                '기존 stopped 기록은 보존하고 별도 복구 회차 한 건을 만듭니다.\n'
+                '이전 승인과 준비 조건 충족은 새 실행 승인이 아닙니다.\n'
+                '서버 원장·권한 및 실행 조건 검사를 통과한 경우에만 1회 송신합니다.\n'
+                '검사에서 멈추어도 복구 회차를 다시 만들거나 자동 재전송하지 않습니다.\n'
+                '종료 시 원래 작품의 관문을 닫습니다.\n\n'
+                f'배치: {REVIEWED_BATCH}\n요청 SHA256: {REVIEWED_REQUEST_SHA256}\n\n'
+                '별도 실행 범위가 확정됐고 양쪽 편집을 멈췄습니까? 이 복구 1회를 새로 승인합니까?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            envelope = manager.reverse_contract_review()
+            approval = {'kind':APPROVAL_KIND, 'approval_id':str(uuid.uuid4()), 'batch_id':REVIEWED_BATCH,
+                        'request_sha256':REVIEWED_REQUEST_SHA256, 'original_execution_sha256':ORIGINAL_EXECUTION_ROWS_SHA256,
+                        'original_preparation_sha256':ORIGINAL_PREPARATION_ROWS_SHA256,
+                        'account_marker':envelope['account_marker'], 'approved_at':now(), 'manual_once':True}
+            worker = manager.launch_http_zero_recovery_once(approval=approval)
+            self.btn_http_zero_recovery.setEnabled(False)
+            self.lbl_contract_readiness.setText('별도 복구 회차의 실행 조건을 확인 중입니다.')
+            def result(success, state):
+                if success:
+                    message = ('별도 복구 영수증을 저장하고 관문을 닫았습니다: ' + state
+                               + '\n구조는 일반 수신에서 확인하세요. 재전송하지 마세요.')
+                else:
+                    message = ('복구가 중단됐습니다: ' + state
+                               + '\n재전송하지 말고 준비 상태를 조회·내보내 주세요.')
+                self.lbl_contract_readiness.setText(message)
+            worker.resultReady.connect(result)
+            manager._start_worker(worker)
+        except Exception as error:
+            self.lbl_contract_readiness.setText('복구를 시작하지 못했습니다. ' + self._contract_review_error(error))
+
+    def send_post_coordination_resume(self):
+        from sync_manager import SyncManager
+        from contract_post_coordination_resume import new_approval, execution_build_sha256
+        manager = SyncManager()
+        try:
+            report = manager.inspect_reviewed_contract_readiness()
+            if (report['stale'] or not report['observation']['all_conditions_met']
+                    or not report['post_coordination_resume']['local_candidate']):
+                self.lbl_contract_readiness.setText('추가 1회 경로의 준비 조건이 충족되지 않았습니다. 회차를 만들지 않았습니다.')
+                return
+            build = execution_build_sha256()
+            answer = QMessageBox.question(self, '조정 후 고정 요청의 추가 1회 승인',
+                '최종검증03의 빈 3권 생성과 원고 순서 갱신을 같은 요청으로 실행합니다.\n'
+                '원본과 두 stopped 기록을 보존하고 이 정책의 추가 회차를 최대 1개 만듭니다.\n'
+                '새 회차 생성 뒤 중단되거나 응답이 유실돼도 재시도하지 않습니다.\n'
+                '검사 통과 시 관문을 일시 사용해 HTTP 최대 1회 송신하고 종료 시 닫습니다.\n'
+                f'실행 설치 SHA256: {build}\n\n'
+                '별도 실행 범위가 확정됐고 양쪽 편집을 멈췄습니까? 이 추가 1회를 새로 승인합니까?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            # Only the explicit Yes creates a fresh approval ID. It is not a DB claim.
+            approval = new_approval(manager.reverse_contract_review())
+            worker = manager.launch_post_coordination_resume_once(approval=approval)
+            self.btn_post_coordination_resume.setEnabled(False)
+            self.lbl_contract_readiness.setText('추가 1회 경로의 실행 조건을 확인 중입니다.')
+            worker.resultReady.connect(lambda success,state:self.lbl_contract_readiness.setText(
+                ('추가 회차 결과: ' if success else '추가 회차 중단: ') + state
+                + '\n재전송하지 말고 준비 상태를 조회·내보내 주세요.'))
+            manager._start_worker(worker)
+        except Exception as error:
+            self.lbl_contract_readiness.setText('추가 실행을 시작하지 못했습니다. ' + self._contract_review_error(error))
+
+    def send_contract_review(self):
+        from sync_manager import SyncManager
+        from reviewed_contract_sender import REVIEWED_BATCH, REVIEWED_REQUEST_SHA256
+        manager = SyncManager()
+        try:
+            envelope = manager.reverse_contract_review()
+            if (envelope['request']['batch']['batch_id'], envelope['request_sha256']) != (REVIEWED_BATCH, REVIEWED_REQUEST_SHA256):
+                self.lbl_contract_review.setText('양쪽에서 검토한 고정 요청과 다릅니다. 송신하지 않았습니다.')
+                return
+            answer = QMessageBox.question(
+                self, '고정 검토 배치의 실제 송신',
+                '별도로 승인한 실제 실행을 시작합니다.\n'
+                '최종검증03: 빈 3권 생성 + 원고 순서 갱신, 고정 요청 1회입니다.\n'
+                '검사 통과 후 관문을 일시적으로 사용하며 종료 시 닫습니다.\n'
+                '응답 유실이나 재시작 시 자동으로 다시 보내지 않습니다.\n\n'
+                f'배치: {REVIEWED_BATCH}\n요청 SHA256: {REVIEWED_REQUEST_SHA256}\n\n'
+                '양쪽 편집을 멈췄고 이 실제 송신을 승인합니까?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            worker = manager.launch_reviewed_contract_once(REVIEWED_BATCH, REVIEWED_REQUEST_SHA256, approved=True)
+            self.btn_send_contract_review.setEnabled(False)
+            self.lbl_contract_review.setText('고정 요청의 실행 조건을 확인 중입니다.')
+            def result(success, state):
+                if success and state == 'committed':
+                    text = '서버 성공 영수증을 저장하고 관문을 닫았습니다. 구조는 일반 수신에서 확인하세요.'
+                elif success and state == 'rejected':
+                    text = '서버 거절 영수증을 저장하고 관문을 닫았습니다. 재전송하지 마세요.'
+                elif state == 'REVIEWED_EXECUTION_ALREADY_STARTED':
+                    text = '이미 실행을 시작한 요청입니다. 재전송하지 않고 기존 실행 결과를 확인하세요.'
+                else:
+                    text = '실행을 중단했습니다. 재전송하지 말고 관문과 읽기 전용 결과를 확인하세요. (' + state + ')'
+                self.lbl_contract_review.setText(text)
+            worker.resultReady.connect(result)
+            manager._start_worker(worker)
+        except Exception as error:
+            self.lbl_contract_review.setText('송신을 시작하지 못했습니다. ' + self._contract_review_error(error))
+
+    def prepare_contract_review(self):
+        from sync_manager import SyncManager
+        try:
+            envelope = SyncManager().prepare_reverse_contract_review()
+            self.lbl_contract_review.setText(
+                "검토 요청을 보관했습니다. 전송되지 않습니다.\n"
+                + "배치: " + envelope['request']['batch']['batch_id']
+                + "\n요청 SHA256: " + envelope['request_sha256']
+            )
+            return envelope
+        except Exception as error:
+            self.lbl_contract_review.setText(self._contract_review_error(error))
+
+    @staticmethod
+    def _contract_review_error(error):
+        messages = {
+            'CONTRACT_PREPARATION_WRONG_PROJECT': '최종검증03을 먼저 여세요.',
+            'CONTRACT_PREPARATION_GATE_OPEN': '계약 관문이 닫힌 상태에서만 준비할 수 있습니다.',
+            'CONTRACT_PREPARATION_MISSING': '저장된 요청이 없습니다. 먼저 검토 요청을 준비하세요.',
+            'CONTRACT_PREPARATION_NOT_READY': '일반 수신과 계약 확인이 완료된 뒤 다시 준비하세요.',
+            'CONTRACT_PREPARATION_QUEUE_NOT_EMPTY': '미완료 작업이나 계약 배치가 있어 준비하지 않았습니다.',
+            'CONTRACT_PREPARATION_BASELINE_CHANGED': '검토 기준과 현재 상태가 다릅니다. 기존 요청은 보존됩니다.',
+            'CONTRACT_PREPARATION_IDENTITY_REQUIRED': '현재 작품의 로그인 계정과 기기 정보를 확인할 수 없습니다.',
+            'CONTRACT_PREPARATION_EXPORT_LOCATION': '작품 폴더 밖에 JSON 파일로 저장하세요.',
+        }
+        return messages.get(getattr(error, 'code', ''), '검토 요청을 처리하지 못했습니다. 전송은 하지 않았습니다.')
+
+    def export_contract_review(self):
+        from sync_manager import SyncManager
+        try:
+            # Resolve before prompting; cancelled export never prepares or reissues.
+            SyncManager().reverse_contract_review()
+            path, _ = QFileDialog.getSaveFileName(
+                self, '검토 요청 내보내기', 'windows-reverse-prepared-request.json', 'JSON (*.json)'
+            )
+            if not path:
+                return None
+            envelope = SyncManager().export_reverse_contract_review(path)
+            self.lbl_contract_review.setText('저장된 원본 요청을 내보냈습니다. 현재 서버 상태나 전송 승인을 뜻하지 않습니다.')
+            return envelope
+        except Exception as error:
+            self.lbl_contract_review.setText(self._contract_review_error(error))
+
     def copy_sync_diagnostics(self):
         try:
             from sync_manager import SyncManager
@@ -744,7 +1020,9 @@ class SettingsPanel(QWidget):
             self.edit_supabase_password.clear()
             self.lbl_supabase_status.setText(config_message)
             self._style_cloud_status(
-                "disconnected" if config_state == "disabled" else "error"
+                "disconnected"
+                if config_state in ("disabled", "credential_busy")
+                else "error"
             )
             self.btn_supabase_login.setEnabled(False)
             self.btn_supabase_logout.setEnabled(False)
@@ -822,7 +1100,9 @@ class SettingsPanel(QWidget):
                     self.lbl_supabase_status.setText(config_message)
                     SettingsPanel._style_cloud_status(
                         self,
-                        "disconnected" if config_state == "disabled" else "error",
+                        "disconnected"
+                if config_state in ("disabled", "credential_busy")
+                else "error",
                     )
                     self.btn_supabase_login.setText("동기화 로그인")
                     self.btn_supabase_login.setEnabled(False)

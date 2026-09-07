@@ -243,6 +243,22 @@ def _valid_project_mode_epoch(project_sync_mode, migration_epoch) -> bool:
     )
 
 
+def _require_int(value, field):
+    """Read one integer the server sent without letting int() raise its own error.
+
+    Every other bad argument in this module leaves as a SyncContractError, so a
+    null or a string arriving here has to do the same. A bare int() would raise
+    TypeError or ValueError instead, and those escape callers that only expect
+    the contract error.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise SyncContractError("INVALID_ARGUMENT", f"invalid {field}")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SyncContractError("INVALID_ARGUMENT", f"invalid {field}") from exc
+
+
 def require_server_compatibility(
     *,
     project_sync_mode: str,
@@ -253,13 +269,145 @@ def require_server_compatibility(
 ):
     if not _valid_project_mode_epoch(project_sync_mode, migration_epoch):
         raise SyncContractError("STALE_MIGRATION_EPOCH")
-    if int(server_protocol_version) < SYNC_PROTOCOL_VERSION:
+    if _require_int(server_protocol_version, "server_protocol_version") < SYNC_PROTOCOL_VERSION:
         raise SyncContractError("PROTOCOL_TOO_OLD")
     if server_contract_sha256 != CANONICAL_CONTRACT_SHA256:
         raise SyncContractError("CONTRACT_DIGEST_MISMATCH")
-    available = set(server_capabilities or ())
+    if isinstance(server_capabilities, (str, bytes)):
+        # A bare string would iterate into single characters and read as a
+        # capability set that happens to be missing everything.
+        raise SyncContractError("INVALID_ARGUMENT", "invalid server_capabilities")
+    try:
+        available = set(server_capabilities or ())
+    except TypeError as exc:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "invalid server_capabilities"
+        ) from exc
     if not set(SERVER_CAPABILITIES).issubset(available):
         raise SyncContractError("CAPABILITY_MISMATCH")
+
+
+HANDSHAKE_COMPATIBILITY_FIELDS = (
+    "project_sync_mode",
+    "migration_epoch",
+    "server_protocol_version",
+    "server_contract_sha256",
+    "server_capabilities",
+)
+
+
+def read_handshake_compatibility(handshake):
+    """Read a get_sync_handshake reply into the five compatibility arguments.
+
+    The reply crosses the network, so nothing about its shape is settled until
+    it is checked here. A server with no allowlist row answers in nulls and
+    empty arrays, and those must not reach ``require_server_compatibility`` as
+    if they were a real server state. Every shape problem leaves as
+    INVALID_ARGUMENT so the caller has one fail-closed code to handle rather
+    than a mix of contract errors and interpreter errors.
+
+    The reply also carries three fields that ``require_server_compatibility``
+    never sees, and each one can contradict the five that it does. A reply that
+    disagrees with itself is checked here, because this is the only place that
+    holds the whole answer at once.
+    """
+    if not isinstance(handshake, dict):
+        raise SyncContractError("INVALID_ARGUMENT", "invalid handshake")
+
+    if not isinstance(handshake.get("project_id"), str):
+        raise SyncContractError("INVALID_ARGUMENT", "invalid project_id")
+    require_uuid(handshake["project_id"], "project_id")
+
+    mode = handshake.get("project_sync_mode")
+    if not isinstance(mode, str) or mode not in PROJECT_MODES:
+        raise SyncContractError("INVALID_ARGUMENT", "invalid project_sync_mode")
+
+    epoch = handshake.get("migration_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise SyncContractError("INVALID_ARGUMENT", "invalid migration_epoch")
+
+    protocol_version = handshake.get("server_protocol_version")
+    if (
+        isinstance(protocol_version, bool)
+        or not isinstance(protocol_version, int)
+        or protocol_version < 0
+    ):
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "invalid server_protocol_version"
+        )
+
+    digest = handshake.get("server_contract_sha256")
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "invalid server_contract_sha256"
+        )
+
+    capabilities = handshake.get("server_capabilities")
+    if not isinstance(capabilities, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in capabilities
+    ):
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "invalid server_capabilities"
+        )
+    if len(set(capabilities)) != len(capabilities):
+        raise SyncContractError("INVALID_ARGUMENT", "duplicate server_capabilities")
+
+    _require_coherent_handshake(handshake, digest, protocol_version)
+
+    return {
+        "project_sync_mode": mode,
+        "migration_epoch": epoch,
+        "server_protocol_version": protocol_version,
+        "server_contract_sha256": digest,
+        "server_capabilities": list(capabilities),
+    }
+
+
+def _require_coherent_handshake(handshake, digest, protocol_version):
+    """Refuse a reply whose extra fields contradict the ones acted on."""
+    if "supported_protocol_versions" not in handshake:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "missing supported_protocol_versions"
+        )
+    supported_versions = handshake["supported_protocol_versions"]
+    if not isinstance(supported_versions, (list, tuple)) or not supported_versions or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0
+        for item in supported_versions
+    ):
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "invalid supported_protocol_versions"
+        )
+    if len(set(supported_versions)) != len(supported_versions):
+        raise SyncContractError("INVALID_ARGUMENT", "duplicate supported_protocol_versions")
+    if SYNC_PROTOCOL_VERSION not in supported_versions:
+        # server_protocol_version on its own is only a ceiling, so a server
+        # that has dropped protocol 3 and answers 4 clears the >= check while
+        # refusing everything this client can actually say. The set is the
+        # field that says which versions are still accepted.
+        raise SyncContractError("PROTOCOL_TOO_OLD")
+    if protocol_version not in supported_versions:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "server_protocol_version outside its own set"
+        )
+
+    if "canonical_contract_sha256" not in handshake:
+        raise SyncContractError(
+            "INVALID_ARGUMENT", "missing canonical_contract_sha256"
+        )
+    canonical = handshake["canonical_contract_sha256"]
+    if canonical != digest:
+        # The digest the server allowlists and the digest it reports serving
+        # are one identity. A server that gives two different answers has not
+        # told this client which contract it is on.
+        raise SyncContractError("CONTRACT_DIGEST_MISMATCH")
+
+    if "contract_version" not in handshake:
+        raise SyncContractError("INVALID_ARGUMENT", "missing contract_version")
+    contract_version = handshake["contract_version"]
+    if contract_version != CONTRACT_VERSION:
+        # A digest that matches the pin while the version does not means the
+        # allowlist row disagrees with itself about what 0.2.0 is.
+        raise SyncContractError("CONTRACT_DIGEST_MISMATCH")
 
 
 def build_atomic_structure_request(

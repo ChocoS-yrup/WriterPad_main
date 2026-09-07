@@ -1,23 +1,32 @@
 import os
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from PyQt6.QtCore import QMutex, Qt
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtCore import QMutex, QPoint, QTimer, Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import (
+    QApplication, QMessageBox, QTreeWidgetItem, QWidget
+)
 
-from mode_writing import WritingModeWidget
+from mode_writing import BinderTreeWidget, WritingModeWidget
 from project_manager import ProjectManager
 from project_manager_writing import WritingProjectManager
-from sync_manager import AutoSaveWorker
+from sync_manager import AutoSaveWorker, SyncManager
 from writing_tree import WritingTreeMixin
 
 
 class WritingDataTestCase(unittest.TestCase):
     """실제 작품 폴더 대신 매 테스트마다 임시 작업공간만 사용한다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -43,6 +52,301 @@ class WritingDataTestCase(unittest.TestCase):
 
     def path(self, relative_path):
         return Path(self.wpm.writing_root_path, relative_path)
+
+    def test_sync_protocol_state_is_refused_at_the_single_write_point(self):
+        """내부 문서가 원고 트리에 파일로 남으면 작품이 열리지 않는다.
+
+        호출부마다 막으면 새 호출부가 생길 때 또 뚫린다. 모든 쓰기가 지나는
+        한 곳에서 거절해야 한다.
+        """
+        for relative_path in (
+            "__antigravity__/tree-order.json",
+            "__antigravity__/trash-purge.json",
+            "__antigravity__",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertFalse(
+                    self.wpm.write_text_file(relative_path, '{"version":1}')
+                )
+
+        self.assertFalse(self.path("__antigravity__").exists())
+
+    def test_the_write_guard_leaves_backup_and_trash_paths_alone(self):
+        """백업·휴지통은 동기화 내부 경로가 아니다. 계속 써져야 한다."""
+        for relative_path in (
+            "백업/충돌/001화 (서버 최신본).txt",
+            "메인/휴지통/버린 원고.txt",
+            "메인/원고/1권/001화.txt",
+        ):
+            with self.subTest(relative_path=relative_path):
+                self.assertTrue(self.wpm.write_text_file(relative_path, "내용"))
+                self.assertEqual(
+                    self.path(relative_path).read_text(encoding="utf-8"), "내용"
+                )
+
+    def test_the_write_guard_and_the_sync_layer_agree_on_one_rule(self):
+        """규칙이 두 벌이면 한쪽은 건너뛰고 한쪽은 쓰게 된다."""
+        from project_creation_v1 import is_sync_internal_path
+        from sync_manager import TREE_ORDER_DOCUMENT_PATH, is_internal_sync_path
+
+        self.assertTrue(is_internal_sync_path(TREE_ORDER_DOCUMENT_PATH))
+        self.assertTrue(is_sync_internal_path(TREE_ORDER_DOCUMENT_PATH))
+        for manuscript in ("메인/원고/1권/001화.txt", "메인/휴지통/버린 원고.txt"):
+            self.assertFalse(is_internal_sync_path(manuscript))
+            self.assertFalse(is_sync_internal_path(manuscript))
+
+    @staticmethod
+    def _wait_for(predicate, timeout_seconds=5.0):
+        app = QApplication.instance() or QApplication([])
+        deadline = time.monotonic() + timeout_seconds
+        while not predicate() and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(10)
+        return bool(predicate())
+
+    def test_slow_binder_create_returns_before_durable_io_finishes(self):
+        app = self.app
+        manager = SyncManager()
+        # SyncManager is process-wide.  A preceding test may have attached a
+        # temporary v2 project whose directory has already been removed; this
+        # fixture exercises local-only binder work and must not publish that
+        # stale project's state from the queued completion callback.
+        manager.release_v2()
+        panel = WritingTreeMixin()
+        panel.sync_manager = manager
+        panel.wpm = self.wpm
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        parent = QTreeWidgetItem(panel.binder_tree, ["📝 메모장"])
+        parent.setData(0, Qt.ItemDataRole.UserRole, "메인/메모장")
+        parent.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        release = threading.Event()
+
+        def slow_create(*_args):
+            release.wait(5.0)
+            return "새 폴더"
+
+        panel._create_binder_item = slow_create
+        started = time.perf_counter()
+        accepted = panel.start_create_item(parent, is_folder=True)
+        elapsed = time.perf_counter() - started
+
+        self.assertTrue(accepted)
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(parent.childCount(), 0)
+        release.set()
+        self.assertTrue(self._wait_for(lambda: parent.childCount() == 1))
+        self.assertEqual(parent.child(0).text(0), "새 폴더")
+        manager.wait_all_workers(5000)
+        self.assertTrue(self._wait_for(
+            lambda: manager._local_structure_worker is None
+        ))
+        app.processEvents()
+
+    def test_context_menu_folder_shortcut_waits_for_key_release(self):
+        class MenuHost(WritingTreeMixin, QWidget):
+            def __init__(host_self):
+                QWidget.__init__(host_self)
+                host_self.binder_tree = BinderTreeWidget(host_self)
+                host_self.binder_tree.setColumnCount(1)
+                host_self.root_nodes = {}
+                host_self.start_create_root_item = MagicMock()
+
+        host = MenuHost()
+        host.resize(320, 320)
+        host.binder_tree.resize(300, 300)
+        host.show()
+        host.binder_tree.show()
+
+        def press_shortcut():
+            popup = QApplication.activePopupWidget()
+            self.assertIsNotNone(popup)
+            QTest.keyPress(popup, Qt.Key.Key_F)
+
+        QTimer.singleShot(100, press_shortcut)
+        host.show_tree_context_menu(QPoint(20, 20))
+        QTest.qWait(180)
+        host.start_create_root_item.assert_not_called()
+
+        QTest.keyRelease(host.binder_tree, Qt.Key.Key_F)
+        self.assertTrue(self._wait_for(
+            lambda: host.start_create_root_item.call_count == 1
+        ))
+        host.start_create_root_item.assert_called_once_with(
+            is_folder=True, edit_name=False
+        )
+        host.close()
+
+    def test_shortcut_create_commits_default_name_without_opening_editor(self):
+        panel = WritingTreeMixin()
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        panel._commit_tree_item_creation = MagicMock(return_value=True)
+
+        with patch("writing_tree.QTimer.singleShot") as single_shot:
+            result = panel.start_create_root_item(
+                is_folder=True,
+                _structure_acquired=True,
+                _created_name="새 폴더",
+                edit_name=False,
+            )
+
+        self.assertTrue(result)
+        single_shot.assert_not_called()
+        item = panel.binder_tree.topLevelItem(0)
+        self.assertEqual(item.text(0), "새 폴더")
+        self.assertFalse(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        panel._commit_tree_item_creation.assert_called_once_with(item)
+
+    def test_duplicate_initial_name_keeps_default_creation_pending(self):
+        panel = WritingTreeMixin()
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        item = QTreeWidgetItem(panel.binder_tree, ["ㄹ"])
+        item.setData(
+            0, Qt.ItemDataRole.UserRole, "메인/메모장/새 폴더"
+        )
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        item.setData(0, Qt.ItemDataRole.UserRole + 4, True)
+        panel.wpm = self.wpm
+        panel.wpm.rename_item = MagicMock(
+            side_effect=Exception("이미 같은 이름의 항목이 존재합니다.")
+        )
+        panel.sync_manager = SimpleNamespace(
+            background_local_structure_enabled=False,
+            local_structure_mutation=lambda: nullcontext(),
+            record_path_change=MagicMock(return_value=[]),
+            record_tree_order=MagicMock(),
+            retry_pending_syncs=MagicMock(),
+            record_structure_recovery=MagicMock(),
+        )
+
+        with patch.object(QMessageBox, "warning"):
+            panel._apply_tree_item_changed(item, 0)
+
+        self.assertEqual(item.text(0), "새 폴더")
+        self.assertTrue(
+            item.data(0, Qt.ItemDataRole.UserRole + 4)
+        )
+
+        self.assertTrue(panel._commit_tree_item_creation(item))
+        panel.sync_manager.record_path_change.assert_called_once_with(
+            "메인/메모장/새 폴더",
+            "메인/메모장/새 폴더",
+            retry=False,
+        )
+        panel.sync_manager.record_tree_order.assert_called_once()
+        self.assertFalse(
+            item.data(0, Qt.ItemDataRole.UserRole + 4)
+        )
+
+    def test_slow_binder_delete_returns_before_trash_io_finishes(self):
+        app = self.app
+        from project_creation_v1 import create_item_at_path
+
+        identity = create_item_at_path(
+            str(self.root / self.project_name),
+            "메인/메모장",
+            "삭제 대상",
+            True,
+        )
+        rel_path = identity["nodes"][-1]["legacy_path"]
+        manager = SyncManager()
+        manager.release_v2()
+        panel = WritingTreeMixin()
+        panel.sync_manager = manager
+        panel.wpm = self.wpm
+        panel.binder_tree = BinderTreeWidget()
+        panel.binder_tree.setColumnCount(1)
+        parent = QTreeWidgetItem(panel.binder_tree, ["📝 메모장"])
+        parent.setData(0, Qt.ItemDataRole.UserRole, "메인/메모장")
+        parent.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        item = QTreeWidgetItem(parent, ["삭제 대상"])
+        item.setData(0, Qt.ItemDataRole.UserRole, rel_path)
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+        panel._refresh_trash_binder_node = MagicMock()
+        release = threading.Event()
+        original_move = self.wpm.move_to_trash
+
+        def slow_move(*args, **kwargs):
+            release.wait(5.0)
+            return original_move(*args, **kwargs)
+
+        self.wpm.move_to_trash = slow_move
+        with patch(
+            "writing_tree.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            started = time.perf_counter()
+            accepted = panel.delete_tree_item(item)
+            elapsed = time.perf_counter() - started
+
+        self.assertTrue(accepted)
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(self.path(rel_path).is_dir())
+        release.set()
+        self.assertTrue(self._wait_for(lambda: parent.childCount() == 0))
+        self.assertFalse(self.path(rel_path).exists())
+        self.assertTrue(
+            any(
+                entry["original_path"] == rel_path
+                for entry in self.wpm.list_trash_items()
+            )
+        )
+        manager.wait_all_workers(5000)
+        self.assertTrue(self._wait_for(
+            lambda: manager._local_structure_worker is None
+        ))
+        app.processEvents()
+
+    def test_busy_structure_gate_accepts_first_click_and_retries_once(self):
+        manager = MagicMock()
+        manager.local_structure_mutation.side_effect = [
+            nullcontext(False),
+            nullcontext(7),
+        ]
+        panel = SimpleNamespace(sync_manager=manager)
+        action = MagicMock()
+        scheduled = []
+
+        with patch(
+            "writing_tree.QTimer.singleShot",
+            side_effect=lambda _delay, callback: scheduled.append(callback),
+        ):
+            accepted = WritingTreeMixin._run_or_queue_structure_action(
+                panel, "delete:one", action
+            )
+            duplicate = WritingTreeMixin._run_or_queue_structure_action(
+                panel, "delete:one", action
+            )
+            self.assertFalse(accepted)
+            self.assertFalse(duplicate)
+            action.assert_not_called()
+            self.assertEqual(len(scheduled), 1)
+
+            scheduled.pop()()
+
+        action.assert_called_once_with()
+        self.assertEqual(
+            manager.notify_local_structure_queue.call_args_list,
+            [call(1), call(0)],
+        )
+
+    def test_ui_heartbeat_reports_event_loop_lateness(self):
+        manager = SimpleNamespace(record_binder_timing=MagicMock())
+        panel = SimpleNamespace(
+            sync_manager=manager,
+            _ui_heartbeat_expected_at=10.0,
+            _ui_heartbeat_interval_ms=250,
+        )
+
+        with patch("mode_writing.time.perf_counter", return_value=10.125):
+            WritingModeWidget._record_ui_heartbeat(panel)
+
+        manager.record_binder_timing.assert_called_once_with(
+            "ui_heartbeat", 125.0
+        )
+        self.assertEqual(panel._ui_heartbeat_expected_at, 10.375)
 
     def test_fixed_binder_uses_story_plot_for_label_and_storage_path(self):
         roots = dict(WritingTreeMixin.FIXED_ROOT_NODES)
@@ -507,7 +811,8 @@ class WritingDataTestCase(unittest.TestCase):
         ):
             WritingTreeMixin.delete_tree_item(panel, item)
 
-        self.assertEqual(manager.local_structure_mutation.call_count, 2)
+        # One non-blocking UI admission probe plus commit and rollback gates.
+        self.assertEqual(manager.local_structure_mutation.call_count, 3)
         manager.record_tombstone.assert_called_once_with(
             live_path, trash_path, retry=False
         )
@@ -558,7 +863,8 @@ class WritingDataTestCase(unittest.TestCase):
         ):
             WritingTreeMixin.restore_trash_item(panel, item)
 
-        self.assertEqual(manager.local_structure_mutation.call_count, 2)
+        # One non-blocking UI admission probe plus commit and rollback gates.
+        self.assertEqual(manager.local_structure_mutation.call_count, 3)
         manager.record_restore.assert_called_once_with(
             trash_path,
             restored_path,
@@ -744,6 +1050,47 @@ class WritingDataTestCase(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.wpm.restore_from_trash(collision_item["trash_path"])
         self.assertEqual(self.wpm.read_text_file("메인/메모장/충돌.txt"), "새 현재본")
+
+    def test_trash_metadata_preserves_original_tree_order_position(self):
+        original = "메인/메모장/가운데 폴더"
+        self.path(original).mkdir(parents=True)
+
+        trash_path = self.wpm.move_to_trash(
+            original,
+            tree_order_parent="메인/메모장",
+            tree_order_index=2,
+        )
+
+        trashed = next(
+            item for item in self.wpm.list_trash_items()
+            if item["trash_path"] == trash_path
+        )
+        self.assertEqual(trashed["tree_order_parent"], "메인/메모장")
+        self.assertEqual(trashed["tree_order_index"], 2)
+
+    def test_restore_projection_reuses_saved_sibling_position(self):
+        restored = "메인/메모장/가운데 폴더"
+        self.path(restored).mkdir(parents=True)
+        panel = SimpleNamespace(wpm=self.wpm)
+        before = {
+            "메인/메모장": ["앞 폴더", "뒤 폴더"],
+            "메인/휴지통": ["가운데 폴더"],
+        }
+
+        projected = WritingTreeMixin._tree_order_with_restored_path(
+            panel,
+            before,
+            "메인/휴지통/가운데 폴더",
+            restored,
+            original_parent="메인/메모장",
+            original_index=1,
+        )
+
+        self.assertEqual(
+            projected["메인/메모장"],
+            ["앞 폴더", "가운데 폴더", "뒤 폴더"],
+        )
+        self.assertNotIn("가운데 폴더", projected["메인/휴지통"])
 
     def test_full_and_partial_extraction_keep_sources_unchanged(self):
         volume = self.path("메인/원고/1권")

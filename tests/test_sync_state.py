@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from mode_writing import WritingModeWidget
@@ -167,14 +167,20 @@ class SyncManagerStateTestCase(unittest.TestCase):
         self.assertIn("로그인", guidance["action"])
         self.assertNotIn("인터넷", guidance["action"])
 
-    def test_queued_work_without_an_error_is_not_reported_as_offline(self):
-        state, _detail, _pending = self._publish_with_v2_error("")
+    def test_queued_work_without_an_error_is_normal_sync_progress(self):
+        with patch.object(self.manager._diagnostics, "record") as record:
+            state, detail, _pending = self._publish_with_v2_error("")
 
-        self.assertEqual(state, "failed")
+        self.assertEqual(state, "syncing")
+        self.assertIn("전송 순서", detail)
+        self.assertFalse(any(
+            call.args and call.args[0] == "sync_failure"
+            for call in record.call_args_list
+        ))
         guidance = WritingModeWidget._storage_status_guidance(
-            state, "", 1, 0, False
+            state, detail, 1, 0, False
         )
-        self.assertEqual(guidance["action_code"], "retry")
+        self.assertNotEqual(guidance["action_code"], "retry")
         self.assertNotIn("인터넷", guidance["action"])
 
     def test_connectivity_error_still_reports_offline(self):
@@ -302,6 +308,12 @@ class SyncManagerStateTestCase(unittest.TestCase):
         self.assertIn("assert_release_config_buildable(config_source)", spec)
         self.assertIn("(config_source, '.')", spec)
         self.assertIn("if Path(config_source).is_file() else []", spec)
+        self.assertIn("qt_runtime_names = (", spec)
+        self.assertIn("'VCRUNTIME140.dll'", spec)
+        self.assertIn("'MSVCP140.dll'", spec)
+        self.assertIn("binaries=qt_root_runtime_binaries", spec)
+        self.assertIn("Path(entry[0]).name.casefold() != 'icuuc.dll'", spec)
+        self.assertIn(".startswith('icudt')", spec)
         source = Path("sync_manager.py").read_text(encoding="utf-8")
         self.assertNotIn("SUPABASE_EMAIL", source)
         self.assertNotIn("SUPABASE_PASSWORD", source)
@@ -563,6 +575,95 @@ class _FakeLabel:
 
 
 class StorageStatusLabelTestCase(unittest.TestCase):
+    def test_editor_dirty_refresh_reuses_cached_activity_without_sqlite_query(self):
+        activity_query = MagicMock(
+            side_effect=AssertionError("typing must not query sync sqlite")
+        )
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            _storage_state="saved",
+            _storage_detail="",
+            _storage_pending_count=0,
+            _storage_account_email="writer@example.com",
+            _storage_sync_activity={},
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                sync_activity_snapshot=activity_query,
+            ),
+        )
+        target.update_storage_status = MethodType(
+            WritingModeWidget.update_storage_status, target
+        )
+
+        WritingModeWidget._refresh_storage_status_for_editor_state(target)
+
+        activity_query.assert_not_called()
+        self.assertIn("로컬 저장 대기 1건", target.lbl_storage_status.text)
+
+    def test_regular_status_refresh_never_falls_back_to_sqlite_snapshot(self):
+        sqlite_query = MagicMock(
+            side_effect=AssertionError("status paint must not query sqlite")
+        )
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _storage_sync_activity={"transfer_pending": 7},
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                sync_activity_snapshot=sqlite_query,
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "failed", "", 7)
+
+        sqlite_query.assert_not_called()
+        self.assertEqual(target._storage_sync_activity["transfer_pending"], 7)
+
+    def test_active_ime_preedit_protects_clean_editor_from_remote_pull(self):
+        left = MagicMock()
+        left.document().isModified.return_value = False
+        left.has_pending_input_method.return_value = True
+        right = MagicMock()
+        right.document().isModified.return_value = False
+        right.has_pending_input_method.return_value = False
+        target = SimpleNamespace(
+            current_loaded_file_left="메인/원고/001화.txt",
+            current_loaded_file_right="메인/원고/002화.txt",
+            is_dirty_left=False,
+            is_dirty_right=False,
+            left_editor=left,
+            right_editor=right,
+        )
+
+        protected = WritingModeWidget.get_remote_sync_protected_paths(target)
+
+        self.assertEqual(protected, {"메인/원고/001화.txt"})
+
+    def test_transient_empty_auth_and_duplicate_publish_do_not_repaint_status(self):
+        label = MagicMock()
+        manager = SimpleNamespace(
+            authenticated_email=MagicMock(return_value="writer@example.com"),
+            display_sync_activity_snapshot=lambda: {},
+        )
+        target = SimpleNamespace(
+            lbl_storage_status=label,
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=manager,
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+        manager.authenticated_email.return_value = ""
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertEqual(target._storage_account_email, "writer@example.com")
+        label.setText.assert_called_once_with("● 동기화 완료")
+        label.setStyleSheet.assert_called_once()
+        label.setToolTip.assert_called_once()
+
     def test_all_user_visible_status_labels(self):
         target = SimpleNamespace(lbl_storage_status=_FakeLabel())
         expected = {
@@ -573,6 +674,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             "auth_required": "로그인 필요",
             "lease": "다른 기기 편집 중",
             "failed": "서버 전송 대기",
+            "local_waiting": "바인더 작업 대기",
             "conflict": "충돌",
             "project_trashed": "서버 휴지통 · 동기화 중지",
             "project_purged": "서버 영구 삭제 · 로컬 사본",
@@ -584,7 +686,8 @@ class StorageStatusLabelTestCase(unittest.TestCase):
                 state,
                 "상세 상태",
                 1 if state in {
-                    "offline", "auth_required", "lease", "failed", "conflict",
+                    "offline", "auth_required", "lease", "failed",
+                    "local_waiting", "conflict",
                     "project_trashed", "project_purged",
                 } else 0,
             )
@@ -676,6 +779,182 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             target.lbl_storage_status.text,
             "● 로컬 저장 완료 · 서버 전송 중 1건",
         )
+
+    def test_conflict_status_never_labels_pending_queue_as_conflict_count(self):
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(authenticated_email=lambda: ""),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "conflict", "구조 기준 확인 필요", 30
+        )
+
+        self.assertEqual(
+            target.lbl_storage_status.text,
+            "● 로컬 저장 완료 · 충돌 확인 필요 · 대기 작업 30건",
+        )
+        self.assertNotIn("충돌 30건", target.lbl_storage_status.text)
+
+    def test_a_stalled_binder_order_says_the_manuscript_is_still_syncing(self):
+        """순서만 막힌 것을 원고 사고처럼 보이게 하면 안 된다."""
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "tree_order_stalled", "서버 문서 목록과 맞지 않습니다.", 0
+        )
+
+        self.assertEqual(
+            target.lbl_storage_status.text, "● 원고 동기화 중 · 바인더 순서 대기"
+        )
+        guidance = WritingModeWidget._storage_status_guidance(
+            "tree_order_stalled", "서버 문서 목록과 맞지 않습니다."
+        )
+        self.assertIn("원고는 정상적으로 동기화", guidance["summary"])
+        self.assertIn("원고는 안전", guidance["action"])
+        self.assertTrue(guidance["warning"])
+        self.assertEqual(guidance["action_code"], "")
+
+    def test_a_project_that_would_not_open_is_never_reported_as_synced(self):
+        """열지 못한 작품에 이전 작품의 상태를 물려주면 안 된다.
+
+        열기가 거부되면 공유 매니저가 해제되어 아무것도 전송되지 않는데,
+        버튼은 직전 작품의 '동기화 완료'를 그대로 들고 있었다.
+        """
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _open_blocked_reason="identity와 파일 트리가 일치하지 않는다",
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertEqual(
+            target.lbl_storage_status.text, "● 작품을 열지 못함 · 동기화 중지"
+        )
+        self.assertNotIn("동기화 완료", target.lbl_storage_status.text)
+        guidance = WritingModeWidget._storage_status_guidance(
+            "project_unopened", "identity와 파일 트리가 일치하지 않는다"
+        )
+        self.assertEqual(
+            guidance["cause"], "identity와 파일 트리가 일치하지 않는다"
+        )
+        self.assertTrue(guidance["warning"])
+        self.assertIn("파일은 그대로", guidance["summary"])
+
+    def test_a_pending_count_from_another_project_is_not_shown_either(self):
+        """해제된 매니저가 남긴 대기 건수는 이 작품의 것이 아니다."""
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=True,
+            is_dirty_right=False,
+            _open_blocked_reason="레거시 프로젝트 — 명시적 가져오기 필요",
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "failed", "이전 작품 오류", 7)
+
+        self.assertEqual(
+            target.lbl_storage_status.text, "● 작품을 열지 못함 · 동기화 중지"
+        )
+        self.assertNotIn("7건", target.lbl_storage_status.text)
+        self.assertNotIn("로컬 저장 대기", target.lbl_storage_status.text)
+
+    def test_an_opened_project_keeps_reporting_normally(self):
+        """열린 작품에는 아무 영향이 없어야 한다."""
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            _open_blocked_reason="",
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: {},
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        self.assertEqual(target.lbl_storage_status.text, "● 동기화 완료")
+
+    def test_invisible_background_pull_keeps_the_completed_sync_label(self):
+        activity = {
+            "transfer_pending": 0,
+            "transferring": 0,
+            "retry_wait": 0,
+            "conflict": 0,
+            "blocked": 0,
+            "pull_pending": 0,
+            "pulling": 1,
+            "pull_visible": 0,
+        }
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: activity,
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        # The five-second background pull must not repaint the button while
+        # the writer is idle.
+        self.assertEqual(target.lbl_storage_status.text, "● 동기화 완료")
+
+        activity["pull_visible"] = 1
+        WritingModeWidget.update_storage_status(target, "saved", "", 0)
+
+        # A manual refresh or the first baseline pull still reports progress.
+        self.assertEqual(target.lbl_storage_status.text, "● 로컬 저장 완료")
+
+    def test_pending_34_and_conflict_zero_is_only_transfer_waiting(self):
+        activity = {
+            "transfer_pending": 34,
+            "transferring": 0,
+            "retry_wait": 0,
+            "conflict": 0,
+            "blocked": 0,
+            "pull_pending": 1,
+            "pulling": 0,
+        }
+        target = SimpleNamespace(
+            lbl_storage_status=_FakeLabel(),
+            is_dirty_left=False,
+            is_dirty_right=False,
+            sync_manager=SimpleNamespace(
+                authenticated_email=lambda: "writer@example.com",
+                display_sync_activity_snapshot=lambda: activity,
+            ),
+        )
+
+        WritingModeWidget.update_storage_status(
+            target, "failed", "서버 전송을 기다립니다.", 34
+        )
+
+        self.assertIn("서버 전송 대기 34건", target.lbl_storage_status.text)
+        self.assertNotIn("충돌", target.lbl_storage_status.text)
+        self.assertEqual(target._storage_sync_activity["conflict"], 0)
 
     def test_guidance_distinguishes_seven_primary_storage_states(self):
         cases = {
@@ -856,6 +1135,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
             current_loaded_file_right=None,
             left_editor=editor,
             right_editor=MagicMock(),
+            apply_editor_margins=MagicMock(),
             lbl_current_doc=_FakeLabel(),
             lbl_r_doc=_FakeLabel(),
             is_dirty_left=False,
@@ -876,6 +1156,7 @@ class StorageStatusLabelTestCase(unittest.TestCase):
 
         self.assertEqual(target.current_loaded_file_left, "메인/메모장/새이름.txt")
         editor.setPlainText.assert_called_once_with("다른 Windows에서 저장한 내용")
+        target.apply_editor_margins.assert_called_once_with(editor)
         self.assertEqual(target.lbl_current_doc.text, "새이름.txt")
         self.assertEqual(target.loaded_versions["메인/메모장/새이름.txt"], 7)
         target.controller.rename_path.assert_called_once()

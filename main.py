@@ -3,6 +3,18 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget
 from PyQt6.QtGui import QIcon, QFont, QKeySequence, QShortcut
 from PyQt6.QtCore import QEvent, Qt
 
+
+if "--qt-import-smoke-test" in sys.argv:
+    # Release builds run this before installation. It validates not only the
+    # Python extension import but also the bundled Qt platform plugin and its
+    # MSVC runtime, without opening projects, credentials, or sync state.
+    smoke_app = QApplication(["writerpad-qt-import-smoke-test"])
+    smoke_window = QMainWindow()
+    smoke_window.winId()
+    smoke_app.processEvents()
+    sys.exit(0)
+
+
 from mode_assistant import AssistantModeWidget, SingleApplication
 from mode_writing import WritingModeWidget
 from project_manager import startup_mode_from_config
@@ -199,6 +211,20 @@ if __name__ == "__main__":
         print("프로그램이 이미 실행 중입니다. 기존 창을 최상단으로 띄웁니다.")
         app.wake_up_server()
         sys.exit(0)
+
+    # Claim the stored Supabase session for this process before anything can
+    # want it. SyncManager is built lazily -- not until a writing project is
+    # opened -- so waiting for it to claim the credential leaves the whole
+    # startup as a window in which another holder can take it and start
+    # exchanging tokens underneath us. Held for the life of the process; the
+    # handle is returned when it exits.
+    from sync_manager import SyncManager
+
+    if SyncManager.acquire_auth_lease() is not True:
+        print(
+            "클라우드 자격 증명을 다른 프로세스가 사용 중입니다. "
+            "이번 실행에서는 서버 동기화를 시작하지 않습니다."
+        )
 
     pid_path = pid_file_path()
     if pid_path:
