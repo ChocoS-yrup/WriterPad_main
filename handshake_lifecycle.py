@@ -209,14 +209,18 @@ class HandshakeLifecycleMixin:
                 id(self.supabase), self._contract_identity())
 
     def _contract_authority_allows_dispatch(self):
+        return self._contract_authority_observation()['allowed']
+
+    def _contract_authority_observation(self):
         # An old/default state is not a current authorization. Unlike the
         # general legacy path, contract writes require an observed baseline.
-        return (
-            self._v2_structure_authority_identity == self._v2_pull_identity()
-            and self._v2_structure_authority in {"contract", "legacy"}
-            and self._contract_project_state_context == self._contract_project_context()
-            and self._current_project_server_state() == "active"
-        )
+        identity_matches = self._v2_structure_authority_identity == self._v2_pull_identity()
+        accepted = self._v2_structure_authority in {'contract', 'legacy'}
+        project_matches = self._contract_project_state_context == self._contract_project_context()
+        active = self._current_project_server_state() == 'active'
+        return {'identity_matches': identity_matches, 'accepted': accepted,
+                'project_context_matches': project_matches, 'project_active': active,
+                'allowed': identity_matches and accepted and project_matches and active}
 
     def request_contract_handshake_async(self):
         """A read-only probe is independent of the outbound/pull queue gate.
@@ -303,14 +307,16 @@ class HandshakeLifecycleMixin:
         except (ContractDispatchPaused, TypeError, ValueError):
             return False
 
-    def _send_contract_request(self, rpc_name, request, context):
+    def _send_contract_request(self, rpc_name, request, context, *, reviewed=None):
         key, store, client, _write_epoch = context
         batch_id = request["batch"]["batch_id"]
         with self._contract_lock:
             self._check_contract_dispatch(request, context)
+            if reviewed is not None:
+                reviewed.check_local()
             if batch_id in self._contract_preparing or batch_id in self._contract_sending:
                 raise ContractDispatchPaused()
-            cached = store.document_batch_response(batch_id)
+            cached = reviewed.cached_response() if reviewed is not None else store.document_batch_response(batch_id)
             if cached is not None:
                 return cached
             # Preparation includes a potentially slow read. Duplicate recovery
@@ -320,6 +326,8 @@ class HandshakeLifecycleMixin:
             self.ensure_session_valid(client)
             with self._contract_lock:
                 self._check_contract_dispatch(request, context)
+                if reviewed is not None:
+                    reviewed.check_local()
             # A contract-only read: never use the legacy compatibility fallback
             # or a cached/default active value to approve this send.
             status = self._response_data(execute_contract_rpc(client.rpc(
@@ -335,18 +343,28 @@ class HandshakeLifecycleMixin:
                 if status["state"] != "active":
                     self.mark_project_server_state(key[5], status["state"])
                     raise ContractDispatchPaused()
+            if reviewed is not None:
+                reviewed.trace('second_remote_before')
+                reviewed.check_remote()
+                reviewed.trace('second_remote_after')
             call = client.rpc(rpc_name, {"p_request": request})
             with self._contract_lock:
+                if reviewed is not None:
+                    reviewed.trace('rpc_constructed')
                 # The status read and RPC construction can both yield. The
                 # captured queue history also rejects blocked -> resolved ABA.
                 self._check_contract_dispatch(request, context)
-                cached = store.document_batch_response(batch_id)
+                cached = reviewed.cached_response() if reviewed is not None else store.document_batch_response(batch_id)
                 if cached is not None:
                     return cached
+                if reviewed is not None:
+                    reviewed.before_http()
                 self._contract_sending.add(batch_id)
             response = self._response_data(execute_contract_rpc(call))
             # A receipt belongs to the captured store even if the UI moved on.
-            if rpc_name == "atomic_structure_commit":
+            if reviewed is not None:
+                receipt = reviewed.record_response(response)
+            elif rpc_name == "atomic_structure_commit":
                 receipt = store.record_structure_batch_response(batch_id, response)
             else:
                 receipt = store.record_document_batch_response(batch_id, response)

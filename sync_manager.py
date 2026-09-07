@@ -40,6 +40,8 @@ from binder_order import (
 )
 from project_paths import LocalProjectPathError, validate_local_project_name
 from sync_diagnostics import SyncDiagnosticLog, format_diagnostic_report
+from contract_preparation import ContractPreparationManagerMixin
+from reviewed_contract_sender import ReviewedSenderManagerMixin
 from sync_v2_store import SyncV2Store
 from handshake_lifecycle import HandshakeLifecycleMixin, ContractDispatchPaused
 from network_recovery import NetworkRecoveryMixin
@@ -877,7 +879,8 @@ def auth_error_facts(error, classified):
     }
 
 
-class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
+class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPreparationManagerMixin, ReviewedSenderManagerMixin, QObject):
+    reviewedPullReleased = pyqtSignal(object)
     syncStateChanged = pyqtSignal(str, str, int)  # state, detail, pending retry count
     conflictDetected = pyqtSignal(object)
     autoMergeApplied = pyqtSignal(object)
@@ -922,6 +925,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
         if self._initialized:
             return
         super().__init__()
+        self.reviewedPullReleased.connect(self._resume_pull_after_review, Qt.ConnectionType.QueuedConnection)
         self._initialized = True
         self.active_workers = set()
         self._retry_queue = {}
@@ -1349,6 +1353,23 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                 return self._schedule_v2_retry(int(remaining_ms) + 1)
         return self.pull_remote_changes_async(reason="general")
 
+    def _queue_pull_after_review(self):
+        """Called with _contract_lock held; queued wake-up carries no authority."""
+        coordinator = self._current_pull_coordinator(create=False)
+        if coordinator and coordinator.get('pull_pending') and not self._shutting_down:
+            self.reviewedPullReleased.emit((self._v2_pull_identity(), self._contract_identity(), coordinator))
+
+    @pyqtSlot(object)
+    def _resume_pull_after_review(self, ticket):
+        with self._contract_lock:
+            identity, account, coordinator = ticket
+            if (self._shutting_down or getattr(self, '_review_execution_busy', False)
+                    or identity != self._v2_pull_identity() or account != self._contract_identity()
+                    or coordinator is not self._current_pull_coordinator(create=False)
+                    or not coordinator.get('pull_pending')):
+                return
+        self.pull_remote_changes_async(_expected_pull=ticket)
+
     def _note_local_structure_activity(self):
         coordinator = self._current_pull_coordinator(create=False)
         if coordinator is not None:
@@ -1370,11 +1391,12 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             # ending here. None of them may land on whatever is attached next.
             self._v2_context_generation += 1
             self._forget_contract_handshake()
+            self._v2_structure_authority = None
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = None
+            self._note_authority_transition('release')
         self._v2_wpm = None
         self._v2_untracked_recovery_paths = set()
-        self._v2_structure_authority = None
-        self._v2_structure_authority_error = ""
-        self._v2_structure_authority_identity = None
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
@@ -1422,9 +1444,10 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             # A new project is a new generation, even when the one before it was
             # released first: a reply from the old one must not pass for this one.
             self._v2_context_generation += 1
-        self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
-        self._v2_structure_authority_error = ""
-        self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
+            self._v2_structure_authority_error = ""
+            self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._note_authority_transition('configure')
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
@@ -2135,7 +2158,11 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             return False
         return True
 
-    def _begin_structure_authority_selection(self):
+    def _note_authority_transition(self, reason):
+        from contract_readiness_diagnostics import note_authority_transition
+        note_authority_transition(self, reason)
+
+    def _begin_structure_authority_selection(self, reason='selection'):
         """Close every server-write exit while one pull chooses its source."""
         with self._contract_lock:
             if self.is_v2_enabled:
@@ -2143,6 +2170,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                 self._v2_structure_authority = STRUCTURE_AUTHORITY_UNKNOWN
                 self._v2_structure_authority_error = ""
                 self._v2_structure_authority_identity = self._v2_pull_identity()
+                self._note_authority_transition(reason)
 
     def _accept_structure_authority(self, authority):
         if authority not in {
@@ -2157,6 +2185,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             self._v2_structure_authority = authority
             self._v2_structure_authority_error = ""
             self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._note_authority_transition('accepted')
         coordinator = self._current_pull_coordinator(create=False)
         if coordinator:
             coordinator.pop('network_retry_after', None)
@@ -2170,6 +2199,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             self._v2_structure_authority = STRUCTURE_AUTHORITY_BLOCKED
             self._v2_structure_authority_error = code
             self._v2_structure_authority_identity = self._v2_pull_identity()
+            self._note_authority_transition('blocked')
         self._v2_last_pull_apply_blocked = True
         coordinator = self._current_pull_coordinator(create=False)
         if coordinator:
@@ -3585,7 +3615,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                 Qt.ConnectionType.QueuedConnection,
             )
             return True
-        if self._auth_retry_blocked or self._shutting_down:
+        if self._auth_retry_blocked or self._shutting_down or getattr(self, '_review_execution_busy', False):
             self._publish_sync_state()
             return False
         if self._v2_retry_timer.isActive():
@@ -4458,7 +4488,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                     pass
                 self._forget_contract_handshake()
                 self._auth_retry_blocked = False
-                self._begin_structure_authority_selection()
+                self._begin_structure_authority_selection('sign_in')
             self._last_sync_error = ""
             self._last_failure_offline = False
             self._publish_sync_state()
@@ -9759,68 +9789,126 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             current = os.path.dirname(current)
 
     def pull_remote_changes_async(
-        self, *, manual=False, retry_pending_after_pull=False, reason=None
+        self, *, manual=False, retry_pending_after_pull=False, reason=None, _expected_pull=None
     ):
-        if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
-            return False
-        self.request_contract_handshake_async()
-        if self._auth_retry_blocked or self._session_restore_waiting() or self._shutting_down:
-            self._publish_sync_state()
-            return False
-        coordinator = self._current_pull_coordinator()
-        if coordinator.get('network_retry_after') is not None:
-            if not manual and time.monotonic() < coordinator['network_retry_after']:
+        with self._contract_lock:
+            if not self.is_v2_enabled or is_forced_offline() or not self.supabase:
                 return False
-            # Revalidate the baseline even with queued local edits. The normal
-            # outbound gate would otherwise prevent recovery indefinitely.
-            reason = 'baseline'
-        if reason is None:
-            reason = (
-                "baseline"
-                if not coordinator["baseline_validated"]
-                else "general"
-            )
-        if reason not in {"baseline", "general"}:
-            raise ValueError(f"unknown pull reason: {reason}")
-        # Realtime, timer, reconnect and UI requests all collapse into this one
-        # bit. It is consumed immediately before a worker starts, never when
-        # that worker happens to finish.
-        coordinator["pull_pending"] = True
-        if (
-            self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
-            and self._v2_structure_authority_identity == self._v2_pull_identity()
-            and not manual
-        ):
-            # The five-second timer must not turn a fail-closed snapshot into
-            # an automatic retry loop. Reopening/reconfiguring starts one new
-            # selection generation deliberately.
-            return False
-        current_pull_worker = (
-            self._v2_pull_worker
-            if self._v2_pull_worker_identity == self._v2_pull_identity()
-            else None
-        )
-        if coordinator["pulling"] or current_pull_worker is not None:
-            try:
-                if coordinator["pulling"] or current_pull_worker.isRunning():
+            if _expected_pull is not None:
+                identity, account, expected_coordinator = _expected_pull
+                if (identity != self._v2_pull_identity() or account != self._contract_identity()
+                        or expected_coordinator is not self._current_pull_coordinator(create=False)):
                     return False
-            except RuntimeError:
-                self._v2_pull_worker = None
-                self._v2_pull_worker_identity = None
+            coordinator = self._current_pull_coordinator()
+            if coordinator is None:
+                return False
+            if reason not in {None, "baseline", "general"}:
+                raise ValueError(f"unknown pull reason: {reason}")
+            if getattr(self, '_review_execution_busy', False):
+                coordinator['pull_pending'] = True
+                coordinator['review_deferred_manual'] = bool(manual or coordinator.get('review_deferred_manual'))
+                coordinator['review_deferred_retry'] = bool(retry_pending_after_pull or coordinator.get('review_deferred_retry'))
+                coordinator['review_deferred_baseline'] = bool(reason == 'baseline' or coordinator.get('review_deferred_baseline'))
+                return False
+            manual = bool(manual or coordinator.get('review_deferred_manual'))
+            retry_pending_after_pull = bool(retry_pending_after_pull or coordinator.get('review_deferred_retry'))
+            if coordinator.get('review_deferred_baseline'):
+                reason = 'baseline'
+            self.request_contract_handshake_async()
+            if self._auth_retry_blocked or self._session_restore_waiting() or self._shutting_down:
+                self._publish_sync_state()
+                return False
+            coordinator = self._current_pull_coordinator()
+            if coordinator.get('network_retry_after') is not None:
+                if not manual and time.monotonic() < coordinator['network_retry_after']:
+                    return False
+                # Revalidate the baseline even with queued local edits. The normal
+                # outbound gate would otherwise prevent recovery indefinitely.
+                reason = 'baseline'
+            if reason is None:
+                reason = (
+                    "baseline"
+                    if not coordinator["baseline_validated"]
+                    else "general"
+                )
+            if reason not in {"baseline", "general"}:
+                raise ValueError(f"unknown pull reason: {reason}")
+            # Realtime, timer, reconnect and UI requests all collapse into this one
+            # bit. It is consumed immediately before a worker starts, never when
+            # that worker happens to finish.
+            coordinator["pull_pending"] = True
+            if (
+                self._v2_structure_authority == STRUCTURE_AUTHORITY_BLOCKED
+                and self._v2_structure_authority_identity == self._v2_pull_identity()
+                and not manual
+            ):
+                # The five-second timer must not turn a fail-closed snapshot into
+                # an automatic retry loop. Reopening/reconfiguring starts one new
+                # selection generation deliberately.
+                return False
+            current_pull_worker = (
+                self._v2_pull_worker
+                if self._v2_pull_worker_identity == self._v2_pull_identity()
+                else None
+            )
+            if coordinator["pulling"] or current_pull_worker is not None:
+                try:
+                    if coordinator["pulling"] or current_pull_worker.isRunning():
+                        return False
+                except RuntimeError:
+                    self._v2_pull_worker = None
+                    self._v2_pull_worker_identity = None
 
-        if reason == "general" and not self._ordinary_pull_gate_is_open(
-            coordinator
-        ):
-            self._publish_sync_state()
-            return False
+            if reason == "general" and not self._ordinary_pull_gate_is_open(
+                coordinator
+            ):
+                self._publish_sync_state()
+                return False
 
-        started_for = self._v2_pull_identity()
-        started_account = self._contract_identity()
-        started_coordinator = coordinator
-        coordinator["pull_pending"] = False
-        coordinator["pulling"] = True
-        coordinator["pull_visible"] = bool(manual or reason == "baseline")
-        self._begin_structure_authority_selection()
+            started_for = self._v2_pull_identity()
+            started_account = self._contract_identity()
+            started_coordinator = coordinator
+            coordinator["pull_pending"] = False
+            coordinator["pulling"] = True
+            reservation = object()
+            coordinator['pull_reservation'] = reservation
+            coordinator["pull_visible"] = bool(manual or reason == "baseline")
+            for flag in ('review_deferred_manual', 'review_deferred_retry', 'review_deferred_baseline'):
+                coordinator.pop(flag, None)
+            self._begin_structure_authority_selection('pull_start')
+        try:
+            return self._start_reserved_pull(started_for, started_account, started_coordinator,
+                                             manual, retry_pending_after_pull, reason, reservation=reservation)
+        except BaseException:
+            with self._contract_lock:
+                if started_coordinator.get('pull_reservation') is not reservation:
+                    raise
+                started_coordinator['pulling'] = False
+                started_coordinator['pull_visible'] = False
+                started_coordinator['pull_pending'] = True
+                started_coordinator.pop('pull_reservation', None)
+                started_coordinator['baseline_validated'] = False
+                started_coordinator['review_deferred_manual'] = bool(manual or started_coordinator.get('review_deferred_manual'))
+                started_coordinator['review_deferred_retry'] = bool(retry_pending_after_pull or started_coordinator.get('review_deferred_retry'))
+                started_coordinator['review_deferred_baseline'] = True
+                current = (started_for == self._v2_pull_identity()
+                           and started_account == self._contract_identity()
+                           and started_coordinator is self._current_pull_coordinator(create=False))
+                if current:
+                    self._begin_structure_authority_selection('pull_start_failed')
+                    worker = self._v2_pull_worker
+                    if worker is not None and self._v2_pull_worker_identity == started_for:
+                        try:
+                            running = worker.isRunning()
+                        except RuntimeError:
+                            running = False
+                        if not running:
+                            self._v2_pull_worker = None
+                            self._v2_pull_worker_identity = None
+            raise
+
+    def _start_reserved_pull(self, started_for, started_account, started_coordinator,
+                             manual, retry_pending_after_pull, reason, *, reservation):
         try:
             protected_paths = set(
                 (self._v2_protected_paths_provider or (lambda: set()))() or set()
@@ -9859,8 +9947,18 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             started_coordinator.get("applied_index_fingerprint")
             if cache_is_fresh else None
         )
-        self._v2_pull_worker = worker
-        self._v2_pull_worker_identity = started_for
+        with self._contract_lock:
+            if (started_for != self._v2_pull_identity() or started_account != self._contract_identity()
+                    or started_coordinator is not self._current_pull_coordinator(create=False)
+                    or started_coordinator.get('pull_reservation') is not reservation):
+                if started_coordinator.get('pull_reservation') is reservation:
+                    started_coordinator['pulling'] = False
+                    started_coordinator['pull_visible'] = False
+                    started_coordinator.pop('pull_reservation', None)
+                worker.deleteLater()
+                return False
+            self._v2_pull_worker = worker
+            self._v2_pull_worker_identity = started_for
         retry_after_success = {"value": False}
         retry_pull_after_finish = {"value": False}
         if manual:
@@ -9871,7 +9969,10 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
 
         def handle_result(success, payload):
             if (not self.is_v2_enabled or self._v2_pull_identity() != started_for
-                    or self._contract_identity() != started_account):
+                    or self._contract_identity() != started_account
+                    or self._v2_pull_worker is not worker
+                    or started_coordinator.get('pull_reservation') is not reservation
+                    or started_coordinator is not self._current_pull_coordinator(create=False)):
                 # This reply belongs to the project that was open when the
                 # request went out. Releasing, or opening another project, ends
                 # that generation: nothing in the reply may be applied to
@@ -10103,7 +10204,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
             else:
                 code = self._stable_error_code(payload)
                 if self._transient_handshake_error(payload):
-                    self._begin_structure_authority_selection()
+                    self._begin_structure_authority_selection('pull_retry')
                     count = min(started_coordinator.get('network_retry_count', 0) + 1, 6)
                     started_coordinator['network_retry_count'] = count
                     started_coordinator['network_retry_after'] = time.monotonic() + min(60, 2 ** count)
@@ -10136,11 +10237,21 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                 print(f"Failed to pull v2 documents: {code or type(payload).__name__}")
 
         def handle_finished():
-            started_coordinator["pulling"] = False
-            started_coordinator["pull_visible"] = False
-            if self._v2_pull_worker is worker:
-                self._v2_pull_worker = None
-                self._v2_pull_worker_identity = None
+            with self._contract_lock:
+                if started_coordinator.get('pull_reservation') is not reservation:
+                    return
+                started_coordinator["pulling"] = False
+                started_coordinator["pull_visible"] = False
+                started_coordinator.pop('pull_reservation', None)
+                current = (self._v2_pull_worker is worker
+                           and self._v2_pull_identity() == started_for
+                           and self._contract_identity() == started_account
+                           and started_coordinator is self._current_pull_coordinator(create=False)
+                           and not self._shutting_down)
+                if self._v2_pull_worker is worker:
+                    self._v2_pull_worker = None
+                    self._v2_pull_worker_identity = None
+            if current:
                 if (
                     retry_after_success["value"]
                     or (
@@ -10162,7 +10273,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, QObject):
                         QTimer.singleShot(
                             0,
                             lambda: self.pull_remote_changes_async(
-                                reason="baseline"
+                                reason="baseline", _expected_pull=(started_for, started_account, started_coordinator)
                             ),
                         )
                     else:

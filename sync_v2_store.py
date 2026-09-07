@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 
 from project_creation_v1 import identity_uuid_for_writing_path
 from project_identity_v1 import KIND_DOCUMENT, KIND_FOLDER
+from contract_preparation import ContractPreparationStoreMixin
+from reviewed_contract_sender import ReviewedExecutionStoreMixin
+from contract_http_zero_recovery import HttpZeroRecoveryStoreMixin, install_schema as install_http_zero_schema
+from contract_post_coordination_resume import ResumeLedger, install_schema as install_resume_schema
 from sync_contract import (
     CANONICAL_CONTRACT_SHA256,
     CLIENT_CAPABILITIES,
@@ -35,7 +39,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8008
+STAGE8_USER_VERSION = 8012
 
 
 def _utc_now():
@@ -54,7 +58,7 @@ def _normalize_path(path):
 FOLDER_TOMBSTONE_PREFIX = "__folder_tombstone__"
 
 
-class SyncV2Store:
+class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, HttpZeroRecoveryStoreMixin):
     """SQLite-backed identity, revision and durable operation queue for sync v2."""
 
     def __init__(self, db_path=None):
@@ -903,6 +907,58 @@ class SyncV2Store:
             END;
             """
         )
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS sync_contract_preparations (
+                preparation_id TEXT PRIMARY KEY,
+                local_key TEXT NOT NULL REFERENCES sync_projects(local_key) ON DELETE CASCADE,
+                purpose TEXT NOT NULL,
+                envelope_json TEXT NOT NULL,
+                envelope_sha256 TEXT NOT NULL,
+                UNIQUE(local_key, purpose)
+            );
+            CREATE TRIGGER IF NOT EXISTS sync_contract_preparations_no_update
+            BEFORE UPDATE ON sync_contract_preparations
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_CONTRACT_PREPARATION'); END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_preparations_no_delete
+            BEFORE DELETE ON sync_contract_preparations
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_CONTRACT_PREPARATION'); END;
+            CREATE TRIGGER IF NOT EXISTS sync_contract_preparations_no_dispatch
+            BEFORE INSERT ON sync_contract_batches
+            WHEN EXISTS (SELECT 1 FROM sync_contract_preparations WHERE preparation_id = NEW.batch_id)
+            BEGIN SELECT RAISE(ABORT, 'REVIEW_ONLY_CONTRACT_PREPARATION'); END;
+        """)
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS sync_reviewed_executions (
+                preparation_id TEXT PRIMARY KEY REFERENCES sync_contract_preparations(preparation_id) ON DELETE CASCADE,
+                request_sha256 TEXT NOT NULL,
+                approval_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('preparing','attempted','committed','rejected','uncertain','stopped')),
+                http_attempts INTEGER NOT NULL DEFAULT 0 CHECK(http_attempts IN (0,1)),
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                response_json TEXT,
+                response_sha256 TEXT,
+                owner_token TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS sync_reviewed_executions_no_reset
+            BEFORE UPDATE ON sync_reviewed_executions
+            WHEN NEW.preparation_id<>OLD.preparation_id OR NEW.request_sha256<>OLD.request_sha256
+              OR NEW.approval_json<>OLD.approval_json OR NEW.started_at<>OLD.started_at OR NEW.owner_token<>OLD.owner_token
+              OR NOT ((OLD.state='preparing' AND NEW.state IN ('attempted','stopped'))
+                   OR (OLD.state='attempted' AND NEW.state IN ('committed','rejected','uncertain')))
+              OR NEW.http_attempts<>CASE WHEN NEW.state IN ('attempted','committed','rejected','uncertain') THEN 1 ELSE 0 END
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_REVIEWED_EXECUTION'); END;
+            CREATE TRIGGER IF NOT EXISTS sync_reviewed_executions_no_delete
+            BEFORE DELETE ON sync_reviewed_executions
+            WHEN NOT EXISTS (SELECT 1 FROM sync_purge_gate)
+            BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_REVIEWED_EXECUTION'); END;
+        """)
+        self.recover_reviewed_executions(connection)
+        install_http_zero_schema(connection)
+        self.recover_http_zero_rounds(connection)
+        install_resume_schema(connection)
+        ResumeLedger(self).recover_http_zero_rounds(connection)
         connection.execute(f"PRAGMA user_version = {STAGE8_USER_VERSION}")
         self._recover_interrupted_dispatches(connection)
 

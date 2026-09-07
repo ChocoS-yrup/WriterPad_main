@@ -97,7 +97,7 @@ class NetworkRecoveryMixin:
                     self.supabase = result
                     self._auth_context_generation += 1
                     self._forget_contract_handshake()
-                    self._begin_structure_authority_selection()
+                    self._begin_structure_authority_selection('session_recovery')
                     self._last_sync_error = ''
                     self._last_failure_offline = False
                 elif self._transient_handshake_error(result):
