@@ -256,8 +256,22 @@ class ContractPrimitiveTests(unittest.TestCase):
                 self.assertEqual(frozen_casefold(source), expected)
                 self.assertEqual(normalize_storage_name(source).normalized, expected)
 
-    def test_frozen_casefold_preserves_previous_runtime_output_for_all_scalars(self):
+    def test_frozen_casefold_preserves_runtime_output_for_admitted_scalars(self):
+        """Only over the scalars the contract admits, or this is version-bound.
+
+        The frozen table is Unicode 15.0.0 and the host is whatever the running
+        Python ships, so the two are not required to agree everywhere and do
+        not: 0 scalars differ on 3.11 (Unicode 14.0.0), 27 on 3.14 (16.0.0).
+        Every one of those sits outside the assigned baseline and is refused
+        before folding, which test_frozen_casefold_scalars checks from the other
+        side. What has to hold here is agreement wherever a name can actually
+        reach the fold.
+        """
+        from storage_name_tables import is_assigned_baseline, is_excluded_scalar
+
         for codepoint in range(sys.maxunicode + 1):
+            if not is_assigned_baseline(codepoint) or is_excluded_scalar(codepoint):
+                continue
             character = chr(codepoint)
             if frozen_casefold(character) != character.casefold():
                 self.fail(f"case-fold mismatch for U+{codepoint:06X}")

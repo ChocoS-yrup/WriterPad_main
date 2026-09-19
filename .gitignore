@@ -54,3 +54,6 @@ output/
 
 # Supabase CLI 로컬 상태
 supabase/.temp/
+
+# Python 3.14 전환 검증용 가상환경. 3.11 은 롤백 지점으로 그대로 둔다.
+.venv314/
