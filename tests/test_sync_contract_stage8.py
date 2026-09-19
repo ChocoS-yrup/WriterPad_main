@@ -72,9 +72,10 @@ LIVE_INACTIVE_REPLY = (
     '"supported_protocol_versions":[]}'
 )
 
-# Recorded from the same project after the row was switched on. Note the mode:
-# an allowlisted contract does not move a project off LEGACY, and epoch stays 0.
-LIVE_ACTIVE_REPLY = (
+# Recorded from the same project after the 0.2.0 row was switched on. Note the
+# mode: an allowlisted contract does not move a project off LEGACY, and epoch
+# stays 0. Kept as the recording it is, now that the client pins 0.3.0.
+LIVE_ACTIVE_REPLY_0_2_0 = (
     '{"supported":true,"project_id":"01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2",'
     '"migration_epoch":0,"contract_version":"0.2.0",'
     '"project_sync_mode":"LEGACY","server_capabilities":'
@@ -85,6 +86,29 @@ LIVE_ACTIVE_REPLY = (
     '"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",'
     '"server_protocol_version":3,"canonical_contract_sha256":'
     '"416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",'
+    '"supported_protocol_versions":[3]}'
+)
+
+# NOT a recording. The 0.3.0 allowlist row is present but disabled, so the
+# server has never answered supported:true for this digest and there is nothing
+# to record yet. This is the reply the 0.3.0 contract says the server owes once
+# stage C enables that row: the shape of LIVE_ACTIVE_REPLY_0_2_0 above, with the
+# digest, version and storage-name capability taken from sync-contract/.
+#
+# Replace it with a real recording once the row is on. Until then, every test
+# that consumes it is checking client behaviour against a contract-derived
+# reply, not against observed server behaviour.
+LIVE_ACTIVE_REPLY = (
+    '{"supported":true,"project_id":"01c1b72f-34fb-4fd4-abec-cbe49bb1b3a2",'
+    '"migration_epoch":0,"contract_version":"0.3.0",'
+    '"project_sync_mode":"LEGACY","server_capabilities":'
+    '["atomic_structure_commit","contract_allowlist_validation",'
+    '"project_mode_migration_lock","folder_tombstones","id_tree_validation",'
+    '"legacy_epoch_zero_adapter","storage_name_v2","document_commit_v1"],'
+    '"server_contract_sha256":'
+    '"abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",'
+    '"server_protocol_version":3,"canonical_contract_sha256":'
+    '"abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",'
     '"supported_protocol_versions":[3]}'
 )
 
@@ -189,13 +213,13 @@ def load_json(path):
 
 class ContractPrimitiveTests(unittest.TestCase):
     def test_release_pin_is_exact(self):
-        self.assertEqual(CONTRACT_VERSION, "0.2.0")
-        self.assertEqual(CONTRACT_GIT_COMMIT, "fcd99b7098b9a04bd93c585d89b16588aa482530")
-        self.assertEqual(CONTRACT_CONTENT_COMMIT, "7bcb5d25c5376b02469666df7318b90b456ffee6")
-        self.assertEqual(CANONICAL_CONTRACT_BYTES, 23256)
+        self.assertEqual(CONTRACT_VERSION, "0.3.0")
+        self.assertEqual(CONTRACT_GIT_COMMIT, "3843b05aa91461e1541f5ebaa14557dc3dc2b39c")
+        self.assertEqual(CONTRACT_CONTENT_COMMIT, "3843b05aa91461e1541f5ebaa14557dc3dc2b39c")
+        self.assertEqual(CANONICAL_CONTRACT_BYTES, 24777)
         self.assertEqual(
             CANONICAL_CONTRACT_SHA256,
-            "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670",
+            "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c",
         )
 
     def test_frozen_unicode15_casefold_table_integrity(self):
@@ -278,7 +302,7 @@ class ContractPrimitiveTests(unittest.TestCase):
             writer_device_id=DEVICE_ID,
             ordered_intents=sources,
             batch_id=BATCH_ID,
-            client_build_id="conformance-0.2.0",
+            client_build_id="conformance-0.3.0",
         )
         self.assertEqual(request, first["request"])
         self.assertEqual(
@@ -313,7 +337,7 @@ class ContractPrimitiveTests(unittest.TestCase):
             structure_revision=payload["structure_revision"],
             operation_id=intent["operation_id"],
             batch_id=first_request["batch"]["batch_id"],
-            client_build_id="conformance-0.2.0",
+            client_build_id="conformance-0.3.0",
         )
         self.assertEqual(request, first_request)
         self.assertEqual(
@@ -2984,7 +3008,7 @@ class ContractHandshakeGateTests(unittest.TestCase):
     def test_a_reply_that_disagrees_with_itself_about_the_contract_is_refused(self):
         cases = (
             {"canonical_contract_sha256": "0" * 64},
-            {"contract_version": "0.3.0"},
+            {"contract_version": "0.2.0"},
             {"contract_version": "0.1.0"},
         )
         for overrides in cases:
@@ -3182,7 +3206,7 @@ class ContractPreflightVerdictTests(unittest.TestCase):
               "supported_protocol_versions": [4]}, "PROTOCOL_TOO_OLD"),
             ({"canonical_contract_sha256": "0" * 64},
              "CONTRACT_DIGEST_MISMATCH"),
-            ({"contract_version": "0.3.0"}, "CONTRACT_DIGEST_MISMATCH"),
+            ({"contract_version": "0.2.0"}, "CONTRACT_DIGEST_MISMATCH"),
             ({"server_contract_sha256": "0" * 64,
               "canonical_contract_sha256": "0" * 64,
               "contract_version": None}, "CONTRACT_DIGEST_MISMATCH"),

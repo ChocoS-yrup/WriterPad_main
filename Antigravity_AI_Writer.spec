@@ -44,7 +44,7 @@ a = Analysis(
         # When present, this validated file contains URL and publishable key
         # fields only. User sessions remain in Windows Credential Manager.
     ] + config_datas,
-    hiddenimports=['markdown', 'keyring', 'unicodedata2'],
+    hiddenimports=['markdown', 'keyring'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

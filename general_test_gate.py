@@ -179,7 +179,7 @@ def _pins(manager):
             or row["project_sync_mode"] != "ID_BASED" or row["migration_epoch"] != 1
             or row["active_contract_sha256"] != CANONICAL_CONTRACT_SHA256
             or row["server_protocol_version"] != SYNC_PROTOCOL_VERSION
-            or CONTRACT_VERSION != "0.2.0" or SYNC_PROTOCOL_VERSION != 3):
+            or CONTRACT_VERSION != "0.3.0" or SYNC_PROTOCOL_VERSION != 3):
         raise PreparationError("새 핸드셰이크가 시험 작품의 계약·mode·epoch와 맞지 않습니다.")
 
 

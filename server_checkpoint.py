@@ -4,7 +4,8 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from sync_contract import CANONICAL_CONTRACT_SHA256, SyncContractError, require_server_compatibility
+from sync_contract import (CANONICAL_CONTRACT_SHA256, CONTRACT_VERSION, SyncContractError,
+                           require_server_compatibility)
 
 SCHEMA_VERSION = 8013
 FUNCTION = "writerpad_checkpoint_observation_allowed"
@@ -142,4 +143,4 @@ def source_record(reading):
     fingerprint = hashlib.sha256(repr(reading["context_key"]).encode("utf-8")).hexdigest()
     return {"kind": "fresh_get_sync_handshake", "observed_at": reading["observed_at"],
             "binding_sha256": fingerprint, "contract_sha256": CANONICAL_CONTRACT_SHA256,
-            "protocol": 3, "contract_version": "0.2.0"}
+            "protocol": 3, "contract_version": CONTRACT_VERSION}

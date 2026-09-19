@@ -1,4 +1,4 @@
-"""Released WriterPad sync-contract 0.2.0 client primitives.
+"""Released WriterPad sync-contract 0.3.0 client primitives.
 
 This module intentionally contains no Supabase credentials and never accepts
 document bodies in diagnostics.  Contract-native writes fail closed unless the
@@ -19,18 +19,17 @@ from storage_name_tables import is_assigned_baseline, is_excluded_scalar
 from unicode15_casefold import frozen_casefold
 
 
-CONTRACT_VERSION = "0.2.0"
-CONTRACT_GIT_COMMIT = "fcd99b7098b9a04bd93c585d89b16588aa482530"
-CONTRACT_CONTENT_COMMIT = "7bcb5d25c5376b02469666df7318b90b456ffee6"
-CANONICAL_CONTRACT_BYTES = 23256
+CONTRACT_VERSION = "0.3.0"
+CONTRACT_GIT_COMMIT = "3843b05aa91461e1541f5ebaa14557dc3dc2b39c"
+CONTRACT_CONTENT_COMMIT = "3843b05aa91461e1541f5ebaa14557dc3dc2b39c"
+CANONICAL_CONTRACT_BYTES = 24777
 CANONICAL_CONTRACT_SHA256 = (
-    "416c1b99edb9bda694731dee4b25688d9d82d1f32610aa23ddfda571ec3c7670"
+    "abbd234c7b65d422c2e43d468f4f724e069ede26a3d24be22eb8b35cce8ebf2c"
 )
 SYNC_PROTOCOL_VERSION = 3
-STORAGE_NAME_ALGORITHM = "storage-name-v1"
-STORAGE_NAME_UNICODE_VERSION = "15.0.0"
+STORAGE_NAME_ALGORITHM = "storage-name-v2"
 CLIENT_BUILD_ID = os.environ.get(
-    "WRITERPAD_BUILD_ID", "writerpad-windows-stage8-contract-0.2.0"
+    "WRITERPAD_BUILD_ID", "writerpad-windows-stage8-contract-0.3.0"
 )
 
 CLIENT_CAPABILITIES = (
@@ -40,7 +39,7 @@ CLIENT_CAPABILITIES = (
     "immutable_batch_contract_metadata",
     "operation_attempt_history",
     "operation_state_events",
-    "storage_name_v1",
+    "storage_name_v2",
     "document_commit_v1",
 )
 SERVER_CAPABILITIES = (
@@ -50,7 +49,7 @@ SERVER_CAPABILITIES = (
     "folder_tombstones",
     "id_tree_validation",
     "legacy_epoch_zero_adapter",
-    "storage_name_v1",
+    "storage_name_v2",
     "document_commit_v1",
 )
 
@@ -101,37 +100,19 @@ class StorageName:
         return self.utf8.hex()
 
 
-def _unicode15_module():
-    try:
-        import unicodedata2 as unicode_data
-    except ImportError:
-        import unicodedata as unicode_data
-    if unicode_data.unidata_version != STORAGE_NAME_UNICODE_VERSION:
-        raise SyncContractError(
-            "UNICODE_VERSION_MISMATCH",
-            f"Unicode {STORAGE_NAME_UNICODE_VERSION} required; "
-            f"runtime provides {unicode_data.unidata_version}",
-        )
-    return unicode_data
-
-
 def normalize_storage_name(value: str) -> StorageName:
-    """Return the normative Unicode-15 storage-name collision key."""
-    if not isinstance(value, str):
-        raise SyncContractError("STORAGE_NAME_INVALID")
-    for character in value:
-        codepoint = ord(character)
-        if character in "/\\" or codepoint <= 31 or codepoint == 127:
-            raise SyncContractError("STORAGE_NAME_INVALID")
-    unicode_data = _unicode15_module()
-    normalized = unicode_data.normalize("NFKC", value)
-    normalized = frozen_casefold(normalized)
-    normalized = unicode_data.normalize("NFKC", normalized).rstrip(" .")
-    if normalized in {"", ".", ".."}:
-        raise SyncContractError("STORAGE_NAME_INVALID")
-    if normalized.split(".", 1)[0] in _RESERVED_BASENAMES:
-        raise SyncContractError("STORAGE_NAME_RESERVED")
-    return StorageName(normalized=normalized, utf8=normalized.encode("utf-8"))
+    """Return the storage-name collision key for the released contract.
+
+    Contract 0.3.0 makes storage-name-v2 the normative algorithm, so this name
+    now delegates rather than carrying its own implementation. The v1 body was
+    the only thing in the client that required unicodedata2 15.0.0, which has no
+    cp314 wheel; removing it is what lets the app run on Python 3.14.
+
+    v1's answers are not lost. They survive in the golden manifest taken while
+    3.11 was still installed, in the 0.2.0 conformance vectors, and in the
+    server's private.storage_name_v1_legacy.
+    """
+    return normalize_storage_name_v2(value)
 
 
 def _reject_supplementary_adjacency(value: str) -> None:
