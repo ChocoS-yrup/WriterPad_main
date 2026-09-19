@@ -103,6 +103,14 @@ rg -n --type swift 'active_contract_sha256|project_sync_mode|migration_epoch|con
 
 읽는 곳이 있으면 0.3.0 전환 시 그 경로도 같이 봐야 한다. Windows 쪽 기록으로는 "Swift에 `contract` 언급 0개"인데 확인해 달라.
 
+### 4-b. 이 트리거를 고치는 마이그레이션은 너희 쪽에서 써야 한다
+
+Staging에 적용된 마이그레이션 9개는 전부 `ChocoS-yrup/Writerpad`에 있다. Windows 저장소의 `supabase/migrations/` 7개는 하나도 적용돼 있지 않은 별개 계보다. 그래서 트리거 수정은 Windows 쪽에서 만들어 보낼 수 있는 것이 아니다.
+
+- 마이그레이션 작성·적용 담당이 누구인가
+- 0.2.0 리터럴 비교를 allowlist 조회로 바꾸는 방향에 동의하는가, 아니면 두 다이제스트를 모두 허용하는 쪽이 나은가
+- 적용 전에 Windows 쪽에서 확인해 줬으면 하는 것이 있는가
+
 ### 5. 이미 `ID_BASED`인 작품을 iPad가 지금 동기화하고 있는가
 
 `일반동기화 검증 20260910` (mode=`ID_BASED`, epoch=1). 이 작품은 **이미 비-LEGACY라 트리거 검사를 받고 있다.**
@@ -112,6 +120,21 @@ rg -n --type swift 'active_contract_sha256|project_sync_mode|migration_epoch|con
 - 난 적이 있다면 앱이 어떻게 처리했는가
 
 **이건 이미 존재하는 실제 시험 사례다.** 답에 따라 트리거 수정의 긴급도가 달라진다.
+
+### 5-b. 오늘 만들어진 시험 작품이 iPad에서 보이는가
+
+2026-09-20에 Windows 3.14 빌드를 시험하면서 새 작품이 하나 만들어졌다.
+
+```
+53b96759…   생성 2026-09-19 23:07 UTC   mode=(설정행 없음, LEGACY/0)   epoch=0
+            폴더 11   문서 26   storage_name_key 채워진 문서 0
+```
+
+실제 원고가 아니라 시험용이므로 왕복 시험 대상으로 그대로 쓸 수 있다.
+
+- iPad에서 이 작품이 보이는가
+- 폴더·문서 개수가 맞는가
+- iPad에서 여기에 폴더 하나를 만들면 Windows에서 보이는가
 
 ### 6. 서버 오류를 iPad가 어떻게 처리하는가
 
