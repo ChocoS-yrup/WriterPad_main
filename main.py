@@ -15,6 +15,72 @@ if "--qt-import-smoke-test" in sys.argv:
     sys.exit(0)
 
 
+if "--runtime-report" in sys.argv:
+    # What a packaged build says about itself, which is the only account that
+    # cannot be wrong. Reading python314.dll out of the binary shows what was
+    # bundled; this shows what actually loaded. The LLM providers are imported
+    # here because llm_provider.py imports them inside functions, so a build can
+    # be missing them entirely and still start, run and pass the smoke test
+    # above — the failure only surfaces when someone uses the AI panel.
+    import importlib
+    import json
+    import unicodedata
+
+    report = {
+        "python": sys.version.split()[0],
+        "python_full": sys.version,
+        "frozen": getattr(sys, "frozen", False),
+        "executable": sys.executable,
+        "stdlib_unicodedata": unicodedata.unidata_version,
+        "packages": {},
+    }
+    for module_name, distribution in (
+        ("PyQt6.QtCore", "PyQt6"),
+        ("supabase", "supabase"),
+        ("keyring", "keyring"),
+        ("markdown", "Markdown"),
+        ("dotenv", "python-dotenv"),
+        ("anthropic", "anthropic"),
+        ("openai", "openai"),
+        ("google.genai", "google-genai"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as error:
+            report["packages"][distribution] = f"IMPORT FAILED: {type(error).__name__}"
+            continue
+        # A frozen build does not carry dist-info for every package, so fall
+        # back to what the module says about itself before giving up.
+        found = None
+        try:
+            from importlib.metadata import version
+
+            found = version(distribution)
+        except Exception:
+            root = importlib.import_module(module_name.split(".")[0])
+            for attribute in ("__version__", "VERSION", "PYQT_VERSION_STR"):
+                value = getattr(module, attribute, None) or getattr(root, attribute, None)
+                if isinstance(value, str):
+                    found = value
+                    break
+        report["packages"][distribution] = found or "imported (version unavailable)"
+    try:
+        import unicodedata2  # noqa: F401
+    except ImportError:
+        report["unicodedata2"] = "absent (expected: storage-name-v2 does not use it)"
+    else:
+        report["unicodedata2"] = "PRESENT - the v1 dependency was meant to be gone"
+
+    failed = [k for k, v in report["packages"].items() if str(v).startswith("IMPORT FAILED")]
+    report["verdict"] = "ok" if not failed else f"missing: {', '.join(failed)}"
+    # Escaped, not raw UTF-8. This is meant to be redirected to a file, and a
+    # windowed frozen build writes stdout in the console code page and ignores
+    # PYTHONIOENCODING, so a Korean path in sys.executable would come back
+    # undecodable. ASCII survives whatever code page is in effect.
+    print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
+    sys.exit(0 if not failed else 1)
+
+
 from integrated_editor_plan import INTEGRATED_EDITOR_ONLY
 if INTEGRATED_EDITOR_ONLY:
     from integrated_editor_runtime import run_integrated_editor_app
