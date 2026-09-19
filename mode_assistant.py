@@ -774,6 +774,8 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
 
     def check_unsaved_changes(self, is_final_quit=False):
         """저장되지 않은 변경사항이 있는지 확인하고 처리. 진행(True) / 취소(False) 반환"""
+        if not self.preserve_failed_ai_responses_before_close():
+            return False
         has_unsaved = False
         panels = self.left_panels[:4] if hasattr(self, 'left_panels') else []
         for i, p in enumerate(panels):
@@ -901,6 +903,9 @@ class AssistantModeWidget(AssistantWorkflowMixin, QWidget):
 
     def closeEvent(self, event):
         """메인 윈도우의 닫기(X) 버튼을 눌렀을 때 호출되는 이벤트"""
+        if not self.preserve_failed_ai_responses_before_close():
+            event.ignore()
+            return
         # 종료 전 현재 화수 및 탭 인덱스 저장
         self.pm.set_project_setting("current_chapter", self.current_chapter)
         

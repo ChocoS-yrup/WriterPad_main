@@ -26,6 +26,7 @@ from cloud_config import (
     load_cloud_client_config,
 )
 from runtime_profile import is_forced_offline
+from general_test_gate import writes_held as general_test_writes_held
 from sync_contract import (
     CANONICAL_CONTRACT_SHA256,
     SyncContractError,
@@ -2098,7 +2099,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             return False
         return self._v2_store.contract_path_enabled(self._v2_context["local_key"])
 
-    def enable_contract_path(self):
+    def enable_contract_path(self, *, _before_open=None):
         """Open the local gate, against a handshake taken at this moment.
 
         A reading from earlier in the session says what the server answered
@@ -2113,6 +2114,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             if (not reading or reading.get("outcome") != "supported"
                     or reading != self._contract_handshake_reading()):
                 raise SyncContractError("CONTRACT_NOT_ALLOWED")
+            if _before_open is not None:
+                _before_open()
             project = self._v2_store.set_contract_path_enabled(
                 self._v2_context["local_key"], True
             )
@@ -3198,6 +3201,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         return worker
 
     def _start_server_action(self, action, callback=None):
+        if general_test_writes_held(self):
+            return None
         if self._shutting_down:
             return None
         worker = ServerActionWorker(action)
@@ -3382,7 +3387,9 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             )
 
         server_state = self._current_project_server_state()
-        if server_state == "trashed":
+        if general_test_writes_held(self):
+            publish("paused", "일반 시험 준비: 송신 보류 중입니다. 로컬 저장은 유지됩니다.")
+        elif server_state == "trashed":
             publish(
                 "project_trashed",
                 "서버 휴지통에 있는 작품입니다. 동기화를 중지하고 로컬 원고만 보존합니다.",
@@ -3600,6 +3607,9 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
 
     def retry_pending_syncs(self, manual=False):
         """다른 서버 요청이 성공한 뒤 대기 중인 항목을 한 건씩 다시 전송한다."""
+        if general_test_writes_held(self):
+            self._publish_sync_state()
+            return False
         if (
             not manual
             and self.thread() is not None
@@ -3864,7 +3874,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         return server_success, effective_error
         
     @staticmethod
-    def create_supabase_client(config=None, *, restore_session=True):
+    def create_supabase_client(config=None, *, restore_session=True,
+                               http_transport=None, preserve_rejected_session=False):
         config = config or load_cloud_client_config(supabase_config_dir())
         if not config.is_ready:
             return None
@@ -3894,6 +3905,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             custom_httpx_client = httpx.Client(
                 timeout=5.0,
                 limits=httpx.Limits(max_keepalive_connections=5),
+                **({"transport": http_transport, "follow_redirects": False,
+                    "trust_env": False} if http_transport is not None else {}),
             )
             # No client refreshes on a timer of its own. Five of them do it on
             # five schedules against one credential, and each rotation retires
@@ -3963,7 +3976,7 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
                         f"/{facts['auth_error_status'] or 'no-status'}"
                         f"/{facts['classified_kind']}"
                     )
-                    if SyncManager._discard_rejected_session(
+                    if not preserve_rejected_session and SyncManager._discard_rejected_session(
                         classified, access_token, refresh_token
                     ):
                         print(f"Supabase session discarded: {detail}.")
@@ -4582,6 +4595,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         return ""
 
     def _ensure_remote_project(self, client):
+        if general_test_writes_held(self):
+            raise ContractDispatchPaused()
         response = client.rpc("ensure_project", {
             "p_project_id": self._v2_context["project_id"],
             "p_name": (
@@ -4667,6 +4682,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
     def _acquire_v2_lease(
         self, document_id, client=None, session_checked=False
     ):
+        if general_test_writes_held(self):
+            raise ContractDispatchPaused()
         client = client or self.supabase
         if not client:
             raise RuntimeError("서버 연결 없음")
@@ -4727,6 +4744,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             return set()
 
     def _release_v2_lease(self, document_id, client=None):
+        if general_test_writes_held(self):
+            return False
         token = self._v2_leases.get(document_id)
         if not token:
             return True
@@ -9964,7 +9983,9 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         if manual:
             self._set_sync_state(
                 "syncing",
-                "서버 구조 기준을 다시 확인한 뒤 대기 작업을 전송합니다.",
+                ("서버 구조 기준을 확인합니다. 일반 시험 송신 보류를 유지합니다."
+                 if general_test_writes_held(self) else
+                 "서버 구조 기준을 다시 확인한 뒤 대기 작업을 전송합니다."),
             )
 
         def handle_result(success, payload):
@@ -10145,6 +10166,9 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
                 self._accept_structure_authority(authority)
                 started_coordinator["baseline_validated"] = True
                 snapshot_fingerprint = payload.get("snapshot_fingerprint")
+                started_coordinator["completed_baseline_sequence"] = (
+                    started_coordinator.get("completed_baseline_sequence", 0) + 1
+                )
                 cache_from_background = bool(
                     isinstance(background_apply, dict)
                     and (
@@ -10340,6 +10364,11 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
 
     def _process_v2_operation(self, operation_id, dispatch_context=None):
         context = dispatch_context or self._contract_dispatch_context()
+        if general_test_writes_held(self, context):
+            return {"kind": "paused", "error": "GENERAL_TEST_SEND_HELD"}
+        from general_test_gate import dispatch_generation_current
+        if not dispatch_generation_current(self, context):
+            return {"kind": "paused", "error": "GENERAL_TEST_AUTHORITY_CHANGED"}
         operation = context[1].operation(operation_id)
         if not operation:
             return {"kind": "retry", "error": "대기 작업을 찾을 수 없습니다."}
@@ -10662,6 +10691,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             return {"kind": "retry", "error": message, "operation": operation}
 
     def _launch_v2_operation(self, operation):
+        if general_test_writes_held(self):
+            return None
         contract_context = None
         if operation.get("provenance_kind") == "CONTRACT_BATCH":
             contract_context = self._contract_dispatch_context()
@@ -10897,6 +10928,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
                     return True, "오프라인 상태로 편집을 허용합니다."
 
     def heartbeat_lock(self, project_name, relative_path, session_id, client=None):
+        if general_test_writes_held(self):
+            return
         if self.is_v2_enabled:
             if is_forced_offline():
                 return
@@ -10937,6 +10970,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             print(f"Failed to heartbeat lock: {e}")
 
     def release_lock(self, project_name, relative_path, session_id, client=None):
+        if general_test_writes_held(self):
+            return False
         if self.is_v2_enabled:
             document = self._v2_store.get_document(self._v2_context["local_key"], relative_path)
             if not document:
@@ -11058,6 +11093,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         return self._launch_content_upload(payload, key, is_retry=False)
 
     def _launch_content_upload(self, payload, key, is_retry=False):
+        if general_test_writes_held(self):
+            return None
         worker = SaveWorker(
             self.supabase,
             None if is_retry else payload["wpm"],
@@ -11144,6 +11181,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         return self._launch_bulk_upload(payload, key, is_retry=False)
 
     def _launch_bulk_upload(self, payload, key, is_retry=False):
+        if general_test_writes_held(self):
+            return None
         bulk_source = SimpleNamespace(writing_root_path=payload["writing_root_path"])
         worker = BulkSaveWorker(self.supabase, bulk_source, payload["project_name"])
         self._bulk_workers.append(worker)
@@ -11188,6 +11227,8 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         return self._launch_history_upload(payload, key, is_retry=False)
 
     def _launch_history_upload(self, payload, key, is_retry=False):
+        if general_test_writes_held(self):
+            return None
         worker = BackupWorker(
             self.supabase,
             None if is_retry else payload["wpm"],

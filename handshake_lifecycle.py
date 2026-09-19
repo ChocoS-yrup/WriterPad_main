@@ -83,7 +83,7 @@ class HandshakeLifecycleMixin:
         return (classify_cloud_error(error).kind in {"dns", "timeout"}
                 or type(error).__name__ in {"ConnectError", "NetworkError", "ReadError", "WriteError", "RemoteProtocolError"})
 
-    def perform_contract_handshake(self, *, require_connection=False, _automatic=False, _expected_key=None):
+    def perform_contract_handshake(self, *, require_connection=False, _automatic=False, _expected_key=None, _checkpoint_acceptor=None):
         # Only the short state transitions use the lock. Authentication and
         # network I/O run on the existing pull worker, never under this lock.
         with self._contract_lock:
@@ -138,7 +138,9 @@ class HandshakeLifecycleMixin:
                 }
                 if handshake.get("supported") is True:
                     compatibility = read_handshake_compatibility(handshake)
-                    project = self.activate_contract_project(**compatibility)
+                    project = (_checkpoint_acceptor(compatibility, reading)
+                               if _checkpoint_acceptor is not None
+                               else self.activate_contract_project(**compatibility))
                     reading.update(
                         outcome="supported",
                         project_sync_mode=project["project_sync_mode"],
@@ -271,6 +273,9 @@ class HandshakeLifecycleMixin:
             raise
 
     def _check_contract_dispatch(self, request, context):
+        from general_test_gate import writes_held
+        if writes_held(self, context):
+            raise ContractDispatchPaused()
         key, store, client, authority = context
         if (key != self._contract_context_key() or not key[-1]
                 or self._auth_retry_blocked or self._shutting_down

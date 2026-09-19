@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from project_manager import ProjectManager
 from project_manager_writing import WritingProjectManager
+from project_identity_v1 import read_identity
 from project_paths import PROJECT_NAME_CONFLICT, LocalProjectPathError
 from server_project_import import (
     IMPORT_ALREADY_COMPLETE,
@@ -186,6 +187,10 @@ class ServerProjectImportTestCase(unittest.TestCase):
 
         binding = self.store.get_project_by_id(project_id)
         document = self.store.get_document_by_id(document_id)
+        self.assertEqual(
+            read_identity(str(Path(result.writing_root_path).parent))["project"]["uuid"],
+            project_id,
+        )
         manuscript = Path(
             result.writing_root_path, "메인", "원고", "1권", "001화.txt"
         )
@@ -425,6 +430,10 @@ class ServerProjectImportTestCase(unittest.TestCase):
 
         result = self._service().import_project(project_id, "빈 서버 작품")
 
+        self.assertEqual(
+            read_identity(str(Path(result.writing_root_path).parent))["project"]["uuid"],
+            project_id,
+        )
         self.assertEqual(result.document_count, 0)
         self.assertEqual(self.store.list_documents(
             self.store.get_project_by_id(project_id)["local_key"]

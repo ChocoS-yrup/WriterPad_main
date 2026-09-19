@@ -375,6 +375,9 @@ class SettingsPanel(QWidget):
         diagnostic_actions.addWidget(self.btn_copy_sync_diagnostics)
         diagnostics_layout.addLayout(diagnostic_actions)
         cloud_layout.addWidget(diagnostics_card)
+        from general_test_gate_ui import GeneralTestGateCard
+        self.general_test_gate_card = GeneralTestGateCard(self.pm, self)
+        cloud_layout.addWidget(self.general_test_gate_card)
         review_card, review_layout = self._create_card(
             "역방향 계약 검토 · 최종검증03",
             "원고 아래 빈 3권과 1권 → 2권 → 3권 순서의 검토 요청을 보관합니다. "

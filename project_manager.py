@@ -184,11 +184,12 @@ class ProjectManager:
         
     def save_ai_response(self, step_name, chapter_num, content):
         if not getattr(self, 'project_path', None):
-            return
+            raise OSError("저장할 작품이 선택되지 않았습니다.")
             
         import datetime
         now = datetime.datetime.now()
-        date_str = now.strftime("%Y%m%d_%H%M%S")
+        from uuid import uuid4
+        date_str = now.strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid4().hex
         
         if step_name not in ["초안", "완성본", "평가", "요약"]:
             step_name = "평가"
@@ -199,11 +200,25 @@ class ProjectManager:
         file_name = f"{chapter_num:03d}화_{date_str}.md"
         file_path = os.path.join(ai_dir, file_name)
         
+        self._write_text_atomic(file_path, content)
+        return file_path
+
+    @staticmethod
+    def _write_text_atomic(path, content):
+        temporary = None
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception as e:
-            print(f"AI response save error: {e}")
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                prefix=".writerpad-", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = handle.name
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.remove(temporary)
 
     def get_project_setting(self, key, default=None):
         if not self.project_settings_path or not os.path.exists(self.project_settings_path):
@@ -370,16 +385,16 @@ class ProjectManager:
         cost_file = os.path.join(self.project_path, "cost_history.json")
         history = []
         if os.path.exists(cost_file):
-            try:
-                with open(cost_file, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-            except:
-                pass
+            with open(cost_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                raise ValueError("비용 이력 형식이 올바르지 않습니다.")
         
         history.append(log_entry)
         
-        with open(cost_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=4)
+        self._write_text_atomic(
+            cost_file, json.dumps(history, ensure_ascii=False, indent=4)
+        )
 
     def get_aggregated_cost_history(self):
         """모든 프로젝트의 cost_history.json을 읽어 하나의 리스트로 병합하여 반환합니다."""

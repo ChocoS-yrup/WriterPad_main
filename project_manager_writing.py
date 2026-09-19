@@ -157,11 +157,17 @@ class WritingProjectManager:
             print(f"파일 읽기 실패 ({target_path}): {e}")
             return None
 
-    def write_text_file(self, relative_path, content):
+    def write_text_file(self, relative_path, content, *, expected_bytes=None, guard=None, temporary_guard=None):
         """
         파일을 저장할 때 utf-8을 강제합니다. (원자적 쓰기 + fsync)
         relative_path: 집필모드/ 하위의 상대 경로
         """
+        if guard is not None:
+            if not isinstance(expected_bytes, bytes):
+                raise ValueError('Guarded save requires the exact prior file bytes')
+            self.compare_write_text_file(relative_path, expected_bytes, content,
+                guard=guard, temporary_guard=temporary_guard)
+            return True
         if not self.writing_root_path:
             return False
 
@@ -183,7 +189,8 @@ class WritingProjectManager:
         locker = QMutexLocker(self._mutex)
         temp_path = target_path + ".tmp"
         try:
-            with open(temp_path, "w", encoding="utf-8") as f:
+            # Persist the same bytes that the sync queue hashes, on Windows too.
+            with open(temp_path, "w", encoding="utf-8", newline="") as f:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())   # .tmp 내용을 디스크에 확정
@@ -197,6 +204,50 @@ class WritingProjectManager:
             except Exception:
                 pass
             return False
+
+    def compare_write_text_file(self, relative_path, expected_bytes, content, *, guard, temporary_guard=None):
+        """Foreground scoped save: compare exact bytes and keep UTF-8 LF on Windows.
+
+        No folder creation or repair. A unique temporary file avoids replacing a
+        recovery file left by another writer. The caller supplies its live grant
+        check; both comparison and the last check run inside the writer mutex.
+        """
+        import tempfile
+        from pathlib import Path
+        from project_creation_v1 import is_sync_internal_path
+        if not self.writing_root_path or is_sync_internal_path(relative_path):
+            raise ValueError("SCOPED_PATH_REFUSED")
+        root = Path(self.writing_root_path).absolute()
+        target = root / relative_path
+        if target.resolve() != target.absolute() or root.resolve() != root:
+            raise ValueError("SCOPED_LINK_REFUSED")
+        if root not in target.resolve().parents or not target.is_file():
+            raise ValueError("SCOPED_PATH_REFUSED")
+        with QMutexLocker(self._mutex):
+            guard()
+            if target.read_bytes() != expected_bytes:
+                raise ValueError("SCOPED_LOCAL_CONTENT_CHANGED")
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=target.parent, prefix=target.name + ".scope-", delete=False) as handle:
+                    temporary = handle.name
+                    handle.write(content.encode("utf-8"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # A full-tree guard can exempt this exact owned temporary file;
+                # it must not ignore arbitrary files matching a name pattern.
+                if temporary_guard is not None:
+                    temporary_guard(temporary)
+                else:
+                    guard()
+                if target.read_bytes() != expected_bytes:
+                    raise ValueError("SCOPED_LOCAL_CONTENT_CHANGED")
+                os.replace(temporary, target)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    os.unlink(temporary)
+        return True
 
     def rename_item(self, old_rel_path, new_rel_path):
         """파일 또는 폴더의 이름을 변경합니다.

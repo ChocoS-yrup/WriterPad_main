@@ -25,6 +25,9 @@ class _AssistantModeStub(QWidget):
         super().__init__()
         self.pm = pm
 
+    def preserve_failed_ai_responses_before_close(self):
+        return True
+
 
 class _WritingModeStub(QWidget):
     switchModeRequested = pyqtSignal()
@@ -115,6 +118,32 @@ class StartupModeTestCase(unittest.TestCase):
 
     def _process_startup_restore(self):
         self.app.processEvents()
+
+    def test_general_test_cards_bind_to_writing_view_manager(self):
+        from general_test_gate_ui import GeneralTestGateCard
+        self._save_config("assistant")
+        manager = object()
+        cards = []
+        def assistant_factory():
+            widget = _AssistantModeStub(self._manager())
+            cards.extend(GeneralTestGateCard(widget.pm, widget) for _ in range(2))
+            widget.left_panels = [SimpleNamespace(general_test_gate_card=cards[0])]
+            widget.right_panels = [SimpleNamespace(general_test_gate_card=cards[1])]
+            return widget
+        def writing_factory(pm):
+            widget = _WritingModeStub(pm)
+            widget.sync_manager = manager
+            return widget
+        with patch("main.AssistantModeWidget", assistant_factory), patch("main.WritingModeWidget", writing_factory):
+            window = MainWindow()
+        try:
+            self.assertTrue(all(card.manager is manager for card in cards))
+            cards[0].waiting_for_pull = True
+            with patch("main.QMessageBox.information"):
+                self.assertFalse(window.close())
+            cards[0].waiting_for_pull = False
+        finally:
+            window.close()
 
     def test_writing_save_then_recreated_window_restores_writing(self):
         self._save_config("assistant")

@@ -39,7 +39,7 @@ ACTIVE_OPERATION_STATES = ("pending", "inflight", "conflict")
 CONTRACT_ACTIVE_STATES = (
     "pending", "inflight", "retry_wait", "blocked", "conflict"
 )
-STAGE8_USER_VERSION = 8012
+STAGE8_USER_VERSION = 8013
 
 
 def _utc_now():
@@ -72,7 +72,25 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
         self._schema_lock = threading.Lock()
         self._transaction_state = threading.local()
         self._reader_state = threading.local()
+        from server_checkpoint import upgrade
+        upgrade(self)
         self._initialize()
+        upgrade(self)
+
+    @classmethod
+    def open_existing_current_schema(cls, db_path):
+        """Attach an existing validation store without migrations or recovery."""
+        if not os.path.isfile(db_path):
+            raise ValueError("EXISTING_SYNC_STORE_REQUIRED")
+        store = object.__new__(cls)
+        store.db_path = os.path.abspath(db_path)
+        store._schema_lock = threading.Lock()
+        store._transaction_state = threading.local()
+        store._reader_state = threading.local()
+        with store._reader() as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] != STAGE8_USER_VERSION:
+                raise ValueError("EXISTING_SYNC_SCHEMA_REQUIRED")
+        return store
 
     def _connect(self):
         connection = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
@@ -80,6 +98,8 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 10000")
+        from server_checkpoint import register_guard
+        register_guard(connection)
         return connection
 
     @contextmanager
@@ -959,7 +979,8 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
         self.recover_http_zero_rounds(connection)
         install_resume_schema(connection)
         ResumeLedger(self).recover_http_zero_rounds(connection)
-        connection.execute(f"PRAGMA user_version = {STAGE8_USER_VERSION}")
+        if current_version < 8012:
+            connection.execute("PRAGMA user_version = 8012")
         self._recover_interrupted_dispatches(connection)
 
     @staticmethod
@@ -1302,7 +1323,28 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                 "SELECT * FROM sync_projects WHERE local_key = ?", (local_key,)
             ).fetchone()
             if row is None:
+                # A newly created local project already owns its UUID. Minting
+                # another one here separates identity-v1 from the server key.
+                # Existing bindings below retain their historical IDs; server
+                # imports bind explicitly in begin_project_import before this.
+                from project_identity_v1 import identity_path, read_identity
+                project_root = os.path.dirname(local_key)
+                if os.path.lexists(identity_path(project_root)):
+                    identity_id = read_identity(project_root)["project"]["uuid"]
+                    if project_id and project_id != identity_id:
+                        raise ValueError(
+                            "로컬 작품 UUID와 지정한 서버 작품 UUID가 다릅니다. "
+                            "기존 서버 작품은 작품 가져오기를 사용해 주세요."
+                        )
+                    project_id = identity_id
                 project_id = project_id or str(uuid.uuid4())
+                if connection.execute(
+                    "SELECT 1 FROM sync_projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone():
+                    raise ValueError(
+                        "이 작품 UUID는 이미 다른 로컬 위치에 연결되어 있습니다."
+                    )
                 connection.execute(
                     """
                     INSERT INTO sync_projects
@@ -1540,6 +1582,12 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                 )
                 connection.execute(
                     "DELETE FROM sync_contract_diagnostics WHERE local_key = ?",
+                    (local_key,),
+                )
+                # 이 관측 이력에는 FK cascade가 없으므로 작품 영구 삭제와
+                # 같은 transaction에서만 제거한다. 평소 이력 보호는 유지한다.
+                connection.execute(
+                    "DELETE FROM sync_server_checkpoint_observations WHERE local_key = ?",
                     (local_key,),
                 )
                 # Everything else hangs off the project row by local_key and

@@ -1,5 +1,5 @@
 import sys, os
-from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QMessageBox
 from PyQt6.QtGui import QIcon, QFont, QKeySequence, QShortcut
 from PyQt6.QtCore import QEvent, Qt
 
@@ -14,6 +14,32 @@ if "--qt-import-smoke-test" in sys.argv:
     smoke_app.processEvents()
     sys.exit(0)
 
+
+from integrated_editor_plan import INTEGRATED_EDITOR_ONLY
+if INTEGRATED_EDITOR_ONLY:
+    from integrated_editor_runtime import run_integrated_editor_app
+    sys.exit(run_integrated_editor_app(sys.argv))
+
+from normal_editor_build import NORMAL_EDITOR_ONLY
+if NORMAL_EDITOR_ONLY:
+    from normal_editor_runtime import run_normal_editor_app
+    sys.exit(run_normal_editor_app(sys.argv))
+
+from general_editor_build import GENERAL_EDITOR_ONLY
+if GENERAL_EDITOR_ONLY:
+    from general_editor_ui import run_general_editor_app
+    sys.exit(run_general_editor_app(sys.argv))
+
+from general_validation_build import GENERAL_VALIDATION_ONLY
+if GENERAL_VALIDATION_ONLY:
+    from general_validation_ui import run_general_validation_app
+    sys.exit(run_general_validation_app(sys.argv))
+
+from body_validation_build import BODY_VALIDATION_ONLY
+if BODY_VALIDATION_ONLY:
+    # Run before any ordinary window, project, manager or dispatcher is created.
+    from body_validation_ui import run_body_validation_app
+    sys.exit(run_body_validation_app(sys.argv))
 
 from mode_assistant import AssistantModeWidget, SingleApplication
 from mode_writing import WritingModeWidget
@@ -73,6 +99,11 @@ class MainWindow(QMainWindow):
         
         # writing_mode 참조 전달 (종료 시 팝업 등에서 사용)
         self.assistant_mode.writing_mode = self.writing_mode
+        for panel in (getattr(self.assistant_mode, "left_panels", [])
+                      + getattr(self.assistant_mode, "right_panels", [])):
+            card = getattr(panel, "general_test_gate_card", None)
+            if card is not None:
+                card.bind_manager(self.writing_mode.sync_manager)
         
         # 모드 스위칭 시그널 연결
         self.assistant_mode.switchModeRequested.connect(self.switch_to_writing)
@@ -169,6 +200,16 @@ class MainWindow(QMainWindow):
             print(f"창 상태 복원 실패: {e}")
 
     def closeEvent(self, event):
+        # Check retained responses before any settings write can fail on the
+        # same full disk that prevented saving the generated response.
+        if not self.assistant_mode.preserve_failed_ai_responses_before_close():
+            event.ignore()
+            return
+        from general_test_gate_ui import GeneralTestGateCard
+        if any(card.busy for card in self.findChildren(GeneralTestGateCard)):
+            QMessageBox.information(self, "시험 준비 중", "연결·수신 확인이 끝난 뒤 종료하세요. 원고 송신은 보류 중입니다.")
+            event.ignore()
+            return
         # 창 상태 저장
         self.assistant_mode.pm.global_config["window_geometry"] = self.saveGeometry().toHex().data().decode()
         self.assistant_mode.pm.global_config["window_state"] = self.saveState().toHex().data().decode()

@@ -446,8 +446,28 @@ class AssistantWorkflowMixin:
         if (self.pm.current_project, self.pm.project_path) != (request.project_name, request.project_path):
             self.update_status_bar()
             return
-        self.pm.log_api_cost(request.step_name, request.model, in_tok, out_tok)
-        self.pm.save_ai_response(request.step_name, request.chapter, generated_text)
+        failures = []
+        history_saved = False
+        try:
+            self.pm.log_api_cost(request.step_name, request.model, in_tok, out_tok)
+        except (OSError, UnicodeError, ValueError):
+            failures.append("비용 이력")
+        try:
+            self.pm.save_ai_response(request.step_name, request.chapter, generated_text)
+            history_saved = True
+        except (OSError, UnicodeError, ValueError):
+            failures.append("AI 응답 이력")
+        if failures:
+            # A separate window owns the original request and response even if
+            # the selected chapter changes or a later request resets the panel.
+            from ai_response_recovery import AIResponseRecoveryDialog
+            dialog = AIResponseRecoveryDialog(
+                request, generated_text, failures, history_saved, self
+            )
+            if not hasattr(self, "_ai_recovery_dialogs"):
+                self._ai_recovery_dialogs = []
+            self._ai_recovery_dialogs.append(dialog)
+            dialog.show()
         self.update_status_bar()
 
         if (
@@ -462,6 +482,14 @@ class AssistantWorkflowMixin:
             else:
                 msg = "작성된 초안을 확인해보세요. 수정하고 싶은 부분이 있다면 말씀해 주세요."
             self.ai_panel.update_result(generated_text, msg)
+
+    def preserve_failed_ai_responses_before_close(self):
+        for dialog in getattr(self, "_ai_recovery_dialogs", ()):
+            if not dialog.can_discard():
+                dialog.show()
+                dialog.raise_()
+                return False
+        return True
 
     def handle_extraction(self, is_full, start, end, fmt):
         if is_full:
