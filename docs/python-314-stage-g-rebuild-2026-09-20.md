@@ -123,6 +123,61 @@ google-genai==2.10.0
 
 `pip check`도 통과한다.
 
+## 크기가 79.5MB 에서 61.6MB 로 줄어든 것은 정상이다
+
+18MB 감소는 놀랄 만한 폭이라 압축 바이트 기준으로 맞춰 보았다.
+
+```
+TOC 압축 합계 차이   -17,917,531
+exe 실제 크기 차이   -17,922,411     (5KB 차이 = PE 헤더·부트로더)
+```
+
+| 항목 | 압축 기준 | 정체 |
+| --- | --- | --- |
+| `numpy` (openblas 6.4MB 포함) | **-8.4 MB** | `process_icon.py` 만 쓴다. 그 파일을 임포트하는 모듈이 없다 |
+| `PIL` (`_avif` 4.3MB 포함) | **-6.7 MB** | 위와 동일 |
+| `PYZ.pyz` | **-5.3 MB** | 위 둘의 파이썬 소스 + `rich`·`pygments`·`yaml` |
+| `unicodedata2` | -0.4 MB | 의도적 제거 |
+| `python311.dll` → `python314.dll` | +0.4 MB | 이번 전환의 목표 |
+| `libcrypto`·`libssl`·`_zstd` | +3.0 MB | cryptography 50 + 3.14 표준 라이브러리 |
+
+`openai` 1,245 / `anthropic` 1,079 / `google` 342 / `jiter` 1 은 모듈 수까지 이전 빌드와 같다. 줄어든 것은 전부 앱이 쓰지 않는 쪽이다.
+
+### 숨은 의존성이 없다는 근거
+
+**동적 임포트** — `importlib.import_module` 과 `__import__` 의 사용처가 앱 전체에서 `main.py` 의 `--runtime-report` 두 줄뿐이다. AST 로 잡히지 않는 경로가 없다.
+
+**SDK 내부 사용** — 여기가 실제 위험 지점이었다. `google-genai` 가 `PIL` 을 12곳에서 임포트한다. 전부 확인했다.
+
+```python
+# types.py:58            정식 보호
+try:
+    import PIL.Image
+except ImportError:
+    PIL_Image = None
+
+# _transformers.py:34    런타임에 실행되지 않는다
+if typing.TYPE_CHECKING:
+    import PIL.Image
+
+# live.py:278            독스트링 안의 예제 코드
+```
+
+`openai` 의 `numpy` 도 `_extras/numpy_proxy.py`(없으면 쓸 때 안내 오류를 내는 지연 프록시)와 오디오 헬퍼뿐이다. `anthropic` 은 둘 다 쓰지 않는다.
+
+**앱이 애초에 그 경로에 닿지 않는다** — `llm_provider.py:125` 가 모델을 거른다.
+
+```python
+unsupported_terms = ("image", "audio", "realtime", "transcribe",
+                     "tts", "embedding", "moderation", "codex")
+```
+
+이미지·오디오 모델을 배제하는 텍스트 전용 설계다.
+
+**실증** — `.venv314` 에는 `PIL` 도 `numpy` 도 없다. 빌드 환경이 곧 exe 의 상황이고, 그 상태에서 `--runtime-report` 가 8개 의존성을 전부 임포트해 `verdict: ok` 를 냈다.
+
+비교하자면 이전 79.5MB 쪽이 비정상이었다. 시스템 3.11 에 153개 패키지가 깔려 있어 PyInstaller 가 안 쓰는 것까지 주워 담았고, 깨끗한 venv 로 빌드하니 실제 필요분만 남았다.
+
 ### 이전 빌드 대비 정상적인 치환
 
 | 이전 | 이번 | 사유 |
