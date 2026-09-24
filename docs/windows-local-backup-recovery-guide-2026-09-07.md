@@ -35,7 +35,7 @@ Windows 묶음은 `windows-manifest.json + windows-data/ + portable-v1/`이다. 
 
 ## 주 앱 또는 Qt가 시작되지 않을 때
 
-`writerpad-recovery.cmd`와 함께 제공된 Python 모듈들을 같은 폴더에 둔다. 이 소스 복구 도구는 Python 3.11이 필요하며 Qt·클라우드 SDK·주 앱을 불러오지 않는다. 이번 PC에 있는 Python을 사용하며 설치 작업은 하지 않았다. EXE 자체가 고장 나도 소스 도구를 사용할 수 있지만 Python 실행 환경까지 고장 난 경우는 이번 검증 범위가 아니다.
+`writerpad-recovery.cmd`와 함께 제공된 Python 모듈들을 같은 폴더에 둔다. 이 소스 복구 도구는 표준 라이브러리만 쓰는 Python 3 스크립트이며(Python 3.14에서 검증) Qt·클라우드 SDK·주 앱을 불러오지 않는다. `writerpad-recovery.cmd`는 Python 3.14를 먼저 찾고(`py -3.14` → 3.14 설치 폴더), 없으면 설치된 다른 Python 3(`py -3`)으로 실행한다. 이번 PC에 있는 Python을 사용하며 설치 작업은 하지 않았다. EXE 자체가 고장 나도 소스 도구를 사용할 수 있지만 Python 실행 환경까지 고장 난 경우는 이번 검증 범위가 아니다.
 
 `writerpad-recovery.cmd`를 직접 실행하면 번호 선택 안내가 나온다.
 
