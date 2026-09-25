@@ -141,15 +141,29 @@ class ModelSelector(QWidget):
             return combo.currentText()
 
     def refresh_account_models(self):
-        if self._model_worker and self._model_worker.isRunning():
-            return
+        if self._model_worker is not None:
+            try:
+                if self._model_worker.isRunning():
+                    return
+            except RuntimeError:
+                self._model_worker = None
         self.btn_refresh_models.setEnabled(False)
         self.btn_refresh_models.setText("모델 조회 중...")
         self.refreshStateChanged.emit("각 제공자의 계정 사용 가능 모델을 조회 중입니다...")
-        self._model_worker = ModelDiscoveryWorker(self)
-        self._model_worker.discoveryFinished.connect(self._on_models_discovered)
-        self._model_worker.discoveryFinished.connect(self._model_worker.deleteLater)
-        self._model_worker.start()
+        worker = ModelDiscoveryWorker(self)
+        self._model_worker = worker
+
+        def cleanup_worker():
+            if self._model_worker is worker:
+                self._model_worker = None
+            worker.deleteLater()
+
+        worker.discoveryFinished.connect(self._on_models_discovered)
+        # discoveryFinished 는 run() 안에서 나가므로 거기에 deleteLater 를 걸면 아직 도는
+        # 스레드를 지울 수 있다(Qt 가 프로세스를 끝낸다). 정리는 QThread.finished 에서 하고,
+        # 다음 클릭이 지워진 객체를 부르지 않도록 참조도 함께 비운다.
+        worker.finished.connect(cleanup_worker)
+        worker.start()
 
     def _on_models_discovered(self, discovered: list, errors: list):
         existing = {model.selection_key: model for model in self.model_specs}
