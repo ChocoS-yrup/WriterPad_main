@@ -166,44 +166,6 @@ def measure_legacy_http_clients():
     return counters
 
 
-def _wait_until(predicate, timeout_ms=10000):
-    loop = QEventLoop()
-    deadline = time.monotonic() + (timeout_ms / 1000)
-
-    def poll():
-        if predicate() or time.monotonic() >= deadline:
-            loop.quit()
-        else:
-            QTimer.singleShot(5, poll)
-
-    QTimer.singleShot(0, poll)
-    loop.exec()
-
-
-def _wait_until_stable(predicate, stable_ms=250, timeout_ms=30000):
-    loop = QEventLoop()
-    deadline = time.monotonic() + (timeout_ms / 1000)
-    stable_since = [None]
-
-    def poll():
-        now = time.monotonic()
-        if predicate():
-            if stable_since[0] is None:
-                stable_since[0] = now
-            if now - stable_since[0] >= stable_ms / 1000:
-                loop.quit()
-                return
-        else:
-            stable_since[0] = None
-        if now >= deadline:
-            loop.quit()
-        else:
-            QTimer.singleShot(5, poll)
-
-    QTimer.singleShot(0, poll)
-    loop.exec()
-
-
 def measure_finished_worker_retention(manager):
     with tempfile.TemporaryDirectory() as temp_dir:
         wpm = SimpleNamespace(

@@ -1,7 +1,10 @@
 import os
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -123,12 +126,13 @@ class EditorViewStateTestCase(unittest.TestCase):
         states = self.pm.global_config[WritingModeWidget._EDITOR_VIEW_STATE_KEY][
             "커서 기억 작품"
         ]["left"]
-        states[short_path] = {
+        self.left.setPlainText("짧은 문서")
+        self._remember(self.left)
+        states[short_path].update({
             "cursor": 9999,
             "vertical_scroll": 9999,
             "horizontal_scroll": 9999,
-        }
-        self.left.setPlainText("짧은 문서")
+        })
 
         self.assertTrue(self._restore(self.left, short_path))
         self.app.processEvents()
@@ -163,6 +167,79 @@ class EditorViewStateTestCase(unittest.TestCase):
         ]
         self.assertIn("메인/원고/왼쪽.txt", states["left"])
         self.assertIn("메인/원고/오른쪽.txt", states["right"])
+
+    def _open_synced_file(self, side, old_text, new_text, *, legacy=False):
+        editor = self.left if side == 'left' else self.right
+        path = '메인/원고/동기화.txt'
+        setattr(self.panel, 'current_loaded_file_' + side, path)
+        editor.setPlainText(old_text)
+        editor.moveCursor(QTextCursor.MoveOperation.Start)
+        self._remember(editor)
+        state = self.panel._saved_editor_view_state(editor, path)
+        if legacy:
+            state.pop('content_sha256', None)
+        # Persisted settings must also work across restart, not just in memory.
+        self.pm.global_config = json.loads(json.dumps(self.pm.global_config))
+        setattr(self.panel, 'current_loaded_file_' + side, '메인/원고/다른문서.txt')
+        editor.setPlainText('Windows에서 확인 중인 다른 문서')
+        self.panel.active_editor = editor
+        self.panel.is_dirty_left = self.panel.is_dirty_right = False
+        self.panel.controller = MagicMock()
+        self.panel.lbl_current_doc = MagicMock()
+        self.panel.lbl_r_doc = MagicMock()
+        self.panel.update_typewriter_setting = MagicMock()
+        self.panel.apply_editor_margins = MagicMock()
+        self.panel.isVisible = lambda: False
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, path)
+            target.parent.mkdir(parents=True)
+            target.write_text(new_text, encoding='utf-8')
+            self.panel.wpm = SimpleNamespace(
+                writing_root_path=root,
+                read_text_file=lambda relative: Path(root, relative).read_text(encoding='utf-8'),
+            )
+            WritingModeWidget._open_file_by_path(self.panel, path)
+            self.app.processEvents()
+        self.assertEqual(editor.toPlainText(), new_text)
+        self.assertFalse(editor.document().isModified())
+        return editor
+
+    def test_unopened_synced_document_opens_at_end_in_either_pane(self):
+        for side in ('left', 'right'):
+            with self.subTest(side=side):
+                editor = self._open_synced_file(side, '이전 원고', 'iPad에서 추가한 원고\n마지막 문장 😀')
+                self.assertTrue(editor.textCursor().atEnd())
+
+    def test_same_length_remote_edit_invalidates_old_position(self):
+        editor = self._open_synced_file('left', '가나다라마', '가나다바마')
+        self.assertTrue(editor.textCursor().atEnd())
+
+    def test_unchanged_document_keeps_saved_position_when_reopened(self):
+        editor = self._open_synced_file('left', '변하지 않은 원고', '변하지 않은 원고')
+        self.assertEqual(editor.textCursor().position(), 0)
+
+    def test_legacy_position_without_content_identity_opens_at_end(self):
+        editor = self._open_synced_file('left', '예전 내용', '새로운 내용', legacy=True)
+        self.assertTrue(editor.textCursor().atEnd())
+
+    def test_saved_cursor_after_emoji_uses_qt_character_positions(self):
+        self.left.setPlainText('😀😀😀 끝')
+        self.left.moveCursor(QTextCursor.MoveOperation.End)
+        self._remember(self.left)
+        self.left.moveCursor(QTextCursor.MoveOperation.Start)
+        self.assertTrue(self._restore(self.left, self.panel.current_loaded_file_left))
+        self.assertTrue(self.left.textCursor().atEnd())
+
+    def test_deferred_scroll_restore_ignores_replaced_document(self):
+        self.left.setPlainText('이전 문서')
+        self._remember(self.left)
+        with patch('mode_writing.QTimer.singleShot') as deferred:
+            self.assertTrue(self._restore(self.left, self.panel.current_loaded_file_left))
+        callback = deferred.call_args.args[1]
+        self.left.setPlainText('동기화 후 다른 내용')
+        with patch.object(self.left.verticalScrollBar(), 'setValue') as scroll:
+            callback()
+            scroll.assert_not_called()
 
 
 if __name__ == "__main__":

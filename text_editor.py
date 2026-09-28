@@ -46,6 +46,30 @@ class SmartTextEdit(QTextEdit):
         self._remember_windows_ime_state()
         super().focusOutEvent(event)
 
+    def has_pending_input_method(self):
+        """Return whether Windows is still displaying an uncommitted preedit."""
+        return bool(self._is_composing and self._ime_preedit_text)
+
+    def text_with_pending_input_method(self):
+        """Return the document text with the visible IME preedit included.
+
+        Windows draws the syllable being composed at the caret, but it is not
+        part of QTextDocument until the IME commits it. A background save
+        reads this instead of forcing that commit: rebuilding the string
+        sends nothing to the IME, injects no cursor keys and runs no nested
+        event loop, so it cannot collide with the writer's next keystroke.
+
+        Autosave rewrites the whole file, so a syllable the writer goes on to
+        change or cancel is corrected by the following save.
+        """
+        text = self.toPlainText()
+        if not self.has_pending_input_method():
+            return text
+        # Block separators occupy one cursor position each and toPlainText
+        # renders them as one newline, so the two offsets stay aligned.
+        position = max(0, min(int(self.textCursor().position()), len(text)))
+        return text[:position] + self._ime_preedit_text + text[position:]
+
     def commit_pending_input_method(self):
         """Commit the focused editor's visible IME preedit before persistence."""
         if (

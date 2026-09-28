@@ -1,4 +1,6 @@
 import os
+from copy import deepcopy
+from dataclasses import dataclass
 
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
@@ -159,27 +161,44 @@ class SingleApplication(QApplication):
             self._out_socket.write(b"WAKEUP")
             self._out_socket.waitForBytesWritten(500)
 
+@dataclass(frozen=True)
+class AIRequestContext:
+    request_id: str
+    project_name: str
+    project_path: str
+    chapter: int
+    step_name: str
+    model: str
+    feedback: bool = False
+
+
 class AIGenerationWorker(QThread):
     """AI API를 호출하고 비동기로 결과를 받아오는 워커 스레드"""
-    finished = pyqtSignal(str, str, int, int) # step_name, generated_text, in_tok, out_tok
+    # Keep QThread.finished for actual thread lifetime/cleanup.
+    resultReady = pyqtSignal(str, str, int, int)
     error = pyqtSignal(str)
 
-    def __init__(self, step_name, messages, selected_model, use_context_caching=False):
-        super().__init__()
+    def __init__(self, step_name, messages, selected_model, use_context_caching=False, parent=None):
+        super().__init__(parent)
         self.step_name = step_name
-        self.messages = messages
+        self.messages = deepcopy(messages)
         self.selected_model = selected_model
         self.use_context_caching = use_context_caching
 
     def run(self):
         from llm_provider import LLMFactory
         try:
+            if self.isInterruptionRequested():
+                return
             provider = LLMFactory.get_provider(self.selected_model)
             res = provider.generate(self.messages, use_context_caching=self.use_context_caching)
+            if self.isInterruptionRequested():
+                return
             if isinstance(res, tuple) and len(res) >= 3:
                 result_text, in_tok, out_tok = res[0], res[1], res[2]
             else:
                 result_text, in_tok, out_tok = str(res), 0, 0
-            self.finished.emit(self.step_name, result_text, in_tok, out_tok)
+            self.resultReady.emit(self.step_name, result_text, in_tok or 0, out_tok or 0)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.isInterruptionRequested():
+                self.error.emit(str(e))

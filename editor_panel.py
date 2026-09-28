@@ -40,10 +40,11 @@ class EditorPanel(QWidget):
         self.search_bar = LocalSearchBar(self.text_edit)
 
         # 오토세이브 타이머 설정
-        self.autosave_timer = QTimer()
+        self.autosave_timer = QTimer(self)
         self.autosave_timer.setInterval(5000)
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.timeout.connect(self.trigger_autosave)
+        self.text_edit.compositionChanged.connect(self.on_text_changed)
 
         # 폰트 불러오기 및 적용
         self.text_edit.setFont(get_saved_font())
@@ -186,7 +187,9 @@ class EditorPanel(QWidget):
         self.autosave_timer.start() # 입력이 발생하면 타이머 (재)시작
 
     def trigger_autosave(self):
-        self.autoSaveRequested.emit(self.step_name, self.text_edit.toPlainText())
+        self.autoSaveRequested.emit(
+            self.step_name, self.text_edit.text_with_pending_input_method()
+        )
 
     def request_save(self):
         """저장 버튼 클릭 시 시그널 발생"""

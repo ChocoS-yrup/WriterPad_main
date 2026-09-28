@@ -6,12 +6,15 @@ on:
     branches:
       - main
     paths:
-      - "sync_contract.py"
-      - "sync_v2_store.py"
-      - "sync_manager.py"
+      - "**/*.py"
       - "tests/**"
       - "requirements-stage8.txt"
-      - "Antigravity_AI_Writer.spec"
+      - "sync-contract/**"
+      - "writerpad-recovery.cmd"
+      - "작가님힘내세요.spec"
+      - "style.qss"
+      - "app_icon.ico"
+      - "model_catalog.json"
       - ".github/workflows/windows-contract.yml"
   workflow_dispatch:
 
@@ -26,8 +29,18 @@ jobs:
       EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
+      QT_QPA_PLATFORM: offscreen
+      ANTIGRAVITY_APP_DATA_DIR: ${{ github.workspace }}/scratch/ci-app-data
+      WRITERPAD_CONTRACT_REVIEW_UI: "0"
       WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
     steps:
+      - name: Preserve released contract bytes on Windows
+        # The released 0.3 commit predates its Windows checkout attributes.
+        # Preserve Git blob bytes before either checkout; never rewrite assets
+        # or relax their canonical digest/CR-byte checks after checkout.
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Check out exact Windows client head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,7 +51,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ChocoS-yrup/Writerpad
-          ref: 7bcb5d25c5376b02469666df7318b90b456ffee6
+          ref: 3843b05aa91461e1541f5ebaa14557dc3dc2b39c
           path: contract-source
           persist-credentials: false
 
@@ -50,41 +63,63 @@ jobs:
           Write-Host "Actual HEAD:   $actual"
           if ($actual -ne $env:EXPECTED_CHECKOUT_SHA) { exit 1 }
 
-      - name: Set up contract validator Python
+      - name: Set up Python for validation, client tests, and packaging
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14.7"
           cache: pip
-          cache-dependency-path: contract-source/sync-contract/requirements-validation.txt
+          cache-dependency-path: |
+            contract-source/sync-contract/requirements-validation.txt
+            requirements-stage8.txt
 
       - name: Validate pinned released contract
         run: |
           python -m pip install -r contract-source/sync-contract/requirements-validation.txt
           python contract-source/sync-contract/scripts/verify_contract.py
 
-      - name: Set up Windows client Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.11.9"
-          cache: pip
-          cache-dependency-path: requirements-stage8.txt
-
       - name: Install pinned Windows dependencies
         run: python -m pip install -r requirements-stage8.txt
 
+      - name: Verify interpreter, dependencies, and storage-name-v2
+        run: python scripts/verify_python314_runtime.py --require-python 3.14.7
+
       - name: Run Windows client tests
-        # -X faulthandler: a Qt widget test can take the interpreter down
-        # without raising, and unittest then prints nothing at all. This makes
-        # the runner dump the C stack so the next failure names its own cause.
-        run: python -X faulthandler -m unittest discover -s tests -v
+        # The hosted runner was still progressing at 20 minutes (1,052 tests
+        # passed). Keep room for the full suite while bounding each stalled test.
+        timeout-minutes: 45
+        # A stalled test dumps all Python thread stacks and fails after 120s.
+        # The wrapper also resolves hosted Windows TEMP aliases for fixtures.
+        run: python -u -X faulthandler scripts/run_windows_tests.py
 
       - name: Build distributable executable
-        run: python -m PyInstaller --noconfirm --clean Antigravity_AI_Writer.spec
+        run: python -m PyInstaller --noconfirm --clean "작가님힘내세요.spec"
+
+      - name: Check packaged Qt startup without opening projects
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
+          $smoke = Start-Process -FilePath $artifact.FullName -ArgumentList '--qt-import-smoke-test' -WindowStyle Hidden -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) { throw "Packaged Qt startup failed: $($smoke.ExitCode)" }
+
+      - name: Check packaged Python and AI provider imports
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
+          $reportPath = Join-Path $env:RUNNER_TEMP 'packaged-runtime.json'
+          $process = Start-Process -FilePath $artifact.FullName -ArgumentList '--runtime-report' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $reportPath
+          if ($process.ExitCode -ne 0) { throw "Packaged imports failed: $($process.ExitCode)" }
+          $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+          if ($report.python -ne '3.14.7' -or $report.frozen -ne $true -or $report.verdict -ne 'ok') {
+            throw "Unexpected packaged Python or incomplete dependencies"
+          }
+          Get-Content -LiteralPath $reportPath
 
       - name: Record executable digest
         shell: pwsh
         run: |
-          $artifact = Get-Item -LiteralPath dist/Antigravity_AI_Writer.exe
+          $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
           $digest = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "executable=$($artifact.FullName)"
           Write-Host "bytes=$($artifact.Length)"

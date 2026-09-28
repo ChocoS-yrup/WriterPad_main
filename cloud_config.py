@@ -18,6 +18,10 @@ ALLOWED_RELEASE_CONFIG_KEYS = frozenset({
 
 CLOUD_DISABLED_MESSAGE = "이 빌드는 클라우드 동기화가 구성되지 않았습니다."
 CLOUD_INVALID_MESSAGE = "클라우드 서버 설정을 확인할 수 없습니다."
+CLOUD_CREDENTIAL_BUSY_MESSAGE = (
+    "다른 프로그램이 클라우드 로그인 정보를 사용 중입니다. "
+    "그 프로그램을 닫은 뒤 다시 시도해주세요."
+)
 CLOUD_DNS_MESSAGE = "클라우드 서버 설정을 확인할 수 없습니다."
 CLOUD_TIMEOUT_MESSAGE = "클라우드 서버 응답 시간이 초과되었습니다."
 CLOUD_AUTH_MESSAGE = "이메일 또는 비밀번호를 확인해주세요."
@@ -210,12 +214,22 @@ def classify_cloud_error(error):
     ) or "timed out" in text:
         return CloudError("timeout", CLOUD_TIMEOUT_MESSAGE)
 
+    # A retryable error names itself one. It carries a status of 0 rather than
+    # anything the server said, so it has to be read before the status below or
+    # it lands in the wrong bucket entirely.
+    if any("retryable" in type(item).__name__.lower() for item in chain):
+        return CloudError("timeout", CLOUD_TIMEOUT_MESSAGE)
+
+    # supabase-auth puts the HTTP status on `status`; httpx and requests-shaped
+    # errors put it on `status_code`. Reading only one of them left every
+    # refusal this library raises falling through to "unknown".
     status_code = next(
         (
             status
             for item in chain
-            for status in [getattr(item, "status_code", None)]
-            if isinstance(status, int)
+            for attribute in ("status_code", "status")
+            for status in [getattr(item, attribute, None)]
+            if isinstance(status, int) and not isinstance(status, bool) and status
         ),
         None,
     )
@@ -225,8 +239,16 @@ def classify_cloud_error(error):
         "email not confirmed",
         "user not found",
         "authentication failed",
+        # How a refused refresh token actually reads. None of the phrases above
+        # appear in it, so without these a revoked session looked unrecognized.
+        "invalid refresh token",
+        "refresh_token_not_found",
+        "refresh token not found",
+        "already used",
+        "session missing",
+        "session_not_found",
     )
-    if any(marker in text for marker in auth_markers) or status_code in {400, 401}:
+    if any(marker in text for marker in auth_markers) or status_code in {400, 401, 403}:
         return CloudError("authentication", CLOUD_AUTH_MESSAGE)
     if status_code is not None or any(
         marker in text for marker in ("server error", "bad gateway", "service unavailable")

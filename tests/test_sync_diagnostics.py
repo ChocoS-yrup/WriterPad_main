@@ -13,6 +13,7 @@ from sync_diagnostics import (
     safe_failure_reason,
     sanitize_sensitive_text,
 )
+from sync_manager import _MeasuredReentrantLock
 
 
 class _FakeLabel:
@@ -24,6 +25,20 @@ class _FakeLabel:
 
 
 class SyncDiagnosticPrivacyTestCase(unittest.TestCase):
+
+    def test_structure_lock_reports_only_outermost_wait_and_hold(self):
+        observed = []
+        lock = _MeasuredReentrantLock(
+            lambda phase, elapsed_ms: observed.append((phase, elapsed_ms))
+        )
+
+        with lock:
+            with lock:
+                pass
+
+        self.assertEqual([phase for phase, _ in observed], ["wait", "hold"])
+        self.assertTrue(all(elapsed_ms >= 0 for _, elapsed_ms in observed))
+
     def test_sensitive_credentials_are_redacted_from_copied_text(self):
         jwt = "eyJabcdefghijk.abcdefghijk.abcdefghijk"
         source = (

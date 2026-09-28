@@ -328,6 +328,48 @@ class ConflictApplyTestCase(unittest.TestCase):
         self.assertEqual(args[2], "메인/원고/1권/002화.txt")
         self.assertEqual(args[3], "선택한 원고")
 
+    def test_sync_protocol_state_is_never_written_into_the_project(self):
+        """내부 문서를 고르게 두면 원고 트리에 파일이 남고 작품이 안 열린다.
+
+        실제로 그렇게 됐다. 파일만 써지고 충돌 상태는 그대로였다.
+        """
+        wpm = MagicMock()
+        sync_manager = MagicMock()
+        target = SimpleNamespace(
+            wpm=wpm, sync_manager=sync_manager,
+            pm=SimpleNamespace(current_project="작품"),
+        )
+
+        applied = WritingModeWidget.apply_conflict_choice(
+            target, "__antigravity__/tree-order.json", '{"version":1}', LOCAL_LABEL
+        )
+
+        self.assertFalse(applied)
+        wpm.write_text_file.assert_not_called()
+        sync_manager.upload_content_async.assert_not_called()
+
+    def test_the_resolver_never_offers_sync_protocol_state(self):
+        """읽을 수도 없는 문서를 작가에게 고르라고 물으면 안 된다."""
+        store = MagicMock()
+        store.conflict_documents.return_value = [
+            {"local_path": "메인/원고/1권/002화.txt", "document_id": "a"},
+            {"local_path": "__antigravity__/tree-order.json", "document_id": "b"},
+        ]
+        target = SimpleNamespace(
+            wpm=MagicMock(),
+            sync_manager=SimpleNamespace(
+                _v2_store=store, _v2_context={"local_key": "키"}
+            ),
+        )
+
+        with patch(
+            "conflict_dialog.build_conflict_view",
+            side_effect=lambda wpm, document, report: document["local_path"],
+        ):
+            views = WritingModeWidget.conflict_views(target)
+
+        self.assertEqual(views, ["메인/원고/1권/002화.txt"])
+
     def test_failed_write_does_not_queue_a_save(self):
         wpm = MagicMock()
         wpm.write_text_file.return_value = False

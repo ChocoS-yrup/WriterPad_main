@@ -1,7 +1,111 @@
 import sys, os
-from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QMessageBox
 from PyQt6.QtGui import QIcon, QFont, QKeySequence, QShortcut
 from PyQt6.QtCore import QEvent, Qt
+
+
+if "--qt-import-smoke-test" in sys.argv:
+    # Release builds run this before installation. It validates not only the
+    # Python extension import but also the bundled Qt platform plugin and its
+    # MSVC runtime, without opening projects, credentials, or sync state.
+    smoke_app = QApplication(["writerpad-qt-import-smoke-test"])
+    smoke_window = QMainWindow()
+    smoke_window.winId()
+    smoke_app.processEvents()
+    sys.exit(0)
+
+
+if "--runtime-report" in sys.argv:
+    # What a packaged build says about itself, which is the only account that
+    # cannot be wrong. Reading python314.dll out of the binary shows what was
+    # bundled; this shows what actually loaded. The LLM providers are imported
+    # here because llm_provider.py imports them inside functions, so a build can
+    # be missing them entirely and still start, run and pass the smoke test
+    # above — the failure only surfaces when someone uses the AI panel.
+    import importlib
+    import json
+    import unicodedata
+
+    report = {
+        "python": sys.version.split()[0],
+        "python_full": sys.version,
+        "frozen": getattr(sys, "frozen", False),
+        "executable": sys.executable,
+        "stdlib_unicodedata": unicodedata.unidata_version,
+        "packages": {},
+    }
+    for module_name, distribution in (
+        ("PyQt6.QtCore", "PyQt6"),
+        ("supabase", "supabase"),
+        ("keyring", "keyring"),
+        ("markdown", "Markdown"),
+        ("dotenv", "python-dotenv"),
+        ("anthropic", "anthropic"),
+        ("openai", "openai"),
+        ("google.genai", "google-genai"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as error:
+            report["packages"][distribution] = f"IMPORT FAILED: {type(error).__name__}"
+            continue
+        # A frozen build does not carry dist-info for every package, so fall
+        # back to what the module says about itself before giving up.
+        found = None
+        try:
+            from importlib.metadata import version
+
+            found = version(distribution)
+        except Exception:
+            root = importlib.import_module(module_name.split(".")[0])
+            for attribute in ("__version__", "VERSION", "PYQT_VERSION_STR"):
+                value = getattr(module, attribute, None) or getattr(root, attribute, None)
+                if isinstance(value, str):
+                    found = value
+                    break
+        report["packages"][distribution] = found or "imported (version unavailable)"
+    try:
+        import unicodedata2  # noqa: F401
+    except ImportError:
+        report["unicodedata2"] = "absent (expected: storage-name-v2 does not use it)"
+    else:
+        report["unicodedata2"] = "PRESENT - the v1 dependency was meant to be gone"
+
+    failed = [k for k, v in report["packages"].items() if str(v).startswith("IMPORT FAILED")]
+    report["verdict"] = "ok" if not failed else f"missing: {', '.join(failed)}"
+    # Escaped, not raw UTF-8. This is meant to be redirected to a file, and a
+    # windowed frozen build writes stdout in the console code page and ignores
+    # PYTHONIOENCODING, so a Korean path in sys.executable would come back
+    # undecodable. ASCII survives whatever code page is in effect.
+    print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
+    sys.exit(0 if not failed else 1)
+
+
+from integrated_editor_plan import INTEGRATED_EDITOR_ONLY
+if INTEGRATED_EDITOR_ONLY:
+    from integrated_editor_runtime import run_integrated_editor_app
+    sys.exit(run_integrated_editor_app(sys.argv))
+
+from normal_editor_build import NORMAL_EDITOR_ONLY
+if NORMAL_EDITOR_ONLY:
+    from normal_editor_runtime import run_normal_editor_app
+    sys.exit(run_normal_editor_app(sys.argv))
+
+from general_editor_build import GENERAL_EDITOR_ONLY
+if GENERAL_EDITOR_ONLY:
+    from general_editor_ui import run_general_editor_app
+    sys.exit(run_general_editor_app(sys.argv))
+
+from general_validation_build import GENERAL_VALIDATION_ONLY
+if GENERAL_VALIDATION_ONLY:
+    from general_validation_ui import run_general_validation_app
+    sys.exit(run_general_validation_app(sys.argv))
+
+from body_validation_build import BODY_VALIDATION_ONLY
+if BODY_VALIDATION_ONLY:
+    # Run before any ordinary window, project, manager or dispatcher is created.
+    from body_validation_ui import run_body_validation_app
+    sys.exit(run_body_validation_app(sys.argv))
 
 from mode_assistant import AssistantModeWidget, SingleApplication
 from mode_writing import WritingModeWidget
@@ -61,6 +165,11 @@ class MainWindow(QMainWindow):
         
         # writing_mode 참조 전달 (종료 시 팝업 등에서 사용)
         self.assistant_mode.writing_mode = self.writing_mode
+        for panel in (getattr(self.assistant_mode, "left_panels", [])
+                      + getattr(self.assistant_mode, "right_panels", [])):
+            card = getattr(panel, "general_test_gate_card", None)
+            if card is not None:
+                card.bind_manager(self.writing_mode.sync_manager)
         
         # 모드 스위칭 시그널 연결
         self.assistant_mode.switchModeRequested.connect(self.switch_to_writing)
@@ -157,6 +266,16 @@ class MainWindow(QMainWindow):
             print(f"창 상태 복원 실패: {e}")
 
     def closeEvent(self, event):
+        # Check retained responses before any settings write can fail on the
+        # same full disk that prevented saving the generated response.
+        if not self.assistant_mode.preserve_failed_ai_responses_before_close():
+            event.ignore()
+            return
+        from general_test_gate_ui import GeneralTestGateCard
+        if any(card.busy for card in self.findChildren(GeneralTestGateCard)):
+            QMessageBox.information(self, "시험 준비 중", "연결·수신 확인이 끝난 뒤 종료하세요. 원고 송신은 보류 중입니다.")
+            event.ignore()
+            return
         # 창 상태 저장
         self.assistant_mode.pm.global_config["window_geometry"] = self.saveGeometry().toHex().data().decode()
         self.assistant_mode.pm.global_config["window_state"] = self.saveState().toHex().data().decode()
@@ -199,6 +318,20 @@ if __name__ == "__main__":
         print("프로그램이 이미 실행 중입니다. 기존 창을 최상단으로 띄웁니다.")
         app.wake_up_server()
         sys.exit(0)
+
+    # Claim the stored Supabase session for this process before anything can
+    # want it. SyncManager is built lazily -- not until a writing project is
+    # opened -- so waiting for it to claim the credential leaves the whole
+    # startup as a window in which another holder can take it and start
+    # exchanging tokens underneath us. Held for the life of the process; the
+    # handle is returned when it exits.
+    from sync_manager import SyncManager
+
+    if SyncManager.acquire_auth_lease() is not True:
+        print(
+            "클라우드 자격 증명을 다른 프로세스가 사용 중입니다. "
+            "이번 실행에서는 서버 동기화를 시작하지 않습니다."
+        )
 
     pid_path = pid_file_path()
     if pid_path:

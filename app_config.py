@@ -1,10 +1,19 @@
 import json
 import os
+import sys
 
 from PyQt6.QtGui import QFont
+from runtime_profile import root_dir
 
 
-FONT_CONFIG_FILE = "fonts.json"
+# Match ProjectManager's storage root. Launchers and shortcuts may start the
+# executable in a read-only directory unrelated to the installed application.
+_settings_root = root_dir(
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
+)
+FONT_CONFIG_FILE = os.path.join(_settings_root, "fonts.json")
 
 def get_saved_font():
     if os.path.exists(FONT_CONFIG_FILE):
@@ -35,7 +44,7 @@ def save_font_to_json(font):
     with open(FONT_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(_settings_root, "config.json")
 DEFAULT_CONFIG = {
     "model_summary": "Gemini 3.1 Pro",
     "model_draft": "Claude Opus 4.8",

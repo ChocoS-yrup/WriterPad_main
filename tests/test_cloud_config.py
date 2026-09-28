@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -150,6 +151,57 @@ class CloudErrorClassificationTestCase(unittest.TestCase):
             super().__init__(message)
             self.status_code = status_code
 
+    class _AuthApiError(RuntimeError):
+        """Shaped like supabase-auth's own error: the status is on `status`."""
+
+        def __init__(self, message, status):
+            super().__init__(message)
+            self.status = status
+
+    class _AuthRetryableError(RuntimeError):
+        """Also supabase-auth's: it names itself, and carries status 0."""
+
+        def __init__(self, message, status=0):
+            super().__init__(message)
+            self.status = status
+
+    def test_the_auth_librarys_own_errors_are_recognized(self):
+        """These arrive from every sign-in and every session restore.
+
+        Reading only `status_code` left each of them unrecognized, and an
+        unrecognized error is treated as a bad moment rather than a refusal, so
+        a genuinely revoked session looked like one worth waiting out.
+        """
+        refusals = (
+            self._AuthApiError("Invalid Refresh Token: Already Used", 400),
+            self._AuthApiError("refresh_token_not_found", 400),
+            self._AuthApiError("Unauthorized", 401),
+            self._AuthApiError("Forbidden", 403),
+            self._AuthApiError("Auth session missing!", 400),
+        )
+        for error in refusals:
+            with self.subTest(refusal=str(error)):
+                self.assertEqual(
+                    classify_cloud_error(error).kind, "authentication"
+                )
+
+    def test_a_retryable_auth_error_is_not_read_as_a_refusal(self):
+        """It carries status 0, which is the transport failing, not the server."""
+        classified = classify_cloud_error(
+            self._AuthRetryableError("Unable to connect to the server")
+        )
+        self.assertEqual(classified.kind, "timeout")
+
+    def test_auth_library_server_faults_stay_server_faults(self):
+        for status in (500, 502, 503):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_cloud_error(
+                        self._AuthApiError("server error", status)
+                    ).kind,
+                    "server_rejection",
+                )
+
     def test_dns_timeout_auth_and_server_rejection_are_distinct(self):
         dns = classify_cloud_error(socket.gaierror(11001, "getaddrinfo failed"))
         timeout = classify_cloud_error(TimeoutError("request timed out"))
@@ -178,6 +230,9 @@ class CloudErrorClassificationTestCase(unittest.TestCase):
         sentinel = "credential-and-key-sentinel"
         target = SimpleNamespace(
             cloud_network_enabled=True,
+            _contract_lock=threading.RLock(),
+            _auth_context_generation=0,
+            _forget_contract_handshake=MagicMock(),
             supabase=SimpleNamespace(
                 auth=SimpleNamespace(
                     sign_in_with_password=MagicMock(
@@ -197,6 +252,10 @@ class CloudErrorClassificationTestCase(unittest.TestCase):
             )
 
         self.assertFalse(success)
+        target.supabase.auth.sign_in_with_password.assert_called_once_with({
+            "email": "account@example.invalid",
+            "password": sentinel,
+        })
         self.assertNotIn(sentinel, message)
         self.assertNotIn(sentinel, output.getvalue())
 

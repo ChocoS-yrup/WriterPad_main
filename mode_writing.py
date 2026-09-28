@@ -1,5 +1,7 @@
 import os
+import hashlib
 import re
+import time
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QTextEdit, QLabel,
@@ -13,7 +15,11 @@ from ui_components import SmartTextEdit
 from datetime import datetime
 
 from project_manager_writing import WritingProjectManager
-from sync_manager import SyncManager, is_live_document_path
+from sync_manager import (
+    SyncManager,
+    is_internal_sync_path,
+    is_live_document_path,
+)
 from three_way_merge import build_conflict_report
 from writing_backup import HistoryViewerDialog
 from writing_search import GlobalSearchDialog, LocalSearchDialog
@@ -279,11 +285,23 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         
         # 프로젝트 열기 판정 (열기는 폴더나 UUID를 만들지 않는다)
         self.open_verdict = None
+        # Set here rather than only on refusal, so the status button cannot
+        # inherit a stale refusal if this widget is ever reused for a second
+        # project instead of being rebuilt.
+        self._open_blocked_reason = ""
         if self.pm.current_project:
             from project_creation_v1 import OPEN_OK
 
             self.open_verdict = self.wpm.initialize_project(self.pm.current_project)
             if self.open_verdict["status"] != OPEN_OK:
+                # Kept for the status button. A refused project releases the
+                # shared sync manager, so the last state it published belongs
+                # to whichever project opened before this one, and the toolbar
+                # went on reporting that one as 동기화 완료.
+                self._open_blocked_reason = (
+                    self.open_verdict.get("reason")
+                    or "작품 구성 검사를 통과하지 못했습니다."
+                )
                 QMessageBox.warning(
                     self,
                     "프로젝트를 열 수 없습니다",
@@ -351,6 +369,15 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             self.sync_manager.pending_retry_count,
         )
         self.load_tree_data()
+        self._ui_heartbeat_interval_ms = 250
+        self._ui_heartbeat_expected_at = time.perf_counter() + 0.25
+        self.ui_heartbeat_timer = QTimer(self)
+        self.ui_heartbeat_timer.setInterval(self._ui_heartbeat_interval_ms)
+        self.ui_heartbeat_timer.timeout.connect(self._record_ui_heartbeat)
+        self.ui_heartbeat_timer.start()
+        self.sync_manager.register_shutdown_timer_stopper(
+            self.ui_heartbeat_timer.stop
+        )
         QTimer.singleShot(250, self.sync_manager.retry_pending_syncs)
         self.remote_pull_timer = QTimer(self)
         self.remote_pull_timer.setInterval(5000)
@@ -363,6 +390,16 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         
         QTimer.singleShot(100, self.load_saved_files)
         
+    def _record_ui_heartbeat(self):
+        now = time.perf_counter()
+        expected = float(getattr(self, "_ui_heartbeat_expected_at", now))
+        late_ms = max(0.0, (now - expected) * 1000.0)
+        interval_ms = int(getattr(self, "_ui_heartbeat_interval_ms", 250))
+        self._ui_heartbeat_expected_at = now + interval_ms / 1000.0
+        recorder = getattr(self.sync_manager, "record_binder_timing", None)
+        if callable(recorder):
+            recorder("ui_heartbeat", late_ms)
+
     def get_active_paths(self):
         paths = []
         if self.current_loaded_file_left: paths.append(self.current_loaded_file_left)
@@ -399,6 +436,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         # Reinsert the path so dictionary order acts as a small LRU list.
         side_states.pop(rel_path, None)
         side_states[rel_path] = {
+            "content_sha256": hashlib.sha256(
+                editor.toPlainText().encode("utf-8")
+            ).hexdigest(),
             "cursor": editor.textCursor().position(),
             "vertical_scroll": editor.verticalScrollBar().value(),
             "horizontal_scroll": editor.horizontalScrollBar().value(),
@@ -432,6 +472,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         state = self._saved_editor_view_state(editor, rel_path)
         if not state:
             return False
+        # An unopened chapter may have changed on another device. Positions
+        # belong to the text the writer last saw, not just its unchanged path.
+        # Older settings have no text identity: use the normal end-of-file
+        # fallback once, then remember a verifiable position on the next save.
+        if state.get("content_sha256") != hashlib.sha256(
+            editor.toPlainText().encode("utf-8")
+        ).hexdigest():
+            return False
         try:
             cursor_position = int(state.get("cursor", 0))
             vertical_scroll = int(state.get("vertical_scroll", 0))
@@ -442,8 +490,10 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         from PyQt6.QtGui import QTextCursor
 
         cursor = QTextCursor(editor.document())
-        cursor.setPosition(max(0, min(cursor_position, len(editor.toPlainText()))))
+        cursor.setPosition(max(0, min(cursor_position, editor.document().characterCount() - 1)))
         editor.setTextCursor(cursor)
+        restored_document = editor.document()
+        restored_revision = restored_document.revision()
 
         def restore_scrollbars():
             if editor is getattr(self, "left_editor", None):
@@ -451,6 +501,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             else:
                 current_path = getattr(self, "current_loaded_file_right", None)
             if current_path != rel_path:
+                return
+            if (editor.document() is not restored_document
+                    or restored_document.revision() != restored_revision):
                 return
             editor.verticalScrollBar().setValue(vertical_scroll)
             editor.horizontalScrollBar().setValue(horizontal_scroll)
@@ -488,20 +541,49 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             commit_input()
         return editor.toPlainText()
 
+    @staticmethod
+    def _editor_text_for_background_save(editor):
+        """Read the editor for a background save without disturbing the IME.
+
+        The syllable being composed is included even though QTextDocument
+        does not hold it yet, so stopping mid-word no longer leaves it
+        unsaved. Reading it costs nothing: unlike a forced commit, nothing is
+        sent to the IME.
+        """
+        if not WritingModeWidget._editor_is_composing(editor):
+            return editor.toPlainText()
+        composed = getattr(editor, "text_with_pending_input_method", None)
+        if callable(composed):
+            return composed()
+        return editor.toPlainText()
+
+    @staticmethod
+    def _editor_is_composing(editor):
+        pending_input = getattr(editor, "has_pending_input_method", None)
+        return bool(callable(pending_input) and pending_input() is True)
+
     def get_editor_content(self, path):
         if path == self.current_loaded_file_left and getattr(self, 'left_editor', None) and not self.left_editor.isReadOnly():
-            return WritingModeWidget._editor_text_for_save(self.left_editor)
+            return WritingModeWidget._editor_text_for_background_save(
+                self.left_editor
+            )
         if path == self.current_loaded_file_right and getattr(self, 'right_editor', None) and not self.right_editor.isReadOnly():
-            return WritingModeWidget._editor_text_for_save(self.right_editor)
+            return WritingModeWidget._editor_text_for_background_save(
+                self.right_editor
+            )
 
     def get_remote_sync_protected_paths(self):
         protected = set()
         if self.current_loaded_file_left and (
-            self.is_dirty_left or self.left_editor.document().isModified()
+            self.is_dirty_left
+            or self.left_editor.document().isModified()
+            or WritingModeWidget._editor_is_composing(self.left_editor)
         ):
             protected.add(self.current_loaded_file_left)
         if self.current_loaded_file_right and (
-            self.is_dirty_right or self.right_editor.document().isModified()
+            self.is_dirty_right
+            or self.right_editor.document().isModified()
+            or WritingModeWidget._editor_is_composing(self.right_editor)
         ):
             protected.add(self.current_loaded_file_right)
         return protected
@@ -841,7 +923,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.left_editor.compositionChanged.connect(
             self.on_editor_text_changed
         )
-        self.left_editor.selectionChanged.connect(self.update_editor_statistics)
+        self.left_editor.selectionChanged.connect(
+            self.schedule_editor_metadata_refresh
+        )
         
         # 포커스 이벤트 가로채기를 위한 이벤트 필터 설치
         self.left_editor.installEventFilter(self)
@@ -893,8 +977,21 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         self.right_editor.compositionChanged.connect(
             self.on_editor_text_changed
         )
-        self.right_editor.selectionChanged.connect(self.update_editor_statistics)
+        self.right_editor.selectionChanged.connect(
+            self.schedule_editor_metadata_refresh
+        )
         self.right_editor.installEventFilter(self)
+
+        # Binder icon scans and whole-document character counts are display
+        # metadata. Coalesce them after an input burst instead of doing both on
+        # every text/cursor signal on the GUI thread.
+        self._pending_editor_metadata_paths = set()
+        self._editor_metadata_timer = QTimer(self)
+        self._editor_metadata_timer.setSingleShot(True)
+        self._editor_metadata_timer.setInterval(75)
+        self._editor_metadata_timer.timeout.connect(
+            self._flush_editor_metadata_updates
+        )
         
         self.right_wrap_frame = QFrame()
         right_wrap_layout = QVBoxLayout(self.right_wrap_frame)
@@ -982,7 +1079,17 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         finally:
             self._editor_splitter_snapping = False
 
-    def update_storage_status(self, state, detail="", pending_count=0):
+    def update_storage_status(
+        self, state, detail="", pending_count=0, refresh_activity=True
+    ):
+        blocked_reason = str(getattr(self, "_open_blocked_reason", "") or "")
+        if blocked_reason:
+            # Nothing is being synced for a project that would not open, so no
+            # state the manager publishes describes it. Say that instead of
+            # inheriting the previous project's answer.
+            state = "project_unopened"
+            detail = blocked_reason
+            pending_count = 0
         labels = {
             "saved": ("● 로컬 저장 완료", "#86efac", "#163522"),
             "backup": (
@@ -1007,6 +1114,26 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "#fca5a5",
                 "#451f24",
             ),
+            "retry_wait": (
+                "● 로컬 저장 완료 · 재시도 대기",
+                "#fdba74",
+                "#422a18",
+            ),
+            "pull_pending": (
+                "● 로컬 저장 완료 · 서버 수신 대기",
+                "#7dd3fc",
+                "#173449",
+            ),
+            "local_waiting": (
+                "● 바인더 작업 대기",
+                "#fcd34d",
+                "#3b3017",
+            ),
+            "blocked": (
+                "● 로컬 저장 완료 · 서버 적용 차단",
+                "#fca5a5",
+                "#451f24",
+            ),
             "empty_guard": (
                 "● 전체 삭제 확인 필요",
                 "#fcd34d",
@@ -1027,16 +1154,42 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "#fca5a5",
                 "#451f24",
             ),
+            "project_unopened": (
+                "● 작품을 열지 못함 · 동기화 중지",
+                "#fca5a5",
+                "#451f24",
+            ),
+            "tree_order_stalled": (
+                "● 원고 동기화 중 · 바인더 순서 대기",
+                "#fcd34d",
+                "#3b3017",
+            ),
         }
         text, color, background = labels.get(state, labels["saved"])
+        activity = dict(getattr(self, "_storage_sync_activity", {}) or {})
+        if refresh_activity:
+            try:
+                manager = getattr(self, "sync_manager", None)
+                snapshot = getattr(
+                    manager, "display_sync_activity_snapshot", None
+                )
+                if callable(snapshot):
+                    activity = snapshot()
+            except Exception:
+                activity = dict(
+                    getattr(self, "_storage_sync_activity", {}) or {}
+                )
         unsaved_editor_count = WritingModeWidget._unsaved_editor_count(self)
         editor_dirty = unsaved_editor_count > 0
-        if editor_dirty and state != "empty_guard":
+        if editor_dirty and state not in {"empty_guard", "project_unopened"}:
             dirty_suffix = {
                 "offline": " · 오프라인",
                 "auth_required": " · 로그인 필요",
                 "lease": " · 다른 기기 편집 중",
                 "failed": " · 서버 전송 대기",
+                "retry_wait": " · 재시도 대기",
+                "pull_pending": " · 서버 수신 대기",
+                "blocked": " · 서버 적용 차단",
                 "conflict": " · 충돌 확인 필요",
                 "project_trashed": " · 서버 휴지통",
                 "project_purged": " · 서버 영구 삭제",
@@ -1066,26 +1219,61 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                     f"● 로컬 저장 완료 · 서버 전송 대기 {pending_count}건"
                     " · 재시도 필요"
                 )
+            elif state == "retry_wait":
+                text = f"● 로컬 저장 완료 · 재시도 대기 {pending_count}건"
+            elif state == "blocked":
+                text = (
+                    "● 로컬 저장 완료 · 서버 적용 차단"
+                    f" · 전송 대기 {pending_count}건"
+                )
             elif state == "conflict":
-                text = f"● 로컬 저장 완료 · 충돌 {pending_count}건"
+                text = (
+                    "● 로컬 저장 완료 · 충돌 확인 필요"
+                    f" · 대기 작업 {pending_count}건"
+                )
             else:
                 text = f"{text} · {pending_count}건 대기"
-        account_email = ""
+        previous_account_email = str(
+            getattr(self, "_storage_account_email", "") or ""
+        )
+        observed_account_email = ""
         try:
             manager = getattr(self, "sync_manager", None)
             if manager:
-                account_email = manager.authenticated_email()
+                observed_account_email = manager.authenticated_email()
         except Exception:
-            account_email = ""
-        if account_email and state == "saved" and not editor_dirty and not pending_count:
+            observed_account_email = ""
+        account_email = str(observed_account_email or "")
+        if (
+            not account_email
+            and previous_account_email
+            and state not in {"auth_required", "project_purged"}
+        ):
+            # Session refresh can swap clients briefly. Do not repaint a
+            # healthy cloud project as local-only during that internal gap.
+            account_email = previous_account_email
+        # The five-second background pull is deliberately invisible: the
+        # manager only raises pull_visible for a manual refresh or the first
+        # baseline pull. Counting every pull as busy made the button alternate
+        # between 동기화 완료 and 로컬 저장 완료 every five seconds while the
+        # writer sat idle. A pull that is still waiting on the upload queue
+        # publishes the pull_pending state, which has its own label.
+        activity_busy = any(int(activity.get(name, 0) or 0) for name in (
+            "transfer_pending", "transferring", "retry_wait", "conflict",
+            "blocked", "pull_visible",
+        ))
+        if (
+            account_email and state == "saved" and not editor_dirty
+            and not pending_count and not activity_busy
+        ):
             text = "● 동기화 완료"
         self._storage_pending_count = pending_count
         self._storage_state = state
         self._storage_detail = detail
         self._storage_editor_dirty_count = unsaved_editor_count
         self._storage_account_email = account_email
-        self.lbl_storage_status.setText(text)
-        self.lbl_storage_status.setStyleSheet(
+        self._storage_sync_activity = activity
+        style_sheet = (
             f"QPushButton {{ color: {color}; background-color: {background}; border: 1px solid {color}; "
             "border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: bold; }}"
             f"QPushButton:hover {{ background-color: {background}; }}"
@@ -1104,7 +1292,14 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         )
         if account_email:
             tooltip = f"클라우드 자동 로그인됨: {account_email}\n{tooltip}"
-        self.lbl_storage_status.setToolTip(tooltip)
+        visual_signature = (text, style_sheet, tooltip)
+        if visual_signature != getattr(
+            self, "_storage_visual_signature", None
+        ):
+            self._storage_visual_signature = visual_signature
+            self.lbl_storage_status.setText(text)
+            self.lbl_storage_status.setStyleSheet(style_sheet)
+            self.lbl_storage_status.setToolTip(tooltip)
 
     @staticmethod
     def _storage_status_guidance(
@@ -1113,6 +1308,35 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         """Translate internal sync state into plain-language cause and action."""
         pending_count = max(0, int(pending_count or 0))
         dirty_count = max(0, int(dirty_count or 0))
+        if state == "project_unopened":
+            return {
+                "title": "작품을 열지 못했습니다",
+                "summary": (
+                    "로컬 파일은 그대로 있습니다. 이 작품은 열리지 않아 "
+                    "동기화를 시작하지 않았습니다."
+                ),
+                "cause": detail or "작품 구성 검사를 통과하지 못했습니다.",
+                "action": "원인을 확인한 뒤 다시 열어주세요. 파일은 변경되지 않았습니다.",
+                "action_code": "",
+                "warning": True,
+            }
+        if state == "tree_order_stalled":
+            return {
+                "title": "바인더 순서만 반영되지 않음",
+                "summary": (
+                    "원고는 정상적으로 동기화되고 있습니다. 다른 기기에서 바꾼 "
+                    "폴더·화 순서만 적용되지 않고 있습니다."
+                ),
+                "cause": detail or (
+                    "다른 기기가 보낸 순서표가 서버 문서 목록과 맞지 않습니다."
+                ),
+                "action": (
+                    "다른 기기에서 순서를 한 번 다시 정리하면 새 순서표가 올라와 "
+                    "해소될 수 있습니다. 원고는 안전합니다."
+                ),
+                "action_code": "",
+                "warning": True,
+            }
         if state == "empty_guard":
             return {
                 "title": "전체 삭제 확인 필요",
@@ -1191,6 +1415,30 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "cause": detail or "서버가 변경 내용을 처리하지 못했습니다.",
                 "action": "상세 원인을 확인한 뒤 지금 다시 시도할 수 있습니다.",
                 "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "retry_wait": {
+                "title": "서버 전송 재시도 대기",
+                "summary": f"원고는 로컬에 저장됐고 서버 전송{pending_text}을 다시 시도할 예정입니다.",
+                "cause": detail or "네트워크 또는 서버 응답을 기다리고 있습니다.",
+                "action": "자동 재시도를 기다리거나 지금 다시 시도할 수 있습니다.",
+                "action_code": "retry" if pending_count else "",
+                "warning": True,
+            },
+            "pull_pending": {
+                "title": "서버 변경 확인 대기",
+                "summary": "로컬 업로드가 안정 지점에 도달하면 서버의 최신 상태를 확인합니다.",
+                "cause": detail or "업로드와 원격 적용이 서로 끼어들지 않도록 순서를 지키고 있습니다.",
+                "action": "현재 작업이 끝날 때까지 잠시 기다려주세요.",
+                "action_code": "",
+                "warning": False,
+            },
+            "blocked": {
+                "title": "서버 적용 차단",
+                "summary": "로컬 원고는 보존됐지만 서버 응답을 안전하게 적용할 수 없어 중지했습니다.",
+                "cause": detail or "구조 또는 식별자 검증이 안전 조건을 통과하지 못했습니다.",
+                "action": "상세 원인을 확인한 뒤 명시적으로 다시 시도해주세요.",
+                "action_code": "retry",
                 "warning": True,
             },
             "lease": {
@@ -1291,6 +1539,7 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             getattr(self, "_storage_state", "saved"),
             getattr(self, "_storage_detail", ""),
             getattr(self, "_storage_pending_count", 0),
+            refresh_activity=False,
         )
 
     def _retry_storage_sync(self):
@@ -1307,6 +1556,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             return
         if getattr(self, "_storage_state", "") == "empty_guard":
             self.manual_save()
+            return
+        if getattr(self, "_storage_state", "") == "blocked":
+            self.sync_manager.retry_pending_syncs(manual=True)
             return
         if getattr(self, "_storage_pending_count", 0):
             # 사용자가 누른 재시도는 예약된 자동 재시도 대기 시간을 건너뛴다.
@@ -1546,8 +1798,9 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         # 스크롤바가 우측 끝에 붙도록 스타일시트의 padding 대신 QTextFrameFormat을 통해 텍스트 여백을 설정
         self.apply_editor_margins()
 
-    def apply_editor_margins(self):
-        for editor in [self.left_editor, self.right_editor]:
+    def apply_editor_margins(self, editor=None):
+        editors = [editor] if editor is not None else [self.left_editor, self.right_editor]
+        for editor in editors:
             doc = editor.document()
             was_modified = doc.isModified()
             signals_were_blocked = editor.blockSignals(True)
@@ -1854,22 +2107,63 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
 
     def on_editor_text_changed(self):
         editor = self.sender() if self.sender() else self.active_editor
+        changed_path = None
         if editor == self.left_editor and getattr(self, 'current_loaded_file_left', None) and not editor.isReadOnly():
             self.is_dirty_left = True
-            has_content = len(editor.toPlainText().strip()) > 0
-            self.update_tree_icon(self.current_loaded_file_left, has_content)
-            self.controller.notify_text_changed(self.current_loaded_file_left)
+            changed_path = self.current_loaded_file_left
+            self.controller.notify_text_changed(changed_path)
         elif editor == self.right_editor and getattr(self, 'current_loaded_file_right', None) and not editor.isReadOnly():
             self.is_dirty_right = True
-            has_content = len(editor.toPlainText().strip()) > 0
-            self.update_tree_icon(self.current_loaded_file_right, has_content)
-            self.controller.notify_text_changed(self.current_loaded_file_right)
+            changed_path = self.current_loaded_file_right
+            self.controller.notify_text_changed(changed_path)
+
+        schedule_metadata = getattr(
+            self, "schedule_editor_metadata_refresh", None
+        )
+        if callable(schedule_metadata):
+            schedule_metadata(changed_path)
 
         refresh_status = getattr(
             self, "_refresh_storage_status_for_editor_state", None
         )
         if callable(refresh_status):
             refresh_status()
+
+    def schedule_editor_metadata_refresh(self, path=None):
+        pending = getattr(self, "_pending_editor_metadata_paths", None)
+        if pending is None:
+            pending = set()
+            self._pending_editor_metadata_paths = pending
+        if path:
+            pending.add(path)
+        timer = getattr(self, "_editor_metadata_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _flush_editor_metadata_updates(self):
+        paths = set(
+            getattr(self, "_pending_editor_metadata_paths", set()) or set()
+        )
+        self._pending_editor_metadata_paths.clear()
+        pairs = (
+            (
+                getattr(self, "current_loaded_file_left", None),
+                getattr(self, "left_editor", None),
+            ),
+            (
+                getattr(self, "current_loaded_file_right", None),
+                getattr(self, "right_editor", None),
+            ),
+        )
+        for path, editor in pairs:
+            if (
+                path
+                and path in paths
+                and editor is not None
+                and not editor.isReadOnly()
+            ):
+                has_content = bool(editor.toPlainText().strip())
+                self.update_tree_icon(path, has_content)
         self.update_editor_statistics()
 
     def on_idle_autosave_persisted(self, path, content, success):
@@ -1892,7 +2186,16 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             if getattr(self, path_attr, None) != path:
                 continue
             editor = getattr(self, editor_attr, None)
-            if editor is None or editor.toPlainText() != content:
+            # Compare against exactly what the background save reads, preedit
+            # included. Comparing the committed text alone would hold the
+            # 로컬 저장 대기 indicator open for as long as a Korean syllable
+            # sits in composition, which is most of a writer's pauses.
+            # Remote pulls stay blocked meanwhile: the protected-path set
+            # tests for an active composition on its own.
+            if editor is None or (
+                WritingModeWidget._editor_text_for_background_save(editor)
+                != content
+            ):
                 continue
             setattr(self, dirty_attr, False)
             editor.document().setModified(False)
@@ -1954,6 +2257,11 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         return [
             build_conflict_view(self.wpm, document, build_conflict_report)
             for document in documents
+            # Protocol state such as the binder order document is not a
+            # manuscript. Offering it as a version to choose between asks the
+            # writer about a file they cannot read, and picking one wrote it
+            # into the project tree without ever clearing the conflict.
+            if not is_internal_sync_path(document.get("local_path"))
         ]
 
     def open_conflict_resolver(self):
@@ -1980,6 +2288,10 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
     def apply_conflict_choice(self, relative_path, content, label=""):
         """Write the chosen version and let the normal save path clear the conflict."""
         if not relative_path:
+            return False
+        if is_internal_sync_path(relative_path):
+            # Sync protocol state has no editor and no save path, so writing it
+            # here cleared nothing and left the file behind in the project tree.
             return False
         if not self.wpm.write_text_file(relative_path, content):
             QMessageBox.warning(
@@ -2208,6 +2520,12 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 if editor.toPlainText() != remote_content:
                     editor.blockSignals(True)
                     editor.setPlainText(remote_content)
+                    self.apply_editor_margins(editor)
+                    # Replacing the snapshot resets Qt's cursor to the start.
+                    # Continue writing after the text received from another device.
+                    from PyQt6.QtGui import QTextCursor
+                    editor.moveCursor(QTextCursor.MoveOperation.End)
+                    editor.ensureCursorVisible()
                     editor.document().setModified(False)
                     editor.blockSignals(False)
                 else:
@@ -2261,6 +2579,12 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
                 "<<<<<<< 내 로컬 편집본\n" + local_content +
                 "\n=======\n" + server_content + "\n>>>>>>> 서버 최신본\n"
             )
+
+        if is_internal_sync_path(rel_path):
+            # A conflict on sync protocol state is not a manuscript conflict.
+            # Comparison copies of it are unreadable to the writer, and the
+            # 충돌 폴더 they land in makes it look like their work is at risk.
+            return
 
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H%M%S")
         base, ext = os.path.splitext(os.path.basename(rel_path))

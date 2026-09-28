@@ -660,6 +660,11 @@ class ProjectSelectionDialog(QDialog):
         self.input_new.setPlaceholderText("새 프로젝트명 입력")
         layout.addWidget(self.input_new)
 
+        self.btn_archive = QPushButton("작품 백업·복구")
+        self.btn_archive.setAutoDefault(False)
+        self.btn_archive.clicked.connect(self.open_archive)
+        layout.addWidget(self.btn_archive)
+
         btn_layout = QHBoxLayout()
         self.btn_open = QPushButton("선택 프로젝트 열기")
         self.btn_open.setMinimumHeight(40)
@@ -738,6 +743,12 @@ class ProjectSelectionDialog(QDialog):
         dialog = ProjectManagementDialog(self.pm, self)
         dialog.exec()
         self.refresh_list()
+
+    def open_archive(self):
+        from project_archive_dialog import ProjectArchiveDialog
+        item = self.list_widget.currentItem()
+        project = os.path.join(self.pm.workspace_dir, item.text()) if item else None
+        ProjectArchiveDialog(project, self).exec()
 
     def open_server_import(self):
         dialog = ServerProjectImportDialog(self.pm, self)

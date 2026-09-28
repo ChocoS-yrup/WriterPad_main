@@ -38,3 +38,22 @@ _사용안함_과거테스트흔적_20260815/
 프롬프트.txt
 out*.log
 create_performance_test_project.py
+
+# 진단 스냅샷과 스모크 산출물. 2026-09-19 분류. 과거 검증 근거이므로
+# 디스크에 보존하고 git에는 넣지 않는다. 임의 삭제 금지.
+_evidence/
+_diagnostic_snapshot_*/
+_smoke_*/
+_review_*.txt
+
+# 패키징된 exe
+집필프로그램/
+
+# 생성된 인계 패키지
+output/
+
+# Supabase CLI 로컬 상태
+supabase/.temp/
+
+# Python 3.14 개발·검증용 가상환경.
+.venv314/
