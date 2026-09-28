@@ -30,7 +30,7 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
       QT_QPA_PLATFORM: offscreen
-      ANTIGRAVITY_APP_DATA_DIR: ${{ runner.temp }}/writerpad-tests
+      ANTIGRAVITY_APP_DATA_DIR: ${{ github.workspace }}/scratch/ci-app-data
       WRITERPAD_CONTRACT_REVIEW_UI: "0"
       WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
     steps:
