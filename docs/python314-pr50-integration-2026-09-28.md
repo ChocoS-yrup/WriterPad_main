@@ -28,6 +28,8 @@ Python은 기존 `.venv314`의 실제 실행 결과인 **3.14.7**을 사용한�
 
 CI가 참조하던 계약 0.2 checkout과 Python 3.12 검증기를 바로잡았다.
 이제 계약 검증, 전체 테스트, EXE 빌드를 같은 Python 3.14.7에서 수행한다.
+GitHub Windows runner의 checkout은 자동 CRLF 변환을 끄고 released 계약의
+LF 바이트를 보존한다. 0.3 pin 자체와 canonical digest/CR 바이트 검사는 유지한다.
 `verify_python314_runtime.py`는 요청한 Python 버전, pip 의존성 검사,
 storage-name-v2 벡터 또는 제공된 golden manifest 비교가 실패하면 실패 종료한다.
 복구 CMD는 `py -3.14`와 알려진 3.14 설치 경로만 사용하며 임의의 Python 3으로

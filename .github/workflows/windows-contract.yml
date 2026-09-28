@@ -34,6 +34,13 @@ jobs:
       WRITERPAD_CONTRACT_REVIEW_UI: "0"
       WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
     steps:
+      - name: Preserve released contract bytes on Windows
+        # The released 0.3 commit predates its Windows checkout attributes.
+        # Preserve Git blob bytes before either checkout; never rewrite assets
+        # or relax their canonical digest/CR-byte checks after checkout.
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Check out exact Windows client head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
