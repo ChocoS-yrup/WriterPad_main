@@ -84,10 +84,10 @@ jobs:
         run: python scripts/verify_python314_runtime.py --require-python 3.14.7
 
       - name: Run Windows client tests
-        # -X faulthandler: a Qt widget test can take the interpreter down
-        # without raising, and unittest then prints nothing at all. This makes
-        # the runner dump the C stack so the next failure names its own cause.
-        run: python -X faulthandler -m unittest discover -s tests -v
+        timeout-minutes: 20
+        # A stalled test dumps all Python thread stacks and fails after 120s.
+        # The wrapper also resolves hosted Windows TEMP aliases for fixtures.
+        run: python -u -X faulthandler scripts/run_windows_tests.py
 
       - name: Build distributable executable
         run: python -m PyInstaller --noconfirm --clean "작가님힘내세요.spec"

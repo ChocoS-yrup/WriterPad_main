@@ -143,3 +143,28 @@ baseline 재검사를 수행하도록 분리하여 계약의 단계 순서를 �
 기존 EXE digest는 수정 전 산출물이며 새 코드의 빌드 증거로 사용하지 않는다.
 게시 커밋의 전체 테스트·EXE CI 결과는 PR에서 별도로 확인한다.
 병합·배포·실제 작품 전환·실앱/실기기/다기기 E2E는 수행하지 않았다.
+
+## CI 정체 진단
+
+기존 실행 36389218736과 36397675305를 취소하여 종료 로그를 확보했다.
+두 실행 모두 `test_cancelled_invocation_preserves_attempt_no_replay`에서
+`entered.wait()`를 무기한 기다렸다. collector 작업은 이미 `safe()`의
+`path.resolve() == path` 검사에서 `PATH_REFUSED`로 종료되어 이벤트를 보낼 수 없었다.
+취소 전에도 여러 임시 경로 기반 시험이 오류/실패를 기록했으므로, 실행 중 표시는
+개별 시험이 모두 성공하고 있다는 의미가 아니었다.
+
+로컬 Python 3.14.7에서 Windows 8.3 짧은 경로를 생성해 동일한 거부를 재현했다.
+해당 경로를 resolve한 정규 경로는 기존 `safe()`를 통과했다. CI 시험 진입점은
+`tempfile` 및 자식 프로세스의 TEMP/TMP를 정규 경로로 통일한다. 제품의 링크·reparse
+point·경로 검사와 실제 데이터 접근 조건은 변경하지 않았다.
+
+- 취소 시험은 이벤트 또는 collector 종료 중 먼저 발생한 결과를 확인한다. 초기
+  예외는 즉시 전파하고 이벤트 대기는 최대 5초로 제한하며 보조 task를 정리한다.
+- 초기 `PATH_REFUSED`를 주입하는 회귀시험을 추가했다. collector 시험 22개 성공.
+- `scripts/run_windows_tests.py`는 동일한 unittest discovery를 실행하고 실패 시 exit 1을
+  유지한다. 개별 시험/시험 사이 준비/발견 단계가 120초 정체되면 전체 Python thread
+  stack을 출력하고 실패 종료한다. 전체 CI 시험 단계에는 20분 제한도 둔다.
+- 임시 합성 subprocess로 짧은 TEMP 경로의 정상화(exit 0), 시험 실패 전달(exit 1),
+  의도적 정체의 stack 출력과 실패 종료(exit 1)를 모두 확인했다.
+- 전체 discovery와 새 게시 head CI 결과는 PR 본문에 기록한다. 취소된 실행을 성공으로
+  집계하지 않으며 테스트 삭제·skip 추가·Python 하향은 하지 않는다.

@@ -15,6 +15,22 @@ import isolated_read_collector as c
 from sync_contract import SERVER_CAPABILITIES
 
 
+async def wait_for_collector_transport(task, entered):
+    """Surface setup failures instead of waiting forever for an unsent request."""
+    waiter = asyncio.create_task(entered.wait())
+    try:
+        done, _ = await asyncio.wait((task, waiter), timeout=5,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            await task  # Propagate the actual collector failure.
+            raise AssertionError('collector completed before cancellation')
+        if waiter not in done:
+            raise AssertionError('collector transport did not start within 5 seconds')
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -233,14 +249,31 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
         self.hook=hook
         scope=self.scope()
         task=asyncio.create_task(self.run_collector(scope))
-        await entered.wait()
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+        try:
+            await wait_for_collector_transport(task, entered)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(self.inspect()['http_used'],1)
         self.assertEqual(self.inspect()['terminal'],'stopped')
         with self.assertRaises(FileExistsError):
             await self.run_collector(scope)
+
+    async def test_transport_wait_surfaces_early_path_failure(self):
+        entered = asyncio.Event()
+        with patch.object(c, 'safe', side_effect=c.ReadStopped('PATH_REFUSED')):
+            task = asyncio.create_task(self.run_collector())
+            try:
+                with self.assertRaisesRegex(c.ReadStopped, 'PATH_REFUSED'):
+                    await asyncio.wait_for(wait_for_collector_transport(task, entered), timeout=1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertFalse(entered.is_set())
+        self.assertEqual(self.calls, [])
 
     async def test_clock_rollback_stops_and_does_not_return_usage(self):
         async def hook(request):
