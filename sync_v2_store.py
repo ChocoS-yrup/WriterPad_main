@@ -56,6 +56,8 @@ def _normalize_path(path):
 # row stays for its id and revision; the path only has to be one no live folder
 # can ever hold, because sync_folders is unique on (local_key, local_path).
 FOLDER_TOMBSTONE_PREFIX = "__folder_tombstone__"
+# The physical server root is not the WriterPad binder's logical <root>.
+SERVER_ROOT_ORDER_PATH = "__server_root__"
 
 
 class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, HttpZeroRecoveryStoreMixin):
@@ -1951,35 +1953,146 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
             result["children"] = json.loads(result.pop("children_json") or "[]")
             return result
 
+    def get_tree_order_for_parent(self, local_key, parent_folder_id):
+        """Reuse server identity even if an older client stored a path alias."""
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_tree_orders WHERE local_key = ? AND parent_folder_id IS ?",
+                (local_key, parent_folder_id),
+            ).fetchall()
+            if len(rows) > 1:
+                raise SyncContractError("TREE_IDENTITY_CONFLICT")
+            return dict(rows[0]) if rows else None
+
+    @staticmethod
+    def _binder_main_folder(connection, local_key):
+        candidates = [
+            row for row in connection.execute(
+                "SELECT * FROM sync_folders WHERE local_key = ? "
+                "AND is_deleted = 0 AND parent_folder_id IS NULL",
+                (local_key,),
+            ).fetchall()
+            if normalize_storage_name(row["name"]).normalized
+            == normalize_storage_name("메인").normalized
+        ]
+        if len(candidates) != 1:
+            raise SyncContractError("BINDER_MAIN_IDENTITY_REQUIRED")
+        main = candidates[0]
+        if (
+            main["revision"] < 1 or main["local_path"] != "메인"
+            or main["name"] != "메인"
+            or main["storage_name_key"] != normalize_storage_name("메인").normalized
+        ):
+            raise SyncContractError("BINDER_MAIN_IDENTITY_REQUIRED")
+        return dict(main)
+
+    def binder_main_folder(self, local_key):
+        """Resolve the unique live, server-revisioned binder root identity."""
+        with self._reader() as connection:
+            return self._binder_main_folder(connection, local_key)
+
+    def _tree_order_parent_path(self, connection, local_key, parent_id):
+        if parent_id is None:
+            return SERVER_ROOT_ORDER_PATH
+        parent = connection.execute(
+            "SELECT * FROM sync_folders WHERE folder_id = ?", (parent_id,)
+        ).fetchone()
+        if (
+            parent is None or parent["local_key"] != local_key
+            or parent["is_deleted"] or parent["revision"] < 1
+        ):
+            raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+        if parent["local_path"] == "메인":
+            if self._binder_main_folder(connection, local_key)["folder_id"] != parent_id:
+                raise SyncContractError("BINDER_MAIN_IDENTITY_REQUIRED")
+            return "<root>"
+        return parent["local_path"]
+
+    def _validated_tree_order_snapshots(self, connection, local_key, snapshots):
+        project = connection.execute(
+            "SELECT project_id FROM sync_projects WHERE local_key = ?", (local_key,)
+        ).fetchone()
+        if project is None:
+            raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+        normalized = []
+        seen_ids, seen_parents = set(), set()
+        for snapshot in snapshots or []:
+            if snapshot.get("project_id", project["project_id"]) != project["project_id"]:
+                raise SyncContractError("TREE_PROJECT_IDENTITY_CONFLICT")
+            order_id = str(uuid.UUID(str(snapshot["tree_order_id"])))
+            parent_id = snapshot.get("parent_folder_id")
+            parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+            parent_path = self._tree_order_parent_path(connection, local_key, parent_id)
+            child_parent_path = (
+                "" if parent_id is None else "메인" if parent_path == "<root>" else parent_path
+            )
+            children = [str(uuid.UUID(str(value))) for value in snapshot.get("children") or []]
+            if len(set(children)) != len(children):
+                raise SyncContractError("TREE_REFERENCE_DUPLICATED")
+            child_names = []
+            for child_id in children:
+                child = connection.execute(
+                    "SELECT * FROM sync_folders WHERE folder_id = ?", (child_id,)
+                ).fetchone()
+                if child is None:
+                    child = connection.execute(
+                        "SELECT * FROM sync_documents WHERE document_id = ?", (child_id,)
+                    ).fetchone()
+                if child is None or child["local_key"] != local_key or child["is_deleted"]:
+                    raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+                child_path = _normalize_path(child["local_path"])
+                actual_parent = child_path.rsplit("/", 1)[0] if "/" in child_path else ""
+                if child["parent_folder_id"] != parent_id or actual_parent != child_parent_path:
+                    raise SyncContractError("TREE_PARENT_MISMATCH")
+                child_names.append(child_path.rsplit("/", 1)[-1])
+            revision = int(snapshot.get("revision") or 0)
+            if revision < 1:
+                raise SyncContractError("REVISION_CONFLICT")
+            if order_id in seen_ids or parent_id in seen_parents:
+                raise SyncContractError("TREE_REFERENCE_DUPLICATED")
+            seen_ids.add(order_id)
+            seen_parents.add(parent_id)
+            existing = connection.execute(
+                "SELECT * FROM sync_tree_orders WHERE tree_order_id = ?", (order_id,)
+            ).fetchone()
+            same_parent = connection.execute(
+                "SELECT tree_order_id FROM sync_tree_orders "
+                "WHERE local_key = ? AND parent_folder_id IS ?",
+                (local_key, parent_id),
+            ).fetchone()
+            if (
+                same_parent and same_parent["tree_order_id"] != order_id
+                or existing and (existing["local_key"] != local_key
+                                 or existing["parent_folder_id"] != parent_id)
+            ):
+                raise SyncContractError("TREE_IDENTITY_CONFLICT")
+            children_json = canonical_json(children)
+            if existing and (
+                revision < existing["revision"]
+                or revision == existing["revision"] and children_json != existing["children_json"]
+            ):
+                raise SyncContractError("REVISION_CONFLICT")
+            normalized.append({
+                "tree_order_id": order_id, "parent_folder_id": parent_id,
+                "parent_path": parent_path, "children": children,
+                "child_names": child_names, "revision": revision,
+                "existing": dict(existing) if existing else None,
+            })
+        return normalized
+
+    def validated_tree_order_snapshots(self, local_key, snapshots):
+        with self._reader() as connection:
+            return self._validated_tree_order_snapshots(connection, local_key, snapshots)
+
     def replace_tree_order_snapshots(self, local_key, snapshots):
         now = _utc_now()
         with self._transaction() as connection:
+            normalized = self._validated_tree_order_snapshots(connection, local_key, snapshots)
             connection.execute(
                 "DELETE FROM sync_tree_orders WHERE local_key = ?", (local_key,)
             )
-            for snapshot in snapshots or []:
-                tree_order_id = str(uuid.UUID(str(snapshot["tree_order_id"])))
-                parent_folder_id = snapshot.get("parent_folder_id")
-                parent_folder_id = (
-                    str(uuid.UUID(str(parent_folder_id)))
-                    if parent_folder_id else None
-                )
-                parent_path = "<root>"
-                if parent_folder_id:
-                    parent = connection.execute(
-                        "SELECT local_path FROM sync_folders WHERE folder_id = ?",
-                        (parent_folder_id,),
-                    ).fetchone()
-                    if parent is None:
-                        raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
-                    parent_path = parent["local_path"]
-                children = [
-                    str(uuid.UUID(str(value)))
-                    for value in (snapshot.get("children") or [])
-                ]
-                revision = int(snapshot.get("revision") or 0)
-                if revision < 1:
-                    raise SyncContractError("REVISION_CONFLICT")
+            for snapshot in normalized:
+                existing = snapshot["existing"] or {}
                 connection.execute(
                     """
                     INSERT INTO sync_tree_orders (
@@ -1988,8 +2101,12 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        tree_order_id, local_key, parent_folder_id, parent_path,
-                        canonical_json(children), revision, now, now,
+                        snapshot["tree_order_id"], local_key,
+                        snapshot["parent_folder_id"], snapshot["parent_path"],
+                        canonical_json(snapshot["children"]), snapshot["revision"],
+                        existing.get("created_at", now),
+                        existing.get("updated_at", now)
+                        if existing.get("revision") == snapshot["revision"] else now,
                     ),
                 )
 
@@ -2281,6 +2398,118 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                 ):
                     return True
             return False
+
+    def apply_equal_revision_structure(self, context, snapshot, *, protected=False):
+        """Accept a server initialization proof without applying a body snapshot.
+
+        The caller supplies a row fetched from the server, including its project
+        and bytea storage key. All durable checks and the four-column update share
+        one transaction so queued work cannot race the metadata write.
+        """
+        if protected:
+            return {"applied": False, "reason": "protected"}
+        if not {
+            "project_id", "document_id", "relative_path", "content", "revision",
+            "is_deleted", "parent_folder_id", "name", "storage_name_key", "structure_revision",
+        }.issubset(snapshot):
+            raise SyncContractError("REMOTE_DOCUMENT_SNAPSHOT_INCOMPLETE")
+        document_id = str(uuid.UUID(str(snapshot["document_id"])))
+        with self._transaction() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM sync_projects WHERE local_key = ?",
+                (context["local_key"],),
+            ).fetchone()
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?", (document_id,)
+            ).fetchone()
+            if (
+                project is None or document is None
+                or project["project_id"] != context["project_id"]
+                or snapshot.get("project_id") != project["project_id"]
+                or document["local_key"] != context["local_key"]
+            ):
+                raise SyncContractError("DOCUMENT_PROJECT_IDENTITY_CONFLICT")
+            if self._has_active_connection(connection, document_id):
+                return {"applied": False, "reason": "active_operations"}
+            structure_operations = connection.execute(
+                "SELECT operation_id FROM sync_structure_operations "
+                "WHERE local_key = ? AND (entity_id = ? OR entity_kind = 'folder')",
+                (context["local_key"], document_id),
+            ).fetchall()
+            if any(self._derived_state(connection, row["operation_id"]) in CONTRACT_ACTIVE_STATES
+                   for row in structure_operations):
+                return {"applied": False, "reason": "active_operations"}
+            renames = connection.execute(
+                "SELECT old_path, new_path FROM sync_folder_rename_intents "
+                "WHERE local_key = ? AND status = 'pending'", (context["local_key"],)
+            ).fetchall()
+            if any(
+                path == prefix or path.startswith(prefix + "/")
+                for rename in renames for prefix in (rename["old_path"], rename["new_path"])
+                for path in (document["local_path"], document["server_path"])
+            ):
+                return {"applied": False, "reason": "active_operations"}
+            if document["sync_state"] != "synced" or any(
+                document[key] is not None
+                for key in ("conflict_base", "conflict_local", "conflict_remote", "conflict_merged")
+            ):
+                return {"applied": False, "reason": "protected"}
+            if (
+                snapshot.get("revision") != document["revision"]
+                or document["revision"] < 1
+                or not isinstance(snapshot.get("content"), str)
+                or snapshot["content"] != document["base_content"]
+                or bool(snapshot.get("is_deleted")) != bool(document["is_deleted"])
+            ):
+                raise SyncContractError("DOCUMENT_BASELINE_MISMATCH")
+            remote_path = _normalize_path(snapshot.get("relative_path"))
+            if (
+                remote_path != _normalize_path(document["server_path"])
+                or _normalize_path(snapshot.get("_server_relative_path") or remote_path) != remote_path
+                or not document["is_deleted"] and _normalize_path(document["local_path"]) != remote_path
+            ):
+                raise SyncContractError("DOCUMENT_PATH_MISMATCH")
+            name = snapshot.get("name")
+            if not isinstance(name, str) or name != remote_path.rsplit("/", 1)[-1]:
+                raise SyncContractError("DOCUMENT_PATH_MISMATCH")
+            storage = normalize_storage_name(name)
+            # PostgREST represents bytea as a PostgreSQL hex string.
+            if snapshot.get("storage_name_key") != "\\x" + storage.utf8.hex():
+                raise SyncContractError("DOCUMENT_STORAGE_KEY_MISMATCH")
+            parent_id = snapshot.get("parent_folder_id")
+            parent_id = str(uuid.UUID(str(parent_id))) if parent_id else None
+            parent_path = remote_path.rsplit("/", 1)[0] if "/" in remote_path else ""
+            if parent_path:
+                parent = connection.execute(
+                    "SELECT * FROM sync_folders WHERE folder_id = ?", (parent_id,)
+                ).fetchone()
+                if (
+                    parent is None or parent["local_key"] != context["local_key"]
+                    or parent["local_path"] != parent_path or parent["revision"] < 1
+                    or parent["is_deleted"] and not document["is_deleted"]
+                ):
+                    raise SyncContractError("DOCUMENT_PARENT_MISMATCH")
+            elif parent_id is not None:
+                raise SyncContractError("DOCUMENT_PARENT_MISMATCH")
+            revision = snapshot.get("structure_revision")
+            if type(revision) is not int or revision < 1:
+                raise SyncContractError("CONTRACT_STRUCTURE_REVISION_REQUIRED")
+            old_revision = document["structure_revision"]
+            structure = (parent_id, name, storage.normalized)
+            previous = tuple(document[key] for key in ("parent_folder_id", "name", "storage_name_key"))
+            if old_revision is None:
+                if any(value is not None for value in previous):
+                    raise SyncContractError("STRUCTURE_REVISION_CONFLICT")
+            elif revision < old_revision or structure != previous:
+                raise SyncContractError("STRUCTURE_REVISION_CONFLICT")
+            elif revision == old_revision:
+                return {"applied": False, "reason": "unchanged"}
+            connection.execute(
+                "UPDATE sync_documents SET parent_folder_id = ?, name = ?, "
+                "storage_name_key = ?, structure_revision = ? WHERE document_id = ?",
+                (*structure, revision, document_id),
+            )
+            return {"applied": True, "reason": "structure_initialized"}
 
     def apply_remote_snapshot(
         self,
@@ -4112,16 +4341,9 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                     elif intent["entity_kind"] == "tree_order":
                         payload = intent["payload"]
                         parent_folder_id = payload.get("parent_folder_id")
-                        parent_path = "<root>"
-                        if parent_folder_id:
-                            parent = connection.execute(
-                                "SELECT local_path FROM sync_folders "
-                                "WHERE folder_id = ? AND local_key = ?",
-                                (parent_folder_id, batch["local_key"]),
-                            ).fetchone()
-                            if parent is None:
-                                raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
-                            parent_path = parent["local_path"]
+                        parent_path = self._tree_order_parent_path(
+                            connection, batch["local_key"], parent_folder_id
+                        )
                         now = _utc_now()
                         connection.execute(
                             """
