@@ -7273,7 +7273,7 @@ class BlockedProjectSyncIsolationTestCase(unittest.TestCase):
         with patch("sync_manager.V2PullWorker", _Worker), patch.object(
             self.manager, "_start_worker"
         ), patch.object(
-            type(self.manager), "supabase", SimpleNamespace(), create=True
+            self.manager, "supabase", SimpleNamespace()
         ), patch("sync_manager.is_forced_offline", return_value=False):
             self.manager.pull_remote_changes_async()
         return captured
