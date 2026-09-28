@@ -141,11 +141,12 @@ def normalize_storage_name_v2(value: str) -> StorageName:
     if not isinstance(value, str):
         raise SyncContractError("STORAGE_NAME_INVALID")
 
+    # Contract error precedence applies to the whole name, not each scalar.
     for character in value:
-        codepoint = ord(character)
-        if not is_assigned_baseline(codepoint):
+        if not is_assigned_baseline(ord(character)):
             raise SyncContractError("STORAGE_NAME_UNASSIGNED")
-        if is_excluded_scalar(codepoint):
+    for character in value:
+        if is_excluded_scalar(ord(character)):
             raise SyncContractError("STORAGE_NAME_UNSUPPORTED_SCALAR")
 
     _reject_supplementary_adjacency(value)
@@ -160,7 +161,8 @@ def normalize_storage_name_v2(value: str) -> StorageName:
         codepoint = ord(character)
         if character in "/\\" or codepoint <= 31 or codepoint == 127:
             raise SyncContractError("STORAGE_NAME_INVALID")
-        if not is_assigned_baseline(codepoint):
+    for character in normalized:
+        if not is_assigned_baseline(ord(character)):
             raise SyncContractError("STORAGE_NAME_UNASSIGNED")
 
     normalized = normalized.rstrip(" .")

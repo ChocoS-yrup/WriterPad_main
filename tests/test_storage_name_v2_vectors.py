@@ -8,6 +8,7 @@ evidence that the two clients produce identical collision keys.
 import json
 import pathlib
 import unittest
+from unittest import mock
 
 from storage_name_tables import (
     BASELINE_CANONICAL_SHA256,
@@ -88,6 +89,26 @@ class StorageNameV2VectorTestCase(unittest.TestCase):
         with self.assertRaises(SyncContractError) as raised:
             normalize_storage_name_v2("\U0001CCD6")
         self.assertEqual(raised.exception.code, "STORAGE_NAME_UNASSIGNED")
+
+    def test_unassigned_input_precedes_exclusions_across_the_whole_name(self):
+        # The released contract checks every scalar's assignment before any
+        # exclusions, regardless of the order of the offending characters.
+        for name in ("\uE000\U0001CCD6", "\U0001CCD6\uE000"):
+            with self.subTest(name=repr(name)):
+                with self.assertRaises(SyncContractError) as raised:
+                    normalize_storage_name_v2(name)
+                self.assertEqual(raised.exception.code, "STORAGE_NAME_UNASSIGNED")
+
+    def test_normalized_invalid_scalar_precedes_defensive_baseline_recheck(self):
+        # Frozen assets do not naturally produce an unassigned NFKC result.
+        # Inject that boundary to verify the mandatory defensive check's order.
+        for invalid in ("/", "\\", "\x00", "\x7f"):
+            for normalized in ("\U0001CCD6" + invalid, invalid + "\U0001CCD6"):
+                with self.subTest(normalized=repr(normalized)):
+                    with mock.patch("sync_contract.unicodedata.normalize", return_value=normalized):
+                        with self.assertRaises(SyncContractError) as raised:
+                            normalize_storage_name_v2("safe")
+                    self.assertEqual(raised.exception.code, "STORAGE_NAME_INVALID")
 
     def test_supplementary_adjacency_is_rejected_before_normalization(self):
         for following in ("́", "ﾞ", "ﾟ"):
