@@ -277,10 +277,13 @@ class ContractPrimitiveTests(unittest.TestCase):
                 self.fail(f"case-fold mismatch for U+{codepoint:06X}")
 
     def test_all_storage_name_vectors(self):
-        vectors = load_json(
-            contract_root() / "conformance_vectors" / "storage-name-v1.json"
-        )["vectors"]
-        self.assertEqual(len(vectors), 15)
+        release_vectors = load_json(
+            contract_root() / "conformance_vectors" / "storage-name-v2.json"
+        )
+        self.assertEqual(release_vectors["algorithm_id"], "storage-name-v2")
+        self.assertEqual(release_vectors["contract_version"], CONTRACT_VERSION)
+        vectors = release_vectors["vectors"]
+        self.assertEqual(len(vectors), 29)
         for vector in vectors:
             with self.subTest(vector=vector["vector_id"]):
                 if vector["valid"]:

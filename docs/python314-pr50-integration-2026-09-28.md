@@ -163,8 +163,19 @@ point·경로 검사와 실제 데이터 접근 조건은 변경하지 않았다
 - 초기 `PATH_REFUSED`를 주입하는 회귀시험을 추가했다. collector 시험 22개 성공.
 - `scripts/run_windows_tests.py`는 동일한 unittest discovery를 실행하고 실패 시 exit 1을
   유지한다. 개별 시험/시험 사이 준비/발견 단계가 120초 정체되면 전체 Python thread
-  stack을 출력하고 실패 종료한다. 전체 CI 시험 단계에는 20분 제한도 둔다.
+  stack을 출력하고 실패 종료한다. 전체 CI 시험 단계에는 45분 제한도 둔다.
 - 임시 합성 subprocess로 짧은 TEMP 경로의 정상화(exit 0), 시험 실패 전달(exit 1),
   의도적 정체의 stack 출력과 실패 종료(exit 1)를 모두 확인했다.
 - 전체 discovery와 새 게시 head CI 결과는 PR 본문에 기록한다. 취소된 실행을 성공으로
   집계하지 않으며 테스트 삭제·skip 추가·Python 하향은 하지 않는다.
+
+후속 실행 36400431402는 기존 취소 시험과 초기 실패 회귀시험을 통과했다. 종료 직전까지
+시험이 계속 진행되어 성공 1,052건을 기록했지만 초기 전체 제한 20분에 도달했다.
+개별 정체가 아닌 전체 실행 시간 부족이므로 전체 제한만 45분으로 조정했다.
+오류/실패 및 subtest traceback은 전체 종료를 기다리지 않고 발생 즉시 출력한다.
+
+이 실행에서 Stage 8 이름 벡터 시험 1건이 구형 `storage-name-v1.json`을 읽는 오류도
+확인했다. 고정 content commit의 원본 파일 34개를 별도 임시 검증 경로에 가져와
+CI와 동일한 `WRITERPAD_SYNC_CONTRACT_DIR`로 실행하자 FileNotFoundError가 재현됐다.
+계약 0.3의 `storage-name-v2.json` 및 29개 벡터를 사용하도록 바꾸고 알고리즘 ID와
+계약 버전도 검사하여 동일 조건에서 성공을 확인했다. 계약 원본 바이트는 수정하지 않았다.

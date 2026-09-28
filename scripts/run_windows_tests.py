@@ -34,6 +34,20 @@ def main():
         faulthandler.dump_traceback_later(args.stall_timeout, exit=True)
 
     class DiagnosticResult(unittest.TextTestResult):
+        def addError(self, test, err):
+            super().addError(test, err)
+            self.printErrorList("ERROR", [self.errors[-1]])
+
+        def addFailure(self, test, err):
+            super().addFailure(test, err)
+            self.printErrorList("FAIL", [self.failures[-1]])
+
+        def addSubTest(self, test, subtest, err):
+            errors, failures = len(self.errors), len(self.failures)
+            super().addSubTest(test, subtest, err)
+            self.printErrorList("ERROR", self.errors[errors:])
+            self.printErrorList("FAIL", self.failures[failures:])
+
         def startTest(self, test):
             arm_watchdog()
             super().startTest(test)

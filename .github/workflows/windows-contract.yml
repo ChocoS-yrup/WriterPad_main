@@ -84,7 +84,9 @@ jobs:
         run: python scripts/verify_python314_runtime.py --require-python 3.14.7
 
       - name: Run Windows client tests
-        timeout-minutes: 20
+        # The hosted runner was still progressing at 20 minutes (1,052 tests
+        # passed). Keep room for the full suite while bounding each stalled test.
+        timeout-minutes: 45
         # A stalled test dumps all Python thread stacks and fails after 120s.
         # The wrapper also resolves hosted Windows TEMP aliases for fixtures.
         run: python -u -X faulthandler scripts/run_windows_tests.py
