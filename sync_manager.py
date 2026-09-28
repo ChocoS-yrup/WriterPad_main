@@ -960,10 +960,11 @@ class SyncManager(QObject):
         project_uuid = uuid.UUID(self._v2_context["project_id"])
         for raw_parent, raw_children in self._normalized_tree_order(tree_order).items():
             parent_path = canonical_tree_parent_path(raw_parent)
-            parent_folder_id = self._folder_id_for_path(
-                "" if parent_path == "<root>" else parent_path,
-                aliases=aliases,
-                pending_folders=pending_folders,
+            parent_folder_id = (
+                self._v2_store.binder_main_folder(local_key)["folder_id"]
+                if parent_path == "<root>" else self._folder_id_for_path(
+                    parent_path, aliases=aliases, pending_folders=pending_folders,
+                )
             )
             children = []
             for child_name in raw_children:
@@ -982,18 +983,21 @@ class SyncManager(QObject):
                 folder = self._v2_store.get_folder_by_path(
                     local_key, lookup_path
                 )
-                if folder:
-                    children.append(folder["folder_id"])
-                    continue
-                document = self._v2_store.get_document(local_key, lookup_path)
-                if document:
-                    children.append(document["document_id"])
-                    continue
-                raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
-            existing = self._v2_store.get_tree_order(
-                local_key,
-                self._path_before_local_change(parent_path, aliases),
-            )
+                document = None if folder else self._v2_store.get_document(local_key, lookup_path)
+                child = folder or document
+                if not child or child.get("is_deleted") or child.get("local_key") != local_key:
+                    raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
+                # Aliases describe a queued local move; check the current proven
+                # parent at its old path before emitting the new parent intent.
+                expected_parent = self._folder_id_for_path(
+                    lookup_path.rsplit("/", 1)[0] if "/" in lookup_path else ""
+                )
+                if child.get("parent_folder_id") != expected_parent:
+                    raise SyncContractError("TREE_PARENT_MISMATCH")
+                children.append(child["folder_id"] if folder else child["document_id"])
+            existing = self._v2_store.get_tree_order_for_parent(local_key, parent_folder_id)
+            if existing and existing["parent_folder_id"] != parent_folder_id:
+                raise SyncContractError("TREE_IDENTITY_CONFLICT")
             tree_order_id = (
                 existing["tree_order_id"] if existing else
                 str(uuid.uuid5(
@@ -2392,8 +2396,8 @@ class SyncManager(QObject):
         response = self._call_with_session(
             lambda: self.supabase.table("documents")
             .select(
-                "document_id,relative_path,content,revision,is_deleted,deleted_at,"
-                "parent_folder_id,name,structure_revision,updated_at"
+                "project_id,document_id,relative_path,content,revision,is_deleted,deleted_at,"
+                "parent_folder_id,name,storage_name_key,structure_revision,updated_at"
             )
             .eq("project_id", self._pull_project_id(project_id))
             .execute(),
@@ -4787,31 +4791,11 @@ class SyncManager(QObject):
         """Resolve server UUID ordering into the path/name order used by the UI."""
         order = {}
         local_key = self._v2_context["local_key"]
-        for snapshot in snapshots or []:
-            parent_id = snapshot.get("parent_folder_id")
-            if parent_id:
-                parent = self._v2_store.get_folder_by_id(parent_id)
-                if parent is None or parent.get("local_key") != local_key:
-                    raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
-                parent_path = parent["local_path"]
-            else:
-                parent_path = "<root>"
-            child_names = []
-            for child_id in snapshot.get("children") or []:
-                child = self._v2_store.get_folder_by_id(child_id)
-                if child is None:
-                    child = self._v2_store.get_document_by_id(child_id)
-                if child is None or child.get("local_key") != local_key:
-                    raise SyncContractError("TREE_REFERENCE_NOT_FOUND")
-                child_path = self._safe_relative_path(child["local_path"])
-                actual_parent = (
-                    child_path.rsplit("/", 1)[0] if "/" in child_path else "<root>"
-                )
-                expected_parent = "메인" if parent_path == "<root>" else parent_path
-                if actual_parent != expected_parent:
-                    raise SyncContractError("TREE_PARENT_MISMATCH")
-                child_names.append(child_path.rsplit("/", 1)[-1])
-            order[parent_path] = child_names
+        for snapshot in self._v2_store.validated_tree_order_snapshots(local_key, snapshots):
+            # Physical null-parent ordering is durable server state, not a
+            # binder order. It must never alias the main folder's children.
+            if snapshot["parent_folder_id"] is not None:
+                order[snapshot["parent_path"]] = snapshot["child_names"]
         return self._validated_remote_tree_order(order) if order else {}
 
     def _apply_contract_tree_order_snapshots(self, snapshots):
@@ -4859,12 +4843,14 @@ class SyncManager(QObject):
         self._v2_last_pull_apply_blocked = False
         self._v2_identity_apply_failed = False
         self._v2_identity_uuid_conflicts = []
+        protection_unavailable = False
         try:
             protected = set(
                 (self._v2_protected_paths_provider or (lambda: set()))() or set()
             )
         except Exception:
             protected = set()
+            protection_unavailable = True
         protected = {
             unicodedata.normalize("NFC", path.replace("\\", "/"))
             for path in protected
@@ -4901,14 +4887,6 @@ class SyncManager(QObject):
                     remote_documents,
                     protected,
                 )
-                if (
-                    not identity_result.get("blocked")
-                    and tree_order_rows is not None
-                    and not defer_contract_tree_order
-                ):
-                    self._v2_store.replace_tree_order_snapshots(
-                        self._v2_context["local_key"], tree_order_rows or []
-                    )
         except Exception as error:
             if strict:
                 raise
@@ -5068,6 +5046,28 @@ class SyncManager(QObject):
                 canonical_old_path = (
                     self._safe_relative_path(old_path) if old_path else None
                 )
+                if (
+                    document and revision == int(document.get("revision") or 0)
+                    and remote.get("structure_revision") is not None
+                ):
+                    # Do this before either equal-revision early return. The
+                    # store updates metadata only; protected paths never enter it.
+                    with self._structure_mutation_gate:
+                        if protection_unavailable:
+                            continue
+                        if old_path and os.path.exists(full_path(old_path)) and (
+                            self._is_reparse_path(full_path(old_path))
+                            or self._v2_wpm.read_text_file(old_path) != content
+                        ):
+                            # Unqueued local bytes are still local work. Do not
+                            # let the active-editor refresh overwrite them.
+                            continue
+                        metadata = self._v2_store.apply_equal_revision_structure(
+                            self._v2_context, remote,
+                            protected=(remote_path in protected or old_path in protected),
+                        )
+                    if metadata["reason"] in {"protected", "active_operations"}:
+                        continue
                 repair_unicode_path = bool(
                     document
                     and not is_deleted
@@ -5424,7 +5424,7 @@ class SyncManager(QObject):
                         pending_count=self.pending_retry_count,
                     )
                 if self._v2_identity_apply_failed or isinstance(
-                    error, (CreationError, IdentityError)
+                    error, (CreationError, IdentityError, SyncContractError)
                 ):
                     # Identity is not per-document work that can be skipped and
                     # still add up to a finished pull. The folder projection is
@@ -5434,15 +5434,22 @@ class SyncManager(QObject):
                 print(f"Failed to apply remote v2 document: {error}")
         if tree_order_rows is not None and not defer_contract_tree_order:
             try:
-                contract_tree_change = self._apply_contract_tree_order_snapshots(
-                    tree_order_rows
-                )
+                # Document metadata must be available before validating child
+                # parent IDs. Reject stale projections before touching UI order.
+                with self._structure_mutation_gate:
+                    self._v2_store.replace_tree_order_snapshots(
+                        self._v2_context["local_key"], tree_order_rows
+                    )
+                    contract_tree_change = self._apply_contract_tree_order_snapshots(
+                        tree_order_rows
+                    )
                 if contract_tree_change:
                     changes.append(contract_tree_change)
             except Exception as error:
                 if strict:
                     raise
                 code = self._stable_error_code(error) or type(error).__name__
+                self._block_pull_with_conflict(error)
                 self._diagnostics.record(
                     "sync_tree_deferred",
                     state=f"contract;reason={code}",
