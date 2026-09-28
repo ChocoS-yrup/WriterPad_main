@@ -30,10 +30,14 @@ class _AssistantModeStub(QWidget):
         super().__init__()
         self.pm = _ProjectManagerStub()
 
+    def preserve_failed_ai_responses_before_close(self):
+        return True
+
 
 class _WritingModeStub(QWidget):
     switchModeRequested = pyqtSignal()
     sendToAssistantRequested = pyqtSignal(str)
+    editorSessionRestored = pyqtSignal()
 
     def __init__(self, _pm):
         super().__init__()

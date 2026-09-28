@@ -84,7 +84,8 @@ class PostCoordinationResumeTests(unittest.TestCase):
         with patch.object(sender,'PROCESS_TOKEN','migration-process'):
             reopened=SyncV2Store(self.store.db_path)
         with reopened._reader() as c:
-            self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],8012)
+            from sync_v2_store import STAGE8_USER_VERSION
+            self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],STAGE8_USER_VERSION)
             for table in (resume.ROUNDS,resume.EVENTS,resume.RECEIPTS):self.assertEqual(c.execute('SELECT count(*) FROM '+table).fetchone()[0],0)
         self.assert_preserved()
 

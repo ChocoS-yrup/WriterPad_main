@@ -144,6 +144,7 @@ def main():
         ),
     )
     parser.add_argument("--out")
+    parser.add_argument("--require-python", help="fail unless this exact Python version ran")
     parser.add_argument("--compare-freeze", help="a pip freeze from the other interpreter")
     arguments = parser.parse_args()
 
@@ -179,10 +180,21 @@ def main():
 
     text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if arguments.out:
-        os.makedirs(os.path.dirname(arguments.out), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(arguments.out)), exist_ok=True)
         with open(arguments.out, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text + "\n")
     print(text)
+    failures = []
+    if arguments.require_python and report["runtime"]["version"] != arguments.require_python:
+        failures.append("unexpected Python version")
+    if report["pip_check"]["returncode"]:
+        failures.append("pip check failed")
+    if report["storage_name_v2_vectors"]["failures"]:
+        failures.append("storage-name-v2 vector mismatch")
+    if report["golden_manifest_replay"].get("differing", 0):
+        failures.append("golden manifest mismatch")
+    if failures:
+        raise SystemExit("; ".join(failures))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from body_validation_transport import BodyHTTPTransport, ForegroundTicket
 from body_validation_service import BodyValidationService, BodySnapshot, DEVICE_ID
 from project_manager_writing import WritingProjectManager
 from sync_v2_store import SyncV2Store
+from tests.body_round_trip_fixture import baseline as synthetic_baseline, pin_baseline, folder_id
 
 ROOT = Path(__file__).resolve().parents[1]
 ACCOUNT = "10000000-0000-4000-8000-000000000001"
@@ -24,9 +25,10 @@ LEASE = "10000000-0000-4000-8000-000000000003"
 
 
 def fixture():
-    baseline = json.loads((ROOT / "_evidence/windows-control-document-repair-20260911/target-baseline.json").read_text("utf-8-sig"))
+    baseline = synthetic_baseline()
     for row in baseline["folders"]:
         row["project_id"] = PROJECT_ID
+        row["deleted_at"] = None
     return {"projects": [{"project_id": PROJECT_ID, "owner_id": ACCOUNT, "name": PROJECT_NAME, "deleted_at": None}],
             "project_sync_settings": [], **{k: baseline[k] for k in ("documents", "folders", "tree_orders")}}
 
@@ -74,6 +76,7 @@ class FakeServer:
 
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
+        pin_baseline(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.writing = self.root / PROJECT_NAME / "집필모드"
@@ -95,7 +98,7 @@ class RuntimeTests(unittest.TestCase):
             nodes.append({"uuid": row["folder_id"], "kind": "folder", "parent_uuid": row["parent_folder_id"],
                 "legacy_path": rel, "path": rel, "title": row["name"],
                 "order": order[rel.rsplit("/", 1)[0] if "/" in rel else "<root>"].index(row["name"])})
-        nodes.append({"uuid": DOCUMENT_ID, "kind": "document", "parent_uuid": "1de12e60-f998-48b9-aae9-7675b4b42fb9",
+        nodes.append({"uuid": DOCUMENT_ID, "kind": "document", "parent_uuid": folder_id("메인/원고/1권"),
             "legacy_path": PATH, "path": PATH, "title": "1화", "order": 0})
         identity_dir = self.writing.parent / ".writerpad"
         identity_dir.mkdir()
@@ -377,7 +380,7 @@ class RuntimeTests(unittest.TestCase):
         cases = [None, [], {**local, "메인/휴지통": ["deleted.txt"]}, {**local, "메인/휴지통": None},
                  {**local, "메인/휴지통": {}}, {**local, "메인/휴지통/하위": []}, {**local, "unknown": []}]
         r = copy.deepcopy(local); r["메인"].reverse(); cases.append(r)
-        r = copy.deepcopy(local); del r["메인/메모장"]; cases.append(r)
+        r = copy.deepcopy(local); del r["메인/합성폴더1"]; cases.append(r)
         r = copy.deepcopy(local); r["메인/원고/1권"] = ["2화.txt"]; cases.append(r)
         for changed in cases:
             with self.subTest(changed=changed):

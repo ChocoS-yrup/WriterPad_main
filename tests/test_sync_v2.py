@@ -1497,7 +1497,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
         )
         self.store = SyncV2Store(str(Path(self.temp.name, "sync.sqlite3")))
         self.context = self.store.configure_project(
-            self.wpm.writing_root_path, "폴더 발행", str(uuid.uuid4())
+            self.wpm.writing_root_path, "폴더 발행"
         )
         self.manager = SyncManager()
         previous = (
@@ -3272,7 +3272,7 @@ class OutboundFolderCreateTestCase(unittest.TestCase):
                 store = SyncV2Store(str(Path(self.temp.name, f"{code}.sqlite3")))
                 self.manager._v2_store = store
                 self.manager._v2_context = store.configure_project(
-                    self.wpm.writing_root_path, "폴더 발행", str(uuid.uuid4())
+                    self.wpm.writing_root_path, "폴더 발행"
                 )
                 client = self._refusing_client(code, "설정집")
                 operation = {
@@ -4976,7 +4976,6 @@ class RemoteTreeOrderMaterializationTestCase(unittest.TestCase):
         self.context = self.store.configure_project(
             self.wpm.writing_root_path,
             self.wpm.current_project,
-            str(uuid.uuid4()),
         )
         self.manager = SyncManager()
         previous = (

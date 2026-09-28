@@ -1,5 +1,4 @@
 """New cookie/diagnostic impact cases only; existing test methods are not run."""
-import importlib.util
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -35,15 +34,9 @@ class HeaderFixTests(unittest.IsolatedAsyncioTestCase):
                        'x-secret-name-sentinel', self.token.value):
             self.assertNotIn(secret.encode(), combined)
 
-    async def test_previous_collector_reproduces_q2_cookie_denial_without_network(self):
-        path = Path(__file__).resolve().parents[1] / '_evidence/windows-read-header-fix-20260914/before/isolated_read_collector.py'
-        spec = importlib.util.spec_from_file_location('synthetic_previous_collector', path)
-        previous = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(previous)
-        # Use the SAME ReadStopped class so the current guard's denial has the
-        # same exception identity as the collector had in the prior application.
-        previous.ReadStopped = c.ReadStopped
-        with patch.object(c, 'collect', previous.collect):
+    async def test_missing_cookie_clear_reproduces_q2_denial_without_network(self):
+        # Reproduce the pre-fix behavior without an untracked source archive.
+        with patch.object(httpx.Cookies, 'clear', return_value=None):
             result = await self.run_launch()
         self.assertEqual((result['reason'], result['http_reserved'], result['forwarded']),
                          ('HEADERS_CHANGED', 2, 1))

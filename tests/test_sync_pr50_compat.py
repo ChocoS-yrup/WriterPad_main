@@ -66,6 +66,11 @@ class TransitionCompatibilityTests(unittest.TestCase):
                 server_protocol_version=3, server_contract_sha256=CANONICAL_CONTRACT_SHA256,
                 server_capabilities=SERVER_CAPABILITIES,
             )
+        # Production keeps this separate from handshake/mode activation.
+        # Enable only the disposable fixture when exercising contract writes.
+        self.store.set_contract_path_enabled(self.local_key, True)
+        from tests.test_sync_contract_stage8 import arm_contract_handshake
+        arm_contract_handshake(self.manager)
 
     def legacy(self, *, deleted=False, root=False):
         path = "메인/문서.txt" if root else "메인/메모장/문서.txt"
@@ -119,6 +124,32 @@ class TransitionCompatibilityTests(unittest.TestCase):
         self.assertEqual(operation["intent_kind"], "update")
         self.assertEqual(operation["base_revision"], 7)
         self.assertEqual(operation["provenance_kind"], "CONTRACT_BATCH")
+
+    def test_shape_only_pull_carries_equal_revision_metadata_without_fetching_body(self):
+        remote = self.legacy()
+        for columns in (self.manager._DOCUMENT_INDEX_COLUMNS, self.manager._DOCUMENT_FULL_COLUMNS):
+            self.assertTrue({"project_id", "storage_name_key"}.issubset(columns.split(",")))
+        index = {key: value for key, value in remote.items() if key != "content"}
+        before = {**index, "parent_folder_id": None, "name": None,
+                  "storage_name_key": None, "structure_revision": None}
+        self.assertNotEqual(self.manager._remote_index_fingerprint([before], [], []),
+                            self.manager._remote_index_fingerprint([index], [], []))
+        with patch.object(self.manager, "_fetch_v2_project_documents") as fetch:
+            completed = self.manager._documents_with_content(self.context["project_id"], [index])
+        fetch.assert_not_called()
+        self.assertEqual(completed, [remote])
+        self.pull(completed[0])
+        self.assertEqual(self.row(remote)["parent_folder_id"], self.sub["folder_id"])
+
+    def test_mode_activation_alone_keeps_contract_path_closed(self):
+        for mode in ("MIGRATING", "ID_BASED"):
+            self.store.activate_contract_project(
+                self.local_key, project_sync_mode=mode, migration_epoch=1,
+                server_protocol_version=3, server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+                server_capabilities=SERVER_CAPABILITIES,
+            )
+        self.assertFalse(self.store.contract_path_enabled(self.local_key))
+        self.assertFalse(self.manager._uses_contract_structure())
 
     def test_active_open_equal_revision_receives_metadata_and_refresh(self):
         remote = self.legacy()

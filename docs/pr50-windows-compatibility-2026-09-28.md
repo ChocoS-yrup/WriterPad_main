@@ -1,5 +1,10 @@
 # Windows compatibility with Writerpad PR #50
 
+> Historical report for the main-based PR #10 only. The Python 3.14 integration
+> supersedes its runtime/base assumptions; see
+> [Python 3.14 integration](python314-pr50-integration-2026-09-28.md).
+> The 3.11 results below are not evidence for the integrated 0.3 client.
+
 ## Reviewed baselines
 
 - Windows main: `8ac1685359d03be245a44b0a808a486c877cea16`.

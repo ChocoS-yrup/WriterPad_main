@@ -567,7 +567,8 @@ class InitializeExistingProjectTestCase(unittest.TestCase):
                     str(self.workspace), "가져온 작품", uuid_factory=self.uuids
                 )
 
-        manager = ProjectManager()
+        with patch("runtime_profile.root_dir", return_value=str(self.workspace.parent)):
+            manager = ProjectManager()
         manager.workspace_dir = str(self.workspace)
         manager.global_config = {}
         manager.save_global_config = lambda: None

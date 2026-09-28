@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from bidirectional_sync_scope import (BodyRoundTripScope, ScopeDenied, BASE, WINDOWS, IPAD,
     PROJECT_ID, PROJECT_NAME, DOCUMENT_ID, ENDPOINT, PATH, content_sha)
+from tests.body_round_trip_fixture import baseline as synthetic_baseline, pin_baseline
 
 ACCOUNT = "10000000-0000-4000-8000-000000000001"
 DEVICE = "10000000-0000-4000-8000-000000000002"
@@ -157,7 +158,7 @@ class ProductPathTests(unittest.TestCase):
         from sync_manager import SyncManager
         from sync_v2_store import SyncV2Store
         app = QApplication.instance() or QApplication([])
-        baseline = json.loads((Path(__file__).parents[1] / "_evidence/windows-control-document-repair-20260911/target-baseline.json").read_text(encoding="utf-8-sig"))
+        baseline = synthetic_baseline()
         with tempfile.TemporaryDirectory() as tmp:
             store = SyncV2Store(str(Path(tmp) / "synthetic.sqlite3"))
             ctx = store.configure_project(str(Path(tmp) / "synthetic-project" / "writing"), PROJECT_NAME, PROJECT_ID)
@@ -228,7 +229,7 @@ class ProductPathTests(unittest.TestCase):
 
 class ReadbackTests(unittest.TestCase):
     def setUp(self):
-        self.snapshot = json.loads((Path(__file__).parents[1] / "_evidence/windows-control-document-repair-20260911/target-baseline.json").read_text(encoding="utf-8-sig"))
+        self.snapshot = pin_baseline(self)
         # Explicit synthetic mode annotations: historical target JSON does not
         # itself contain these fields and is not a fresh live preflight.
         self.snapshot.update(project_sync_mode="LEGACY", migration_epoch=0, project_sync_settings_rows=0)

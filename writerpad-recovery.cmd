@@ -2,7 +2,7 @@
 setlocal
 rem Python 3.14 first, without hard-coding the Python311 path. The py launcher
 rem knows where Python is installed, so ask it for 3.14; only when that fails
-rem fall back to the install folders, then to any Python 3.
+rem fall back to the 3.14 install folders. Never run recovery on older Python.
 rem Keep this file ASCII with CRLF line endings. cmd.exe reads batch files in
 rem the console code page (949 on Korean Windows), and UTF-8 Korean text there
 rem breaks its line parsing.
@@ -24,8 +24,9 @@ if exist "%LocalAppData%\Programs\Python\Python314\python.exe" (
   goto done
 )
 
-echo Python 3.14 was not found. Trying another installed Python 3.
-py -3 "%RECOVERY%" --interactive
+echo Python 3.14 was not found. Install Python 3.14 before running recovery.
+pause
+exit /b 1
 
 :done
 pause

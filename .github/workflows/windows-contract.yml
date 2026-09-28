@@ -9,6 +9,8 @@ on:
       - "**/*.py"
       - "tests/**"
       - "requirements-stage8.txt"
+      - "sync-contract/**"
+      - "writerpad-recovery.cmd"
       - "작가님힘내세요.spec"
       - "style.qss"
       - "app_icon.ico"
@@ -27,6 +29,8 @@ jobs:
       EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
+      QT_QPA_PLATFORM: offscreen
+      ANTIGRAVITY_APP_DATA_DIR: ${{ runner.temp }}/writerpad-tests
       WRITERPAD_CONTRACT_REVIEW_UI: "0"
       WRITERPAD_SYNC_CONTRACT_DIR: ${{ github.workspace }}/contract-source/sync-contract
     steps:
@@ -40,7 +44,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ChocoS-yrup/Writerpad
-          ref: 7bcb5d25c5376b02469666df7318b90b456ffee6
+          ref: 3843b05aa91461e1541f5ebaa14557dc3dc2b39c
           path: contract-source
           persist-credentials: false
 
@@ -52,27 +56,25 @@ jobs:
           Write-Host "Actual HEAD:   $actual"
           if ($actual -ne $env:EXPECTED_CHECKOUT_SHA) { exit 1 }
 
-      - name: Set up contract validator Python
+      - name: Set up Python for validation, client tests, and packaging
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14.7"
           cache: pip
-          cache-dependency-path: contract-source/sync-contract/requirements-validation.txt
+          cache-dependency-path: |
+            contract-source/sync-contract/requirements-validation.txt
+            requirements-stage8.txt
 
       - name: Validate pinned released contract
         run: |
           python -m pip install -r contract-source/sync-contract/requirements-validation.txt
           python contract-source/sync-contract/scripts/verify_contract.py
 
-      - name: Set up Windows client Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: requirements-stage8.txt
-
       - name: Install pinned Windows dependencies
         run: python -m pip install -r requirements-stage8.txt
+
+      - name: Verify interpreter, dependencies, and storage-name-v2
+        run: python scripts/verify_python314_runtime.py --require-python 3.14.7
 
       - name: Run Windows client tests
         # -X faulthandler: a Qt widget test can take the interpreter down
@@ -90,6 +92,20 @@ jobs:
           $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
           $smoke = Start-Process -FilePath $artifact.FullName -ArgumentList '--qt-import-smoke-test' -WindowStyle Hidden -Wait -PassThru
           if ($smoke.ExitCode -ne 0) { throw "Packaged Qt startup failed: $($smoke.ExitCode)" }
+
+      - name: Check packaged Python and AI provider imports
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $artifact = Get-Item -LiteralPath 'dist/작가님 힘내세요.exe'
+          $reportPath = Join-Path $env:RUNNER_TEMP 'packaged-runtime.json'
+          $process = Start-Process -FilePath $artifact.FullName -ArgumentList '--runtime-report' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $reportPath
+          if ($process.ExitCode -ne 0) { throw "Packaged imports failed: $($process.ExitCode)" }
+          $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+          if ($report.python -ne '3.14.7' -or $report.frozen -ne $true -or $report.verdict -ne 'ok') {
+            throw "Unexpected packaged Python or incomplete dependencies"
+          }
+          Get-Content -LiteralPath $reportPath
 
       - name: Record executable digest
         shell: pwsh
