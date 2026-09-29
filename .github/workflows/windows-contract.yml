@@ -87,7 +87,8 @@ jobs:
         # The hosted runner was still progressing at 20 minutes (1,052 tests
         # passed). Keep room for the full suite while bounding each stalled test.
         timeout-minutes: 45
-        # A stalled test dumps all Python thread stacks and fails after 120s.
+        # A stalled test dumps all Python thread stacks after 120s; the
+        # 720-save SQLite stress case has a 240s bound on busy runners.
         # The wrapper also resolves hosted Windows TEMP aliases for fixtures.
         run: python -u -X faulthandler scripts/run_windows_tests.py
 
