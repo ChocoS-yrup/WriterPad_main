@@ -224,9 +224,13 @@ class BoundaryTests(unittest.TestCase):
             other=store.configure_project(str(Path(folder)/'other'),'other',str(uuid4()))
             other_op=store.enqueue(other,'other.txt','unchanged pending content')
             key=context['local_key']
-            with store._transaction() as c:
-                c.execute("UPDATE sync_projects SET project_sync_mode='MIGRATING',migration_epoch=1 WHERE local_key=?",(key,))
-                c.execute("UPDATE sync_projects SET project_sync_mode='ID_BASED',migration_epoch=1 WHERE local_key=?",(key,))
+            for mode in ('MIGRATING', 'ID_BASED'):
+                store.activate_contract_project(
+                    key, project_sync_mode=mode, migration_epoch=1,
+                    server_protocol_version=3,
+                    server_contract_sha256=CANONICAL_CONTRACT_SHA256,
+                    server_capabilities=SERVER_CAPABILITIES,
+                )
             self.assertEqual(check_store_binding(store,key)['contract_path_enabled'],0)
             with self.assertRaises(GeneralValidationDenied):check_store_binding(store,other['local_key'])
             store.set_contract_path_enabled(key,True)  # Synthetic DB only.

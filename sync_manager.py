@@ -32,6 +32,7 @@ from sync_contract import (
     SyncContractError,
     require_server_compatibility,
 )
+from contract_transport import execute_contract_rpc
 from binder_order import (
     ROOT_STORAGE_NAMES,
     canonical_manuscript_children,
@@ -2133,6 +2134,85 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             self._forget_contract_handshake()
         self._publish_sync_state()
         return project
+
+    def recover_rejected_legacy_queue(self):
+        """Explicitly bridge one rejected protocol-2 chain to contract 0.3.
+
+        This action is never called by an automatic retry. A fresh handshake
+        and read-only absence checks precede the local gate/queue transition.
+        """
+        if not self.is_v2_enabled or self._v2_worker is not None or self._v2_structure_worker is not None:
+            raise SyncContractError("LEGACY_HANDOFF_NOT_ALLOWED")
+        if general_test_writes_held(self):
+            raise SyncContractError("CONTRACT_NOT_ALLOWED")
+        store = self._v2_store
+        local_key = self._v2_context["local_key"]
+        candidate = store.rejected_legacy_create_candidate(local_key)
+        if candidate is None:
+            raise SyncContractError("LEGACY_HANDOFF_NOT_ALLOWED")
+        key = self._contract_context_key()
+        reading = self.perform_contract_handshake(require_connection=True)
+        if not reading or reading.get("outcome") != "supported":
+            raise SyncContractError("CONTRACT_NOT_ALLOWED")
+        client = self.supabase
+        self.ensure_session_valid(client)
+        status = self._response_data(execute_contract_rpc(client.rpc(
+            "get_project_status", {"p_project_id": self._v2_context["project_id"]}
+        )))
+        if (
+            not isinstance(status, dict)
+            or status.get("project_id") != self._v2_context["project_id"]
+            or status.get("state") != "active"
+        ):
+            raise SyncContractError("CONTRACT_NOT_ALLOWED")
+        document_rows = getattr(
+            client.table("documents").select("document_id")
+            .eq("project_id", self._v2_context["project_id"])
+            .eq("document_id", candidate["document_id"]).limit(1).execute(),
+            "data", None,
+        )
+        operation_rows = getattr(
+            client.table("sync_operations").select("operation_id")
+            .eq("project_id", self._v2_context["project_id"])
+            .in_("operation_id", candidate["original_operation_ids"]).execute(),
+            "data", None,
+        )
+        folder_rows = []
+        if candidate["parent_folder_ids"]:
+            folder_rows = getattr(
+                client.table("folders").select("folder_id,is_deleted")
+                .eq("project_id", self._v2_context["project_id"])
+                .in_("folder_id", candidate["parent_folder_ids"]).execute(),
+                "data", None,
+            )
+        if (
+            key != self._contract_context_key()
+            or not isinstance(document_rows, list)
+            or not isinstance(operation_rows, list)
+            or not isinstance(folder_rows, list)
+            or document_rows or operation_rows
+            or {row.get("folder_id") for row in folder_rows}
+            != set(candidate["parent_folder_ids"])
+            or any(row.get("is_deleted") for row in folder_rows)
+            or store.rejected_legacy_create_candidate(local_key) != candidate
+        ):
+            raise SyncContractError("SERVER_ABSENCE_REQUIRED")
+        gate_was_open = self.contract_path_enabled()
+        if not gate_was_open:
+            self.enable_contract_path()
+        try:
+            successor = store.prepare_rejected_legacy_create(
+                candidate["operation_id"], writer_device_id=self._v2_device_id,
+                server_absence_verified=True,
+            )
+        except Exception:
+            if not gate_was_open:
+                self.disable_contract_path()
+            raise
+        return {
+            "successor_operation_id": successor["operation_id"],
+            "dispatch_started": bool(self.retry_pending_syncs(manual=True)),
+        }
 
     def _uses_contract_structure(self):
         if not self.is_v2_enabled:
