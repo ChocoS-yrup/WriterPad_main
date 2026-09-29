@@ -2838,6 +2838,7 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
         content,
         is_deleted,
         supersedes_operation_id=None,
+        local_only_supersedes=False,
     ):
         project = connection.execute(
             "SELECT * FROM sync_projects WHERE local_key = ?", (context["local_key"],)
@@ -2850,10 +2851,18 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
         # observed value stays on the project row untouched, as the last thing
         # the server said, and only the shape of this write is held back: a
         # branch that read the observed mode alone would emit a contract batch
-        # for a path nobody opened here.
-        effective_write_mode = (
-            observed_mode if project["contract_path_enabled"] else "LEGACY"
-        )
+        # for a path nobody opened here. LEGACY/0 itself is a valid contract
+        # mode once the local gate and server compatibility have been checked.
+        contract_write_enabled = bool(project["contract_path_enabled"])
+        effective_write_mode = observed_mode if contract_write_enabled else "LEGACY"
+        if contract_write_enabled:
+            require_server_compatibility(
+                project_sync_mode=observed_mode,
+                migration_epoch=int(project["migration_epoch"] or 0),
+                server_protocol_version=int(project["server_protocol_version"] or 0),
+                server_contract_sha256=project["active_contract_sha256"] or "",
+                server_capabilities=json.loads(project["server_capabilities_json"] or "[]"),
+            )
         payload = self._payload_for_document(
             local_path, relative_path, base_content, content, is_deleted
         )
@@ -2868,11 +2877,11 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
             "delete" if is_deleted else
             "create" if int(base_revision or 0) == 0 else "update"
         )
-        if effective_write_mode != "LEGACY" and base_revision is None:
+        if contract_write_enabled and base_revision is None:
             provenance = "LOCAL_DEFERRED"
             protocol_version = SYNC_PROTOCOL_VERSION
             capabilities_json = canonical_json(list(CLIENT_CAPABILITIES))
-        elif effective_write_mode != "LEGACY":
+        elif contract_write_enabled:
             provenance = "CONTRACT_BATCH"
             protocol_version = SYNC_PROTOCOL_VERSION
             contract_version = CONTRACT_VERSION
@@ -2905,7 +2914,12 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                 is_deleted=bool(is_deleted),
                 structure_revision=structure_revision,
                 operation_id=operation_id,
-                supersedes_operation_id=supersedes_operation_id,
+                # The server has a foreign key on supersedes_operation_id.
+                # A rejected protocol-2 operation absent from the server can
+                # only be linked in this local append-only queue.
+                supersedes_operation_id=(
+                    None if local_only_supersedes else supersedes_operation_id
+                ),
                 client_build_id=CLIENT_BUILD_ID,
             )
             payload = request["ordered_intents"][0]["payload"]
@@ -3045,6 +3059,175 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
             )
             return operation
 
+    def rejected_legacy_create_candidate(self, local_key):
+        """Describe a sole rejected legacy document chain without its content."""
+        with self._reader() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sync_operations WHERE local_key = ? ORDER BY queue_id",
+                (local_key,),
+            ).fetchall()
+            active = [row for row in rows if self._derived_state(
+                connection, row["operation_id"]
+            ) in CONTRACT_ACTIVE_STATES]
+            if not active:
+                return None
+            first = active[0]
+            if (
+                first["provenance_kind"] != "LEGACY_EPOCH_0"
+                or first["base_revision"] != 0
+                or first["intent_kind"] != "create"
+                or self._operation_dict(connection, first)["last_error"]
+                != "PROTOCOL_TOO_OLD"
+                or any(row["document_id"] != first["document_id"] for row in active)
+            ):
+                return None
+            structure_rows = connection.execute(
+                "SELECT operation_id FROM sync_structure_operations WHERE local_key = ?",
+                (local_key,),
+            ).fetchall()
+            if any(self._derived_state(
+                connection, row["operation_id"]
+            ) in CONTRACT_ACTIVE_STATES for row in structure_rows):
+                return None
+            parent_ids = set()
+            for row in active:
+                parent_path = row["relative_path"].rpartition("/")[0]
+                if not parent_path:
+                    continue
+                folder = connection.execute(
+                    "SELECT folder_id, revision, is_deleted FROM sync_folders "
+                    "WHERE local_key = ? AND local_path = ?",
+                    (local_key, parent_path),
+                ).fetchone()
+                if (
+                    folder is None or folder["is_deleted"]
+                    or int(folder["revision"] or 0) < 1
+                ):
+                    return None
+                parent_ids.add(folder["folder_id"])
+            return {
+                "operation_id": first["operation_id"],
+                "document_id": first["document_id"],
+                "original_operation_ids": [row["operation_id"] for row in active],
+                "parent_folder_ids": sorted(parent_ids),
+            }
+
+    def prepare_rejected_legacy_create(
+        self, operation_id, *, writer_device_id, server_absence_verified=False,
+    ):
+        """Prepare an explicit protocol-3 successor without sending anything.
+
+        The caller must have verified that neither the document nor the old
+        operation IDs exist remotely and opened the contract gate after a fresh
+        handshake. The original queue rows and their content stay immutable.
+        """
+        if not server_absence_verified:
+            raise SyncContractError("SERVER_ABSENCE_REQUIRED")
+        with self._transaction() as connection:
+            first = connection.execute(
+                "SELECT * FROM sync_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if first is None:
+                raise SyncContractError("OPERATION_NOT_FOUND")
+            if (
+                self._derived_state(connection, operation_id) != "retry_wait"
+                or first["provenance_kind"] != "LEGACY_EPOCH_0"
+                or first["sync_protocol_version"] != 2
+                or first["batch_id"] is not None
+                or first["intent_kind"] != "create"
+                or first["base_revision"] != 0
+                or first["is_deleted"]
+                or int(first["legacy_attempt_count"] or 0) != 0
+            ):
+                raise SyncContractError("LEGACY_HANDOFF_NOT_ALLOWED")
+            attempts = connection.execute(
+                "SELECT rpc_name, outcome, error_code FROM sync_operation_attempts "
+                "WHERE operation_id = ? ORDER BY attempt_number",
+                (operation_id,),
+            ).fetchall()
+            if not attempts or any(
+                attempt["rpc_name"] != "commit_document"
+                or attempt["outcome"] != "retryable_error"
+                or attempt["error_code"] != "PROTOCOL_TOO_OLD"
+                for attempt in attempts
+            ):
+                raise SyncContractError("LEGACY_RESULT_UNCERTAIN")
+            project = connection.execute(
+                "SELECT * FROM sync_projects WHERE local_key = ?",
+                (first["local_key"],),
+            ).fetchone()
+            if (
+                project is None or not project["contract_path_enabled"]
+                or project["project_sync_mode"] != "LEGACY"
+                or int(project["migration_epoch"] or 0) != 0
+            ):
+                raise SyncContractError("CONTRACT_NOT_ALLOWED")
+            document = connection.execute(
+                "SELECT * FROM sync_documents WHERE document_id = ?",
+                (first["document_id"],),
+            ).fetchone()
+            if document is None or int(document["revision"] or 0) != 0:
+                raise SyncContractError("LEGACY_RESULT_UNCERTAIN")
+            rows = connection.execute(
+                "SELECT * FROM sync_operations WHERE document_id = ? ORDER BY queue_id",
+                (first["document_id"],),
+            ).fetchall()
+            active = [row for row in rows if self._derived_state(
+                connection, row["operation_id"]
+            ) in {"pending", "retry_wait", "inflight"}]
+            if not active or active[0]["operation_id"] != operation_id:
+                raise SyncContractError("LEGACY_CHAIN_UNSAFE")
+            previous_path = first["relative_path"]
+            previous_content = first["content"]
+            renamed = False
+            for row in active[1:]:
+                if (
+                    self._derived_state(connection, row["operation_id"]) != "pending"
+                    or row["provenance_kind"] != "LEGACY_EPOCH_0"
+                    or row["batch_id"] is not None
+                    or row["base_revision"] is not None
+                    or row["is_deleted"]
+                    or row["document_id"] != first["document_id"]
+                ):
+                    raise SyncContractError("LEGACY_CHAIN_UNSAFE")
+                if row["relative_path"] != previous_path:
+                    old_parent = previous_path.rpartition("/")[0]
+                    new_parent = row["relative_path"].rpartition("/")[0]
+                    if renamed or old_parent != new_parent or row["content"] != previous_content:
+                        raise SyncContractError("LEGACY_CHAIN_UNSAFE")
+                    renamed = True
+                previous_path = row["relative_path"]
+                previous_content = row["content"]
+            if connection.execute(
+                "SELECT 1 FROM sync_operations WHERE supersedes_operation_id = ? LIMIT 1",
+                (operation_id,),
+            ).fetchone():
+                raise SyncContractError("LEGACY_HANDOFF_ALREADY_PREPARED")
+            successor = self._insert_document_operation(
+                connection,
+                context={
+                    "local_key": first["local_key"],
+                    "project_id": first["project_id"],
+                    "writer_device_id": writer_device_id,
+                },
+                document=document,
+                local_path=first["local_path"],
+                relative_path=first["relative_path"],
+                base_revision=0,
+                base_content=first["base_content"],
+                content=first["content"],
+                is_deleted=False,
+                supersedes_operation_id=operation_id,
+                local_only_supersedes=True,
+            )
+            self._append_event(
+                connection, operation_id, "superseded",
+                related_operation_id=successor["operation_id"],
+                detail={"successor_operation_id": successor["operation_id"]},
+            )
+            return successor
+
     def recover_stranded_operations(self, local_key=None):
         """Re-issue chained edits whose predecessor will never complete.
 
@@ -3108,6 +3291,17 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                 ):
                     # 앞선 작업이 아직 살아 있다면 정상적으로 기다리는 중이다.
                     continue
+                # A contract rename may be the missing predecessor. A blocked
+                # or paused structure batch must never let content overtake it.
+                structure_rows = connection.execute(
+                    "SELECT operation_id FROM sync_structure_operations "
+                    "WHERE entity_kind = 'document' AND entity_id = ?",
+                    (row["document_id"],),
+                ).fetchall()
+                if any(self._derived_state(
+                    connection, item["operation_id"]
+                ) in CONTRACT_ACTIVE_STATES for item in structure_rows):
+                    continue
                 document = connection.execute(
                     "SELECT * FROM sync_documents WHERE document_id = ?",
                     (row["document_id"],),
@@ -3150,7 +3344,15 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
             ).fetchall()
             ready = []
             for row in rows:
-                if self._derived_state(connection, row["operation_id"]) in {
+                operation = self._operation_dict(connection, row)
+                if (
+                    operation["provenance_kind"] == "LEGACY_EPOCH_0"
+                    and operation["last_error"] == "PROTOCOL_TOO_OLD"
+                ):
+                    # A protocol-2 request cannot recover by retrying the same
+                    # removed RPC. An explicit contract handoff is required.
+                    continue
+                if operation["status"] in {
                     "pending", "retry_wait"
                 }:
                     ready.append(row)
@@ -3454,26 +3656,53 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                     ).fetchone()
                     if previous_batch:
                         context["writer_device_id"] = previous_batch["writer_device_id"]
-                successor = self._insert_document_operation(
-                    connection,
-                    context=context,
-                    document=connection.execute(
-                        "SELECT * FROM sync_documents WHERE document_id = ?",
-                        (dependent["document_id"],),
-                    ).fetchone(),
-                    local_path=dependent["local_path"],
-                    relative_path=dependent["relative_path"],
-                    base_revision=int(result["revision"]),
-                    base_content=operation["content"],
-                    content=dependent["content"],
-                    is_deleted=bool(dependent["is_deleted"]),
-                    supersedes_operation_id=dependent["operation_id"],
+                document = connection.execute(
+                    "SELECT * FROM sync_documents WHERE document_id = ?",
+                    (dependent["document_id"],),
+                ).fetchone()
+                legacy_rename = (
+                    operation["provenance_kind"] == "CONTRACT_BATCH"
+                    and dependent["provenance_kind"] == "LEGACY_EPOCH_0"
+                    and dependent["relative_path"] != operation["relative_path"]
+                    and dependent["content"] == operation["content"]
+                    and not dependent["is_deleted"]
                 )
-                self._append_event(
-                    connection, dependent["operation_id"], "superseded",
-                    related_operation_id=successor["operation_id"],
-                    detail={"successor_operation_id": successor["operation_id"]},
-                )
+                if legacy_rename:
+                    old_parent = operation["relative_path"].rpartition("/")[0]
+                    new_parent = dependent["relative_path"].rpartition("/")[0]
+                    if old_parent != new_parent:
+                        raise SyncContractError("LEGACY_CHAIN_UNSAFE")
+                    self.create_structure_batch(
+                        context, context["writer_device_id"], [{
+                            "entity_kind": "document",
+                            "entity_id": dependent["document_id"],
+                            "intent_kind": "rename",
+                            "base_revision": int(document["structure_revision"] or 0),
+                            "payload": {"name": dependent["relative_path"].rsplit("/", 1)[-1]},
+                        }],
+                        local_supersedes_operation_ids=[dependent["operation_id"]],
+                    )
+                else:
+                    successor = self._insert_document_operation(
+                        connection,
+                        context=context,
+                        document=document,
+                        local_path=dependent["local_path"],
+                        relative_path=dependent["relative_path"],
+                        base_revision=int(result["revision"]),
+                        base_content=operation["content"],
+                        content=dependent["content"],
+                        is_deleted=bool(dependent["is_deleted"]),
+                        supersedes_operation_id=dependent["operation_id"],
+                        local_only_supersedes=(
+                            dependent["provenance_kind"] == "LEGACY_EPOCH_0"
+                        ),
+                    )
+                    self._append_event(
+                        connection, dependent["operation_id"], "superseded",
+                        related_operation_id=successor["operation_id"],
+                        detail={"successor_operation_id": successor["operation_id"]},
+                    )
             return self._operation_dict(connection, operation)
 
     def rebase_clean_merge(
@@ -4014,6 +4243,7 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
         ordered_intents,
         *,
         batch_id=None,
+        local_supersedes_operation_ids=None,
     ):
         with self._transaction() as connection:
             project = connection.execute(
@@ -4044,6 +4274,11 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                 batch_id=batch_id,
                 client_build_id=CLIENT_BUILD_ID,
             )
+            if local_supersedes_operation_ids is not None and (
+                len(local_supersedes_operation_ids) != len(request["ordered_intents"])
+                or any(intent.get("supersedes_operation_id") for intent in request["ordered_intents"])
+            ):
+                raise SyncContractError("INVALID_ARGUMENT")
             batch = request["batch"]
             existing = connection.execute(
                 "SELECT * FROM sync_contract_batches WHERE batch_id = ?",
@@ -4075,14 +4310,18 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                     json_sha256(request), now,
                 ),
             )
-            superseded_ids = [
-                intent.get("supersedes_operation_id")
-                for intent in request["ordered_intents"]
-                if intent.get("supersedes_operation_id")
-            ]
+            # The wire cannot reference protocol-2 IDs that never reached the
+            # server, but the local immutable structure row can still retain
+            # the original operation identity for audit and recovery.
+            local_links = (
+                local_supersedes_operation_ids
+                if local_supersedes_operation_ids is not None
+                else [intent.get("supersedes_operation_id") for intent in request["ordered_intents"]]
+            )
+            superseded_ids = [item for item in local_links if item]
             if len(superseded_ids) != len(set(superseded_ids)):
                 raise SyncContractError("INVALID_ARGUMENT")
-            for intent in request["ordered_intents"]:
+            for intent, local_link in zip(request["ordered_intents"], local_links):
                 connection.execute(
                     """
                     INSERT INTO sync_structure_operations (
@@ -4099,12 +4338,11 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                         intent["batch_id"], intent["sequence"],
                         intent["base_revision"], canonical_json(intent["payload"]),
                         intent["payload_sha256"],
-                        intent.get("supersedes_operation_id"), now,
+                        local_link, now,
                     ),
                 )
                 self._append_event(connection, intent["operation_id"], "enqueued")
-            for intent in request["ordered_intents"]:
-                original_id = intent.get("supersedes_operation_id")
+            for intent, original_id in zip(request["ordered_intents"], local_links):
                 if original_id:
                     self._append_event(
                         connection, original_id, "superseded",
@@ -4330,14 +4568,116 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
                             ),
                         )
                     elif intent["entity_kind"] == "document":
-                        connection.execute(
-                            "UPDATE sync_documents SET structure_revision = ?, "
-                            "updated_at = ? WHERE document_id = ? AND local_key = ?",
-                            (
-                                result_revision, _utc_now(), intent["entity_id"],
-                                batch["local_key"],
-                            ),
+                        local_intent = connection.execute(
+                            "SELECT supersedes_operation_id FROM sync_structure_operations "
+                            "WHERE operation_id = ?",
+                            (intent["operation_id"],),
+                        ).fetchone()
+                        original_id = (
+                            local_intent["supersedes_operation_id"]
+                            if local_intent is not None else None
                         )
+                        original = (
+                            connection.execute(
+                                "SELECT * FROM sync_operations WHERE operation_id = ?",
+                                (original_id,),
+                            ).fetchone()
+                            if original_id else None
+                        )
+                        legacy_rename = (
+                            original is not None
+                            and original["provenance_kind"] == "LEGACY_EPOCH_0"
+                            and intent["intent_kind"] == "rename"
+                            and original["document_id"] == intent["entity_id"]
+                        )
+                        if legacy_rename:
+                            document = connection.execute(
+                                "SELECT * FROM sync_documents WHERE document_id = ?",
+                                (intent["entity_id"],),
+                            ).fetchone()
+                            old_parent = document["server_path"].rpartition("/")[0]
+                            new_parent = original["relative_path"].rpartition("/")[0]
+                            if (
+                                old_parent != new_parent
+                                or original["relative_path"].rsplit("/", 1)[-1]
+                                != intent["payload"]["name"]
+                                or result_revision != int(document["structure_revision"] or 0) + 1
+                            ):
+                                raise SyncContractError("LEGACY_CHAIN_UNSAFE")
+                            connection.execute(
+                                "UPDATE sync_documents SET server_path = ?, name = ?, "
+                                "storage_name_key = ?, structure_revision = ?, "
+                                "updated_at = ? WHERE document_id = ? AND local_key = ?",
+                                (
+                                    original["relative_path"], intent["payload"]["name"],
+                                    normalize_storage_name(intent["payload"]["name"]).normalized,
+                                    result_revision, _utc_now(), intent["entity_id"],
+                                    batch["local_key"],
+                                ),
+                            )
+                            dependent = next((row for row in connection.execute(
+                                "SELECT * FROM sync_operations WHERE document_id = ? "
+                                "AND queue_id > ? AND base_revision IS NULL ORDER BY queue_id",
+                                (intent["entity_id"], original["queue_id"]),
+                            ).fetchall() if self._derived_state(
+                                connection, row["operation_id"]
+                            ) in {"pending", "retry_wait"}), None)
+                            if dependent and (
+                                dependent["relative_path"] != original["relative_path"]
+                                or dependent["is_deleted"]
+                            ):
+                                self._append_event(
+                                    connection, dependent["operation_id"], "blocked",
+                                    error_code="LEGACY_CHAIN_UNSAFE",
+                                )
+                            elif dependent:
+                                try:
+                                    successor = self._insert_document_operation(
+                                        connection,
+                                        context={
+                                            "local_key": batch["local_key"],
+                                            "project_id": batch["project_id"],
+                                            "writer_device_id": batch["writer_device_id"],
+                                        },
+                                        document=connection.execute(
+                                            "SELECT * FROM sync_documents WHERE document_id = ?",
+                                            (intent["entity_id"],),
+                                        ).fetchone(),
+                                        local_path=dependent["local_path"],
+                                        relative_path=dependent["relative_path"],
+                                        base_revision=int(document["revision"]),
+                                        base_content=original["content"],
+                                        content=dependent["content"],
+                                        is_deleted=bool(dependent["is_deleted"]),
+                                        supersedes_operation_id=dependent["operation_id"],
+                                        local_only_supersedes=True,
+                                    )
+                                except SyncContractError as error:
+                                    self._append_event(
+                                        connection, dependent["operation_id"], "blocked",
+                                        error_code=error.code,
+                                    )
+                                else:
+                                    self._append_event(
+                                        connection, dependent["operation_id"], "superseded",
+                                        related_operation_id=successor["operation_id"],
+                                        detail={"successor_operation_id": successor["operation_id"]},
+                                    )
+                            else:
+                                connection.execute(
+                                    "UPDATE sync_documents SET sync_state = 'synced', "
+                                    "updated_at = ? WHERE document_id = ?",
+                                    (_utc_now(), intent["entity_id"]),
+                                )
+                        else:
+                            connection.execute(
+                                "UPDATE sync_documents SET structure_revision = ?, "
+                                "updated_at = ? WHERE document_id = ? AND local_key = ?",
+                                (
+                                    result_revision, _utc_now(), intent["entity_id"],
+                                    batch["local_key"],
+                                ),
+                            )
                     elif intent["entity_kind"] == "tree_order":
                         payload = intent["payload"]
                         parent_folder_id = payload.get("parent_folder_id")

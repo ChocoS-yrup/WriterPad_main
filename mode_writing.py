@@ -1476,6 +1476,24 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             getattr(self, "_storage_editor_dirty_count", 0),
             bool(getattr(self, "_storage_account_email", "")),
         )
+        manager = getattr(self, "sync_manager", None)
+        store = getattr(manager, "_v2_store", None)
+        context = getattr(manager, "_v2_context", None)
+        candidate_lookup = getattr(store, "rejected_legacy_create_candidate", None)
+        if (
+            getattr(self, "_storage_pending_count", 0)
+            and isinstance(context, dict)
+            and callable(candidate_lookup)
+            and candidate_lookup(context["local_key"]) is not None
+        ):
+            guidance = {
+                "title": "구형 서버 전송 보류",
+                "summary": "로컬 대기 작업은 보존됐고 구형 전송은 중지됐습니다.",
+                "cause": "서버가 protocol 2 작업을 PROTOCOL_TOO_OLD로 거절했습니다.",
+                "action": "계약 0.3 호환성과 서버의 문서·작업 부재를 확인한 뒤 원래 작업을 연결해 전송합니다.",
+                "action_code": "recover_legacy",
+                "warning": True,
+            }
         box = QMessageBox(self)
         box.setWindowTitle(guidance["title"])
         box.setIcon(
@@ -1493,6 +1511,10 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
             action_button = box.addButton(
                 "지금 다시 시도", QMessageBox.ButtonRole.ActionRole
             )
+        elif action_code == "recover_legacy":
+            action_button = box.addButton(
+                "계약 0.3으로 전환·전송", QMessageBox.ButtonRole.ActionRole
+            )
         elif action_code == "open_conflicts":
             action_button = box.addButton(
                 "충돌 문서 확인", QMessageBox.ButtonRole.ActionRole
@@ -1506,6 +1528,15 @@ class WritingModeWidget(WritingTreeMixin, WritingExtractionMixin, QWidget):
         if action_button is not None and box.clickedButton() is action_button:
             if action_code == "retry":
                 self._retry_storage_sync()
+            elif action_code == "recover_legacy":
+                try:
+                    manager.recover_rejected_legacy_queue()
+                except Exception as error:
+                    code = getattr(error, "code", type(error).__name__)
+                    QMessageBox.warning(
+                        self, "전환 보류",
+                        f"안전 조건을 확인하지 못해 대기열을 보존했습니다. ({code})",
+                    )
             elif action_code == "open_conflicts":
                 self.open_conflict_resolver()
             elif action_code == "manual_save":
