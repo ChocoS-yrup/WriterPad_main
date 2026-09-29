@@ -218,6 +218,19 @@ class LegacyContractHandoffTests(unittest.TestCase):
                 raise AssertionError("unexpected table")
 
         self_project_id = self.project_id
+        reading = {"outcome": "supported", "observed_at": "2026-09-29T00:00:00+00:00",
+                   "context_key": ("stable",)}
+        compatibility = {
+            "project_sync_mode": "ID_BASED", "migration_epoch": 1,
+            "server_protocol_version": 3,
+            "server_contract_sha256": CANONICAL_CONTRACT_SHA256,
+            "server_capabilities": SERVER_CAPABILITIES,
+        }
+
+        def handshake(**kwargs):
+            kwargs["_checkpoint_acceptor"](compatibility, reading)
+            return reading
+
         manager = SyncManager()
         manager._v2_store = self.store
         manager._v2_context = dict(self.context)
@@ -228,9 +241,13 @@ class LegacyContractHandoffTests(unittest.TestCase):
             with (
                 patch("sync_manager.general_test_writes_held", return_value=False),
                 patch.object(manager, "_contract_context_key", return_value=("stable",)),
-                patch.object(manager, "perform_contract_handshake", return_value={"outcome": "supported"}),
+                patch.object(manager, "perform_contract_handshake", side_effect=handshake),
+                patch.object(manager, "_contract_handshake_reading", return_value=reading),
                 patch.object(manager, "ensure_session_valid"),
-                patch.object(manager, "enable_contract_path", side_effect=lambda: self.store.set_contract_path_enabled(self.context["local_key"], True)),
+                patch.object(manager, "_begin_structure_authority_selection"),
+                patch.object(manager, "_current_pull_coordinator", return_value={}),
+                patch.object(manager, "_publish_sync_state"),
+                patch.object(manager, "pull_remote_changes_async", return_value=True) as pull,
                 patch.object(manager, "retry_pending_syncs", return_value=False),
             ):
                 manager.supabase = ReadOnlyClient([{"document_id": self.first["document_id"]}])
@@ -256,13 +273,72 @@ class LegacyContractHandoffTests(unittest.TestCase):
                     "get_project_status", "documents", "sync_operations", "folders",
                 ])
                 manager.supabase = ReadOnlyClient([])
+                observations = 0
+
+                def drifting_handshake(**kwargs):
+                    nonlocal observations
+                    observations += 1
+                    observed = dict(compatibility)
+                    if observations == 2:
+                        observed.update(project_sync_mode="LEGACY", migration_epoch=0)
+                    kwargs["_checkpoint_acceptor"](observed, reading)
+                    return reading
+
+                with patch.object(manager, "perform_contract_handshake",
+                                  side_effect=drifting_handshake):
+                    with self.assertRaises(SyncContractError):
+                        manager.recover_rejected_legacy_queue()
+                self.assertEqual(observations, 2)
+                self.assertFalse(self.store.contract_path_enabled(self.context["local_key"]))
+                self.assertEqual(self.store.get_project(self.context["local_key"])["project_sync_mode"],
+                                 "LEGACY")
+                manager.supabase = ReadOnlyClient([])
+                with patch.object(
+                    self.store, "prepare_rejected_legacy_create",
+                    side_effect=SyncContractError("LEGACY_CHAIN_UNSAFE"),
+                ):
+                    with self.assertRaises(SyncContractError):
+                        manager.recover_rejected_legacy_queue()
+                rolled_back = self.store.get_project(self.context["local_key"])
+                self.assertEqual(
+                    (rolled_back["project_sync_mode"], rolled_back["migration_epoch"],
+                     rolled_back["contract_path_enabled"]), ("LEGACY", 0, 0),
+                )
+                self.assertEqual(
+                    [self.store.operation(item["operation_id"])["status"]
+                     for item in (self.first, self.second, self.third)],
+                    ["retry_wait", "pending", "pending"],
+                )
+                with self.store._reader() as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT count(*) FROM sync_server_checkpoint_observations"
+                    ).fetchone()[0], 0)
+                manager.supabase = ReadOnlyClient([])
                 result = manager.recover_rejected_legacy_queue()
                 self.assertTrue(self.store.contract_path_enabled(self.context["local_key"]))
+                self.assertEqual(
+                    (self.store.get_project(self.context["local_key"])["project_sync_mode"],
+                     self.store.get_project(self.context["local_key"])["migration_epoch"]),
+                    ("ID_BASED", 1),
+                )
                 self.assertTrue(result["successor_operation_id"])
-                self.assertFalse(result["dispatch_started"])
+                self.assertTrue(result["dispatch_started"])
+                pull.assert_called_once_with(
+                    manual=True, retry_pending_after_pull=True, reason="baseline"
+                )
+                successor = self.store.operation(result["successor_operation_id"])
+                self.assertEqual(successor["document_id"], self.first["document_id"])
+                self.assertEqual(successor["supersedes_operation_id"], self.first["operation_id"])
+                request = self.store.structure_batch_request(successor["batch_id"])
+                self.assertEqual((request["project_sync_mode"], request["migration_epoch"]),
+                                 ("ID_BASED", 1))
                 self.assertEqual(manager.supabase.calls, [
                     "get_project_status", "documents", "sync_operations",
                 ])
+                with self.store._reader() as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT count(*) FROM sync_server_checkpoint_observations"
+                    ).fetchone()[0], 1)
         finally:
             manager.supabase = None
             manager._v2_context = None

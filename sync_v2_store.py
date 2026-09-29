@@ -3159,8 +3159,8 @@ class SyncV2Store(ContractPreparationStoreMixin, ReviewedExecutionStoreMixin, Ht
             ).fetchone()
             if (
                 project is None or not project["contract_path_enabled"]
-                or project["project_sync_mode"] != "LEGACY"
-                or int(project["migration_epoch"] or 0) != 0
+                or (project["project_sync_mode"], int(project["migration_epoch"] or 0))
+                not in {("LEGACY", 0), ("ID_BASED", 1)}
             ):
                 raise SyncContractError("CONTRACT_NOT_ALLOWED")
             document = connection.execute(

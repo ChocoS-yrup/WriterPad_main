@@ -2151,7 +2151,23 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
         if candidate is None:
             raise SyncContractError("LEGACY_HANDOFF_NOT_ALLOWED")
         key = self._contract_context_key()
-        reading = self.perform_contract_handshake(require_connection=True)
+        compatibility = {}
+
+        def observe_handoff_checkpoint(observed, _reading):
+            # A migrated server can be ahead of this legacy local queue. Keep
+            # the handshake read-only until the absence checks have passed.
+            require_server_compatibility(**observed)
+            if (observed["project_sync_mode"], observed["migration_epoch"]) not in {
+                ("LEGACY", 0), ("ID_BASED", 1)
+            }:
+                raise SyncContractError("INVALID_PROJECT_MODE_TRANSITION")
+            compatibility.clear()
+            compatibility.update(observed)
+            return observed
+
+        reading = self.perform_contract_handshake(
+            require_connection=True, _checkpoint_acceptor=observe_handoff_checkpoint
+        )
         if not reading or reading.get("outcome") != "supported":
             raise SyncContractError("CONTRACT_NOT_ALLOWED")
         client = self.supabase
@@ -2197,21 +2213,73 @@ class SyncManager(NetworkRecoveryMixin, HandshakeLifecycleMixin, ContractPrepara
             or store.rejected_legacy_create_candidate(local_key) != candidate
         ):
             raise SyncContractError("SERVER_ABSENCE_REQUIRED")
-        gate_was_open = self.contract_path_enabled()
-        if not gate_was_open:
-            self.enable_contract_path()
-        try:
-            successor = store.prepare_rejected_legacy_create(
-                candidate["operation_id"], writer_device_id=self._v2_device_id,
-                server_absence_verified=True,
+        # Re-observe immediately before opening the gate. The three local
+        # changes are one SQLite transaction: a failed preparation cannot
+        # leave a migrated checkpoint or an open gate behind.
+        last_compatibility = dict(compatibility)
+        reading = self.perform_contract_handshake(
+            require_connection=True, _checkpoint_acceptor=observe_handoff_checkpoint
+        )
+        if (not reading or reading.get("outcome") != "supported"
+                or compatibility != last_compatibility):
+            raise SyncContractError("CONTRACT_NOT_ALLOWED")
+        from server_checkpoint import accept, source_record
+        with self._contract_lock:
+            def guard():
+                if (key != self._contract_context_key()
+                        or reading != self._contract_handshake_reading()):
+                    raise SyncContractError("CONTRACT_NOT_ALLOWED")
+
+            def queue_guard():
+                if store.rejected_legacy_create_candidate(local_key) != candidate:
+                    raise SyncContractError("LEGACY_CHAIN_UNSAFE")
+
+            with store._transaction():
+                guard()
+                queue_guard()
+                current = store.get_project(local_key)
+                if current is None or current["project_id"] != self._v2_context["project_id"]:
+                    raise SyncContractError("CONTRACT_NOT_ALLOWED")
+                gate_was_open = bool(current["contract_path_enabled"])
+                if compatibility["project_sync_mode"] == "ID_BASED":
+                    if gate_was_open:
+                        raise SyncContractError("CONTRACT_NOT_ALLOWED")
+                    project, changed = accept(
+                        store,
+                        binding=(local_key, current["project_id"], current["project_name"]),
+                        expected_checkpoint=(current["project_sync_mode"], current["migration_epoch"]),
+                        compatibility=compatibility, source=source_record(reading),
+                        guard=guard, legacy_candidate=candidate,
+                    )
+                else:
+                    project = store.activate_contract_project(local_key, **compatibility)
+                    changed = False
+                if not gate_was_open:
+                    store.set_contract_path_enabled(local_key, True)
+                successor = store.prepare_rejected_legacy_create(
+                    candidate["operation_id"], writer_device_id=self._v2_device_id,
+                    server_absence_verified=True,
+                )
+            self._v2_context.update(
+                project_sync_mode=project["project_sync_mode"],
+                migration_epoch=project["migration_epoch"],
             )
-        except Exception:
-            if not gate_was_open:
-                self.disable_contract_path()
-            raise
+            if changed:
+                self._begin_structure_authority_selection()
+                coordinator = self._current_pull_coordinator()
+                coordinator.update(
+                    baseline_validated=False, applied_snapshot_fingerprint=None,
+                    applied_index_fingerprint=None,
+                )
+        self._publish_sync_state()
+        started = (
+            self.pull_remote_changes_async(
+                manual=True, retry_pending_after_pull=True, reason="baseline"
+            ) if changed else self.retry_pending_syncs(manual=True)
+        )
         return {
             "successor_operation_id": successor["operation_id"],
-            "dispatch_started": bool(self.retry_pending_syncs(manual=True)),
+            "dispatch_started": bool(started),
         }
 
     def _uses_contract_structure(self):

@@ -89,11 +89,14 @@ def _empty_queue(store, connection, key):
                 raise SyncContractError("CONTRACT_PREPARATION_NOT_READY")
 
 
-def accept(store, *, binding, expected_checkpoint, compatibility, source, guard):
-    """Called only inside the validated handshake callback and manager lock.
+def accept(store, *, binding, expected_checkpoint, compatibility, source, guard,
+           legacy_candidate=None):
+    """Accept a validated checkpoint under the manager lock.
 
     guard revalidates runtime binding, generation, durable hold, closed gate,
-    memory work and queue stamp after SQLite has reserved the write lock.
+    memory work and queue stamp after SQLite has reserved the write lock. A
+    rejected legacy chain may cross only when the caller keeps this transaction
+    open through gate opening and successor preparation.
     Completed requests and every historical event remain untouched.
     """
     require_server_compatibility(**compatibility)
@@ -109,7 +112,10 @@ def accept(store, *, binding, expected_checkpoint, compatibility, source, guard)
                 or row["contract_path_enabled"]
                 or (row["project_sync_mode"], row["migration_epoch"]) != expected_checkpoint):
             raise SyncContractError("CONTRACT_PREPARATION_NOT_READY")
-        _empty_queue(store, connection, key)
+        if legacy_candidate is None:
+            _empty_queue(store, connection, key)
+        elif store.rejected_legacy_create_candidate(key) != legacy_candidate:
+            raise SyncContractError("LEGACY_CHAIN_UNSAFE")
         old = (row["project_sync_mode"], row["migration_epoch"])
         if old == ("ID_BASED", 1):
             return dict(row), False
