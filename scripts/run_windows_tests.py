@@ -29,9 +29,11 @@ def main():
     print(f"Python: {sys.version.split()[0]}; canonical test temp: {canonical_temp}", flush=True)
     faulthandler.enable()
 
-    def arm_watchdog():
+    def arm_watchdog(timeout=None):
         faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(args.stall_timeout, exit=True)
+        faulthandler.dump_traceback_later(
+            args.stall_timeout if timeout is None else timeout, exit=True
+        )
 
     class DiagnosticResult(unittest.TextTestResult):
         def addError(self, test, err):
@@ -49,7 +51,14 @@ def main():
             self.printErrorList("FAIL", self.failures[failures:])
 
         def startTest(self, test):
-            arm_watchdog()
+            # The 720-save durability stress case can spend over two minutes
+            # in SQLite on a busy hosted Windows runner while still making
+            # progress. Keep the normal bound for every other test.
+            slow_stress_case = test.id().endswith(
+                "test_long_run_resources.LongRunResourceTestCase."
+                "test_offline_repeated_save_keeps_immutable_durable_intents"
+            )
+            arm_watchdog(args.stall_timeout * 2 if slow_stress_case else None)
             super().startTest(test)
 
         def stopTest(self, test):

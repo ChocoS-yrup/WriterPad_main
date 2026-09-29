@@ -130,17 +130,19 @@ class EditorTests(unittest.TestCase):
     def test_window_buttons_run_workers_and_create_fresh_services(self):
         window = self.window()
         window.start('manual_prepare')
-        for _ in range(200):
+        for _ in range(1000):
             QTest.qWait(10)
             if window.worker is None:break
+        self.assertIsNone(window.worker,window.log.toPlainText())
         self.assertIsNotNone(window.service,window.log.toPlainText())
         window.editor.setPlainText(plan.MANUAL)
         window.start('manual_save')
         window.start('manual_send')
         window.start('manual_send')  # A second UI event cannot launch another worker.
-        for _ in range(200):
+        for _ in range(1000):
             QTest.qWait(10)
             if window.worker is None:break
+        self.assertIsNone(window.worker,window.log.toPlainText())
         self.assertEqual(available_action(self.journals),'auto_prepare',window.log.toPlainText())
         self.assertEqual(self.server.calls.count(('POST','document_commit')),1)
 
